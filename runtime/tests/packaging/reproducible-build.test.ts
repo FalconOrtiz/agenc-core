@@ -294,8 +294,16 @@ describe("reproducible install and release contract", () => {
       "tests/tui/workbench/buffer-neovim-lifecycle.real-neovim.test.ts",
     );
     expect(neovimJob).toContain("numTotalTestSuites: 2");
-    expect(neovimJob).toContain("numTotalTests: 4");
+    expect(neovimJob).toContain("numTotalTests: 8");
     expect(neovimJob).toContain("results.testResults.length !== 1");
+    expect(neovimJob).toContain('if test "$RUNNER_OS" = "Windows"; then');
+    expect(neovimJob).toContain(
+      '"$npm_command" rebuild better-sqlite3 esbuild',
+    );
+    expect(neovimJob).toContain(
+      '"$npm_command" rebuild better-sqlite3 esbuild node-pty',
+    );
+    expect(neovimJob).toContain("$_.ProcessId -ne $PID -and");
     expect(neovimJob).toContain("pgrep -f --");
 
     const macosJob = workflow.slice(
@@ -313,21 +321,30 @@ describe("reproducible install and release contract", () => {
     const windowsJob = workflow.slice(workflow.indexOf("\n  windows-native:"));
     expect(windowsJob).toContain("runs-on: windows-2025");
     expect(windowsJob).toContain(
+      "npm.cmd run build --workspace=@tetsuo-ai/runtime",
+    );
+    expect(windowsJob).toContain(
+      "tests/app-server/windows-named-pipe.win32.test.ts",
+    );
+    expect(windowsJob).toContain(
       "tests/durability/atomic-artifact.win32.test.ts",
     );
     expect(windowsJob).toContain(
       "tests/utils/execFileNoThrow.win32.test.ts",
     );
     expect(windowsJob).toContain("--config vitest.native.config.ts");
-    expect(windowsJob).toContain("numTotalTestSuites: 3");
-    expect(windowsJob).toContain("numTotalTests: 3");
+    expect(windowsJob).toContain("numTotalTestSuites: 4");
+    expect(windowsJob).toContain("numTotalTests: 5");
     expect(windowsJob).toContain(
       "npm.cmd ci --ignore-scripts --no-audit --no-fund",
     );
-    expect(windowsJob).not.toContain("npm.cmd rebuild");
+    expect(windowsJob).toContain("npm.cmd rebuild better-sqlite3 esbuild");
+    expect(windowsJob).toContain(
+      'if ($LASTEXITCODE -ne 0) { throw "native dependency rebuild failed" }',
+    );
     expect(windowsJob).not.toContain("npm_config_build_from_source");
     expect(windowsJob).toContain(
-      "Windows native capability lane passed 3 tests in 2 files with zero skipped",
+      "Windows native capability lane passed 5 tests in 3 files with zero skipped",
     );
 
     expect(workflow.match(
@@ -336,7 +353,7 @@ describe("reproducible install and release contract", () => {
     expect(workflow.match(
       /actions\/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e/g,
     )).toHaveLength(4);
-    expect(workflow.match(/--require-zero-skips/g)).toHaveLength(5);
+    expect(workflow.match(/--require-zero-skips/g)).toHaveLength(6);
     expect(workflow).not.toMatch(/uses:\s+actions\/[\w-]+@v\d/);
     expect(workflow).not.toContain("cache: npm");
     expect(workflow).not.toContain("--passWithNoTests");

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   TuiSession,
@@ -24,6 +24,16 @@ describe("TUI E2E harness state isolation", () => {
       hasRenderedAssistantReply([
         "                               │ AGENC",
         "                               │ OK",
+      ]),
+    ).toBe(true);
+  });
+
+  it("recognizes a compact workbench reply aligned below its user prompt", () => {
+    expect(
+      hasRenderedAssistantReply([
+        " │ ▾ project                         ❯ hi                                                        │",
+        " │     package.json                                                                                │",
+        " │     README.md                       OK                                                         │",
       ]),
     ).toBe(true);
   });
@@ -51,6 +61,14 @@ describe("TUI E2E harness state isolation", () => {
         "                                 legacy reply",
       ]),
     ).toBe(true);
+    expect(
+      hasRenderedAssistantReply([
+        " │ ▾ project                         ❯ hi                                                        │",
+        " │     package.json                                                              Delegate work │",
+        " │                                                                                              │",
+        " │ ┌ composer chrome                                                                           │",
+      ]),
+    ).toBe(false);
   });
 
   it("writes trust to AGENC_HOME when it differs from HOME", () => {
@@ -122,6 +140,61 @@ describe("TUI E2E harness state isolation", () => {
     expect(runner).toContain("teardownTuiGateState(gateState, BIN_AGENC)");
     expect(runner).not.toContain("DEFAULT_DAEMON_SOCKET");
     expect(runner).not.toContain("restartDaemon()");
+  });
+
+  it("removes embedded-Neovim workspaces only after PTY cleanup", () => {
+    const runner = readFileSync(
+      new URL("../scripts/check-tui-e2e/runner.mjs", import.meta.url),
+      "utf8",
+    );
+    const runScenarioStart = runner.indexOf(
+      "export async function runScenario(",
+    );
+    const sessionCleanup = runner.indexOf(
+      "await session.cleanup();",
+      runScenarioStart,
+    );
+    const scenarioReturn = runner.indexOf("\n  return {", sessionCleanup);
+    const runScenarioEntryStart = runner.indexOf(
+      "async function runScenarioEntry(",
+      scenarioReturn,
+    );
+    const scenarioRun = runner.indexOf(
+      "result = await runScenario(",
+      runScenarioEntryStart,
+    );
+    const gateTeardown = runner.indexOf(
+      "await teardownTuiGateState(gateState, BIN_AGENC);",
+      scenarioRun,
+    );
+
+    expect(runScenarioStart).toBeGreaterThan(-1);
+    expect(sessionCleanup).toBeGreaterThan(runScenarioStart);
+    expect(scenarioReturn).toBeGreaterThan(sessionCleanup);
+    expect(runScenarioEntryStart).toBeGreaterThan(scenarioReturn);
+    expect(scenarioRun).toBeGreaterThan(runScenarioEntryStart);
+    expect(gateTeardown).toBeGreaterThan(scenarioRun);
+
+    for (const scenario of [
+      "120-workbench-buffer-neovim.mjs",
+      "121-workbench-buffer-neovim-missing-fallback.mjs",
+      "122-workbench-buffer-neovim-kill-cleanup.mjs",
+      "123-workbench-buffer-neovim-runtime-exit.mjs",
+      "124-workbench-buffer-neovim-visual-render.mjs",
+      "130-workbench-buffer-neovim-platform-gate.mjs",
+      "131-workbench-buffer-neovim-platform-kill-cleanup.mjs",
+    ]) {
+      const source = readFileSync(
+        new URL(
+          `../scripts/check-tui-e2e/scenarios/${scenario}`,
+          import.meta.url,
+        ),
+        "utf8",
+      );
+      expect(source).toContain("mkdtemp(join(tmpdir(),");
+      expect(source).toContain("Windows cannot delete a live process cwd.");
+      expect(source).not.toMatch(/\brm\s*\(/u);
+    }
   });
 
   it("forces deterministic gate controls after scenario overrides", () => {
@@ -211,6 +284,33 @@ describe("TUI E2E harness state isolation", () => {
     await expect(session.prepare()).rejects.toThrow(
       /requires runner-owned gate state or useTempHome isolation/u,
     );
+  });
+
+  it("omits unsupported node-pty signals when terminating on Windows", () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    if (platformDescriptor === undefined) {
+      throw new Error("process.platform descriptor is unavailable");
+    }
+    const kill = vi.fn((signal?: string) => {
+      if (signal !== undefined) {
+        throw new Error("Signals not supported on windows.");
+      }
+    });
+    const session = new TuiSession();
+    session.term = { kill } as typeof session.term;
+
+    Object.defineProperty(process, "platform", {
+      ...platformDescriptor,
+      value: "win32",
+    });
+    try {
+      session.kill("SIGKILL");
+    } finally {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
+
+    expect(kill).toHaveBeenCalledOnce();
+    expect(kill).toHaveBeenCalledWith();
   });
 
   it("gives every scenario a private clean git fixture", () => {

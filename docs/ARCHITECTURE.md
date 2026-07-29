@@ -43,7 +43,8 @@ and [`quickstart.md`](quickstart.md). Reference docs for operators and embedders
    `AGENC_HOME`**. Owns agent/session lifecycle, JSON-RPC dispatch, command
    execution, provider-key vending, permission requests, realtime methods,
    health, recovery, and background-agent attachment. Clients authenticate
-   with a cookie on a Unix socket (optional WebSocket transport).
+   with a cookie on a Unix socket or Windows named pipe (optional WebSocket
+   transport).
 3. **Clients** — interactive **TUI**, one-shot **print / `--no-tui`**,
    **background agents**, the **channel gateway**, **remote control**, and
    the embedding **SDK**. Real work flows through the daemon; the TUI is a
@@ -122,7 +123,7 @@ The daemon and runtime persist under one home. Relocate with an absolute
 
 | Path                                                               | Purpose                                                                                                                              |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `daemon.sock`                                                      | Unix domain socket (clients + SDK)                                                                                                   |
+| `daemon.sock`                                                      | Unix domain socket (clients + SDK); Windows uses a stable per-home named pipe instead                                                 |
 | `daemon.cookie`                                                    | Shared secret for local client auth (0600)                                                                                           |
 | `daemon.pid`                                                       | Detached daemon PID                                                                                                                  |
 | `daemon.log`                                                       | Daemon log sink                                                                                                                      |
@@ -353,7 +354,15 @@ The TUI is a **custom `react-reconciler` Ink fork** under
 `runtime/src/tui/ink` (own renderer, double-buffered frame diffing, event
 dispatch, bidi/ANSI) — not the upstream `ink` package. On top: app shell,
 prompt input, transcript, and the **workbench** (project explorer, preview,
-editable `BUFFER` preferring embedded `nvim --embed`). See
+and editable `BUFFER`).
+
+BUFFER prefers a supervised `nvim --embed` workspace session. Neovim owns
+editing, modes, command-line UI, messages, popups, buffers, and plugins; AgenC
+attaches a line-grid UI, renders that native grid into the measured center
+pane, routes terminal input, and owns process and file-safety boundaries.
+Loaded and hidden Neovim buffers form one safety unit: navigation reuses the
+session, dirty state is aggregated across the buffer manifest, and a workbench
+transition cannot abandon edits in a non-active buffer. See
 [`embedded-neovim-buffer.md`](embedded-neovim-buffer.md).
 
 A throwing frame is contained; the next frame full-repaints rather than
