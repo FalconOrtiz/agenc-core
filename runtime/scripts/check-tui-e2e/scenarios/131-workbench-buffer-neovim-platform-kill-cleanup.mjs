@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   anchorWorkbenchProjectRoot,
+  runEmbeddedNeovimCommand,
   waitForFrameText,
   waitForScreen,
 } from "../helpers/workbench-buffer-neovim.mjs";
@@ -27,15 +28,17 @@ export default async function (session) {
   const target = join(cwd, "target.txt");
   const pidFile = join(cwd, "nvim-platform-kill.pid");
   const jobPidFile = join(cwd, "nvim-platform-detached-job.pid");
+  const dirtyProofFile = join(cwd, "nvim-platform-dirty-proof.txt");
   let neovimPid = 0;
   let detachedJobPid = 0;
   try {
     await anchorWorkbenchProjectRoot(cwd);
-    await writeFile(target, "platform-kill-alpha\n", "utf8");
+    const originalTarget = "platform-kill-alpha\n";
+    await writeFile(target, originalTarget, "utf8");
     session.cwd = cwd;
     await openEmbeddedNeovim(session);
 
-    await runNeovimCommand(
+    await runEmbeddedNeovimCommand(
       session,
       "call writefile([string(getpid())], 'nvim-platform-kill.pid')",
     );
@@ -49,7 +52,7 @@ export default async function (session) {
       "process.on('SIGTERM', () => {});",
       "setInterval(() => {}, 1000);",
     ].join("");
-    await runNeovimCommand(
+    await runEmbeddedNeovimCommand(
       session,
       `call jobstart([${
         [
@@ -60,6 +63,7 @@ export default async function (session) {
           "agenc-neovim-platform-descendant",
         ].map(vimLiteral).join(", ")
       }], {'detach': v:true})`,
+      { readySession: true },
     );
     detachedJobPid = await readPidFile(jobPidFile);
     if (!processIsAlive(detachedJobPid)) {
@@ -68,17 +72,38 @@ export default async function (session) {
       );
     }
 
+    // Outer-PTY write completion and rendered idleness do not acknowledge
+    // Neovim's asynchronous nvim_input requests. Have the editor itself
+    // publish each insert-mode change so the full marker is proven before the
+    // TUI is killed, without depending on a transient terminal frame.
+    await runEmbeddedNeovimCommand(
+      session,
+      "autocmd TextChangedI,TextChangedP target.txt call writefile(getline(1, '$'), 'nvim-platform-dirty-proof.txt')",
+      { readySession: true },
+    );
     session.send("G");
     await sleep(80);
     session.send("o");
     await sleep(80);
     await session.type("UNSAVED_PLATFORM_KILL_MARK", { perCharMs: 15 });
-    await waitForFrameText(
-      session,
+    const dirtyProof = await waitForFileText(
+      dirtyProofFile,
       /UNSAVED_PLATFORM_KILL_MARK/u,
-      "dirty hosted-platform Neovim edit",
-      10_000,
+      5_000,
     );
+    const expectedDirtyProof =
+      `${originalTarget}UNSAVED_PLATFORM_KILL_MARK\n`;
+    if (dirtyProof !== expectedDirtyProof) {
+      throw new Error(
+        `Neovim dirty-buffer proof was not exact: ${JSON.stringify(dirtyProof)}`,
+      );
+    }
+    const targetBeforeKill = await readFile(target, "utf8");
+    if (targetBeforeKill !== originalTarget) {
+      throw new Error(
+        `dirty Neovim text changed disk before TUI termination: ${JSON.stringify(targetBeforeKill)}`,
+      );
+    }
 
     session.kill("SIGKILL");
     await waitForPidGone(
@@ -92,8 +117,10 @@ export default async function (session) {
       "detached Neovim job after hosted-platform TUI termination",
     );
     const saved = await readFile(target, "utf8");
-    if (saved.includes("UNSAVED_PLATFORM_KILL_MARK")) {
-      throw new Error(`TUI termination wrote dirty Neovim text: ${saved}`);
+    if (saved !== originalTarget) {
+      throw new Error(
+        `TUI termination changed dirty Neovim text on disk: ${JSON.stringify(saved)}`,
+      );
     }
   } finally {
     if (detachedJobPid > 0 && processIsAlive(detachedJobPid)) {
@@ -135,22 +162,6 @@ async function openEmbeddedNeovim(session) {
   );
 }
 
-async function runNeovimCommand(session, command) {
-  session.send("\x1b");
-  await sleep(80);
-  session.send(":");
-  await waitForFrameText(
-    session,
-    /CMDLINE_NORMAL/u,
-    "embedded Neovim command-line mode",
-    5_000,
-  );
-  await sleep(80);
-  await session.type(command, { perCharMs: 5 });
-  session.send("\r");
-  await session.waitForIdle({ idleWindow: 500, timeout: 10_000 });
-}
-
 async function readPidFile(path) {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -162,6 +173,19 @@ async function readPidFile(path) {
     await sleep(50);
   }
   throw new Error(`embedded Neovim did not write its pid file: ${path}`);
+}
+
+async function waitForFileText(path, pattern, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    last = await readFile(path, "utf8").catch(() => "");
+    if (pattern.test(last)) return last;
+    await sleep(50);
+  }
+  throw new Error(
+    `dirty Neovim buffer proof did not update ${path} within ${timeoutMs}ms: ${last}`,
+  );
 }
 
 function processIsAlive(pid) {

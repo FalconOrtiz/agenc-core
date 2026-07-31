@@ -153,12 +153,75 @@ describe("hosted Neovim platform gate contract", () => {
       ),
       "utf8",
     );
-    expect(saveScenario).toContain('runNeovimCommand(session, "write")');
+    expect(saveScenario).toContain('"write", {');
+    expect(saveScenario).toContain("readySession: true");
     expect(saveScenario).toContain("waitForFileText(");
     expect(saveScenario).toContain("PLATFORM_NVIM_MARK");
+    expect(saveScenario).toContain("nvim-platform-edit-proof.txt");
+    expect(saveScenario).toContain(
+      "autocmd TextChangedI,TextChangedP target.txt",
+    );
+    expect(saveScenario).toContain("editProof !== expectedEditProof");
+    const editInputIndex = saveScenario.indexOf(
+      'session.type("PLATFORM_NVIM_MARK"',
+    );
+    const editProofWaitIndex = saveScenario.indexOf(
+      "const editProof = await waitForFileText(",
+    );
+    const editEscapeIndex = saveScenario.indexOf(
+      'session.send("\\x1b")',
+      editInputIndex,
+    );
+    expect(editInputIndex).toBeGreaterThan(-1);
+    expect(editProofWaitIndex).toBeGreaterThan(editInputIndex);
+    expect(editEscapeIndex).toBeGreaterThan(editProofWaitIndex);
+    expect(saveScenario).toContain("nvim-platform-exit.intent");
+    expect(saveScenario).toContain("| qa!");
     expect(saveScenario).toContain(
       "Ctrl+S boundary is covered separately through the terminal parser",
     );
+    const helperSource = readFileSync(
+      resolve(
+        RUNTIME_ROOT,
+        "scripts/check-tui-e2e/helpers/workbench-buffer-neovim.mjs",
+      ),
+      "utf8",
+    );
+    expect(helperSource).toContain("/CMDLINE_NORMAL/u");
+    expect(helperSource).toContain("\\x1b[200~");
+    expect(helperSource).toContain("\\x1b[201~");
+    expect(helperSource).not.toContain("session.type(`:${command}`");
+    const killScenario = readFileSync(
+      resolve(
+        RUNTIME_ROOT,
+        "scripts/check-tui-e2e/scenarios",
+        "131-workbench-buffer-neovim-platform-kill-cleanup.mjs",
+      ),
+      "utf8",
+    );
+    expect(killScenario).toContain("nvim-platform-dirty-proof.txt");
+    expect(killScenario).toContain(
+      "autocmd TextChangedI,TextChangedP target.txt",
+    );
+    expect(killScenario).toContain("writefile(getline(1, '$')");
+    expect(killScenario).toContain("targetBeforeKill !== originalTarget");
+    expect(killScenario).toContain("dirtyProof !== expectedDirtyProof");
+    expect(killScenario).toContain("readySession: true");
+    const dirtyAcknowledgementIndex = killScenario.indexOf(
+      "autocmd TextChangedI,TextChangedP target.txt",
+    );
+    const dirtyInputIndex = killScenario.indexOf(
+      'session.type("UNSAVED_PLATFORM_KILL_MARK"',
+    );
+    const dirtyProofWaitIndex = killScenario.indexOf(
+      "const dirtyProof = await waitForFileText(",
+    );
+    expect(dirtyAcknowledgementIndex).toBeGreaterThan(-1);
+    expect(dirtyInputIndex).toBeGreaterThan(dirtyAcknowledgementIndex);
+    expect(dirtyProofWaitIndex).toBeGreaterThan(dirtyInputIndex);
+    expect(
+      killScenario.slice(dirtyInputIndex),
+    ).not.toContain("runEmbeddedNeovimCommand");
     expect(() =>
       selectPlatformScenarios([...HOSTED_NEOVIM_SCENARIOS], "freebsd-x64")
     ).toThrow("unsupported TUI E2E platform");

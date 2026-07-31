@@ -48,6 +48,52 @@ export async function waitForFrameText(session, pattern, label, timeoutMs = 10_0
   throw new Error(`${label} did not render in the latest PTY frame: ${frame.slice(-1200)}`);
 }
 
+export async function runEmbeddedNeovimCommand(
+  session,
+  command,
+  { readySession = false } = {},
+) {
+  // The terminal grid can paint NORMAL before the provider commits the session
+  // that receives input. The provider header binds ready state to that
+  // committed session, but its coarse "normal" label also covers transient
+  // native modes. Normalize the owned session with Escape before entering Ex.
+  // The callers prove command delivery through concrete process/file effects;
+  // do not make that contract depend on a ConPTY-rendered presentation footer.
+  // A caller may bypass the presentation gate only after concrete evidence
+  // proves that this same Neovim process is live and already received input.
+  if (!readySession) {
+    await waitForFrameText(
+      session,
+      /\[embedded Neovim [^,\n]+,\s*normal,\s*ready(?:,|\])/iu,
+      `committed embedded Neovim session before :${command}`,
+      5_000,
+    );
+  }
+  await session.waitForIdle({ idleWindow: 200, timeout: 5_000 });
+  session.send("\x1b");
+  await sleep(80);
+  session.send(":");
+  // Neovim's provider footer remains in CMDLINE_NORMAL for the lifetime of
+  // command mode. Do not paste the command body until that real editor-state
+  // acknowledgement proves the normalized Escape and colon were consumed.
+  await waitForFrameText(
+    session,
+    /CMDLINE_NORMAL/u,
+    `embedded Neovim command mode before :${command}`,
+    5_000,
+  );
+  // Deliver the command body through the terminal's real bracketed-paste
+  // protocol. BufferSurface routes that one paste event to one acknowledged
+  // nvim_paste RPC instead of launching an unobserved nvim_input request for
+  // every character. Escape, colon, the command-mode acknowledgement, and
+  // Enter remain real editor interactions, so this still exercises the
+  // complete PTY input path.
+  session.send(`\x1b[200~${command}\x1b[201~`);
+  await sleep(80);
+  session.send("\r");
+  await session.waitForIdle({ idleWindow: 500, timeout: 10_000 });
+}
+
 export async function listNeovimPids() {
   const processes = await listProcesses();
   return processes

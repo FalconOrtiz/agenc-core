@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   anchorWorkbenchProjectRoot,
+  runEmbeddedNeovimCommand,
   waitForFrameText,
   waitForScreen,
 } from "../helpers/workbench-buffer-neovim.mjs";
@@ -25,15 +26,18 @@ export const meta = {
 export default async function (session) {
   const cwd = await mkdtemp(join(tmpdir(), "agenc-platform-nvim-e2e-"));
   const pidFile = join(cwd, "nvim-platform.pid");
+  const exitIntentFile = join(cwd, "nvim-platform-exit.intent");
+  const editProofFile = join(cwd, "nvim-platform-edit-proof.txt");
   let neovimPid = 0;
   try {
     await anchorWorkbenchProjectRoot(cwd);
     const target = join(cwd, "target.txt");
-    await writeFile(target, "platform-alpha\n", "utf8");
+    const originalTarget = "platform-alpha\n";
+    await writeFile(target, originalTarget, "utf8");
     session.cwd = cwd;
     await openEmbeddedNeovim(session);
 
-    await runNeovimCommand(
+    await runEmbeddedNeovimCommand(
       session,
       "call writefile([string(getpid())], 'nvim-platform.pid')",
     );
@@ -42,23 +46,37 @@ export default async function (session) {
       throw new Error(`embedded Neovim pid ${neovimPid} was not alive after startup`);
     }
 
+    await runEmbeddedNeovimCommand(
+      session,
+      "autocmd TextChangedI,TextChangedP target.txt call writefile(getline(1, '$'), 'nvim-platform-edit-proof.txt')",
+      { readySession: true },
+    );
     session.send("G");
     await sleep(80);
     session.send("o");
     await sleep(80);
     await session.type("PLATFORM_NVIM_MARK", { perCharMs: 15 });
-    session.send("\x1b");
-    await waitForFrameText(
-      session,
+    const editProof = await waitForFileText(
+      editProofFile,
       /PLATFORM_NVIM_MARK/u,
-      "hosted-platform Neovim edit",
-      10_000,
+      5_000,
     );
+    const expectedEditProof = `${originalTarget}PLATFORM_NVIM_MARK\n`;
+    if (editProof !== expectedEditProof) {
+      throw new Error(
+        `Neovim platform edit proof was not exact: ${JSON.stringify(editProof)}`,
+      );
+    }
+    session.send("\x1b");
     // Exercise Neovim's real write path in the hosted PTY. The host-owned
     // Ctrl+S boundary is covered separately through the terminal parser and
     // rendered BufferSurface integration test; emitting Ctrl+S from node-pty
     // is not portable because PTY line discipline can retain XOFF handling.
-    await runNeovimCommand(session, "write");
+    // The saved bytes are the authoritative end-to-end edit proof; ConPTY can
+    // omit the transient frame containing the newly inserted marker.
+    await runEmbeddedNeovimCommand(session, "write", {
+      readySession: true,
+    });
     await session.waitForIdle({ idleWindow: 500, timeout: 10_000 });
     const saved = await waitForFileText(
       target,
@@ -69,8 +87,13 @@ export default async function (session) {
       throw new Error(`embedded Neovim did not save the platform marker: ${saved}`);
     }
 
-    await runNeovimCommand(session, "q!");
-    await waitForPidGone(neovimPid, 10_000, "embedded Neovim after :q!");
+    await runEmbeddedNeovimCommand(
+      session,
+      "call writefile(['qa!'], 'nvim-platform-exit.intent') | qa!",
+      { readySession: true },
+    );
+    await waitForFileText(exitIntentFile, /qa!/u, 5_000);
+    await waitForPidGone(neovimPid, 10_000, "embedded Neovim after :qa!");
     await waitForFrameText(
       session,
       /Describe a task…/u,
@@ -106,22 +129,6 @@ async function openEmbeddedNeovim(session) {
   );
 }
 
-async function runNeovimCommand(session, command) {
-  session.send("\x1b");
-  await sleep(80);
-  session.send(":");
-  await waitForFrameText(
-    session,
-    /CMDLINE_NORMAL/u,
-    "embedded Neovim command-line mode",
-    5_000,
-  );
-  await sleep(80);
-  await session.type(command, { perCharMs: 5 });
-  session.send("\r");
-  await session.waitForIdle({ idleWindow: 500, timeout: 10_000 });
-}
-
 async function readPidFile(path) {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -144,7 +151,7 @@ async function waitForFileText(path, pattern, timeoutMs) {
     await sleep(50);
   }
   throw new Error(
-    `provider save did not update ${path} within ${timeoutMs}ms: ${last}`,
+    `expected file text did not update ${path} within ${timeoutMs}ms: ${last}`,
   );
 }
 
