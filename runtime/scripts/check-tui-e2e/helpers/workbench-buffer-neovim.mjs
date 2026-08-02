@@ -75,6 +75,10 @@ export async function waitForExactFileText(
   );
 }
 
+export function sendEmbeddedNeovimInput(session, text) {
+  session.send(text);
+}
+
 export async function runEmbeddedNeovimCommand(
   session,
   command,
