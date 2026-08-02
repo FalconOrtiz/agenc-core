@@ -219,6 +219,20 @@ export interface TurnCheckpointEvent {
   readonly resumableState: TurnCheckpointSliceLine;
 }
 
+/** Existing checkpoint shape. A missing discriminator is legacy version 1. */
+export interface TurnCheckpointV1Event extends TurnCheckpointEvent {
+  readonly checkpointVersion?: 1;
+}
+
+/**
+ * A3 checkpoint shape whose prefix hash authenticates every persisted tool
+ * result body through `ResponseItem.toolResultIntegrity`.
+ */
+export interface TurnCheckpointV2Event extends TurnCheckpointEvent {
+  readonly checkpointVersion: 2;
+  readonly toolResultIntegrityVersion: 1;
+}
+
 /**
  * Serialized, JSON-safe projection of the resumable `TurnState` counters.
  * The authoritative shape + (de)serialization live in `turn-state.ts`
