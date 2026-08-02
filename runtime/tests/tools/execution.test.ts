@@ -18,6 +18,8 @@ import {
 } from "./execution.js";
 import type { Tool } from "./types.js";
 import type { ToolInvocation } from "./context.js";
+import type { ToolDispatchResult } from "../tool-registry.js";
+import { readPendingPhysicalSettlement } from "./physical-settlement.js";
 import { buildGuardianApprovalRequest } from "../permissions/guardian/approval-request.js";
 import type { GuardianApprovalReviewOptions } from "../permissions/guardian/reviewer.js";
 import type {
@@ -130,35 +132,49 @@ describe("I-9 resolveTimeoutMs + withTimeoutAndAbort", () => {
     expect(resolveTimeoutMs(tool, { timeoutMs: 5_000 })).toBeNull();
   });
 
-  test("timer records ToolTimeoutError but waits for physical settlement", async () => {
+  test("A1 timeout returns before physical settlement and preserves the late result", async () => {
     vi.useFakeTimers();
     try {
       const physical = Promise.withResolvers<string>();
-      let settled = false;
-      const running = withTimeoutAndAbort(() => physical.promise, {
+      let physicalOutcome: "pending" | "settled" = "pending";
+      const ownedPhysicalSettlement = physical.promise.then((value) => {
+        physicalOutcome = "settled";
+        return value;
+      });
+      let callerOutcome: "pending" | "completed" | "timed_out" = "pending";
+      const running = withTimeoutAndAbort(() => ownedPhysicalSettlement, {
         timeoutMs: 50,
         toolName: "stub",
       });
       void running.then(
         () => {
-          settled = true;
+          callerOutcome = "completed";
         },
-        () => {
-          settled = true;
+        (error: unknown) => {
+          if (error instanceof ToolTimeoutError) callerOutcome = "timed_out";
         },
       );
 
       await vi.advanceTimersByTimeAsync(50);
-      expect(settled).toBe(false);
+      await Promise.resolve();
+      expect({ callerOutcome, physicalOutcome }).toEqual({
+        callerOutcome: "timed_out",
+        physicalOutcome: "pending",
+      });
 
+      const error = await running.catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ToolTimeoutError);
+      const pending = readPendingPhysicalSettlement<string>(error);
+      expect(pending?.callerStop).toBe("timeout");
       physical.resolve("late result");
-      await expect(running).rejects.toThrow(ToolTimeoutError);
+      await expect(pending?.settlement).resolves.toBe("late result");
+      expect(physicalOutcome).toBe("settled");
     } finally {
       vi.useRealTimers();
     }
   });
 
-  test("signal abort preempts timer but waits for physical settlement", async () => {
+  test("signal abort preempts timer without waiting for physical settlement", async () => {
     const ctl = new AbortController();
     const physical = Promise.withResolvers<string>();
     let settled = false;
@@ -177,14 +193,15 @@ describe("I-9 resolveTimeoutMs + withTimeoutAndAbort", () => {
     );
 
     ctl.abort("user");
-    await Promise.resolve();
-    expect(settled).toBe(false);
-
+    const error = await running.catch((caught: unknown) => caught);
+    expect(settled).toBe(true);
+    const pending = readPendingPhysicalSettlement<string>(error);
+    expect(pending?.callerStop).toBe("abort");
     physical.resolve("late result");
-    await expect(running).rejects.toThrow(/user|aborted/);
+    await expect(pending?.settlement).resolves.toBe("late result");
   });
 
-  test("null timeout preserves abort semantics without releasing early", async () => {
+  test("null timeout still separates abort from physical settlement", async () => {
     const ctl = new AbortController();
     const physical = Promise.withResolvers<string>();
     let settled = false;
@@ -203,11 +220,99 @@ describe("I-9 resolveTimeoutMs + withTimeoutAndAbort", () => {
     );
 
     ctl.abort("user");
-    await Promise.resolve();
-    expect(settled).toBe(false);
-
+    const error = await running.catch((caught: unknown) => caught);
+    expect(settled).toBe(true);
+    const pending = readPendingPhysicalSettlement<string>(error);
     physical.resolve("late result");
-    await expect(running).rejects.toThrow(/user|aborted/);
+    await expect(pending?.settlement).resolves.toBe("late result");
+  });
+
+  test("observes an abort raised synchronously while physical work starts", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctl = new AbortController();
+      const physical = Promise.withResolvers<string>();
+      const running = withTimeoutAndAbort(
+        () => {
+          ctl.abort("startup abort");
+          return physical.promise;
+        },
+        {
+          timeoutMs: null,
+          toolName: "stub",
+          signal: ctl.signal,
+        },
+      );
+      const observed = Promise.race([
+        running.catch((error: unknown) => error),
+        new Promise<"missed">((resolve) => {
+          setTimeout(() => resolve("missed"), 20);
+        }),
+      ]);
+
+      await vi.advanceTimersByTimeAsync(20);
+      const error = await observed;
+      physical.resolve("late result");
+
+      expect(error).not.toBe("missed");
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("AbortError");
+      const pending = readPendingPhysicalSettlement<string>(error);
+      expect(pending?.callerStop).toBe("abort");
+      await expect(pending?.settlement).resolves.toBe("late result");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("preserves re-entrant abort priority when physical startup then throws", async () => {
+    const ctl = new AbortController();
+    const running = withTimeoutAndAbort(
+      async () => {
+        ctl.abort("abort before throw");
+        throw new Error("physical startup failed");
+      },
+      {
+        timeoutMs: null,
+        toolName: "stub",
+        signal: ctl.signal,
+      },
+    );
+
+    const error = await running.catch((caught: unknown) => caught);
+
+    expect((error as Error).name).toBe("AbortError");
+    const pending = readPendingPhysicalSettlement<string>(error);
+    expect(pending?.callerStop).toBe("abort");
+    await expect(pending?.settlement).rejects.toThrow("physical startup failed");
+  });
+
+  test("starts physical work before returning control to a later abort", async () => {
+    const ctl = new AbortController();
+    const physical = Promise.withResolvers<string>();
+    const order: string[] = [];
+    const running = withTimeoutAndAbort(
+      () => {
+        order.push("physical-started");
+        return physical.promise;
+      },
+      {
+        timeoutMs: null,
+        toolName: "stub",
+        signal: ctl.signal,
+      },
+    );
+    order.push("wrapper-returned");
+    const callerOutcome = running.catch((error: unknown) => error);
+
+    ctl.abort("after wrapper return");
+    const error = await callerOutcome;
+    physical.resolve("late result");
+
+    expect(order).toEqual(["physical-started", "wrapper-returned"]);
+    expect((error as Error).name).toBe("AbortError");
+    const pending = readPendingPhysicalSettlement<string>(error);
+    await expect(pending?.settlement).resolves.toBe("late result");
   });
 
   test("timeout aborts the provided controller so the underlying tool can cancel", async () => {
@@ -234,10 +339,13 @@ describe("I-9 resolveTimeoutMs + withTimeoutAndAbort", () => {
       await vi.advanceTimersByTimeAsync(20);
       expect(ctl.signal.aborted).toBe(true);
       expect(String(ctl.signal.reason)).toContain("tool timeout");
-      expect(settled).toBe(false);
+      await Promise.resolve();
+      expect(settled).toBe(true);
 
+      const error = await running.catch((caught: unknown) => caught);
+      const pending = readPendingPhysicalSettlement<string>(error);
       physical.resolve("late result");
-      await expect(running).rejects.toThrow(ToolTimeoutError);
+      await expect(pending?.settlement).resolves.toBe("late result");
     } finally {
       vi.useRealTimers();
     }
@@ -526,7 +634,7 @@ describe("runToolUse end-to-end", () => {
     expect(seenSurface).toBe("tool");
   });
 
-  test("I-9 timeout waits for a stalled tool to physically settle", async () => {
+  test("I-9 timeout returns before a stalled tool physically settles", async () => {
     const tool: Tool = {
       name: "stuck",
       description: "",
@@ -1117,6 +1225,93 @@ describe("runToolUse — hook invocation", () => {
     });
     expect(sawPost).toBe(true);
     expect(out.content).toBe("rewritten");
+  });
+
+  test("late physical success completes post-hooks after caller timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const physical = Promise.withResolvers<{ readonly content: string }>();
+      const failureHook = vi.fn<PostToolUseFailureHook>(() => {});
+      const postHook = vi.fn<PostToolUseHook>(() => ({
+        kind: "additionalContext",
+        content: ["late lint context"],
+        result: { content: "rewritten late result" },
+      }));
+      const additionalContexts: string[][] = [];
+      const tool: Tool = {
+        name: "late-success",
+        description: "",
+        inputSchema: {},
+        timeoutMs: 20,
+        execute: () => physical.promise,
+      };
+      const running = executeToolDispatch({
+        rawArgs: "{}",
+        currentTurnId: "t1",
+        tool,
+        invocation: makeInvocation("c-late-success", tool.name),
+        postHooks: [postHook],
+        failureHooks: [failureHook],
+        onHookAdditionalContext: (contexts) => {
+          additionalContexts.push([...contexts]);
+        },
+      });
+      const callerOutcome = running.catch((caught: unknown) => caught);
+
+      await vi.advanceTimersByTimeAsync(20);
+      const error = await callerOutcome;
+      const pending = readPendingPhysicalSettlement<ToolDispatchResult>(error);
+
+      expect(error).toBeInstanceOf(ToolTimeoutError);
+      expect(failureHook).not.toHaveBeenCalled();
+      expect(postHook).not.toHaveBeenCalled();
+
+      physical.resolve({ content: "raw late result" });
+      await expect(pending?.settlement).resolves.toEqual(
+        expect.objectContaining({ content: "rewritten late result" }),
+      );
+      expect(postHook).toHaveBeenCalledOnce();
+      expect(failureHook).not.toHaveBeenCalled();
+      expect(additionalContexts).toEqual([["late lint context"]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("late physical rejection runs failure hooks exactly once", async () => {
+    vi.useFakeTimers();
+    try {
+      const physical = Promise.withResolvers<{ readonly content: string }>();
+      const failureHook = vi.fn<PostToolUseFailureHook>(() => {});
+      const tool: Tool = {
+        name: "late-failure",
+        description: "",
+        inputSchema: {},
+        timeoutMs: 20,
+        execute: () => physical.promise,
+      };
+      const running = executeToolDispatch({
+        rawArgs: "{}",
+        currentTurnId: "t1",
+        tool,
+        invocation: makeInvocation("c-late-failure", tool.name),
+        failureHooks: [failureHook],
+      });
+      const callerOutcome = running.catch((caught: unknown) => caught);
+
+      await vi.advanceTimersByTimeAsync(20);
+      const error = await callerOutcome;
+      const pending = readPendingPhysicalSettlement<ToolDispatchResult>(error);
+
+      expect(error).toBeInstanceOf(ToolTimeoutError);
+      expect(failureHook).not.toHaveBeenCalled();
+
+      physical.reject(new Error("late physical failure"));
+      await expect(pending?.settlement).rejects.toThrow("late physical failure");
+      expect(failureHook).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("executeToolDispatch exposes the code-mode result projection", async () => {

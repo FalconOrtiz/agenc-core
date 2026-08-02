@@ -18,7 +18,11 @@ import { serializeRolloutItem } from "../../src/session/rollout-item.js";
 import { RolloutStore } from "../../src/session/rollout-store.js";
 import { ExecutionAdmissionRepository } from "../../src/state/execution-admission.js";
 import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
-import { resolveDurableEffectReview } from "../../src/state/effect-review.js";
+import {
+  createOperatorEffectReviewResolution,
+  resolveDurableEffectReview,
+  resolveLiveDurableEffectReview,
+} from "../../src/state/effect-review.js";
 import { recoverDaemonStateOnStartup } from "../../src/state/recovery.js";
 import { recordInFlightToolCallStart } from "../../src/state/tool-output-rotation.js";
 import {
@@ -28,7 +32,25 @@ import {
 import { listUnresolvedUnknownOutcomeEffects } from "../../src/state/unknown-outcome-gate.js";
 
 const OPENED_AT = "2026-07-18T00:00:00.000Z";
+const REVIEW_SHA256 = "b".repeat(64);
 const created: string[] = [];
+
+function operatorReview(reviewedAt: string, actorId = "operator-test") {
+  return createOperatorEffectReviewResolution({
+    disposition: "confirmed_committed",
+    actorId,
+    evidenceRef: `operator-observation:${actorId}`,
+    evidenceSha256: REVIEW_SHA256,
+    reviewedAt,
+  });
+}
+
+function operatorReviewEventId(runId: string): string {
+  return (
+    `effect-review:${runId}:tool:turn-1:call-1:` +
+    `operator:resolved:${REVIEW_SHA256.slice(0, 12)}`
+  );
+}
 
 afterEach(() => {
   for (const path of created.splice(0)) {
@@ -134,13 +156,72 @@ function recoverAdmissionBeforeRollout(cwd: string): void {
 }
 
 describe("M4 effect restart recovery", () => {
+  it("fails closed when a v2 result omits its required effect boundary", () => {
+    const cwd = workspace();
+    const runId = "run-malformed-v2-boundary";
+    const original = store(cwd, runId);
+    expect(
+      original.append(
+        {
+          id: "v2-intent",
+          seq: 1,
+          msg: {
+            type: "effect_intent",
+            payload: {
+              formatVersion: 2,
+              minimumReaderRuntime: "0.14.0",
+              runId,
+              stepId: "tool:turn-1:call-1",
+              callId: "call-1",
+              toolName: "test-effect",
+              recoveryCategory: "side-effecting",
+              intentDigest: "intent-digest",
+              attempt: 1,
+              recordedAt: OPENED_AT,
+            },
+          },
+        },
+        { durable: true },
+      ),
+    ).toBe(true);
+    expect(
+      original.append(
+        {
+          id: "v2-result-without-boundary",
+          seq: 2,
+          msg: {
+            type: "effect_result",
+            payload: {
+              formatVersion: 2,
+              minimumReaderRuntime: "0.14.0",
+              runId,
+              stepId: "tool:turn-1:call-1",
+              callId: "call-1",
+              toolName: "test-effect",
+              recoveryCategory: "side-effecting",
+              intentEventSeq: 1,
+              outcome: "committed",
+              recordedAt: "2026-07-18T00:00:01.000Z",
+            },
+          },
+        },
+        { durable: true },
+      ),
+    ).toBe(true);
+    original.close();
+
+    expect(() => store(cwd, runId, true)).toThrow(
+      /effect_result format v2 requires effectBoundary/u,
+    );
+  });
+
   it("turns a dangling side effect into a journaled review lock without replay", () => {
     const cwd = workspace();
     const runId = "run-side-effect";
     const original = store(cwd, runId);
-    expect(original.append(intent(runId, "side-effecting"), { durable: true })).toBe(
-      true,
-    );
+    expect(
+      original.append(intent(runId, "side-effecting"), { durable: true }),
+    ).toBe(true);
     original.close();
 
     const resumed = store(cwd, runId, true);
@@ -162,7 +243,6 @@ describe("M4 effect restart recovery", () => {
         },
       },
     });
-
     const paths = resolveStateDatabasePaths({ cwd });
     const driver = openStateDatabasePaths(paths);
     try {
@@ -265,7 +345,9 @@ describe("M4 effect restart recovery", () => {
         ["step-1", "unknown_outcome"],
         ["step-2", "unknown_outcome"],
       ]);
-      expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toHaveLength(2);
+      expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toHaveLength(
+        2,
+      );
     } finally {
       driver.close();
       resumed.close();
@@ -278,9 +360,9 @@ describe("M4 effect restart recovery", () => {
     const runId = "run-before-dispatch";
     const original = store(cwd, runId);
     reserveToolStep(cwd, runId);
-    expect(original.append(intent(runId, "side-effecting"), { durable: true })).toBe(
-      true,
-    );
+    expect(
+      original.append(intent(runId, "side-effecting"), { durable: true }),
+    ).toBe(true);
     original.close();
 
     const resumed = store(cwd, runId, true);
@@ -354,9 +436,9 @@ describe("M4 effect restart recovery", () => {
     const cwd = workspace();
     const runId = "run-idempotent";
     const original = store(cwd, runId);
-    expect(original.append(intent(runId, "idempotent"), { durable: true })).toBe(
-      true,
-    );
+    expect(
+      original.append(intent(runId, "idempotent"), { durable: true }),
+    ).toBe(true);
     original.close();
 
     const resumed = store(cwd, runId, true);
@@ -377,6 +459,29 @@ describe("M4 effect restart recovery", () => {
         },
       },
     });
+    expect(
+      resumed.assertToolEffectAttemptAllowed({
+        callId: "call-1",
+        recoveryCategory: "idempotent",
+        idempotencyKey: "sha256:safe-retry",
+      }),
+    ).toBe(2);
+    resumed.close();
+
+    const recoveredAgain = store(cwd, runId, true);
+    expect(
+      recoveredAgain.assertToolEffectAttemptAllowed({
+        callId: "call-1",
+        recoveryCategory: "idempotent",
+        idempotencyKey: "sha256:safe-retry",
+      }),
+    ).toBe(2);
+    expect(
+      recoveredAgain
+        .readAll()
+        .filter((item) => item.type === "event_msg")
+        .map((item) => item.payload.msg.type),
+    ).toEqual(["effect_intent", "recovery_decision"]);
 
     const paths = resolveStateDatabasePaths({ cwd });
     const driver = openStateDatabasePaths(paths);
@@ -394,7 +499,7 @@ describe("M4 effect restart recovery", () => {
       expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toEqual([]);
     } finally {
       driver.close();
-      resumed.close();
+      recoveredAgain.close();
       created.push(paths.projectDir);
     }
   });
@@ -403,9 +508,9 @@ describe("M4 effect restart recovery", () => {
     const cwd = workspace();
     const runId = "run-reviewed";
     const original = store(cwd, runId);
-    expect(original.append(intent(runId, "side-effecting"), { durable: true })).toBe(
-      true,
-    );
+    expect(
+      original.append(intent(runId, "side-effecting"), { durable: true }),
+    ).toBe(true);
     original.close();
     const recovered = store(cwd, runId, true);
     recovered.close();
@@ -417,14 +522,11 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toMatchObject({
         kind: "resolved",
         durable: true,
-        eventId: `effect-review:${runId}:tool:turn-1:call-1`,
         sequence: 3,
       });
       expect(
@@ -435,16 +537,14 @@ describe("M4 effect restart recovery", () => {
       ).toMatchObject({
         reviewStatus: "resolved",
         reviewedBy: "operator-test",
-        reviewResolution: "human_verified",
+        reviewResolution: "confirmed_committed",
       });
       expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toEqual([]);
       expect(
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:30.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:30.000Z"),
         }),
       ).toMatchObject({
         kind: "already_resolved",
@@ -455,11 +555,12 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:31.000Z",
-          reviewedBy: "different-operator",
-          resolution: "human_verified",
+          resolution: operatorReview(
+            "2026-07-18T00:01:31.000Z",
+            "different-operator",
+          ),
         }),
-      ).toThrow(/conflicting content/);
+      ).toThrow(/different review resolution/);
       expect(() =>
         recordInFlightToolCallStart(driver, {
           sessionId: runId,
@@ -488,6 +589,82 @@ describe("M4 effect restart recovery", () => {
       ]);
     } finally {
       replayed.close();
+    }
+  });
+
+  it("resolves through the live journal owner and reprojects one canonical review", () => {
+    const cwd = workspace();
+    const runId = "run-live-reviewed";
+    const original = store(cwd, runId);
+    original.append(intent(runId, "side-effecting"), { durable: true });
+    original.close();
+    const live = store(cwd, runId, true);
+    const paths = resolveStateDatabasePaths({ cwd });
+    const driver = openStateDatabasePaths(paths);
+    let failProjection = true;
+    const resolution = operatorReview("2026-07-18T00:01:00.000Z");
+    const journal = {
+      readAll: () => live.readAll(),
+      append: (
+        eventId: string,
+        payload: Extract<
+          Event["msg"],
+          { readonly type: "effect_review_resolved" }
+        >["payload"],
+      ): Event => {
+        const lastSequence = live
+          .readAll()
+          .filter((item) => item.type === "event_msg")
+          .reduce(
+            (highest, item) => Math.max(highest, item.payload.seq ?? 0),
+            0,
+          );
+        const event: Event = {
+          eventId,
+          id: eventId,
+          seq: lastSequence + 1,
+          msg: { type: "effect_review_resolved", payload },
+        };
+        expect(live.append(event, { durable: true })).toBe(true);
+        return event;
+      },
+      project: (event: Event): void => {
+        if (failProjection) {
+          throw new Error("simulated live review projection failure");
+        }
+        live.recordEffectEvent(event);
+      },
+    };
+
+    try {
+      expect(() =>
+        resolveLiveDurableEffectReview(
+          driver,
+          { sessionId: runId, toolCallId: "call-1", resolution },
+          journal,
+        ),
+      ).toThrow(/simulated live review projection failure/);
+      failProjection = false;
+      expect(
+        resolveLiveDurableEffectReview(
+          driver,
+          { sessionId: runId, toolCallId: "call-1", resolution },
+          journal,
+        ),
+      ).toMatchObject({ kind: "resolved", durable: true, sequence: 3 });
+      expect(
+        live
+          .readAll()
+          .filter(
+            (item) =>
+              item.type === "event_msg" &&
+              item.payload.msg.type === "effect_review_resolved",
+          ),
+      ).toHaveLength(1);
+    } finally {
+      driver.close();
+      live.close();
+      created.push(paths.projectDir);
     }
   });
 
@@ -522,9 +699,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:03:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:03:00.000Z"),
         }),
       ).toThrow(/outside this project's sessions\/archived_sessions roots/);
       expect(readFileSync(externalPath, "utf8")).toBe(
@@ -595,22 +770,22 @@ describe("M4 effect restart recovery", () => {
           finishedAt: "2026-07-18T00:00:30.000Z",
         },
       });
-      driver.prepareState(
-        `CREATE TRIGGER test_abort_legacy_review_projection
+      driver
+        .prepareState(
+          `CREATE TRIGGER test_abort_legacy_review_projection
          BEFORE UPDATE ON in_flight_tool_calls
          WHEN OLD.status = 'poisoned' AND NEW.status = 'unknown_resolved'
          BEGIN
            SELECT RAISE(ABORT, 'simulated crash before legacy gate projection');
          END`,
-      ).run();
+        )
+        .run();
 
       expect(() =>
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toThrow(/simulated crash before legacy gate projection/);
       // The canonical append survives, while the outer SQLite transaction
@@ -624,7 +799,9 @@ describe("M4 effect restart recovery", () => {
       expect(runs.getEffect(runId, "tool:turn-1:call-1")).toMatchObject({
         reviewStatus: "pending",
       });
-      expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toHaveLength(1);
+      expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toHaveLength(
+        1,
+      );
       driver
         .prepareState("DROP TRIGGER test_abort_legacy_review_projection")
         .run();
@@ -639,7 +816,7 @@ describe("M4 effect restart recovery", () => {
       expect(runs.getEffect(runId, "tool:turn-1:call-1")).toMatchObject({
         reviewStatus: "resolved",
         reviewedBy: "operator-test",
-        reviewEventId: `effect-review:${runId}:tool:turn-1:call-1`,
+        reviewEventId: operatorReviewEventId(runId),
       });
       expect(listUnresolvedUnknownOutcomeEffects(driver, runId)).toEqual([]);
       expect(runs.getCurrentTerminalResult(runId)).toMatchObject({
@@ -701,9 +878,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:03:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:03:00.000Z"),
         }),
       ).toMatchObject({ kind: "resolved", durable: true, sequence: 3 });
       expect(readFileSync(historicalPath, "utf8")).toContain(
@@ -743,9 +918,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toMatchObject({ kind: "resolved", durable: true, sequence: 3 });
 
@@ -786,9 +959,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toThrow(/no retained canonical journal evidence/);
       expect(
@@ -832,9 +1003,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toThrow(/invalid or non-monotonic sequence/);
     } finally {
@@ -872,9 +1041,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toThrow(/event id .* is duplicated/);
     } finally {
@@ -886,11 +1053,11 @@ describe("M4 effect restart recovery", () => {
   it("keys review idempotency by canonical eventId, not reusable correlation id", () => {
     const cwd = workspace();
     const runId = "run-review-correlation-collision";
-    const reviewEventId = `effect-review:${runId}:tool:turn-1:call-1`;
+    const reviewEventId = operatorReviewEventId(runId);
     const original = store(cwd, runId);
-    expect(original.append(intent(runId, "side-effecting"), { durable: true })).toBe(
-      true,
-    );
+    expect(
+      original.append(intent(runId, "side-effecting"), { durable: true }),
+    ).toBe(true);
     expect(
       original.append(
         {
@@ -916,9 +1083,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:00.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:00.000Z"),
         }),
       ).toMatchObject({
         kind: "resolved",
@@ -929,9 +1094,7 @@ describe("M4 effect restart recovery", () => {
         resolveDurableEffectReview(driver, {
           sessionId: runId,
           toolCallId: "call-1",
-          reviewedAt: "2026-07-18T00:01:30.000Z",
-          reviewedBy: "operator-test",
-          resolution: "human_verified",
+          resolution: operatorReview("2026-07-18T00:01:30.000Z"),
         }),
       ).toMatchObject({ kind: "already_resolved", sequence: 4 });
     } finally {
@@ -957,6 +1120,9 @@ describe("M4 effect restart recovery", () => {
       kind: "resolve-tool-call" as const,
       sessionId: runId,
       toolCallId: "call-1",
+      disposition: "confirmed_committed" as const,
+      evidenceRef: "operator-observation:cli-reviewer",
+      evidenceSha256: REVIEW_SHA256,
     };
     const options = {
       driver,
@@ -1020,6 +1186,9 @@ describe("M4 effect restart recovery", () => {
             kind: "resolve-tool-call",
             sessionId: runId,
             toolCallId: "call-1",
+            disposition: "confirmed_committed",
+            evidenceRef: "operator-observation:live-review",
+            evidenceSha256: REVIEW_SHA256,
           },
           {
             driver,

@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { RunTerminalResult } from "../../src/contracts/run-contracts.js";
+import type {
+  EffectReviewResolution,
+  RunTerminalResult,
+} from "../../src/contracts/run-contracts.js";
 import {
   RunDurabilityConflictError,
   StateRunDurabilityRepository,
@@ -21,6 +24,23 @@ const T0 = "2026-07-18T00:00:00.000Z";
 const T1 = "2026-07-18T00:00:01.000Z";
 const T2 = "2026-07-18T00:00:02.000Z";
 const T3 = "2026-07-18T00:00:03.000Z";
+const REVIEW_DIGEST = "a".repeat(64);
+
+function committedReview(reviewedAt = T2) {
+  return {
+    version: 1 as const,
+    kind: "effect_review_resolution" as const,
+    disposition: "confirmed_committed" as const,
+    actorKind: "operator" as const,
+    actorId: "operator-1",
+    evidenceKind: "operator_evidence" as const,
+    evidenceRef: "incident:INC-1",
+    evidenceSha256: REVIEW_DIGEST,
+    reviewedAt,
+    workflowStatus: "resolved" as const,
+    domainAction: "mark_completed" as const,
+  };
+}
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "agenc-run-durability-home-"));
@@ -171,9 +191,7 @@ describe("StateRunDurabilityRepository", () => {
         eventId: "event-reopen-3",
         reason: "too_early",
       }),
-    ).toThrowError(
-      expect.objectContaining({ code: "RUN_EPOCH_NOT_TERMINAL" }),
-    );
+    ).toThrowError(expect.objectContaining({ code: "RUN_EPOCH_NOT_TERMINAL" }));
 
     runs.recordTerminalResult({
       epoch: 2,
@@ -191,9 +209,9 @@ describe("StateRunDurabilityRepository", () => {
       epoch: 2,
       status: "failed",
     });
-    expect(runs.listTerminalHistory("run-1").map((item) => item.epoch)).toEqual([
-      1, 2,
-    ]);
+    expect(runs.listTerminalHistory("run-1").map((item) => item.epoch)).toEqual(
+      [1, 2],
+    );
   });
 
   it("review-locks unknown mutations and rejects late outcome laundering", () => {
@@ -232,6 +250,7 @@ describe("StateRunDurabilityRepository", () => {
         runId: "run-1",
         stepId: "step-write",
         outcome: "committed",
+        effectBoundary: "crossed",
         eventId: "event-late-success",
         eventSequence: 3,
         completedAt: T2,
@@ -287,9 +306,7 @@ describe("StateRunDurabilityRepository", () => {
     const reviewed = runs.resolveEffectReview({
       runId: "run-1",
       stepId: "step-write",
-      reviewedAt: T2,
-      reviewedBy: "operator-1",
-      resolution: "manual_remediation",
+      resolution: committedReview(),
       eventId: "event-review",
       evidence: { ticket: "INC-1" },
     });
@@ -302,9 +319,7 @@ describe("StateRunDurabilityRepository", () => {
       runs.resolveEffectReview({
         runId: "run-1",
         stepId: "step-write",
-        reviewedAt: T2,
-        reviewedBy: "operator-1",
-        resolution: "manual_remediation",
+        resolution: committedReview(),
         eventId: "event-review",
         evidence: { ticket: "INC-1" },
       }).applied,
@@ -313,9 +328,11 @@ describe("StateRunDurabilityRepository", () => {
       runs.resolveEffectReview({
         runId: "run-1",
         stepId: "step-write",
-        reviewedAt: T3,
-        reviewedBy: "operator-2",
-        resolution: "confirmed_committed",
+        resolution: {
+          ...committedReview(T3),
+          actorId: "operator-2",
+          evidenceRef: "incident:INC-2",
+        },
         eventId: "event-review-conflict",
       }),
     ).toThrowError(
@@ -333,6 +350,74 @@ describe("StateRunDurabilityRepository", () => {
     expect(runs.getEffect("run-1", "step-write")?.outcome).toBe(
       "unknown_outcome",
     );
+  });
+
+  it("rejects review dispositions whose workflow action disagrees", () => {
+    runs.ensureInitialEpoch({ runId: "run-1", openedAt: T0 });
+    beginSideEffect();
+    runs.markEffectUnknown({
+      runId: "run-1",
+      stepId: "step-write",
+      eventId: "event-unknown",
+      eventSequence: 2,
+      reason: "acknowledgement_lost",
+      observedAt: T1,
+    });
+    const evidence = {
+      version: 1 as const,
+      kind: "effect_review_resolution" as const,
+      actorKind: "operator" as const,
+      actorId: "operator-1",
+      evidenceKind: "operator_evidence" as const,
+      evidenceRef: "incident:INC-invalid",
+      evidenceSha256: REVIEW_DIGEST,
+      reviewedAt: T2,
+    };
+    const invalid: readonly EffectReviewResolution[] = [
+      {
+        ...evidence,
+        disposition: "confirmed_committed",
+        workflowStatus: "resolved",
+        domainAction: "retry_new_attempt",
+      },
+      {
+        ...evidence,
+        disposition: "confirmed_no_effect",
+        workflowStatus: "resolved",
+        domainAction: "mark_completed",
+      },
+      {
+        ...evidence,
+        disposition: "remains_unknown",
+        workflowStatus: "resolved",
+        domainAction: "mark_completed",
+      },
+      {
+        ...evidence,
+        disposition: "confirmed_committed",
+        workflowStatus: "abandoned",
+        domainAction: "abandon_item",
+      },
+      {
+        ...evidence,
+        disposition: "confirmed_no_effect",
+        workflowStatus: "pending",
+      },
+    ];
+
+    for (const [index, resolution] of invalid.entries()) {
+      expect(() =>
+        runs.resolveEffectReview({
+          runId: "run-1",
+          stepId: "step-write",
+          resolution,
+          eventId: `event-invalid-review-${index}`,
+        }),
+      ).toThrow(/pending effect review|workflow status.*disagree/);
+    }
+    expect(runs.getEffect("run-1", "step-write")).toMatchObject({
+      reviewStatus: "pending",
+    });
   });
 
   it("requires durable idempotency keys and unique projected event sequences", () => {
@@ -359,6 +444,7 @@ describe("StateRunDurabilityRepository", () => {
       runId: "run-1",
       stepId: "step-a",
       outcome: "committed",
+      effectBoundary: "crossed",
       eventId: "event-result-a",
       eventSequence: 2,
       resultDigest: "sha256:result",
@@ -374,6 +460,66 @@ describe("StateRunDurabilityRepository", () => {
     ).toThrowError(
       expect.objectContaining({ code: "RUN_EVENT_SEQUENCE_CONFLICT" }),
     );
+  });
+
+  it("permits only durable same-key recovery of an unsettled idempotent attempt", () => {
+    runs.ensureInitialEpoch({ runId: "run-1", openedAt: T0 });
+    const gate = (options: {
+      readonly idempotencyKey: string;
+      readonly retrySafeDeferredStepIds?: ReadonlySet<string>;
+    }) =>
+      runs.assertEffectAttemptAllowed({
+        sessionId: "session-1",
+        callId: "call-read",
+        recoveryCategory: "idempotent",
+        ...options,
+      });
+
+    expect(gate({ idempotencyKey: "sha256:stable-read" })).toBe(1);
+    runs.beginEffect({
+      runId: "run-1",
+      epoch: 1,
+      stepId: "tool:turn-1:call-read",
+      sessionId: "session-1",
+      callId: "call-read",
+      toolName: "FileRead",
+      recoveryCategory: "idempotent",
+      idempotencyKey: "sha256:stable-read",
+      intentDigest: "sha256:read-attempt-1",
+      eventId: "event-read-attempt-1",
+      eventSequence: 1,
+      intentAt: T0,
+    });
+
+    expect(() => gate({ idempotencyKey: "sha256:stable-read" })).toThrowError(
+      expect.objectContaining({ code: "RUN_EFFECT_OUTCOME_CONFLICT" }),
+    );
+    expect(
+      gate({
+        idempotencyKey: "sha256:stable-read",
+        retrySafeDeferredStepIds: new Set(["tool:turn-1:call-read"]),
+      }),
+    ).toBe(2);
+    expect(() =>
+      gate({
+        idempotencyKey: "sha256:different-read",
+        retrySafeDeferredStepIds: new Set(["tool:turn-1:call-read"]),
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_EFFECT_OUTCOME_CONFLICT" }),
+    );
+
+    runs.completeEffect({
+      runId: "run-1",
+      stepId: "tool:turn-1:call-read",
+      outcome: "committed",
+      effectBoundary: "crossed",
+      eventId: "event-read-result-1",
+      eventSequence: 2,
+      resultDigest: "sha256:read-result-1",
+      completedAt: T1,
+    });
+    expect(gate({ idempotencyKey: "sha256:stable-read" })).toBe(2);
   });
 
   it("tracks historical rollout sources and makes retirement gaps explicit", () => {
@@ -413,7 +559,9 @@ describe("StateRunDurabilityRepository", () => {
       boundAt: T1,
     });
     const bindings = runs.listJournalBindings("run-1", 1);
-    expect(bindings.map((binding) => [binding.sourcePath, binding.active])).toEqual([
+    expect(
+      bindings.map((binding) => [binding.sourcePath, binding.active]),
+    ).toEqual([
       ["/rollouts/run-1-a.jsonl", false],
       ["/rollouts/run-1-b.jsonl", true],
     ]);
@@ -488,27 +636,31 @@ describe("StateRunDurabilityRepository", () => {
       lastSequence: 4,
       boundAt: T0,
     });
-    driver.prepareState(
-      `INSERT INTO threads (thread_id, created_at, updated_at)
+    driver
+      .prepareState(
+        `INSERT INTO threads (thread_id, created_at, updated_at)
        VALUES ('run-1', ?, ?)`,
-    ).run(T0, T0);
-    driver.prepareState(
-      `INSERT INTO thread_rollout_items (
+      )
+      .run(T0, T0);
+    driver
+      .prepareState(
+        `INSERT INTO thread_rollout_items (
          thread_id, source_path, line_number, byte_offset, item_index,
          item_type, event_id, event_seq, payload_json, line_hash
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      "run-1",
-      "/rollouts/retired.jsonl",
-      1,
-      0,
-      1,
-      "event_msg",
-      "event-9",
-      9,
-      "{}",
-      "sha256:line",
-    );
+      )
+      .run(
+        "run-1",
+        "/rollouts/retired.jsonl",
+        1,
+        0,
+        1,
+        "event_msg",
+        "event-9",
+        9,
+        "{}",
+        "sha256:line",
+      );
 
     expect(() =>
       driver.transactionImmediate(() => {
@@ -520,7 +672,9 @@ describe("StateRunDurabilityRepository", () => {
         throw new Error("roll back outer prune transaction");
       }),
     ).toThrow(/roll back outer prune transaction/);
-    expect(runs.getJournalBinding("/rollouts/retired.jsonl")?.active).toBe(true);
+    expect(runs.getJournalBinding("/rollouts/retired.jsonl")?.active).toBe(
+      true,
+    );
 
     const retired = runs.retireJournalSource({
       sourcePath: "/rollouts/retired.jsonl",
@@ -561,6 +715,7 @@ describe("StateRunDurabilityRepository", () => {
       runId: "run-1",
       stepId: "step-write",
       outcome: "committed",
+      effectBoundary: "crossed",
       eventId: "event-result",
       eventSequence: 2,
       completedAt: T1,
