@@ -8,12 +8,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, matchesGlob, resolve } from "node:path";
+import { basename, dirname, join, matchesGlob, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
@@ -59,8 +61,23 @@ const testFingerprint = "FND-001:HARNESS-SELF-TEST:CONTRACT-FIXTURE";
 const inventoryOverflowFileCount = 320;
 const jsonNodeOverflowCount = 16_384;
 const sourceAstNodeOverflowItems = 16_500;
+const defaultFixtureTimeoutMs = 5_000;
+const fullInventorySettlementHeadroomMs = 60_000;
+const fullInventoryAuditTimeoutMs = loadRedProbeManifest(
+  runtimeRoot,
+).probes.reduce(
+  (totalMs: number, probe: { readonly timeoutMs: number }) =>
+    totalMs + probe.timeoutMs,
+  fullInventorySettlementHeadroomMs,
+);
+const coldModuleLoadMilliseconds = 500;
+const coldModuleFixtureTimeoutMs = 5_000;
+const preReadyHardDeadlineMilliseconds = 5_000;
+const preReadyBlockingImportMilliseconds = 10_000;
 const reporterHandoffSymbolKey = "agenc.red-probe.report-expected-failure.v1";
 const finalAuthenticationDomain = "AGENC_RED_PROBE_FINAL_V1\0";
+const markdownLoaderSha256 =
+  "7fe828cfce5d415c2ac59b6d4b0226c41ebd86f531fb20a87c469359c571510f";
 const protocolAuthenticationSecret = Buffer.alloc(32, 0x11);
 const alternateProtocolAuthenticationSecret = Buffer.alloc(32, 0x22);
 const protocolEntry = Object.freeze({
@@ -74,6 +91,7 @@ interface FixtureOptions {
   readonly source?: string;
   readonly fingerprint?: string;
   readonly task?: string;
+  readonly temporaryDirectory?: string;
   readonly timeoutMs?: number;
 }
 
@@ -137,10 +155,15 @@ function probeSource(options: ProbeSourceOptions = {}): string {
 }
 
 function createFixture(options: FixtureOptions = {}): string {
-  const fixtureRoot = mkdtempSync(join(tmpdir(), "agenc-red-probe-contract-"));
+  const fixtureRoot = realpathSync(
+    mkdtempSync(
+      join(options.temporaryDirectory ?? tmpdir(), "agenc-red-probe-contract-"),
+    ),
+  );
   temporaryRoots.push(fixtureRoot);
   const probeDirectory = join(fixtureRoot, "tests/fnd/red-probes");
   const helperDirectory = join(fixtureRoot, "tests/helpers");
+  mkdirSync(join(fixtureRoot, "src"), { recursive: true });
   mkdirSync(probeDirectory, { recursive: true });
   mkdirSync(helperDirectory, { recursive: true });
   copyFileSync(
@@ -150,6 +173,10 @@ function createFixture(options: FixtureOptions = {}): string {
   copyFileSync(
     resolve(runtimeRoot, "tests/helpers/red-probe-bootstrap.mjs"),
     join(helperDirectory, "red-probe-bootstrap.mjs"),
+  );
+  copyFileSync(
+    resolve(runtimeRoot, "tests/helpers/red-probe-markdown-loader.mjs"),
+    join(helperDirectory, "red-probe-markdown-loader.mjs"),
   );
   const fingerprint = options.fingerprint ?? testFingerprint;
   const task = options.task ?? testTask;
@@ -166,7 +193,7 @@ function createFixture(options: FixtureOptions = {}): string {
         fingerprint,
         sourceSha256: sha256(source),
         task,
-        timeoutMs: options.timeoutMs ?? 1_000,
+        timeoutMs: options.timeoutMs ?? defaultFixtureTimeoutMs,
       },
     ],
   };
@@ -210,6 +237,13 @@ function protocolFinalLine(
     assertions: 1,
     skipped: 0,
     todos: 0,
+    markdownSupport: {
+      loaderSha256: markdownLoaderSha256,
+      runtimeSourceRootUrl: pathToFileURL(
+        `${resolve(runtimeRoot, "src")}${sep}`,
+      ).href,
+      assets: [],
+    },
   };
   const authenticationTag = createHmac("sha256", authenticationSecret)
     .update(finalAuthenticationDomain, "utf8")
@@ -232,6 +266,13 @@ function observeProtocolLines(
         state,
         line,
         authenticationSecret,
+        {
+          loaderSha256: markdownLoaderSha256,
+          runtimeSourceRoot: resolve(runtimeRoot, "src"),
+          runtimeSourceRootUrl: pathToFileURL(
+            `${resolve(runtimeRoot, "src")}${sep}`,
+          ).href,
+        },
       ),
     createRedProbeProtocolState(),
   );
@@ -297,14 +338,153 @@ afterEach(() => {
 });
 
 describe("FND red-probe supervisor", () => {
-  it("audits the registered nonempty harness self-probe with zero skips and todos", async () => {
-    await expect(auditRedProbes()).resolves.toEqual({
+  it(
+    "audits the registered nonempty harness self-probe with zero skips and todos",
+    async () => {
+      await expect(auditRedProbes()).resolves.toEqual({
+        files: 13,
+        expectedRed: 13,
+        assertions: 13,
+        skipped: 0,
+        todos: 0,
+      });
+    },
+    // Each probe has its own hard deadline. The outer test must cover the
+    // complete sequential inventory plus bounded supervisor settlement so a
+    // loaded hosted runner reports the owning probe instead of Vitest timeout.
+    fullInventoryAuditTimeoutMs,
+  );
+
+  it("loads and authenticates one bounded runtime markdown dependency", async () => {
+    const markdown = "repository-owned prompt asset\n";
+    const temporaryTarget = realpathSync(
+      mkdtempSync(join(tmpdir(), "agenc-red-probe-temp-target-")),
+    );
+    const temporaryAlias = `${temporaryTarget}-alias`;
+    temporaryRoots.push(temporaryAlias, temporaryTarget);
+    symlinkSync(
+      temporaryTarget,
+      temporaryAlias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const fixtureRoot = createFixture({
+      temporaryDirectory: temporaryAlias,
+      source: probeSource({
+        imports: ['import markdown from "../../../src/policy.md";'],
+        actual: "markdown",
+        expected: JSON.stringify("replacement prompt asset\n"),
+      }),
+    });
+    writeFileSync(join(fixtureRoot, "src/policy.md"), markdown, {
+      mode: 0o600,
+    });
+    expect(fixtureRoot).toBe(realpathSync(fixtureRoot));
+
+    await expect(auditRedProbes({ runtimeRoot: fixtureRoot })).resolves.toEqual(
+      {
+        files: 1,
+        expectedRed: 1,
+        assertions: 1,
+        skipped: 0,
+        todos: 0,
+      },
+    );
+  });
+
+  it("orders authenticated markdown assets by canonical code units", async () => {
+    const fixtureRoot = createFixture({
+      source: probeSource({
+        imports: [
+          'import lower from "../../../src/a.md";',
+          'import upper from "../../../src/A.md";',
+        ],
+        actual: "[lower, upper]",
+        expected: JSON.stringify(["different lower\n", "different upper\n"]),
+      }),
+    });
+    writeFileSync(join(fixtureRoot, "src/a.md"), "lower\n", { mode: 0o600 });
+    writeFileSync(join(fixtureRoot, "src/A.md"), "upper\n", { mode: 0o600 });
+
+    await expect(auditRedProbes({ runtimeRoot: fixtureRoot })).resolves.toEqual(
+      {
+        files: 1,
+        expectedRed: 1,
+        assertions: 1,
+        skipped: 0,
+        todos: 0,
+      },
+    );
+  });
+
+  it("starts heartbeat silence only after bounded cold module loading", async () => {
+    const source = probeSource({
+      imports: [
+        'import { coldCapability } from "../../../src/cold-capability.js";',
+      ],
+      actual: "coldCapability()",
+      expected: "2",
+    });
+    const fixtureRoot = createFixture({
+      source,
+      timeoutMs: coldModuleFixtureTimeoutMs,
+    });
+    writeFileSync(
+      join(fixtureRoot, "src/cold-capability.ts"),
+      [
+        `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${coldModuleLoadMilliseconds});`,
+        "export function coldCapability(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await expect(
+      auditRedProbes({
+        runtimeRoot: fixtureRoot,
+        testing: { heartbeatSilenceMs: 250 },
+      }),
+    ).resolves.toEqual({
       files: 1,
       expectedRed: 1,
       assertions: 1,
       skipped: 0,
       todos: 0,
     });
+  });
+
+  it("keeps the hard deadline and descendant containment active before readiness", async () => {
+    const fixtureRoot = createFixture({
+      source: probeSource({
+        imports: ['import "../../helpers/pre-ready-hang.js";'],
+      }),
+      timeoutMs: preReadyHardDeadlineMilliseconds,
+    });
+    const marker = join(fixtureRoot, "pre-ready-descendant.pid");
+    writeFixtureHelperModule(
+      fixtureRoot,
+      "pre-ready-hang.ts",
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `const child = spawn(process.execPath, ["--eval", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });`,
+        'if (child.pid === undefined) throw new Error("missing descendant pid");',
+        `writeFileSync(${JSON.stringify(marker)}, String(child.pid), "utf8");`,
+        "child.unref();",
+        `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${preReadyBlockingImportMilliseconds});`,
+        "",
+      ].join("\n"),
+    );
+
+    await expect(
+      auditRedProbes({ runtimeRoot: fixtureRoot }),
+    ).rejects.toThrow(
+      `timed out after ${preReadyHardDeadlineMilliseconds}ms`,
+    );
+    const descendantPid = Number.parseInt(readFileSync(marker, "utf8"), 10);
+    expect(Number.isSafeInteger(descendantPid)).toBe(true);
+    expect(() => process.kill(descendantPid, 0)).toThrow();
   });
 
   it("keeps the TypeScript helper and Node supervisor protocol constants exact", () => {
@@ -334,6 +514,16 @@ describe("FND red-probe supervisor", () => {
     });
   });
 
+  it("rejects authenticated final evidence before the ready heartbeat", () => {
+    const state = observeProtocolLines([
+      protocolHeartbeatLine(1),
+      protocolFinalLine(),
+    ]);
+    expect(state.finalRecordObserved).toBe(false);
+    expect(state.protocolInvalid).toBe(true);
+    expect(state.recordsObserved).toBe(2);
+  });
+
   it.each([
     {
       name: "non-one initial sequence",
@@ -359,18 +549,23 @@ describe("FND red-probe supervisor", () => {
         `"authenticationTag":"${firstNibble === "0" ? "1" : "0"}`,
     );
     expect(
-      observeProtocolLines([protocolHeartbeatLine(1), mutatedFinal])
+      observeProtocolLines([
+        protocolHeartbeatLine(1),
+        protocolHeartbeatLine(2),
+        mutatedFinal,
+      ])
         .protocolInvalid,
     ).toBe(true);
     expect(
       observeProtocolLines(
-        [protocolHeartbeatLine(1), validFinal],
+        [protocolHeartbeatLine(1), protocolHeartbeatLine(2), validFinal],
         alternateProtocolAuthenticationSecret,
       ).protocolInvalid,
     ).toBe(true);
     expect(
       observeProtocolLines([
         protocolHeartbeatLine(1),
+        protocolHeartbeatLine(2),
         protocolFinalLine(alternateProtocolAuthenticationSecret),
       ]).protocolInvalid,
     ).toBe(true);
@@ -379,12 +574,13 @@ describe("FND red-probe supervisor", () => {
   it("rejects every record after the final record", () => {
     const state = observeProtocolLines([
       protocolHeartbeatLine(1),
-      protocolFinalLine(),
       protocolHeartbeatLine(2),
+      protocolFinalLine(),
+      protocolHeartbeatLine(3),
     ]);
     expect(state.finalRecordObserved).toBe(true);
     expect(state.protocolInvalid).toBe(true);
-    expect(state.recordsObserved).toBe(3);
+    expect(state.recordsObserved).toBe(4);
   });
 
   it("reserves explicit Windows launch headroom for argv and environment transport", () => {
@@ -1296,20 +1492,6 @@ describe("FND red-probe supervisor", () => {
       error: "did not exit expected-red",
     },
     {
-      name: "getter-thrown AssertionError",
-      source: probeSource({
-        imports: ['import { AssertionError } from "node:assert";'],
-        beforeAssertion: [
-          "const actual = { get value() {",
-          '  throw new AssertionError({ actual: 1, expected: 2, operator: "deepStrictEqual" });',
-          "} };",
-        ],
-        actual: "actual",
-        expected: "{ value: 2 }",
-      }),
-      error: "did not exit expected-red",
-    },
-    {
       name: "wrong fingerprint",
       source: probeSource({
         fingerprint: "FND-001:HARNESS-SELF-TEST:WRONG-FINGERPRINT",
@@ -1354,6 +1536,40 @@ describe("FND red-probe supervisor", () => {
     const fixtureRoot = createFixture({ source, timeoutMs });
     await expect(auditRedProbes({ runtimeRoot: fixtureRoot })).rejects.toThrow(
       error,
+    );
+  });
+
+  it("rejects a getter-thrown AssertionError without platform-dependent fatal formatting", async () => {
+    const fixtureRoot = createFixture({
+      source: probeSource({
+        imports: [
+          'import { AssertionError } from "node:assert";',
+          'import "../../helpers/assertion-error-exit.mjs";',
+        ],
+        beforeAssertion: [
+          "const actual = { get value() {",
+          '  throw new AssertionError({ actual: 1, expected: 2, operator: "deepStrictEqual" });',
+          "} };",
+        ],
+        actual: "actual",
+        expected: "{ value: 2 }",
+      }),
+    });
+    writeFixtureHelperModule(
+      fixtureRoot,
+      "assertion-error-exit.mjs",
+      [
+        'import { AssertionError } from "node:assert";',
+        'process.once("uncaughtException", (error) => {',
+        "  if (!(error instanceof AssertionError)) throw error;",
+        "  process.exitCode = 1;",
+        "});",
+        "",
+      ].join("\n"),
+    );
+
+    await expect(auditRedProbes({ runtimeRoot: fixtureRoot })).rejects.toThrow(
+      "did not exit expected-red",
     );
   });
 
