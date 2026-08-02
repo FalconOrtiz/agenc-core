@@ -49,6 +49,14 @@ export interface SupervisedProcessOptions {
   /** Optional caller-supplied deadline. Omitted means unbounded. */
   readonly timeoutMs?: number;
   readonly maxOutputBytes: number;
+  /**
+   * Retain stdout in the result and charge it to `maxOutputBytes`.
+   *
+   * Set to false only for a streaming consumer which supplies `onStdout` and
+   * enforces its own record, decoded-byte, and aggregate-work ceilings. Stderr
+   * remains retained and charged to `maxOutputBytes`.
+   */
+  readonly captureStdout?: boolean;
   /** Optional bounded source bytes for native helpers that read stdin. */
   readonly stdin?: string | Buffer;
   readonly signal?: AbortSignal;
@@ -83,8 +91,11 @@ const MAX_PROCESS_TABLE_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_TABLE_RECORDS = 32_768;
 const MAX_OWNED_PROCESS_IDENTITIES = 4_096;
 const LINUX_SUBREAPER_BROKER_NAME = "agenc-process-broker";
-
 const WINDOWS_JOB_BROKER_NAME = "agenc-process-job-broker.exe";
+const WINDOWS_COMMAND_LINE_QUOTE_CODE_UNIT = 0x22;
+const WINDOWS_COMMAND_LINE_SPACE_CODE_UNIT = 0x20;
+const WINDOWS_COMMAND_LINE_TAB_CODE_UNIT = 0x09;
+const WINDOWS_COMMAND_LINE_BACKSLASH_CODE_UNIT = 0x5c;
 
 const LINUX_CGROUP_OWNER_WATCHDOG_SCRIPT = String.raw`
 set -u
@@ -1393,16 +1404,26 @@ function spawnWindowsJobContainedProcess(
   return child;
 }
 
-function quoteWindowsCommandLineArgument(value: string): string {
-  if (value.length > 0 && !/[\s"]/u.test(value)) return value;
+/** Quote one argument exactly as libuv does before `CreateProcessW`. */
+export function quoteWindowsCommandLineArgument(value: string): string {
+  let needsQuotes = value.length === 0;
+  for (let index = 0; index < value.length && !needsQuotes; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    needsQuotes =
+      codeUnit === WINDOWS_COMMAND_LINE_SPACE_CODE_UNIT ||
+      codeUnit === WINDOWS_COMMAND_LINE_TAB_CODE_UNIT ||
+      codeUnit === WINDOWS_COMMAND_LINE_QUOTE_CODE_UNIT;
+  }
+  if (!needsQuotes) return value;
+
   let quoted = '"';
   let backslashes = 0;
   for (const character of value) {
-    if (character === "\\") {
+    if (character.charCodeAt(0) === WINDOWS_COMMAND_LINE_BACKSLASH_CODE_UNIT) {
       backslashes += 1;
       continue;
     }
-    if (character === '"') {
+    if (character.charCodeAt(0) === WINDOWS_COMMAND_LINE_QUOTE_CODE_UNIT) {
       quoted += "\\".repeat(backslashes * 2 + 1);
       quoted += '"';
       backslashes = 0;
@@ -1414,6 +1435,17 @@ function quoteWindowsCommandLineArgument(value: string): string {
   }
   quoted += "\\".repeat(backslashes * 2);
   return `${quoted}"`;
+}
+
+/** Count the exact UTF-16 command line, including separators and final NUL. */
+export function windowsCommandLineUtf16CodeUnits(
+  executable: string,
+  args: readonly string[],
+): number {
+  return (
+    [executable, ...args].map(quoteWindowsCommandLineArgument).join(" ")
+      .length + 1
+  );
 }
 
 /** Run a native helper with bounded output and process-tree cleanup. */
@@ -1479,8 +1511,21 @@ export function runSupervisedProcess(
       target: Buffer[],
       chunk: Buffer,
       callback: SupervisedProcessOptions["onStdout"],
+      capture: boolean,
     ): void => {
-      if (settled) return;
+      if (settled || processError !== undefined) {
+        return;
+      }
+      if (!capture) {
+        if (stopReason !== undefined) return;
+        try {
+          callback?.(chunk, control);
+        } catch (error) {
+          processError ??= toError(error);
+          requestStop("consumer_limit");
+        }
+        return;
+      }
       const remaining = options.maxOutputBytes - outputBytes;
       const accepted =
         remaining > 0
@@ -1489,11 +1534,13 @@ export function runSupervisedProcess(
       if (accepted.byteLength > 0) {
         target.push(accepted);
         outputBytes += accepted.byteLength;
-        try {
-          callback?.(accepted, control);
-        } catch (error) {
-          processError = toError(error);
-          requestStop("consumer_limit");
+        if (stopReason === undefined) {
+          try {
+            callback?.(accepted, control);
+          } catch (error) {
+            processError ??= toError(error);
+            requestStop("consumer_limit");
+          }
         }
       }
       if (accepted.byteLength < chunk.byteLength) requestStop("output_limit");
@@ -1582,10 +1629,10 @@ export function runSupervisedProcess(
     if (options.signal?.aborted === true) onAbort();
 
     child.stdout.on("data", (chunk: Buffer) =>
-      append(stdout, chunk, options.onStdout),
+      append(stdout, chunk, options.onStdout, options.captureStdout !== false),
     );
     child.stderr.on("data", (chunk: Buffer) =>
-      append(stderr, chunk, options.onStderr),
+      append(stderr, chunk, options.onStderr, true),
     );
     child.stdin.on("error", (error: NodeJS.ErrnoException) => {
       // Search helpers such as `rg -l -` may deliberately stop reading once
@@ -1594,12 +1641,12 @@ export function runSupervisedProcess(
       if (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED") {
         return;
       }
-      processError = error;
+      processError ??= error;
       requestStop("spawn_error");
     });
     child.stdin.end(options.stdin);
     child.once("error", (error) => {
-      processError = error;
+      processError ??= error;
       requestStop("spawn_error");
       closed = true;
       maybeFinish();
@@ -1630,6 +1677,11 @@ function validateLimits(options: SupervisedProcessOptions): void {
   if (!Number.isFinite(options.maxOutputBytes) || options.maxOutputBytes <= 0) {
     throw new Error(
       "supervised process maxOutputBytes must be finite and positive",
+    );
+  }
+  if (options.captureStdout === false && options.onStdout === undefined) {
+    throw new Error(
+      "supervised process captureStdout=false requires an onStdout consumer",
     );
   }
 }

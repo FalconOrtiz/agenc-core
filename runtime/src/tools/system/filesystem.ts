@@ -274,7 +274,9 @@ function boundSessionReadContent(
  */
 function resolveWorkspaceReadScopeRoot(): string {
   try {
-    return resolve(resolveSessionWorkspaceRoot()).normalize("NFC");
+    return normalizeFilesystemUnicodeIdentity(
+      resolve(resolveSessionWorkspaceRoot()),
+    );
   } catch {
     return resolveSessionWorkspaceRoot();
   }
@@ -860,8 +862,12 @@ export async function safePath(
       };
     }
 
-    // Canonicalize target (follows symlinks, normalize Unicode for macOS HFS+/APFS)
-    const canonical = (await canonicalize(normalizedTarget)).normalize("NFC");
+    // A POSIX pathname's Unicode spelling remains part of its identity unless
+    // realpath above proved that two spellings resolve to the same entry. This
+    // is also required on normalization-sensitive filesystems mounted on
+    // macOS. Windows retains the historical NFC key used by these tools.
+    const canonicalTarget = await canonicalize(normalizedTarget);
+    const canonical = normalizeFilesystemUnicodeIdentity(canonicalTarget);
 
     // Verify canonical path is within an allowed prefix
     if (allowedPaths.length === 0) {
@@ -872,15 +878,16 @@ export async function safePath(
       };
     }
     const normalizedAllowed = await Promise.all(
-      allowedPaths.map(async (p) =>
-        (await canonicalize(expandHomeDirectory(p))).normalize("NFC"),
-      ),
+      allowedPaths.map(async (p) => {
+        const allowed = await canonicalize(expandHomeDirectory(p));
+        return normalizeFilesystemUnicodeIdentity(allowed);
+      }),
     );
     const inside = normalizedAllowed.some(
       (prefix) =>
         canonical === prefix ||
-        canonical.startsWith(prefix + "/") ||
-        canonical.startsWith(prefix + "\\"),
+        canonical.startsWith(`${prefix}/`) ||
+        (process.platform === "win32" && canonical.startsWith(`${prefix}\\`)),
     );
     if (!inside) {
       return {
@@ -948,11 +955,15 @@ export function resolveToolAllowedPaths(
     )
     .map((entry) => resolveSessionWorkspaceRoot(entry))
     .filter((entry): entry is string => typeof entry === "string")
-    .map((entry) => resolve(entry).normalize("NFC"));
+    .map((entry) => normalizeFilesystemUnicodeIdentity(resolve(entry)));
   if (normalizedExtraRoots.length === 0) {
     return allowedPaths;
   }
   return Array.from(new Set([...allowedPaths, ...normalizedExtraRoots]));
+}
+
+function normalizeFilesystemUnicodeIdentity(path: string): string {
+  return process.platform === "win32" ? path.normalize("NFC") : path;
 }
 
 /** Validate and resolve a path argument from tool input. */
@@ -1011,7 +1022,7 @@ export async function safePathAllowingSessionPlanFile(
   const planCtx = planFileContextFromArgs(args);
   if (planCtx !== null && !hasUnsafeShape(targetPath)) {
     try {
-      const canonical = (await canonicalize(targetPath)).normalize("NFC");
+      const canonical = await canonicalize(targetPath);
       if (isSessionPlanFile(canonical, planCtx)) {
         return { safe: true, resolved: canonical };
       }
@@ -1046,7 +1057,7 @@ async function validatePath(
   const planCtx = planFileContextFromArgs(args);
   if (planCtx !== null && !hasUnsafeShape(input)) {
     try {
-      const canonical = (await canonicalize(input)).normalize("NFC");
+      const canonical = await canonicalize(input);
       if (isSessionPlanFile(canonical, planCtx)) {
         return [canonical, null];
       }
@@ -1298,9 +1309,13 @@ function createDeleteTool(
         for (const allowed of resolveToolAllowedPaths(allowedPaths, args)) {
           let canonicalAllowed: string;
           try {
-            canonicalAllowed = (await realpath(allowed)).normalize("NFC");
+            canonicalAllowed = normalizeFilesystemUnicodeIdentity(
+              await realpath(allowed),
+            );
           } catch {
-            canonicalAllowed = allowed.normalize("NFC");
+            canonicalAllowed = normalizeFilesystemUnicodeIdentity(
+              resolve(allowed),
+            );
           }
           if (resolved === canonicalAllowed) {
             return errorResult("Cannot delete sandbox root directory");
@@ -1530,7 +1545,7 @@ export function createFilesystemTools(config: FilesystemToolConfig): Tool[] {
     }
   }
   const allowedPaths = config.allowedPaths.map((p) =>
-    resolve(p).normalize("NFC"),
+    normalizeFilesystemUnicodeIdentity(resolve(p)),
   );
 
   const allowDelete = config.allowDelete ?? false;

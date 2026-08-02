@@ -253,12 +253,12 @@ describe("reproducible install and release contract", () => {
     );
     const normalizedCiRequiredGates = ciRequiredGates.replace(/\s+/gu, " ");
     for (const inventory of [
-      "45 passing macOS tests in eight suites across five files",
-      "47 passing Windows tests in ten suites across six files",
+      "46 passing macOS tests in eight suites across five files",
+      "49 passing Windows tests in twelve suites across seven files",
       "same 44-test, seven-suite, four-file FND set",
       "shared 80-test, eight-suite, five-file FND set",
-      "81 tests, ten suites, and six files",
-      "86 tests, thirteen suites, and eight files",
+      "82 tests, ten suites, and six files",
+      "88 tests, fifteen suites, and nine files",
     ]) {
       expect(normalizedCiRequiredGates).toContain(inventory);
     }
@@ -302,7 +302,13 @@ describe("reproducible install and release contract", () => {
       "tests/sandbox/linux-launcher/linux-launcher.kernel.test.ts",
     );
     expect(linuxKernelJob).toContain("numTotalTestSuites: 1");
-    expect(linuxKernelJob).toContain("numTotalTests: 1");
+    expect(linuxKernelJob).toContain("numTotalTests: 2");
+    expect(linuxKernelJob).toContain("numPassedTests: 2");
+    expect(linuxKernelJob).toContain(
+      'bwrap_help="$(bwrap --help)"',
+    );
+    expect(linuxKernelJob).toContain("grep -Fq -- '--ro-bind-fd'");
+    expect(linuxKernelJob).toContain("/proc/[0-9]*/exe");
     expect(linuxKernelJob).toContain("pgrep -x bwrap");
     expect(linuxKernelJob).toContain(
       "agenc-kernel-e2e-[0-9a-f]{8}-[0-9a-f]{4}",
@@ -427,9 +433,9 @@ describe("reproducible install and release contract", () => {
     expect(macosJob).toContain("tests/tools/runtimes/runtime.darwin.test.ts");
     expect(macosJob).toContain("--config vitest.native.config.ts");
     expect(macosJob).toContain("numTotalTestSuites: 10");
-    expect(macosJob).toContain("numTotalTests: 81");
+    expect(macosJob).toContain("numTotalTests: 82");
     expect(macosJob).toContain(
-      "macOS FND/native capability lane passed 81 tests in 6 files with zero skipped",
+      "macOS FND/native capability lane passed 82 tests in 6 files with zero skipped",
     );
 
     const windowsJob = workflow.slice(workflow.indexOf("\n  windows-native:"));
@@ -443,7 +449,7 @@ describe("reproducible install and release contract", () => {
     expect(windowsJob).toContain("Run the exact Windows FND red-probe audit");
     expect(windowsJob).toContain("node runtime/scripts/run-fnd-red-probes.mjs");
     expect(windowsJob).toContain(
-      "red probes: files=10 expected-red=10 assertions=10 skipped=0 todo=0",
+      "red probes: files=9 expected-red=9 assertions=9 skipped=0 todo=0",
     );
     expect(windowsJob).toContain(
       'if ($LASTEXITCODE -ne 0) { throw "Windows red-probe audit failed" }',
@@ -489,9 +495,12 @@ describe("reproducible install and release contract", () => {
       "tests/fnd/process-repository-helpers.native.test.ts",
     );
     expect(windowsJob).toContain("tests/utils/execFileNoThrow.win32.test.ts");
+    expect(windowsJob).toContain(
+      "tests/workspace/bound-helper-transport.win32.test.ts",
+    );
     expect(windowsJob).toContain("--config vitest.native.config.ts");
-    expect(windowsJob).toContain("numTotalTestSuites: 13");
-    expect(windowsJob).toContain("numTotalTests: 86");
+    expect(windowsJob).toContain("numTotalTestSuites: 15");
+    expect(windowsJob).toContain("numTotalTests: 88");
     expect(windowsJob).toContain(
       "npm.cmd ci --ignore-scripts --no-audit --no-fund",
     );
@@ -501,7 +510,7 @@ describe("reproducible install and release contract", () => {
     );
     expect(windowsJob).not.toContain("npm_config_build_from_source");
     expect(windowsJob).toContain(
-      "Windows FND/native capability lane passed 86 tests in 8 files with zero skipped",
+      "Windows FND/native capability lane passed 88 tests in 9 files with zero skipped",
     );
 
     expect(
@@ -1473,10 +1482,13 @@ describe("reproducible install and release contract", () => {
     expect(nativeBuild).toContain(
       '"tests/utils/execFileNoThrow.win32.test.ts"',
     );
-    expect(nativeBuild).toContain("expected_native_tests=45");
-    expect(nativeBuild).toContain("expected_native_tests=47");
+    expect(nativeBuild).toContain(
+      '"tests/workspace/bound-helper-transport.win32.test.ts"',
+    );
+    expect(nativeBuild).toContain("expected_native_tests=46");
+    expect(nativeBuild).toContain("expected_native_tests=49");
     expect(nativeBuild).toContain("expected_native_suites=8");
-    expect(nativeBuild).toContain("expected_native_suites=10");
+    expect(nativeBuild).toContain("expected_native_suites=12");
     expect(nativeBuild).toContain('run "${native_tests[@]}"');
     expect(nativeBuild).toContain("\"${native_tests[@]}\" <<'NODE'");
     expect(nativeBuild).toContain("...expectedFiles");

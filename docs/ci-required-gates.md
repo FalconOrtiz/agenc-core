@@ -17,8 +17,9 @@ on that complete matrix, so it is a barrier: no Linux, Darwin, or Windows
 artifact construction starts unless all three runner images and native
 toolchains match reviewed profiles. The candidate then builds all five native
 artifacts. Its macOS and Windows jobs first run the shared 44-test FND contract
-set, then add one Seatbelt test on macOS or three Windows
-atomic-publication/`.cmd` tests. The tagged workflow later promotes and
+set, then add one Seatbelt and one volume-sensitive pathname-identity test on
+macOS or three Windows atomic-publication/`.cmd` tests. The tagged workflow
+later promotes and
 re-attests those exact candidate bytes without rebuilding them. These probes
 gate their artifacts but do not authorize merge or replace the local evidence.
 Release workflows must not be invoked merely to verify a change.
@@ -857,12 +858,13 @@ GitHub-hosted jobs to publish or promote exact reviewed bytes. They do not
 repeat the local verification plan. The candidate phase of
 `release-runtime.yml` runs the exact native-only allowlist after its first clean
 install and
-requires the recorded result to contain 45 passing macOS tests in eight suites
-across five files or 47 passing Windows tests in ten suites across six files,
+requires the recorded result to contain 46 passing macOS tests in eight suites
+across five files or 49 passing Windows tests in twelve suites across seven files,
 with zero failed, pending, skipped, or todo tests. Both candidate lanes begin
 with the same 44-test, seven-suite, four-file FND set for bounded file I/O,
 fixture loading, portable paths, and process containment. macOS adds one
-Seatbelt test; Windows adds three atomic-publication and `.cmd` tests. Its
+Seatbelt test and one volume-sensitive pathname-identity test; Windows adds
+three atomic-publication and `.cmd` tests. Its
 tagged phase only promotes and re-attests the five sealed runtime artifacts.
 Before artifact or promotion work starts, each workflow:
 
@@ -904,10 +906,12 @@ Linux local gate. Its `linux-kernel-sandbox` job installs the digest- and
 byte-pinned Ubuntu bubblewrap package from
 [`release-toolchain.json`](../release-toolchain.json), keeps Ubuntu's global
 AppArmor user-namespace restriction enabled, and loads the narrow profile
-rendered by AgenC for a root-owned generated wrapper. The one-test allowlist
+rendered by AgenC for a root-owned generated wrapper. The two-test allowlist
 then exercises the production broker, manager, packaged launcher, bubblewrap,
 user/PID/mount/network namespaces, network seccomp, filesystem mounts, and
 descendant cleanup as an unprivileged process with no effective capabilities.
+Linux readiness requires bubblewrap's descriptor-based `--ro-bind-fd` mount;
+older builds fail closed with an upgrade diagnostic before namespace setup.
 The job proves host loopback reachability before the sandbox, requires the
 sandboxed socket syscall to fail with `EPERM`, and unloads the profile with
 process- and checkout-cleanliness postconditions.
@@ -915,27 +919,31 @@ process- and checkout-cleanliness postconditions.
 The `powershell` job installs the digest- and byte-pinned
 PowerShell runtime from [`release-toolchain.json`](../release-toolchain.json),
 enters the same credential-stripped, private-home Vitest boundary as the
-default suite, and runs an exact four-file allowlist. The Node tripwire remains
+default suite, and runs an exact three-file allowlist. The Node tripwire remains
 active, while the native PowerShell subprocess is restricted to local
 fixtures, fixed telemetry/update opt-outs, and an asserted no-process-leak
 postcondition; this narrow lane is not an OS egress boundary.
 The `neovim` job similarly provisions the official digest- and byte-pinned
 Neovim 0.12.1 Linux binary and requires all four real-process lifecycle tests
-in its one-file allowlist. The `macos-native` job first runs the 62-test
+in its one-file allowlist. Its provider and observed-descendant phase runs an
+exact 63-test, three-file allowlist on every required hosted target. The
+`macos-native` job first runs the 67-test
 red-probe runner contract, including residual-process settlement on Darwin.
 The macOS and Windows native jobs then run a shared 80-test, eight-suite,
 five-file FND set. It combines the 44-test release-builder set with 36
 benchmark-harness fault contracts for process-tree containment, owned-root
 retention, exclusive artifact publication, minimal subprocess environments,
 bounded metadata commands, and provenance binding. macOS adds one Seatbelt test
-for an exact total of 81 tests, ten suites, and six files. Before its native
-allowlist, Windows requires the exact one-file FND red-probe audit summary and
+and one volume-sensitive pathname-identity test for an exact total of 82 tests,
+ten suites, and six files. Before its native allowlist, Windows requires the
+exact one-file FND red-probe audit summary and
 runs three forced-containment tests in one file. Its named-pipe and
-atomic-publication/`.cmd` contracts bring the native total to 86 tests,
-thirteen suites, and eight files. Release builders deliberately retain their
+atomic-publication/`.cmd` and bound-helper transport contracts bring the native
+total to 88 tests, fifteen suites, and nine files. Release builders deliberately retain their
 narrower 44-test shared set: the Windows release subset excludes the two
-named-pipe-only PR tests and the benchmark fault contract, so it remains 47
-tests, ten suites, and six files. Native result parsers require the exact
+named-pipe-only PR tests and the benchmark fault contract, while retaining the
+two bound-helper transport tests, so it remains 49 tests, twelve suites, and
+seven files. Native result parsers require the exact
 reviewed suite, test, and normalized file inventory with no failed, pending,
 skipped, or todo tests. The red-containment parser additionally requires
 exactly three passing per-file assertions while accepting Vitest's

@@ -3,10 +3,14 @@ import {
   closeSync,
   existsSync,
   fstatSync,
+  fsyncSync,
+  lstatSync,
   openSync,
   readSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  statSync,
 } from "node:fs";
 import {
   appendFile,
@@ -22,6 +26,7 @@ import {
   dirname,
   isAbsolute,
   join,
+  parse,
   relative,
   resolve,
   sep,
@@ -44,6 +49,8 @@ const MAX_PROPOSAL_RECEIPTS = 512;
 const MAX_QUARANTINE_BYTES = 512 * 1024;
 const MAX_PERSISTED_QUARANTINE_DIRECTORIES = 4_096;
 const MAX_QUARANTINE_ROOT_PREFIX_BYTES = 64 * 1024;
+const MAX_PERSISTED_WORKSPACE_ROOT_BYTES = 4_096;
+const MAX_PERSISTED_WORKSPACE_ROOT_SEGMENTS = 1_024;
 // The persistent daemon client rejects an unterminated JSON frame once its
 // receive buffer exceeds 16 MiB. Count the trailing newline as part of that
 // budget because the client observes it before splitting the complete frame.
@@ -533,8 +540,14 @@ export interface WorkspaceMutationCoordinatorOptions {
 
 export interface WorkspaceToolOperationToken {
   readonly tokenId: string;
+  readonly workspacePath: string;
   readonly workspaceRoot: string;
   readonly toolName: string;
+}
+
+export interface WorkspaceReadToolOperation {
+  readonly token: WorkspaceToolOperationToken;
+  readonly requiresStrictCandidateReads: boolean;
 }
 
 export type WorkspaceMutationObservedState =
@@ -1096,8 +1109,22 @@ export class WorkspaceMutationCoordinator {
   authoritativeDirtySnapshotsUnder(
     path: string,
   ): readonly WorkspaceAuthoritativeDirtySnapshot[] {
-    this.#expireLeaseIfNeeded();
     const target = this.resolvePath(path);
+    return this.authoritativeDirtySnapshotsUnderIdentity(target);
+  }
+
+  authoritativeDirtySnapshotsUnderIdentity(
+    path: string,
+  ): readonly WorkspaceAuthoritativeDirtySnapshot[] {
+    this.#expireLeaseIfNeeded();
+    const target = normalizePathIdentity(path);
+    const rel = relative(this.workspaceRoot, target);
+    if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new WorkspaceMutationCoordinatorError(
+        "INVALID_WORKSPACE",
+        `path is outside workspace: ${path}`,
+      );
+    }
     if (this.#quarantineHydrationFailed) {
       throw new WorkspaceMutationCoordinatorError(
         "EDITOR_LEASE_EXPIRED",
@@ -2840,7 +2867,7 @@ export class WorkspaceMutationCoordinator {
         `path is outside workspace: ${path}`,
       );
     }
-    return candidate.normalize("NFC");
+    return candidate;
   }
 
   async #serializeProposalResolution<Result>(
@@ -3572,7 +3599,7 @@ function readPersistedWorkspaceRoot(quarantinePath: string): string {
         `workspace quarantine has an invalid root: ${quarantinePath}`,
       );
     }
-    return canonicalizePathSync(workspaceRoot);
+    return workspaceRoot;
   } finally {
     closeSync(descriptor);
   }
@@ -3605,15 +3632,43 @@ function discoverPersistedWorkspaceRoots(agencHome: string): readonly string[] {
     if (!entry.isDirectory()) {
       throw new Error(`unsafe workspace quarantine directory: ${entry.name}`);
     }
-    const workspaceRoot = readPersistedWorkspaceRoot(quarantinePath);
-    const expectedKey = createHash("sha256")
+    const persistedWorkspaceRoot = readPersistedWorkspaceRoot(quarantinePath);
+    const persistedKey = createHash("sha256")
+      .update(persistedWorkspaceRoot)
+      .digest("hex")
+      .slice(0, 32);
+    const workspaceRoot = canonicalPersistedWorkspaceRoot(
+      persistedWorkspaceRoot,
+    );
+    if (workspaceRoot === null) {
+      throw new Error(
+        `workspace quarantine path identity changed: ${entry.name}`,
+      );
+    }
+    const runtimeKey = createHash("sha256")
       .update(workspaceRoot)
       .digest("hex")
       .slice(0, 32);
-    if (expectedKey !== entry.name) {
+    if (entry.name !== persistedKey && entry.name !== runtimeKey) {
       throw new Error(
         `workspace quarantine root does not match its directory: ${entry.name}`,
       );
+    }
+    if (runtimeKey !== entry.name) {
+      const legacyDirectory = join(directory, entry.name);
+      const runtimeDirectory = join(directory, runtimeKey);
+      if (existsSync(runtimeDirectory)) {
+        throw new Error(
+          `workspace quarantine normalization collides with existing state: ${runtimeKey}`,
+        );
+      }
+      renameSync(legacyDirectory, runtimeDirectory);
+      const descriptor = openSync(directory, "r");
+      try {
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
     }
     roots.add(workspaceRoot);
   }
@@ -3647,6 +3702,11 @@ export class WorkspaceMutationCoordinatorRegistry {
 
   getOrCreate(workspaceRoot: string): WorkspaceMutationCoordinator {
     const root = canonicalizePathSync(workspaceRoot);
+    this.#hydratePersistedCoordinatorsOverlapping(root);
+    return this.#getOrCreateCanonical(root);
+  }
+
+  #getOrCreateCanonical(root: string): WorkspaceMutationCoordinator {
     let coordinator = this.#coordinators.get(root);
     if (coordinator === undefined) {
       coordinator = new WorkspaceMutationCoordinator({
@@ -3668,9 +3728,7 @@ export class WorkspaceMutationCoordinatorRegistry {
   findForWorkspaceRootIdentity(
     workspaceRoot: string,
   ): WorkspaceMutationCoordinator | null {
-    return (
-      this.#coordinators.get(resolve(workspaceRoot).normalize("NFC")) ?? null
-    );
+    return this.#coordinators.get(normalizePathIdentity(workspaceRoot)) ?? null;
   }
 
   findForPath(path: string): WorkspaceMutationCoordinator | null {
@@ -3713,14 +3771,55 @@ export class WorkspaceMutationCoordinatorRegistry {
     return bestAuthoritative ?? bestProtected ?? bestContaining;
   }
 
+  findOverlappingPathIdentities(
+    path: string,
+    options: { readonly includeDescendants?: boolean } = {},
+  ): readonly WorkspaceMutationCoordinator[] {
+    // The caller supplies the identity captured at admission. Re-running
+    // realpath here would move the snapshot fence after a pathname exchange.
+    const target = normalizePathIdentity(path);
+    return [...this.#coordinators.values()]
+      .filter((coordinator) => {
+        const targetRelativeToCoordinator = relative(
+          coordinator.workspaceRoot,
+          target,
+        );
+        if (
+          targetRelativeToCoordinator !== ".." &&
+          !targetRelativeToCoordinator.startsWith(`..${sep}`) &&
+          !isAbsolute(targetRelativeToCoordinator)
+        ) {
+          return true;
+        }
+        if (options.includeDescendants !== true) return false;
+        const coordinatorRelativeToTarget = relative(
+          target,
+          coordinator.workspaceRoot,
+        );
+        return (
+          coordinatorRelativeToTarget !== ".." &&
+          !coordinatorRelativeToTarget.startsWith(`..${sep}`) &&
+          !isAbsolute(coordinatorRelativeToTarget)
+        );
+      })
+      .sort((left, right) =>
+        left.workspaceRoot.localeCompare(right.workspaceRoot),
+      );
+  }
+
   acquireEditor(
     workspaceRoot: string,
     input: WorkspaceEditorAcquireInput,
   ): WorkspaceEditorLease {
     const root = canonicalizePathSync(workspaceRoot);
-    const crossingOperation = [...this.#toolOperations.values()].find(
-      (operation) => workspaceRootsOverlap(root, operation.workspaceRoot),
-    );
+    // A pathname-only overlap check is insufficient while an admitted tool
+    // keeps a directory inode alive: the directory can be renamed and reached
+    // through a new pathname before the tool releases its descriptor. Fence
+    // all new Editor authority during that short operation window so no
+    // topology exchange can create an unobserved nested coordinator.
+    const crossingOperation = this.#toolOperations.values().next().value as
+      | WorkspaceToolOperationToken
+      | undefined;
     if (crossingOperation !== undefined) {
       throw new WorkspaceMutationCoordinatorError(
         "EDITOR_LEASE_CONFLICT",
@@ -3765,6 +3864,7 @@ export class WorkspaceMutationCoordinatorRegistry {
     }
     const token: WorkspaceToolOperationToken = {
       tokenId: randomUUID(),
+      workspacePath: normalizePathIdentity(workspaceRoot),
       workspaceRoot: root,
       toolName,
     };
@@ -3772,10 +3872,28 @@ export class WorkspaceMutationCoordinatorRegistry {
     return token;
   }
 
+  beginReadToolOperation(
+    workspaceRoot: string,
+    toolName: string,
+  ): WorkspaceReadToolOperation {
+    const root = canonicalizePathSync(workspaceRoot);
+    const requiresStrictCandidateReads =
+      this.hasProtectedEditorAuthority(root);
+    const token: WorkspaceToolOperationToken = {
+      tokenId: randomUUID(),
+      workspacePath: normalizePathIdentity(workspaceRoot),
+      workspaceRoot: root,
+      toolName,
+    };
+    this.#toolOperations.set(token.tokenId, token);
+    return { token, requiresStrictCandidateReads };
+  }
+
   endToolOperation(token: WorkspaceToolOperationToken): void {
     const current = this.#toolOperations.get(token.tokenId);
     if (
       current?.workspaceRoot === token.workspaceRoot &&
+      current.workspacePath === token.workspacePath &&
       current.toolName === token.toolName
     ) {
       this.#toolOperations.delete(token.tokenId);
@@ -3829,7 +3947,7 @@ export class WorkspaceMutationCoordinatorRegistry {
     }
     for (const workspaceRoot of persistedRoots) {
       if (workspaceRootsOverlap(target, workspaceRoot)) {
-        this.getOrCreate(workspaceRoot);
+        this.#getOrCreateCanonical(workspaceRoot);
       }
     }
   }
@@ -3852,7 +3970,7 @@ export class WorkspaceMutationCoordinatorRegistry {
           "quarantine-v1.json",
         );
         if (existsSync(quarantinePath)) {
-          this.getOrCreate(candidate);
+          this.#getOrCreateCanonical(candidate);
         }
       }
       const parent = dirname(candidate);
@@ -4050,19 +4168,140 @@ function canonicalizePathSync(path: string): string {
   for (;;) {
     try {
       const canonicalParent = realpathSync.native(cursor);
-      return resolve(canonicalParent, ...missingSegments.reverse()).normalize(
-        "NFC",
+      return normalizePathIdentity(
+        resolve(canonicalParent, ...missingSegments.reverse()),
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw error;
       }
       const parent = dirname(cursor);
-      if (parent === cursor) return resolved.normalize("NFC");
+      if (parent === cursor) return normalizePathIdentity(resolved);
       missingSegments.push(basename(cursor));
       cursor = parent;
     }
   }
+}
+
+function normalizePathIdentity(path: string): string {
+  const resolved = resolve(path);
+  // POSIX pathname spelling is identity unless realpath above proved an alias.
+  // This includes normalization-sensitive filesystems mounted on macOS.
+  return process.platform === "win32" ? resolved.normalize("NFC") : resolved;
+}
+
+function canonicalPersistedWorkspaceRoot(path: string): string | null {
+  const resolved = resolve(path);
+  try {
+    if (!persistedWorkspaceRootWithinBounds(resolved)) return null;
+    // A persisted spelling may be an APFS normalization alias, but a symlink
+    // replacement is not continuity of the workspace that owned the state.
+    const beforePrefixes = snapshotPathPrefixesSync(resolved);
+    if (beforePrefixes === null) return null;
+    const beforeLeaf = beforePrefixes[beforePrefixes.length - 1];
+    if (beforeLeaf === undefined || !beforeLeaf.isDirectory) return null;
+    const canonical = normalizePathIdentity(realpathSync.native(resolved));
+    const requestedIdentity = statSync(resolved, { bigint: true });
+    const canonicalIdentity = statSync(canonical, { bigint: true });
+    if (
+      !statMatchesPathPrefixIdentity(requestedIdentity, beforeLeaf) ||
+      !statMatchesPathPrefixIdentity(canonicalIdentity, beforeLeaf) ||
+      !requestedIdentity.isDirectory() ||
+      !canonicalIdentity.isDirectory() ||
+      requestedIdentity.dev !== canonicalIdentity.dev ||
+      requestedIdentity.ino !== canonicalIdentity.ino
+    ) {
+      return null;
+    }
+    const afterPrefixes = snapshotPathPrefixesSync(resolved);
+    if (
+      afterPrefixes === null ||
+      !pathPrefixSnapshotsEqual(beforePrefixes, afterPrefixes)
+    ) {
+      return null;
+    }
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
+interface PathPrefixIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly mode: bigint;
+  readonly isDirectory: boolean;
+}
+
+function snapshotPathPrefixesSync(
+  path: string,
+): readonly PathPrefixIdentity[] | null {
+  const resolved = resolve(path);
+  const root = parse(resolved).root;
+  if (root.length === 0) return null;
+  const displacement = relative(root, resolved);
+  const segments = displacement.length === 0 ? [] : displacement.split(sep);
+  const identities: PathPrefixIdentity[] = [];
+  let prefix = root;
+  for (let index = 0; index <= segments.length; index += 1) {
+    if (index > 0) {
+      const segment = segments[index - 1];
+      if (segment === undefined) return null;
+      prefix = join(prefix, segment);
+    }
+    const identity = lstatSync(prefix, { bigint: true });
+    if (identity.isSymbolicLink()) return null;
+    identities.push({
+      dev: identity.dev,
+      ino: identity.ino,
+      mode: identity.mode,
+      isDirectory: identity.isDirectory(),
+    });
+  }
+  return identities;
+}
+
+function pathPrefixSnapshotsEqual(
+  left: readonly PathPrefixIdentity[],
+  right: readonly PathPrefixIdentity[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((identity, index) => {
+      const candidate = right[index];
+      return (
+        candidate !== undefined &&
+        identity.dev === candidate.dev &&
+        identity.ino === candidate.ino &&
+        identity.mode === candidate.mode &&
+        identity.isDirectory === candidate.isDirectory
+      );
+    })
+  );
+}
+
+function persistedWorkspaceRootWithinBounds(path: string): boolean {
+  if (Buffer.byteLength(path, "utf8") > MAX_PERSISTED_WORKSPACE_ROOT_BYTES) {
+    return false;
+  }
+  const root = parse(path).root;
+  if (root.length === 0) return false;
+  const displacement = relative(root, path);
+  if (displacement.length === 0) return true;
+  return (
+    displacement.split(sep).length <= MAX_PERSISTED_WORKSPACE_ROOT_SEGMENTS
+  );
+}
+
+function statMatchesPathPrefixIdentity(
+  stat: { readonly dev: bigint; readonly ino: bigint; readonly mode: bigint },
+  prefix: PathPrefixIdentity,
+): boolean {
+  return (
+    stat.dev === prefix.dev &&
+    stat.ino === prefix.ino &&
+    stat.mode === prefix.mode
+  );
 }
 
 function isSameOrDescendantPath(parent: string, candidate: string): boolean {
@@ -4334,6 +4573,55 @@ export function workspaceAuthoritativeDirtySnapshots(
   );
 }
 
+export interface WorkspaceAuthoritativeDirtySnapshotCapture {
+  readonly snapshots: readonly WorkspaceAuthoritativeDirtySnapshot[];
+  readonly isCurrent: () => boolean;
+}
+
+export function captureWorkspaceAuthoritativeDirtySnapshots(
+  path: string,
+  options: { readonly includeDescendants?: boolean } = {},
+): WorkspaceAuthoritativeDirtySnapshotCapture {
+  // Preserve the once-admitted identity across later rename/symlink exchange.
+  const target = normalizePathIdentity(path);
+  const captures = workspaceMutationCoordinators
+    .findOverlappingPathIdentities(target, options)
+    .map((coordinator) => {
+      const scope = isSameOrDescendantPath(coordinator.workspaceRoot, target)
+        ? target
+        : coordinator.workspaceRoot;
+      return {
+        coordinator,
+        scope,
+        snapshots:
+          coordinator.authoritativeDirtySnapshotsUnderIdentity(scope),
+      };
+    });
+  const snapshots = captures
+    .flatMap((capture) => capture.snapshots)
+    .sort((left, right) => left.path.localeCompare(right.path));
+  for (let index = 1; index < snapshots.length; index += 1) {
+    if (snapshots[index - 1]?.path === snapshots[index]?.path) {
+      throw new WorkspaceMutationCoordinatorError(
+        "EDITOR_LEASE_CONFLICT",
+        `multiple Editor workspaces claim authority for ${snapshots[index]?.path}`,
+      );
+    }
+  }
+  return {
+    snapshots,
+    isCurrent: () =>
+      captures.every((capture) =>
+        workspaceAuthoritativeDirtySnapshotsEqual(
+          capture.snapshots,
+          capture.coordinator.authoritativeDirtySnapshotsUnderIdentity(
+            capture.scope,
+          ),
+        ),
+      ),
+  };
+}
+
 export function workspaceAuthoritativeDirtySnapshotsEqual(
   left: readonly WorkspaceAuthoritativeDirtySnapshot[],
   right: readonly WorkspaceAuthoritativeDirtySnapshot[],
@@ -4402,6 +4690,16 @@ export function beginWorkspaceToolOperation(
   toolName: string,
 ): WorkspaceToolOperationToken {
   return workspaceMutationCoordinators.beginToolOperation(
+    workspaceRoot,
+    toolName,
+  );
+}
+
+export function beginWorkspaceReadToolOperation(
+  workspaceRoot: string,
+  toolName: string,
+): WorkspaceReadToolOperation {
+  return workspaceMutationCoordinators.beginReadToolOperation(
     workspaceRoot,
     toolName,
   );

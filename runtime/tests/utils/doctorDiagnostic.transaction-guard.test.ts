@@ -74,7 +74,12 @@ function diagnosticFixture(
     hasUpdatePermissions: null,
     multipleInstallations: [],
     warnings: [],
-    ripgrepStatus: { working: true, mode: "system", systemPath: "/usr/bin/rg" },
+    ripgrepStatus: {
+      working: true,
+      grepPinnedWorking: true,
+      mode: "system",
+      systemPath: "/usr/bin/rg",
+    },
     transactionGuard,
     sandbox: {
       kind: "not_required",
@@ -83,6 +88,42 @@ function diagnosticFixture(
     },
   };
 }
+
+describe("formatDiagnosticText ripgrep probes", () => {
+  it.each([
+    [true, true, "ok", "ok"],
+    [true, false, "ok", "NOT WORKING"],
+    [false, true, "NOT WORKING", "ok"],
+    [false, false, "NOT WORKING", "NOT WORKING"],
+  ] as const)(
+    "renders configured=%s and packaged=%s independently",
+    (working, grepPinnedWorking, configuredText, packagedText) => {
+      const base = diagnosticFixture({
+        enabled: false,
+        source: "default",
+        model: "guard-model",
+        endpoint: "http://127.0.0.1:11434",
+        failMode: "closed",
+        endpointReachable: null,
+      });
+      const fixture: DiagnosticInfo = {
+        ...base,
+        ripgrepStatus: {
+          ...base.ripgrepStatus,
+          working,
+          grepPinnedWorking,
+        },
+      };
+
+      const text = formatDiagnosticText(fixture);
+
+      expect(text).toContain(`Configured rg (TUI/legacy): ${configuredText}`);
+      expect(text).toContain(
+        `Packaged rg (Grep/Glob/Orient): ${packagedText}`,
+      );
+    },
+  );
+});
 
 describe("getTransactionGuardDoctorStatus", () => {
   it("reports an enabled guard with a reachable endpoint", async () => {

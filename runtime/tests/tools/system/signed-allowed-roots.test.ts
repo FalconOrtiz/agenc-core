@@ -51,7 +51,9 @@ describe("HMAC-signed trusted filesystem roots", () => {
       expect(verifyAllowedRoots("/", "deadbeef")).toEqual([]);
       expect(verifyAllowedRoots(["/tmp"], undefined)).toEqual([]);
       expect(verifyAllowedRoots(["/tmp"], 42)).toEqual([]);
-      expect(verifyAllowedRoots([1, 2], signAllowedRoots(["/tmp"]))).toEqual([]);
+      expect(verifyAllowedRoots([1, 2], signAllowedRoots(["/tmp"]))).toEqual(
+        [],
+      );
     });
 
     it("is order/duplication-insensitive (canonical signature)", () => {
@@ -98,6 +100,47 @@ describe("HMAC-signed trusted filesystem roots", () => {
       expect(resolved).toContain(resolve("/work/tree"));
       expect(resolved).toContain(BASE[0]);
     });
+
+    it.runIf(process.platform === "linux")(
+      "preserves an NFD spelling in a signed POSIX workspace root",
+      () => {
+        const nfdRoot = "/work/cafe\u0301";
+        const nfcRoot = "/work/caf\u00e9";
+        const injected = withSignedAllowedRoots({}, [nfdRoot]);
+        const resolved = resolveToolAllowedPaths(BASE, roundTrip(injected));
+
+        expect(resolved).toContain(resolve(nfdRoot));
+        expect(resolved).not.toContain(resolve(nfcRoot));
+      },
+    );
+
+    it(
+      "preserves a signed Darwin root until filesystem lookup proves an alias",
+      () => {
+        const platformDescriptor = Object.getOwnPropertyDescriptor(
+          process,
+          "platform",
+        );
+        if (platformDescriptor === undefined) {
+          throw new Error("process.platform descriptor is unavailable");
+        }
+        Object.defineProperty(process, "platform", {
+          ...platformDescriptor,
+          value: "darwin",
+        });
+        try {
+          const nfdRoot = "/work/cafe\u0301";
+          const nfcRoot = "/work/caf\u00e9";
+          const injected = withSignedAllowedRoots({}, [nfdRoot]);
+          const resolved = resolveToolAllowedPaths(BASE, roundTrip(injected));
+
+          expect(resolved).toContain(resolve(nfdRoot));
+          expect(resolved).not.toContain(resolve(nfcRoot));
+        } finally {
+          Object.defineProperty(process, "platform", platformDescriptor);
+        }
+      },
+    );
   });
 
   // (c) LAUNDERING: a writer given args that already contain an UNSIGNED
@@ -111,10 +154,12 @@ describe("HMAC-signed trusted filesystem roots", () => {
       const injected = withSignedAllowedRoots(dirty, ["/work/tree"]);
       const args = roundTrip(injected);
 
-      expect(verifyAllowedRoots(
-        args[SESSION_ALLOWED_ROOTS_ARG],
-        args[SESSION_ALLOWED_ROOTS_SIG_ARG],
-      )).toEqual(["/work/tree"]);
+      expect(
+        verifyAllowedRoots(
+          args[SESSION_ALLOWED_ROOTS_ARG],
+          args[SESSION_ALLOWED_ROOTS_SIG_ARG],
+        ),
+      ).toEqual(["/work/tree"]);
 
       const resolved = resolveToolAllowedPaths(BASE, args);
       expect(resolved).toContain(resolve("/work/tree"));
@@ -127,10 +172,12 @@ describe("HMAC-signed trusted filesystem roots", () => {
         [SESSION_ALLOWED_ROOTS_SIG_ARG]: "ff".repeat(32),
       });
       const injected = withSignedAllowedRoots(dirty, ["/work/tree"]);
-      expect(verifyAllowedRoots(
-        injected[SESSION_ALLOWED_ROOTS_ARG],
-        injected[SESSION_ALLOWED_ROOTS_SIG_ARG],
-      )).toEqual(["/work/tree"]);
+      expect(
+        verifyAllowedRoots(
+          injected[SESSION_ALLOWED_ROOTS_ARG],
+          injected[SESSION_ALLOWED_ROOTS_SIG_ARG],
+        ),
+      ).toEqual(["/work/tree"]);
     });
   });
 
@@ -156,10 +203,12 @@ describe("HMAC-signed trusted filesystem roots", () => {
     it("is idempotent when re-adding an existing signed root", () => {
       const first = withSignedAllowedRoots({}, ["/root/a"]);
       const again = withSignedAllowedRoots(roundTrip(first), ["/root/a"]);
-      expect(verifyAllowedRoots(
-        again[SESSION_ALLOWED_ROOTS_ARG],
-        again[SESSION_ALLOWED_ROOTS_SIG_ARG],
-      )).toEqual(["/root/a"]);
+      expect(
+        verifyAllowedRoots(
+          again[SESSION_ALLOWED_ROOTS_ARG],
+          again[SESSION_ALLOWED_ROOTS_SIG_ARG],
+        ),
+      ).toEqual(["/root/a"]);
     });
   });
 });
@@ -183,7 +232,8 @@ describe("canonicalToolSurface — authoritative signed session id", () => {
     switchSession = state.switchSession;
     getSessionId = state.getSessionId;
     restoreSessionId = getSessionId();
-    ({ CanonicalFileReadTool } = await import("src/tools/canonicalToolSurface.js"));
+    ({ CanonicalFileReadTool } =
+      await import("src/tools/canonicalToolSurface.js"));
     setCurrentRuntimeSession(legacyTestSession);
   });
 

@@ -23,6 +23,7 @@ import { createFileWriteTool } from "../../src/tools/system/file-write.js";
 import { createNotebookEditTool } from "../../src/tools/system/notebook-edit.js";
 import { createFilesystemTools } from "../../src/tools/system/filesystem.js";
 import {
+  captureWorkspaceAuthoritativeDirtySnapshots,
   WorkspaceMutationCoordinator,
   WorkspaceMutationCoordinatorError,
   WorkspaceMutationCoordinatorRegistry,
@@ -64,6 +65,460 @@ afterEach(async () => {
 });
 
 describe("WorkspaceMutationCoordinator", () => {
+  it.runIf(process.platform === "linux")(
+    "keeps POSIX NFC and NFD Editor buffer identities distinct",
+    async () => {
+      const workspaceRoot = await tempDirectory("agenc-coherence-unicode-");
+      const agencHome = await tempDirectory("agenc-coherence-home-");
+      const nfcPath = join(workspaceRoot, "caf\u00e9.ts");
+      const nfdPath = join(workspaceRoot, "cafe\u0301.ts");
+      const nfcContent = "export const nfcIdentity = true;\n";
+      const nfdContent = "export const nfdIdentity = true;\n";
+      const coordinator = new WorkspaceMutationCoordinator({
+        workspaceRoot,
+        agencHome,
+      });
+      const lease = coordinator.acquire({
+        workspaceRoot,
+        editorInstanceId: "unicode-editor",
+      });
+
+      coordinator.sync({
+        workspaceRoot,
+        editorInstanceId: "unicode-editor",
+        leaseToken: lease.leaseToken,
+        epoch: lease.epoch,
+        sequence: 0,
+        buffers: [
+          {
+            path: nfcPath,
+            bufferHandle: 1,
+            changedtick: 1,
+            contentSha256: sha256(nfcContent),
+            dirty: true,
+            content: nfcContent,
+          },
+          {
+            path: nfdPath,
+            bufferHandle: 2,
+            changedtick: 1,
+            contentSha256: sha256(nfdContent),
+            dirty: true,
+            content: nfdContent,
+          },
+        ],
+      });
+      await coordinator.flushQuarantinePersistence();
+
+      expect(coordinator.resolvePath(nfcPath)).toBe(nfcPath);
+      expect(coordinator.resolvePath(nfdPath)).toBe(nfdPath);
+      expect(coordinator.authoritativeRead(nfcPath)).toMatchObject({
+        authority: "editor_dirty",
+        content: nfcContent,
+      });
+      expect(coordinator.authoritativeRead(nfdPath)).toMatchObject({
+        authority: "editor_dirty",
+        content: nfdContent,
+      });
+    },
+  );
+
+  it.runIf(process.platform === "linux")(
+    "keeps normalization-sensitive Darwin volume siblings distinct",
+    async () => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(
+        process,
+        "platform",
+      );
+      if (platformDescriptor === undefined) {
+        throw new Error("process.platform descriptor is unavailable");
+      }
+      Object.defineProperty(process, "platform", {
+        ...platformDescriptor,
+        value: "darwin",
+      });
+      try {
+        const workspaceRoot = await tempDirectory("agenc-coherence-darwin-");
+        const agencHome = await tempDirectory("agenc-coherence-darwin-home-");
+        const nfcPath = join(workspaceRoot, "caf\u00e9.ts");
+        const nfdPath = join(workspaceRoot, "cafe\u0301.ts");
+        const nfcContent = "export const nfcIdentity = true;\n";
+        const nfdContent = "export const nfdIdentity = true;\n";
+        await writeFile(nfcPath, "nfc disk\n", "utf8");
+        await writeFile(nfdPath, "nfd disk\n", "utf8");
+        const coordinator = new WorkspaceMutationCoordinator({
+          workspaceRoot,
+          agencHome,
+        });
+        const lease = coordinator.acquire({
+          workspaceRoot,
+          editorInstanceId: "darwin-unicode-editor",
+        });
+        coordinator.sync({
+          workspaceRoot,
+          editorInstanceId: lease.editorInstanceId,
+          leaseToken: lease.leaseToken,
+          epoch: lease.epoch,
+          sequence: 0,
+          buffers: [
+            {
+              path: nfcPath,
+              bufferHandle: 1,
+              changedtick: 1,
+              contentSha256: sha256(nfcContent),
+              dirty: true,
+              content: nfcContent,
+            },
+            {
+              path: nfdPath,
+              bufferHandle: 2,
+              changedtick: 1,
+              contentSha256: sha256(nfdContent),
+              dirty: true,
+              content: nfdContent,
+            },
+          ],
+        });
+        await coordinator.flushQuarantinePersistence();
+
+        expect(coordinator.resolvePath(nfcPath)).toBe(nfcPath);
+        expect(coordinator.resolvePath(nfdPath)).toBe(nfdPath);
+        expect(coordinator.authoritativeRead(nfcPath)).toMatchObject({
+          authority: "editor_dirty",
+          content: nfcContent,
+        });
+        expect(coordinator.authoritativeRead(nfdPath)).toMatchObject({
+          authority: "editor_dirty",
+          content: nfdContent,
+        });
+      } finally {
+        Object.defineProperty(process, "platform", platformDescriptor);
+      }
+    },
+  );
+
+  it("migrates persisted state only after proving the existing canonical root", async () => {
+    const parent = await tempDirectory("agenc-coherence-canonical-legacy-");
+    const agencHome = await tempDirectory(
+      "agenc-coherence-canonical-legacy-home-",
+    );
+    const workspaceRoot = join(parent, "workspace");
+    const persistedAlias = `${parent}/./workspace`;
+    await mkdir(workspaceRoot);
+    const legacyQuarantinePath = workspaceMutationStatePath(
+      persistedAlias,
+      agencHome,
+      "quarantine-v1.json",
+    );
+    await mkdir(dirname(legacyQuarantinePath), { recursive: true });
+    const content = "legacy dirty content\n";
+    await writeFile(
+      legacyQuarantinePath,
+      `${JSON.stringify({
+        version: 1,
+        workspaceRoot: persistedAlias,
+        entries: [
+          {
+            path: `${persistedAlias}/buffer.ts`,
+            contentSha256: sha256(content),
+            contentBytes: Buffer.byteLength(content),
+            changedtick: 1,
+            epoch: 1,
+            editorInstanceId: "legacy-canonical-editor",
+            authority: "editor_dirty",
+          },
+        ],
+        proposalCommitments: [],
+        proposalReceipts: [],
+        mutationIntents: [],
+        topologyIntents: [],
+        changeSequence: 0,
+        changes: [],
+      })}\n`,
+      "utf8",
+    );
+    const runtimeQuarantinePath = workspaceMutationStatePath(
+      workspaceRoot,
+      agencHome,
+      "quarantine-v1.json",
+    );
+
+    const firstRegistry = new WorkspaceMutationCoordinatorRegistry({
+      agencHome,
+    });
+    expect(
+      firstRegistry.getOrCreate(workspaceRoot).hasProtectedEditorPaths(),
+    ).toBe(true);
+    expect(firstRegistry.hasProtectedEditorAuthority(workspaceRoot)).toBe(true);
+    await expect(stat(legacyQuarantinePath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(stat(runtimeQuarantinePath)).resolves.toMatchObject({
+      isFile: expect.any(Function),
+    });
+
+    const secondRegistry = new WorkspaceMutationCoordinatorRegistry({
+      agencHome,
+    });
+    expect(
+      secondRegistry.getOrCreate(workspaceRoot).hasProtectedEditorPaths(),
+    ).toBe(true);
+    expect(secondRegistry.hasProtectedEditorAuthority(workspaceRoot)).toBe(true);
+  });
+
+  it.runIf(process.platform === "linux")(
+    "does not migrate persisted Darwin state across distinct normalization siblings",
+    async () => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(
+        process,
+        "platform",
+      );
+      if (platformDescriptor === undefined) {
+        throw new Error("process.platform descriptor is unavailable");
+      }
+      const parent = await tempDirectory("agenc-coherence-sensitive-state-");
+      const agencHome = await tempDirectory(
+        "agenc-coherence-sensitive-state-home-",
+      );
+      const nfcWorkspaceRoot = join(parent, "caf\u00e9");
+      const nfdWorkspaceRoot = join(parent, "cafe\u0301");
+      await mkdir(nfcWorkspaceRoot);
+      await mkdir(nfdWorkspaceRoot);
+      const nfdQuarantinePath = workspaceMutationStatePath(
+        nfdWorkspaceRoot,
+        agencHome,
+        "quarantine-v1.json",
+      );
+      const nfcQuarantinePath = workspaceMutationStatePath(
+        nfcWorkspaceRoot,
+        agencHome,
+        "quarantine-v1.json",
+      );
+      await mkdir(dirname(nfdQuarantinePath), { recursive: true });
+      const content = "normalization-sensitive dirty content\n";
+      await writeFile(
+        nfdQuarantinePath,
+        `${JSON.stringify({
+          version: 1,
+          workspaceRoot: nfdWorkspaceRoot,
+          entries: [
+            {
+              path: join(nfdWorkspaceRoot, "buffer.ts"),
+              contentSha256: sha256(content),
+              contentBytes: Buffer.byteLength(content),
+              changedtick: 1,
+              epoch: 1,
+              editorInstanceId: "sensitive-darwin-editor",
+              authority: "editor_dirty",
+            },
+          ],
+          proposalCommitments: [],
+          proposalReceipts: [],
+          mutationIntents: [],
+          topologyIntents: [],
+          changeSequence: 0,
+          changes: [],
+        })}\n`,
+        "utf8",
+      );
+
+      Object.defineProperty(process, "platform", {
+        ...platformDescriptor,
+        value: "darwin",
+      });
+      try {
+        const registry = new WorkspaceMutationCoordinatorRegistry({ agencHome });
+        expect(
+          registry.getOrCreate(nfcWorkspaceRoot).hasProtectedEditorPaths(),
+        ).toBe(false);
+        expect(registry.hasProtectedEditorAuthority(nfcWorkspaceRoot)).toBe(
+          false,
+        );
+        expect(
+          registry.getOrCreate(nfdWorkspaceRoot).hasProtectedEditorPaths(),
+        ).toBe(true);
+        await expect(stat(nfdQuarantinePath)).resolves.toMatchObject({
+          isFile: expect.any(Function),
+        });
+        await expect(stat(nfcQuarantinePath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        Object.defineProperty(process, "platform", platformDescriptor);
+      }
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects persisted authority when its workspace path is retargeted",
+    async () => {
+      const parent = await tempDirectory("agenc-coherence-retarget-");
+      const agencHome = await tempDirectory("agenc-coherence-retarget-home-");
+      const workspaceRoot = join(parent, "workspace");
+      const displaced = join(parent, "workspace-displaced");
+      const outside = join(parent, "outside");
+      await mkdir(workspaceRoot);
+      await mkdir(outside);
+      const quarantinePath = workspaceMutationStatePath(
+        workspaceRoot,
+        agencHome,
+        "quarantine-v1.json",
+      );
+      await mkdir(dirname(quarantinePath), { recursive: true });
+      await writeFile(
+        quarantinePath,
+        `${JSON.stringify({
+          version: 1,
+          workspaceRoot,
+          entries: [],
+          proposalCommitments: [],
+          proposalReceipts: [],
+          mutationIntents: [],
+          topologyIntents: [],
+          changeSequence: 0,
+          changes: [],
+        })}\n`,
+        "utf8",
+      );
+      await rename(workspaceRoot, displaced);
+      await symlink(outside, workspaceRoot, "dir");
+      const registry = new WorkspaceMutationCoordinatorRegistry({ agencHome });
+
+      expect(() => registry.hasProtectedEditorAuthority(workspaceRoot)).toThrow(
+        /path identity changed/u,
+      );
+      await expect(stat(quarantinePath)).resolves.toMatchObject({
+        isFile: expect.any(Function),
+      });
+    },
+  );
+
+  it("rejects persisted authority whose workspace root is a file", async () => {
+    const parent = await tempDirectory("agenc-coherence-file-root-");
+    const agencHome = await tempDirectory("agenc-coherence-file-root-home-");
+    const workspaceRoot = join(parent, "not-a-directory");
+    await writeFile(workspaceRoot, "ordinary file\n", "utf8");
+    const quarantinePath = workspaceMutationStatePath(
+      workspaceRoot,
+      agencHome,
+      "quarantine-v1.json",
+    );
+    await mkdir(dirname(quarantinePath), { recursive: true });
+    await writeFile(
+      quarantinePath,
+      `${JSON.stringify({
+        version: 1,
+        workspaceRoot,
+        entries: [],
+        proposalCommitments: [],
+        proposalReceipts: [],
+        mutationIntents: [],
+        topologyIntents: [],
+        changeSequence: 0,
+        changes: [],
+      })}\n`,
+      "utf8",
+    );
+    const registry = new WorkspaceMutationCoordinatorRegistry({ agencHome });
+
+    expect(() => registry.hasProtectedEditorAuthority(workspaceRoot)).toThrow(
+      /path identity changed/u,
+    );
+    await expect(stat(quarantinePath)).resolves.toMatchObject({
+      isFile: expect.any(Function),
+    });
+  });
+
+  it.each([
+    ["overlong", `/${"a".repeat(4_097)}`],
+    ["too deeply segmented", `/${"a/".repeat(1_024)}workspace`],
+  ])(
+    "rejects an %s persisted root before traversing it",
+    async (_kind, persistedRoot) => {
+      const parent = await tempDirectory("agenc-coherence-bounded-root-");
+      const agencHome = await tempDirectory(
+        "agenc-coherence-bounded-root-home-",
+      );
+      const quarantinePath = workspaceMutationStatePath(
+        persistedRoot,
+        agencHome,
+        "quarantine-v1.json",
+      );
+      await mkdir(dirname(quarantinePath), { recursive: true });
+      await writeFile(
+        quarantinePath,
+        `${JSON.stringify({
+          version: 1,
+          workspaceRoot: persistedRoot,
+          entries: [],
+          proposalCommitments: [],
+          proposalReceipts: [],
+          mutationIntents: [],
+          topologyIntents: [],
+          changeSequence: 0,
+          changes: [],
+        })}\n`,
+        "utf8",
+      );
+      const registry = new WorkspaceMutationCoordinatorRegistry({ agencHome });
+
+      expect(() => registry.hasProtectedEditorAuthority(parent)).toThrow(
+        /path identity changed/u,
+      );
+      await expect(stat(quarantinePath)).resolves.toMatchObject({
+        isFile: expect.any(Function),
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects persisted authority when an ancestor symlink is retargeted",
+    async () => {
+      const parent = await tempDirectory("agenc-coherence-ancestor-retarget-");
+      const agencHome = await tempDirectory(
+        "agenc-coherence-ancestor-retarget-home-",
+      );
+      const originalParent = join(parent, "original");
+      const outsideParent = join(parent, "outside");
+      const aliasParent = join(parent, "alias");
+      const workspaceRoot = join(aliasParent, "workspace");
+      await mkdir(join(originalParent, "workspace"), { recursive: true });
+      await mkdir(join(outsideParent, "workspace"), { recursive: true });
+      await symlink(originalParent, aliasParent, "dir");
+      const quarantinePath = workspaceMutationStatePath(
+        workspaceRoot,
+        agencHome,
+        "quarantine-v1.json",
+      );
+      await mkdir(dirname(quarantinePath), { recursive: true });
+      await writeFile(
+        quarantinePath,
+        `${JSON.stringify({
+          version: 1,
+          workspaceRoot,
+          entries: [],
+          proposalCommitments: [],
+          proposalReceipts: [],
+          mutationIntents: [],
+          topologyIntents: [],
+          changeSequence: 0,
+          changes: [],
+        })}\n`,
+        "utf8",
+      );
+      await rm(aliasParent);
+      await symlink(outsideParent, aliasParent, "dir");
+      const registry = new WorkspaceMutationCoordinatorRegistry({ agencHome });
+
+      expect(() => registry.hasProtectedEditorAuthority(workspaceRoot)).toThrow(
+        /path identity changed/u,
+      );
+      await expect(stat(quarantinePath)).resolves.toMatchObject({
+        isFile: expect.any(Function),
+      });
+    },
+  );
+
   it("emits a content-free live proposal reference bound to the replacement hash", () => {
     const beforeText = "const value = 1;\n";
     const afterText = "const value = 2;\n";
@@ -129,6 +584,7 @@ describe("WorkspaceMutationCoordinator", () => {
         },
       ],
     });
+    await coordinator.flushQuarantinePersistence();
 
     expect(synced.dirtyPaths).toEqual([path]);
     expect(
@@ -890,7 +1346,125 @@ describe("WorkspaceMutationCoordinator", () => {
         "parent-shell-after-restart",
       ),
     ).toThrow(/protected Editor authority/u);
+    const readOperation = restartedRegistry.beginReadToolOperation(
+      workspaceRoot,
+      "parent-read-after-restart",
+    );
+    expect(readOperation.requiresStrictCandidateReads).toBe(true);
+    const siblingRoot = join(workspaceRoot, "sibling");
+    await mkdir(siblingRoot);
+    expect(() =>
+      restartedRegistry.acquireEditor(siblingRoot, {
+        workspaceRoot: siblingRoot,
+        editorInstanceId: "sibling-during-parent-read",
+      }),
+    ).toThrow(/active tool/u);
+    restartedRegistry.endToolOperation(readOperation.token);
+    expect(
+      restartedRegistry.acquireEditor(siblingRoot, {
+        workspaceRoot: siblingRoot,
+        editorInstanceId: "sibling-after-parent-read",
+      }).editorInstanceId,
+    ).toBe("sibling-after-parent-read");
   });
+
+  it.runIf(process.platform !== "win32")(
+    "keeps the Editor-acquisition fence attached after the admitted root is renamed",
+    async () => {
+      const workspaceRoot = await tempDirectory("agenc-coherence-fenced-root-");
+      const displacedRoot = `${workspaceRoot}-displaced`;
+      temporaryPaths.push(displacedRoot);
+      const registry = new WorkspaceMutationCoordinatorRegistry();
+      const operation = registry.beginReadToolOperation(
+        workspaceRoot,
+        "renamed-root-read",
+      );
+
+      await rename(workspaceRoot, displacedRoot);
+      const nestedRoot = join(displacedRoot, "nested");
+      await mkdir(nestedRoot);
+
+      expect(() =>
+        registry.acquireEditor(nestedRoot, {
+          workspaceRoot: nestedRoot,
+          editorInstanceId: "renamed-root-editor",
+        }),
+      ).toThrow(/active tool/u);
+
+      registry.endToolOperation(operation.token);
+      expect(
+        registry.acquireEditor(nestedRoot, {
+          workspaceRoot: nestedRoot,
+          editorInstanceId: "post-read-editor",
+        }).editorInstanceId,
+      ).toBe("post-read-editor");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "captures the admitted dirty identity after a pathname exchange",
+    async () => {
+      const workspaceRoot = await tempDirectory(
+        "agenc-coherence-captured-root-",
+      );
+      const displacedRoot = `${workspaceRoot}-displaced`;
+      temporaryPaths.push(displacedRoot);
+      const outsideRoot = await tempDirectory(
+        "agenc-coherence-captured-outside-",
+      );
+      process.env.AGENC_HOME = await tempDirectory(
+        "agenc-coherence-captured-home-",
+      );
+      const dirtyPath = join(workspaceRoot, "dirty.ts");
+      const dirtyContent = "authoritative editor bytes\n";
+      await writeFile(dirtyPath, "stale disk bytes\n", "utf8");
+      const coordinator = workspaceMutationCoordinators.getOrCreate(
+        workspaceRoot,
+      );
+      const lease = coordinator.acquire({
+        workspaceRoot,
+        editorInstanceId: "captured-root-editor",
+      });
+      coordinator.sync({
+        workspaceRoot,
+        editorInstanceId: lease.editorInstanceId,
+        leaseToken: lease.leaseToken,
+        epoch: lease.epoch,
+        sequence: 0,
+        buffers: [
+          {
+            path: dirtyPath,
+            bufferHandle: 1,
+            changedtick: 1,
+            contentSha256: sha256(dirtyContent),
+            dirty: true,
+            content: dirtyContent,
+          },
+        ],
+      });
+      await coordinator.flushQuarantinePersistence();
+
+      await rename(workspaceRoot, displacedRoot);
+      await writeFile(
+        join(outsideRoot, "dirty.ts"),
+        "replacement path bytes\n",
+        "utf8",
+      );
+      await symlink(outsideRoot, workspaceRoot, "dir");
+
+      const capture = captureWorkspaceAuthoritativeDirtySnapshots(
+        workspaceRoot,
+        { includeDescendants: true },
+      );
+      expect(capture.snapshots).toHaveLength(1);
+      expect(capture.snapshots[0]).toMatchObject({
+        path: dirtyPath,
+        content: dirtyContent,
+        authority: "editor_dirty",
+      });
+      expect(capture.isCurrent()).toBe(true);
+    },
+  );
 
   it("quarantines last-known-clean loaded paths after a daemon crash", async () => {
     const workspaceRoot = await tempDirectory("agenc-coherence-workspace-");
