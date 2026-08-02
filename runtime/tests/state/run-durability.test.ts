@@ -1,4 +1,13 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -75,6 +84,24 @@ function terminal(
     finishedAt: T1,
     ...overrides,
   };
+}
+
+function fractionalDescriptorEvidence(directory: string): {
+  readonly path: string;
+  readonly sizeBytes: number;
+  readonly mtimeMs: number;
+} {
+  const path = join(directory, "descriptor-evidence.jsonl");
+  writeFileSync(path, '{"type":"session_state","payload":{}}\n');
+  const timestampSeconds = 1_700_000_000.123_456;
+  utimesSync(path, timestampSeconds, timestampSeconds);
+  const descriptor = openSync(path, "r");
+  try {
+    const stats = fstatSync(descriptor);
+    return { path, sizeBytes: stats.size, mtimeMs: stats.mtimeMs };
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function beginSideEffect(stepId = "step-write", sequence = 1) {
@@ -706,6 +733,49 @@ describe("StateRunDurabilityRepository", () => {
         observedAt: T3,
       }),
     ).toEqual({ applied: false, value: undefined });
+  });
+
+  it("binds descriptor-exact strict-scan evidence without truncating fractional mtime", () => {
+    const source = fractionalDescriptorEvidence(cwd);
+    runs.ensureInitialEpoch({ runId: "run-1", openedAt: T0 });
+    runs.bindJournalSource({
+      runId: "run-1",
+      epoch: 1,
+      childRunId: "run-1",
+      sessionId: "session-1",
+      sourcePath: source.path,
+      boundAt: T0,
+    });
+    const bound = runs.bindAuthoritativeJournalEvidence({
+      sourcePath: source.path,
+      sourceSha256: "a".repeat(64),
+      sourceSizeBytes: source.sizeBytes,
+      sourceMtimeMs: source.mtimeMs,
+      journalFormat: "sequenced_v1",
+      minimumReaderRuntime: "0.13.0",
+      updatedAt: T1,
+    });
+    expect(Number.isInteger(source.mtimeMs)).toBe(false);
+    expect(bound).toMatchObject({
+      authoritativeSourceSha256: "a".repeat(64),
+      authoritativeSourceSizeBytes: source.sizeBytes,
+      authoritativeSourceMtimeMs: source.mtimeMs,
+      journalFormat: "sequenced_v1",
+      minimumReaderRuntime: "0.13.0",
+    });
+    expect(() =>
+      runs.bindAuthoritativeJournalEvidence({
+        sourcePath: source.path,
+        sourceSha256: "b".repeat(64),
+        sourceSizeBytes: source.sizeBytes,
+        sourceMtimeMs: source.mtimeMs,
+        journalFormat: "sequenced_v1",
+        minimumReaderRuntime: "0.13.0",
+        updatedAt: T2,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_JOURNAL_BINDING_CONFLICT" }),
+    );
   });
 
   it("survives repository reopen without losing terminal, effect, or binding state", () => {
