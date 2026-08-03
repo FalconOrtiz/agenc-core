@@ -63,11 +63,12 @@ import { delegate } from "../agents/delegate.js";
 import {
   runAgentsOnCsv,
   recordAgentJobResultAsync,
-  resumeAgentJobsFromRepository,
+  CsvJobRecoverySupervisor,
   type AgentJobProgressEmitter,
   type AgentJobSpawn,
   type AgentJobSpawnContext,
 } from "../agents/jobs/job-orchestrator.js";
+import { logError } from "../utils/log.js";
 import { createCsvInputRootCapability } from "../agents/jobs/csv-reader.js";
 import {
   createCsvOutputRootCapability,
@@ -1526,6 +1527,26 @@ function strictArgs(
 function callIdFromArgs(args: Record<string, unknown>, prefix: string): string {
   return stringValue(args.__callId) ?? `${prefix}-${randomUUID()}`;
 }
+
+interface OwnedCsvRecoverySupervisor {
+  readonly supervisor: CsvJobRecoverySupervisor;
+  readonly terminalObservation: Promise<void>;
+}
+
+interface CsvRecoverySupervisorLease {
+  readonly repository: CsvAgentJobsRepository;
+  readonly initialization: Promise<OwnedCsvRecoverySupervisor | null>;
+}
+
+interface CsvRecoverySupervisorLeaseAccess {
+  readonly lease: CsvRecoverySupervisorLease;
+  readonly creator: boolean;
+}
+
+const csvRecoverySupervisorLeases = new WeakMap<
+  CsvAgentJobsRepository,
+  CsvRecoverySupervisorLease
+>();
 
 function currentAgentContext(
   session: Session,
@@ -4075,25 +4096,104 @@ export async function resumeInterruptedAgentJobs(opts: {
   readonly csvAgentJobsRepositories: CsvAgentJobsRepositoryProvider;
   readonly signal?: AbortSignal;
 }): Promise<number> {
-  return opts.csvAgentJobsRepositories.withRepository(
+  let resolveStartup!: (startedJobs: number) => void;
+  let rejectStartup!: (error: unknown) => void;
+  const startup = new Promise<number>((resolve, reject) => {
+    resolveStartup = resolve;
+    rejectStartup = reject;
+  });
+  const repositoryLease = opts.csvAgentJobsRepositories.withRepository(
     opts.workspaceRoot,
-    (repository, signal) =>
-      resumeInterruptedAgentJobsWithRepository({
-        session: opts.session,
-        workspaceRoot: opts.workspaceRoot,
-        repository,
-        signal,
-      }),
+    async (repository, signal) => {
+      try {
+        const access = getOrCreateCsvRecoverySupervisorLease({
+          session: opts.session,
+          workspaceRoot: opts.workspaceRoot,
+          repository,
+          signal,
+        });
+        const owned = await access.lease.initialization;
+        if (owned === null) {
+          resolveStartup(0);
+          return;
+        }
+        resolveStartup(await owned.supervisor.start());
+        if (access.creator) await owned.terminalObservation;
+      } catch (error) {
+        rejectStartup(error);
+        throw error;
+      }
+    },
     { ...(opts.signal !== undefined ? { signal: opts.signal } : {}) },
   );
+  void repositoryLease.catch((error: unknown) => {
+    rejectStartup(error);
+    logError(error);
+  });
+  return startup;
 }
 
-async function resumeInterruptedAgentJobsWithRepository(opts: {
+function getOrCreateCsvRecoverySupervisorLease(opts: {
   readonly session: Session;
   readonly workspaceRoot: string;
   readonly repository: CsvAgentJobsRepository;
   readonly signal?: AbortSignal;
-}): Promise<number> {
+}): CsvRecoverySupervisorLeaseAccess {
+  opts.signal?.throwIfAborted();
+  const existing = csvRecoverySupervisorLeases.get(opts.repository);
+  if (existing !== undefined) {
+    return { lease: existing, creator: false };
+  }
+
+  let resolveInitialization!: (
+    owned: OwnedCsvRecoverySupervisor | null,
+  ) => void;
+  let rejectInitialization!: (error: unknown) => void;
+  const initialization = new Promise<OwnedCsvRecoverySupervisor | null>(
+    (resolve, reject) => {
+      resolveInitialization = resolve;
+      rejectInitialization = reject;
+    },
+  );
+  const lease: CsvRecoverySupervisorLease = {
+    repository: opts.repository,
+    initialization,
+  };
+  csvRecoverySupervisorLeases.set(opts.repository, lease);
+  void initializeCsvRecoverySupervisor(opts).then(
+    resolveInitialization,
+    rejectInitialization,
+  );
+  void initialization.then(
+    (owned) => {
+      if (owned === null) {
+        forgetCsvRecoverySupervisorLease(lease);
+        return;
+      }
+      void owned.terminalObservation.then(
+        () => forgetCsvRecoverySupervisorLease(lease),
+        () => forgetCsvRecoverySupervisorLease(lease),
+      );
+    },
+    () => forgetCsvRecoverySupervisorLease(lease),
+  );
+  return { lease, creator: true };
+}
+
+function forgetCsvRecoverySupervisorLease(
+  lease: CsvRecoverySupervisorLease,
+): void {
+  if (csvRecoverySupervisorLeases.get(lease.repository) === lease) {
+    csvRecoverySupervisorLeases.delete(lease.repository);
+  }
+}
+
+async function initializeCsvRecoverySupervisor(opts: {
+  readonly session: Session;
+  readonly workspaceRoot: string;
+  readonly repository: CsvAgentJobsRepository;
+  readonly signal?: AbortSignal;
+}): Promise<OwnedCsvRecoverySupervisor | null> {
   opts.signal?.throwIfAborted();
   const repository = opts.repository;
   const outputRootCapability = createCsvOutputRootCapability(
@@ -4102,25 +4202,32 @@ async function resumeInterruptedAgentJobsWithRepository(opts: {
   await recoverCsvOutputIntents(outputRootCapability, repository, {
     signal: opts.signal,
   });
-  if (
-    repository.listJobs({ status: "running" }).length === 0 &&
-    repository.listJobs({ status: "pending" }).length === 0
-  ) {
-    return 0;
+  if (repository.listRunnableJobsPage({ limit: 1 }).jobs.length === 0) {
+    return null;
   }
   const { control, registry } = ensureAgentControl(opts.session);
   const { backgroundTaskLifecycle, registerAgentThreadTask } =
     await import("../tasks/index.js");
   opts.signal?.throwIfAborted();
-  const outstandingThreadIds = new Set<string>();
-  const cancelOutstandingThreads = async (): Promise<void> => {
-    const ids = [...outstandingThreadIds];
+  const outstandingThreadIds = new Map<string, Set<string>>();
+  const threadIdsForJob = (jobId: string): Set<string> => {
+    const current = outstandingThreadIds.get(jobId);
+    if (current !== undefined) return current;
+    const created = new Set<string>();
+    outstandingThreadIds.set(jobId, created);
+    return created;
+  };
+  const cancelOutstandingThreads = async (jobId: string): Promise<void> => {
+    const owned = outstandingThreadIds.get(jobId);
+    if (owned === undefined) return;
+    const ids = [...owned];
     const outcomes = await Promise.allSettled(
       ids.map(async (id) => {
         await control.shutdown(id, "agent_job_cancelled");
-        outstandingThreadIds.delete(id);
+        owned.delete(id);
       }),
     );
+    if (owned.size === 0) outstandingThreadIds.delete(jobId);
     const failures = outcomes
       .filter(
         (outcome): outcome is PromiseRejectedResult =>
@@ -4156,7 +4263,7 @@ async function resumeInterruptedAgentJobsWithRepository(opts: {
       }
     },
     async spawn(ctx: AgentJobSpawnContext) {
-      opts.signal?.throwIfAborted();
+      ctx.signal?.throwIfAborted();
       const outcome = await delegate({
         parent: opts.session,
         parentPath: ROOT_AGENT_PATH,
@@ -4173,11 +4280,11 @@ async function resumeInterruptedAgentJobsWithRepository(opts: {
             }
           : {}),
       });
-      if (opts.signal?.aborted === true) {
+      if (ctx.signal?.aborted === true) {
         if (outcome.kind !== "rejected") {
           await control.shutdown(outcome.thread.threadId, "session_shutdown");
         }
-        opts.signal.throwIfAborted();
+        ctx.signal.throwIfAborted();
       }
       if (outcome.kind === "rejected") {
         return outcome.category === "retryable_capacity"
@@ -4185,7 +4292,7 @@ async function resumeInterruptedAgentJobsWithRepository(opts: {
           : { kind: "rejected" as const, reason: outcome.reason };
       }
       const thread = outcome.thread;
-      outstandingThreadIds.add(thread.threadId);
+      threadIdsForJob(ctx.jobId).add(thread.threadId);
       try {
         registerAgentThreadTask(backgroundTaskLifecycle, thread as never, {
           description: `csv-job:${ctx.itemId}`,
@@ -4204,26 +4311,56 @@ async function resumeInterruptedAgentJobsWithRepository(opts: {
         threadFinished,
       };
     },
-    async cancelOutstanding() {
-      await cancelOutstandingThreads();
+    async cancelOutstanding(jobId) {
+      await cancelOutstandingThreads(jobId);
     },
-    async retireItem(_jobId, _itemId, threadId) {
+    async retireItem(jobId, _itemId, threadId) {
       await control.shutdown(threadId, "csv_job_item_retired");
-      outstandingThreadIds.delete(threadId);
+      const owned = outstandingThreadIds.get(jobId);
+      owned?.delete(threadId);
+      if (owned?.size === 0) outstandingThreadIds.delete(jobId);
     },
   };
   opts.signal?.throwIfAborted();
-  const resumed = await resumeAgentJobsFromRepository({
+  const supervisor = new CsvJobRecoverySupervisor({
     repository,
     spawn,
     outputRootCapability,
     ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    onError: logError,
   });
-  if (opts.signal?.aborted === true) {
-    await cancelOutstandingThreads();
-    opts.signal.throwIfAborted();
-  }
-  return resumed.length;
+  const owned: OwnedCsvRecoverySupervisor = {
+    supervisor,
+    terminalObservation: supervisor.waitForCompletion().then(
+      () => undefined,
+      () => undefined,
+    ),
+  };
+  return owned;
+}
+
+export async function shutdownCsvJobRecoverySupervisor(opts: {
+  readonly workspaceRoot: string;
+  readonly csvAgentJobsRepositories: CsvAgentJobsRepositoryProvider;
+  readonly signal?: AbortSignal;
+}): Promise<void> {
+  await opts.csvAgentJobsRepositories.withRepository(
+    opts.workspaceRoot,
+    async (repository, signal) => {
+      signal.throwIfAborted();
+      const lease = csvRecoverySupervisorLeases.get(repository);
+      if (lease === undefined) return;
+      const owned = await lease.initialization;
+      if (owned === null) {
+        forgetCsvRecoverySupervisorLease(lease);
+        return;
+      }
+      await owned.supervisor.shutdown();
+      await owned.terminalObservation;
+      forgetCsvRecoverySupervisorLease(lease);
+    },
+    { ...(opts.signal !== undefined ? { signal: opts.signal } : {}) },
+  );
 }
 
 export async function startCronSchedulerRunner(opts: {
