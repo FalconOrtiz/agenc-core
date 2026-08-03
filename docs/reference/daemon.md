@@ -142,6 +142,34 @@ cursor is scoped to that filter and should not be persisted across daemon
 upgrades. Persisted metadata is read with an indexed keyset page rather than a
 full thread-history scan.
 
+`fs.fuzzy_search` builds bounded path-only generations. Git worktrees use
+Git's NUL-delimited tracked-plus-standard-untracked surface, including global,
+repository, and common-worktree excludes; tracked-but-deleted entries are
+removed. Non-Git roots use the packaged ripgrep byte protocol. The daemon
+publishes a generation only after its count, byte count, and digest verify.
+Unchanged warm requests search the immutable in-memory generation and do not
+walk the workspace again. A caller may pass `refresh: true` to wait for a
+complete replacement generation; otherwise a verified older generation may be
+served while a rebuild is running.
+
+The request's optional `limit` defaults to 50 and accepts integers from 1
+through 1,000. The daemon rejects malformed Unicode, queries over 256 Unicode
+code points, more than 64 raw roots, more than 32 canonical roots, roots over
+16,384 UTF-8 bytes, and aggregate root text over 262,144 bytes. Requested roots
+are canonicalized and intersected with the authenticated connection's trusted
+workspace capability; request data is never treated as its own authorization.
+
+The additive `freshness` response reports each root's generation, age, watcher
+state, audit time, directory coverage, and stale/degraded/truncated flags.
+`directoryCoverage: "nonempty_only"` is explicit for both Git and non-Git
+generations: Git cannot represent a directory whose last tracked file was
+deleted, while ripgrep cannot provide exact ignored empty-directory parity.
+Callers must inspect these fields: watcher loss, a daemon restart gap, and
+incomplete directory coverage are never presented as proof of full freshness.
+Additive `matcher` metadata reports optimal versus full-query degraded
+matching, resource-limit truncation, and the evaluated/total candidate counts.
+No query prefix is silently discarded.
+
 Run inspection searches discovered project state databases by `runId`:
 
 - `run.status` returns lifecycle status plus aggregate admission step,
