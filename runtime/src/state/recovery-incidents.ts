@@ -8,6 +8,7 @@ import {
   MAX_RECOVERY_QUARANTINE_INCIDENTS_TOTAL,
   MAX_RECOVERY_QUARANTINE_OBSERVATIONS_PER_INCIDENT,
   MAX_RECOVERY_SOURCE_PATH_UTF8_BYTES,
+  MAX_RECOVERY_SOURCES_PER_RUN,
   RECOVERY_MINIMUM_READER_RUNTIME,
   CanonicalJournalIntegrityError,
   assertRecoverySha256,
@@ -99,6 +100,11 @@ export interface RecoveryAbandonment {
   readonly reason: string;
   readonly abandonedAtMs: number;
   readonly minimumReaderRuntime: string;
+}
+
+export interface ActiveRecoverySource {
+  readonly sourceKind: RecoverySourceKind;
+  readonly sourcePath: string;
 }
 
 export interface RecoveryPage<T> {
@@ -430,6 +436,8 @@ export class StateRecoveryIncidentRepository {
     readonly actor: string;
     readonly reason: string;
     readonly abandonedAtMs: number;
+    /** Present only when E1a proved the current descriptor-pinned digest. */
+    readonly verifiedCurrentSourceSha256?: string;
   }): RecoveryAbandonment {
     return this.driver.transactionImmediate(() => {
       const incident = this.requireActiveQuarantine(params.quarantineId);
@@ -439,13 +447,18 @@ export class StateRecoveryIncidentRepository {
       ) {
         throw new Error("confirmed run id does not match quarantined evidence");
       }
-      if (
-        incident.sourceSha256 !==
-        assertRecoverySha256(
-          params.expectedSourceSha256,
-          "expectedSourceSha256",
-        )
-      ) {
+      const expectedSourceSha256 = assertRecoverySha256(
+        params.expectedSourceSha256,
+        "expectedSourceSha256",
+      );
+      const verifiedSourceSha256 =
+        params.verifiedCurrentSourceSha256 === undefined
+          ? incident.sourceSha256
+          : assertRecoverySha256(
+              params.verifiedCurrentSourceSha256,
+              "verifiedCurrentSourceSha256",
+            );
+      if (verifiedSourceSha256 !== expectedSourceSha256) {
         throw new Error(
           "confirmed source digest does not match quarantined evidence",
         );
@@ -454,7 +467,7 @@ export class StateRecoveryIncidentRepository {
         runId: incident.runId,
         sourceKind: incident.sourceKind,
         sourcePath: incident.sourcePath,
-        sourceSha256: incident.sourceSha256,
+        sourceSha256: verifiedSourceSha256,
         quarantineId: incident.quarantineId,
         actor: params.actor,
         reason: params.reason,
@@ -668,6 +681,42 @@ export class StateRecoveryIncidentRepository {
       )
       .get(requiredRecoveryText(runId, "runId"));
     return row === undefined ? undefined : abandonmentFromRow(row);
+  }
+
+  listActiveSourcesForRun(runId: string): readonly ActiveRecoverySource[] {
+    const normalizedRunId = requiredRecoveryText(runId, "runId");
+    const rows = this.driver
+      .prepareState<
+        [string, string, number],
+        { source_kind: RecoverySourceKind; source_path: string }
+      >(
+        `SELECT MIN(source_kind) AS source_kind, source_path
+         FROM (
+           SELECT source_kind, source_path
+           FROM run_recovery_quarantine
+           WHERE run_id = ? AND state = 'active'
+           UNION ALL
+           SELECT source_kind, source_path
+           FROM run_recovery_deferred
+           WHERE run_id = ? AND state = 'active'
+         )
+         GROUP BY source_path
+         ORDER BY source_path, source_kind
+         LIMIT ?`,
+      )
+      .all(
+        normalizedRunId,
+        normalizedRunId,
+        MAX_RECOVERY_SOURCES_PER_RUN + 1,
+      );
+    return Object.freeze(
+      rows.map((row) =>
+        Object.freeze({
+          sourceKind: row.source_kind,
+          sourcePath: row.source_path,
+        }),
+      ),
+    );
   }
 
   private recordObservation(
