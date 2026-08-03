@@ -59,7 +59,7 @@ describe("state migration registry", () => {
   it("loads state migrations from numbered migration files in order", () => {
     expect(STATE_DB_MIGRATIONS.map((migration) => migration.version)).toEqual([
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-      20, 21,
+      20, 21, 22,
     ]);
     expect(STATE_DB_MIGRATIONS.map((migration) => migration.name)).toEqual([
       "initial_state_schema",
@@ -83,6 +83,7 @@ describe("state migration registry", () => {
       "csv_job_identity_replay",
       "tool_pair_projection_schema",
       "csv_job_scheduler",
+      "workflow_handoff_artifacts",
     ]);
     expectMigrationVersionsAreUnique(STATE_DB_MIGRATIONS);
   });
@@ -122,7 +123,88 @@ describe("state migration registry", () => {
       "019_csv_job_identity_replay.ts",
       "020_tool_pair_projection_schema.ts",
       "021_csv_job_scheduler.ts",
+      "022_workflow_handoff_artifacts.ts",
     ]);
+  });
+
+  it("adds workflow handoffs at v22 without changing legacy tool-output state", () => {
+    const db = new Database(":memory:");
+    try {
+      applyMigrations(
+        db,
+        STATE_DB_MIGRATIONS.filter((migration) => migration.version <= 21),
+      );
+      const legacyColumns = db
+        .prepare<[], { readonly name: string; readonly type: string }>(
+          "PRAGMA table_info(in_flight_tool_calls)",
+        )
+        .all();
+
+      applyMigrations(db, STATE_DB_MIGRATIONS);
+
+      expect(
+        db
+          .prepare<[], { readonly name: string; readonly type: string }>(
+            "PRAGMA table_info(in_flight_tool_calls)",
+          )
+          .all(),
+      ).toEqual(legacyColumns);
+      expect(
+        db
+          .prepare<[], { readonly version: number; readonly name: string }>(
+            "SELECT version, name FROM schema_migrations WHERE version = 22",
+          )
+          .get(),
+      ).toEqual({ version: 22, name: "workflow_handoff_artifacts" });
+      const artifactColumns = db
+        .prepare<[], { readonly name: string }>(
+          "PRAGMA table_info(workflow_handoff_artifacts)",
+        )
+        .all()
+        .map((row) => row.name);
+      expect(artifactColumns).toContain("compatibility_epoch");
+      expect(artifactColumns).not.toContain("minimum_reader_runtime");
+      expect(
+        db
+          .prepare<[], { readonly name: string }>(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'workflow_handoff_%'
+             ORDER BY name`,
+          )
+          .all()
+          .map((row) => row.name),
+      ).toEqual([
+        "workflow_handoff_artifacts",
+        "workflow_handoff_cursors",
+        "workflow_handoff_quota_global",
+        "workflow_handoff_quota_runs",
+        "workflow_handoff_references",
+        "workflow_handoff_sequence",
+      ]);
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO workflow_handoff_artifacts (
+               artifact_id, format_version, kind, compatibility_epoch,
+               idempotency_key, run_id, workflow_id, producer_step_id,
+               digest, byte_length, token_count, storage_ref, status, preview,
+               preview_truncated, created_at_ms, last_access_at_ms,
+               unreferenced_at_ms
+             ) VALUES (
+               'wh_000000000000000000000000000000000000000000000001', 1,
+               'future_kind', 'workflow_handoff.v1/state-schema.22',
+               'key', 'run', 'workflow', 'step',
+               'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+               0, 0,
+               'workflow-handoff:wh_000000000000000000000000000000000000000000000001',
+               'intent', '', 0, 1, 1, 1
+             )`,
+          )
+          .run(),
+      ).toThrow();
+    } finally {
+      db.close();
+    }
   });
 
   it("upgrades persisted effect-evidence v17 state to recovery schema v18 additively", () => {

@@ -2,11 +2,11 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Accepted target; implementation pending |
+| Status | B3a artifact contract implemented; B3b scheduler consumption pending |
 | Audit snapshot | `d2b228e87ea63bd6a5d93e6f599f36bce88d672b` |
 | Audit date | 2026-07-31 |
 | Owners | Workflow artifact contract (B3a), then bounded scheduler consumption (B3b) |
-| Compatibility | Additive artifact kind; old readers and garbage collectors fail closed and preserve unknown bytes |
+| Compatibility | Exact `workflow_handoff.v1/state-schema.22` epoch; old readers and garbage collectors fail closed and preserve unknown bytes |
 
 ## Context
 
@@ -28,7 +28,8 @@ is insufficient.
 The strict artifact record binds:
 
 - artifact format version and `workflow_handoff` kind;
-- runtime-owned artifact ID and minimum reader version;
+- runtime-owned artifact ID and exact `workflow_handoff.v1/state-schema.22`
+  compatibility epoch;
 - owning run/workflow and producer step identities;
 - exact encoded byte length, media/encoding contract, and SHA-256;
 - creation/commit sequence and retention state; and
@@ -40,7 +41,8 @@ trusted `0700` user-private root, `0600` files, and no-follow/descriptor
 containment checks appropriate to the platform, with equivalent per-user,
 non-inheriting access controls on Windows.
 
-Publication reserves artifact count and bytes transactionally before file
+Publication checks transactionally maintained per-run and global count/byte
+ledgers in O(1), then reserves the artifact before file
 creation, creates a stable idempotent intent, writes and flushes the exact bytes,
 atomically installs the final file, flushes its directory where supported, then
 commits metadata. Readers verify kind, ownership, length, and digest before use.
@@ -51,6 +53,8 @@ recovery completes or removes without guessing.
 
 Initial contract limits are:
 
+- 16,777,216 serialized manifest bytes, 100,000 finite JSON nodes, and
+  8,388,608 aggregate string UTF-8 bytes across keys and values;
 - 32,768 handoff tokens, with a default ceiling of 8,192;
 - 131,072 tokens per full step result;
 - 16,777,216 bytes per artifact and 268,435,456 bytes per run;
@@ -58,6 +62,12 @@ Initial contract limits are:
 - 4,096 artifacts per run and 100,000 globally;
 - 2,048 preview bytes per step and 4,194,304 final-response bytes; and
 - 256 cleanup records per keyset page.
+
+Whole-document ingestion bounds apply before the independent schema and
+semantic maxima. Consequently, object keys, step ids, and reference values
+share the 8 MiB string budget, and reference objects share the 100,000-node
+budget; a nominal message or alias maximum does not reserve additional bytes or
+nodes beyond those whole-document ceilings.
 
 Hitting an artifact byte, count, inode, result-token, handoff-token, or
 reservation ceiling produces the exact `handoff_failed` path. It retains the
@@ -97,11 +107,14 @@ handoff and advertise the new result unions and limits.
 
 ## Rollback
 
-Rollback disables new workflow scheduling and artifact creation while the
-minimum compatible reader continues inspection and cleanup. It preserves all
-committed handoffs and child effect evidence until reachability proves them
-unreferenced. It MUST NOT expose an unknown kind to old garbage collection or
-flatten artifact content back into prompts.
+Rollback disables new workflow scheduling and artifact creation while a reader
+that explicitly implements the `workflow_handoff.v1/state-schema.22` epoch
+continues inspection and cleanup. This contract intentionally does not claim
+that runtime `0.13.0`, or any other speculative release version, is compatible.
+The public and persisted record carry the exact epoch, not a minimum-runtime
+semver. Rollback preserves all committed handoffs and child effect evidence
+until reachability proves them unreferenced. It MUST NOT expose an unknown kind
+to old garbage collection or flatten artifact content back into prompts.
 
 ## Alternatives rejected
 
@@ -124,3 +137,37 @@ preview, final-response, and RSS bounds.
 Primary references: SQLite's [atomic commit](https://www.sqlite.org/atomiccommit.html),
 [RIFL](https://web.stanford.edu/~ouster/cgi-bin/papers/rifl.pdf), and
 [OrchBench](https://arxiv.org/abs/2607.25656).
+
+## Implemented B3a surfaces
+
+The version-1 schema and kind registry live in
+`runtime/src/agents/workflow-handoff-schema.ts`, with the standalone JSON
+Schema in `workflow-handoff-artifact.v1.schema.json`. Public mirrors are
+checked in the runtime's generated SDK types and `@tetsuo-ai/agenc-sdk`.
+
+`WorkflowHandoffArtifactStore` owns intent reservation, exact-byte atomic
+publication, commit sequencing, digest-bound reads, references, quota
+accounting, restart recovery, and keyset-paged retention cleanup. POSIX uses a
+descriptor-confined private root and no-follow child operations. Windows uses
+a protected, non-inheriting current-user DACL, rejects reparse points and
+non-NTFS roots, publishes with an atomic no-replace hard link, and rechecks
+root/file identity and ACLs around each operation. Operator list and inspect
+methods return identity, ownership, digest, quota, reachability, and lifecycle
+metadata only; they never read artifact output or expose previews.
+
+Migration 022 is additive. Its table accepts only `workflow_handoff` records
+with the exact `workflow_handoff.v1/state-schema.22` compatibility epoch and
+maintains per-run and global quota aggregates with insert/delete triggers; the
+explicit artifact-kind gate continues to recognize the legacy `tool-result`
+kind and throws on unknown kinds with an instruction to preserve bytes.
+
+Evidence is in:
+
+- `runtime/tests/agents/workflow-contracts.test.ts`;
+- `runtime/tests/bin/workflow-tool-contract.test.ts`;
+- `runtime/tests/agents/workflow-handoff-store.test.ts`;
+- `runtime/tests/sdk-package/workflow-handoff.contract.test.ts`; and
+- `runtime/benchmarks/workflow-contract-1024.ts`.
+
+The B3a layer does not release dependencies or replace the existing scheduler.
+That remains the separately reviewed B3b rollout gate.
