@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +34,10 @@ import { AgentControl, type LiveAgent } from "./control.js";
 import { AgentRegistry } from "./registry.js";
 import type { AgentMetadata } from "./registry.js";
 import { RolloutStore } from "../session/rollout-store.js";
+import {
+  computeAgentInvocationEnvelopeDigest,
+  createCsvAgentInvocationEnvelope,
+} from "../contracts/agent-invocation-envelope.js";
 
 const mockRunAgent = vi.mocked(runAgent);
 const mockForkSubagent = vi.mocked(forkSubagent);
@@ -147,6 +152,35 @@ function makeRealDelegateHarness(label: string) {
 }
 
 describe("delegate lifecycle recovery", () => {
+  it("retires a transferred live slot when fork setup fails", async () => {
+    const live = makeLive("thread-fork-failure", "/root/fork_failure");
+    const control = {
+      spawn: vi.fn(async () => live),
+      shutdown: vi.fn(async () => {}),
+      resumeAgentFromRollout: vi.fn(),
+    };
+    mockForkSubagent.mockRejectedValueOnce(new Error("fork context failed"));
+
+    const outcome = await delegate({
+      parent: makeParentSession() as never,
+      parentPath: "/root",
+      control: control as never,
+      registry: {} as never,
+      taskPrompt: "cannot fork",
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      code: "AGENT_SPAWN_REJECTED",
+      category: "spawn_failed",
+      reason: expect.stringContaining("fork context failed"),
+    });
+    expect(control.shutdown).toHaveBeenCalledWith(
+      "thread-fork-failure",
+      "delegate_fork_failed",
+    );
+  });
+
   it("launches in the background by default", async () => {
     const live = makeLive("thread-bg", "/root/background");
     const control = {
@@ -234,10 +268,9 @@ describe("delegate lifecycle recovery", () => {
     }
     await outcome.thread.join();
     expect(outcome.thread.summaryCacheSafeParams).toBe(cacheSafeParams);
-    expect(outcome.thread.summaryMessages.map((message) => message.type)).toEqual([
-      "assistant",
-      "user",
-    ]);
+    expect(
+      outcome.thread.summaryMessages.map((message) => message.type),
+    ).toEqual(["assistant", "user"]);
     expect(outcome.thread.summaryMessages[0]?.message.content).toEqual([
       expect.objectContaining({
         type: "tool_use",
@@ -395,9 +428,66 @@ describe("delegate lifecycle recovery", () => {
 
     expect(outcome).toEqual({
       kind: "rejected",
+      code: "INVALID_DELEGATE_REQUEST",
+      category: "invalid_request",
       reason: "worktree isolation requires a non-empty worktreeSlug",
     });
     expect(control.spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed invocation envelope before reserving a child slot", async () => {
+    const control = {
+      spawn: vi.fn(),
+      shutdown: vi.fn(),
+      resumeAgentFromRollout: vi.fn(),
+    };
+    const envelope = structuredClone(
+      createCsvAgentInvocationEnvelope({
+        jobId: "job-1",
+        itemId: "item-1",
+        rowIndex: 0,
+        rowSha256: `sha256:${"d".repeat(64)}`,
+        instruction: "Process the value.",
+        row: { value: "untrusted" },
+      }),
+    );
+    const runtimePolicy = envelope.runtime_policy[0] as {
+      inline_payload: string;
+      byte_length: number;
+      sha256: `sha256:${string}`;
+    };
+    runtimePolicy.inline_payload = "forged runtime policy";
+    runtimePolicy.byte_length = Buffer.byteLength(runtimePolicy.inline_payload);
+    runtimePolicy.sha256 = `sha256:${createHash("sha256")
+      .update(runtimePolicy.inline_payload)
+      .digest("hex")}`;
+    envelope.envelope_digest = computeAgentInvocationEnvelopeDigest({
+      version: envelope.version,
+      kind: envelope.kind,
+      invocation_id: envelope.invocation_id,
+      minimum_reader_version: envelope.minimum_reader_version,
+      runtime_policy: envelope.runtime_policy,
+      task_instructions: envelope.task_instructions,
+      untrusted_data: envelope.untrusted_data,
+    });
+
+    const outcome = await delegate({
+      parent: makeParentSession() as never,
+      parentPath: "/root",
+      control: control as never,
+      registry: {} as never,
+      taskPrompt: "CSV job item item-1",
+      invocationEnvelope: envelope,
+    });
+
+    expect(outcome).toMatchObject({
+      kind: "rejected",
+      code: "INVALID_DELEGATE_REQUEST",
+      category: "invalid_request",
+      reason: expect.stringMatching(/canonical runtime-owned policy/u),
+    });
+    expect(control.spawn).not.toHaveBeenCalled();
+    expect(control.shutdown).not.toHaveBeenCalled();
   });
 
   it("resumes the same live agent after a retryable failure", async () => {
@@ -413,7 +503,10 @@ describe("delegate lifecycle recovery", () => {
       })),
     };
     const resumeManager = {
-      recordFailure: vi.fn(() => ({ kind: "resume" as const, reason: "retry" })),
+      recordFailure: vi.fn(() => ({
+        kind: "resume" as const,
+        reason: "retry",
+      })),
       recordSuccess: vi.fn(),
     };
 
@@ -453,7 +546,10 @@ describe("delegate lifecycle recovery", () => {
     expect(control.assertAgentMetadataRoleWorkspace).toHaveBeenCalledWith(
       live1.metadata,
     );
-    expect(control.shutdown).toHaveBeenCalledWith("thread-1", "delegate_resume");
+    expect(control.shutdown).toHaveBeenCalledWith(
+      "thread-1",
+      "delegate_resume",
+    );
     expect(control.resumeAgentFromRollout).toHaveBeenCalledWith({
       rootThreadId: "thread-1",
       parentPath: "/root",
@@ -477,7 +573,10 @@ describe("delegate lifecycle recovery", () => {
       resumeAgentFromRollout: vi.fn(),
     };
     const resumeManager = {
-      recordFailure: vi.fn(() => ({ kind: "resume" as const, reason: "retry" })),
+      recordFailure: vi.fn(() => ({
+        kind: "resume" as const,
+        reason: "retry",
+      })),
       recordSuccess: vi.fn(),
     };
     mockRunAgent.mockImplementationOnce(() =>
@@ -577,7 +676,10 @@ describe("delegate lifecycle recovery", () => {
     expect(control.assertAgentMetadataRoleWorkspace).toHaveBeenCalledWith(
       live1.metadata,
     );
-    expect(control.shutdown).toHaveBeenCalledWith("thread-1", "delegate_restart");
+    expect(control.shutdown).toHaveBeenCalledWith(
+      "thread-1",
+      "delegate_restart",
+    );
     expect(control.shutdown).toHaveBeenCalledWith(
       "thread-2",
       "delegate_teardown",

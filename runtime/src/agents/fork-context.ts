@@ -20,12 +20,19 @@
  */
 
 import type { LLMContentPart, LLMMessage } from "../llm/types.js";
+import {
+  assertAgentInvocationEnvelope,
+  materializeAgentInvocationMessages,
+  validateAgentInvocationMessageSequence,
+  type AgentInvocationEnvelope,
+} from "../contracts/agent-invocation-envelope.js";
 import type { ResponseItem, RolloutItem } from "../session/rollout-item.js";
 import type { Session } from "../session/session.js";
 import {
   filterForkedRolloutItems,
   truncateRolloutToLastNForkTurns,
 } from "./thread-rollout-truncation.js";
+import { responseItemToLlmMessage } from "../session/message-history-conversion.js";
 
 // ─────────────────────────────────────────────────────────────────────
 // Fork modes
@@ -42,6 +49,7 @@ export interface ForkContextInput {
   readonly useProvidedParentMessages?: boolean;
   readonly taskPrompt: string;
   readonly taskContent?: readonly LLMContentPart[];
+  readonly invocationEnvelope?: AgentInvocationEnvelope;
   readonly worktreePath?: string;
 }
 
@@ -60,11 +68,24 @@ function lastNUserTurns(
   n: number,
 ): LLMMessage[] {
   if (n <= 0) return [];
+  validateAgentInvocationMessageSequence(messages);
   // Walk backwards; each user message begins a turn.
   let userCount = 0;
   let sliceIndex = 0;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "user") {
+    const message = messages[i];
+    const invocation = message?.runtimeOnly?.agentInvocation;
+    if (invocation !== undefined) {
+      if (invocation.channelIndex !== 2) continue;
+      userCount += 1;
+      if (userCount === n) {
+        sliceIndex = i - 2;
+        break;
+      }
+      i -= 2;
+      continue;
+    }
+    if (message?.role === "user") {
       userCount += 1;
       if (userCount === n) {
         sliceIndex = i;
@@ -154,15 +175,7 @@ function responseItemToForkMessage(item: ResponseItem): LLMMessage | null {
     if (item.phase === "commentary") return null;
     if (item.toolCallId || item.toolName) return null;
   }
-  return {
-    role: item.role,
-    content: (typeof item.content === "string"
-      ? item.content
-      : item.content.map((part) => ({ ...part }))) as LLMMessage["content"],
-    ...(item.phase === "commentary" || item.phase === "final_answer"
-      ? { phase: item.phase }
-      : {}),
-  };
+  return responseItemToLlmMessage(item);
 }
 
 function responseItemsToForkMessages(
@@ -232,6 +245,14 @@ function rolloutBackedParentMessages(input: ForkContextInput): LLMMessage[] {
 export async function forkSubagent(
   input: ForkContextInput,
 ): Promise<ForkContextResult> {
+  if (input.invocationEnvelope !== undefined) {
+    assertAgentInvocationEnvelope(input.invocationEnvelope);
+    if (input.taskContent !== undefined) {
+      throw new TypeError(
+        "agent invocation envelope cannot be combined with legacy taskContent",
+      );
+    }
+  }
   // I-36: flush parent rollout.
   if (input.parent.rolloutStore) {
     try {
@@ -241,36 +262,48 @@ export async function forkSubagent(
     }
   }
 
-  const directivePrompt = buildDirective(input);
-  const directiveMessage = buildDirectiveMessage(input);
+  const directivePrompt =
+    input.invocationEnvelope === undefined
+      ? buildDirective(input)
+      : `Agent invocation ${input.invocationEnvelope.invocation_id}`;
+  const directiveMessages: ReadonlyArray<LLMMessage> =
+    input.invocationEnvelope === undefined
+      ? [buildDirectiveMessage(input)]
+      : materializeAgentInvocationMessages(input.invocationEnvelope);
 
   if (input.mode === undefined) {
     return {
-      messages: [directiveMessage],
+      messages: directiveMessages,
       directivePrompt,
     };
   }
 
   const parentMessages = rolloutBackedParentMessages(input);
+  validateAgentInvocationMessageSequence(parentMessages);
 
   switch (input.mode.kind) {
     case "full_history":
-      return {
-        messages: [...parentMessages, directiveMessage],
+      return validatedForkResult({
+        messages: [...parentMessages, ...directiveMessages],
         directivePrompt,
-      };
+      });
 
     case "last_n_turns":
-      return {
+      return validatedForkResult({
         messages: [
           ...(input.parent.rolloutStore
             ? parentMessages
             : lastNUserTurns(parentMessages, input.mode.n)),
-          directiveMessage,
+          ...directiveMessages,
         ],
         directivePrompt,
-      };
+      });
   }
+}
+
+function validatedForkResult(result: ForkContextResult): ForkContextResult {
+  validateAgentInvocationMessageSequence(result.messages);
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -294,8 +327,7 @@ export function buildCacheSafeParams(opts: {
   readonly overrideSystemPrompt?: string;
   readonly overrideToolAllowlist?: ReadonlyArray<string>;
 }): CacheSafeParams {
-  const systemPrompt =
-    opts.overrideSystemPrompt ?? opts.parent.systemPrompt;
+  const systemPrompt = opts.overrideSystemPrompt ?? opts.parent.systemPrompt;
   const toolCatalogIds = opts.overrideToolAllowlist
     ? opts.parent.toolCatalogIds.filter((id) =>
         opts.overrideToolAllowlist!.includes(id),

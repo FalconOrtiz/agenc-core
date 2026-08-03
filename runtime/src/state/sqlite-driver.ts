@@ -27,6 +27,7 @@ import {
 import { AGENT_ROLE_WORKSPACE_PROVENANCE_SCHEMA_VERSION } from "./migrations/012_agent_role_workspace_provenance.js";
 import { RUN_DURABILITY_SCHEMA_VERSION } from "./migrations/015_run_durability_schema.js";
 import { EFFECT_EVIDENCE_V2_SCHEMA_VERSION } from "./migrations/017_effect_evidence_v2.js";
+import { CSV_JOB_IDENTITY_REPLAY_SCHEMA_VERSION } from "./migrations/019_csv_job_identity_replay.js";
 import { replayAtomicSessionSnapshotWrites } from "./atomic-snapshot-writes.js";
 
 export interface OpenStateDatabaseOptions {
@@ -46,6 +47,7 @@ export const LOGS_DATABASE_FILENAME = "agenc-logs_1.sqlite";
 export const STATE_PRE_V12_BACKUP_FILENAME = "agenc-state_1.pre-v12.sqlite";
 export const STATE_PRE_V15_BACKUP_FILENAME = "agenc-state_1.pre-v15.sqlite";
 export const STATE_PRE_V17_BACKUP_FILENAME = "agenc-state_1.pre-v17.sqlite";
+export const STATE_PRE_V19_BACKUP_FILENAME = "agenc-state_1.pre-v19.sqlite";
 
 export type SqliteDatabase = BetterSqlite3.Database;
 export type SqliteStatement<
@@ -251,8 +253,12 @@ function applyStateMigrations(
   db.exec("BEGIN IMMEDIATE");
   try {
     if (hasUserStateTables(db)) {
-      const maxApplied = maxAppliedMigrationVersion(db);
-      if (maxApplied < AGENT_ROLE_WORKSPACE_PROVENANCE_SCHEMA_VERSION) {
+      if (
+        !hasAppliedMigrationVersion(
+          db,
+          AGENT_ROLE_WORKSPACE_PROVENANCE_SCHEMA_VERSION,
+        )
+      ) {
         createPreMigrationStateBackupLocked(
           paths,
           STATE_PRE_V12_BACKUP_FILENAME,
@@ -260,7 +266,7 @@ function applyStateMigrations(
           "pre-v12",
         );
       }
-      if (maxApplied < RUN_DURABILITY_SCHEMA_VERSION) {
+      if (!hasAppliedMigrationVersion(db, RUN_DURABILITY_SCHEMA_VERSION)) {
         createPreMigrationStateBackupLocked(
           paths,
           STATE_PRE_V15_BACKUP_FILENAME,
@@ -268,12 +274,22 @@ function applyStateMigrations(
           "pre-v15",
         );
       }
-      if (maxApplied < EFFECT_EVIDENCE_V2_SCHEMA_VERSION) {
+      if (!hasAppliedMigrationVersion(db, EFFECT_EVIDENCE_V2_SCHEMA_VERSION)) {
         createPreMigrationStateBackupLocked(
           paths,
           STATE_PRE_V17_BACKUP_FILENAME,
           EFFECT_EVIDENCE_V2_SCHEMA_VERSION,
           "pre-v17",
+        );
+      }
+      if (
+        !hasAppliedMigrationVersion(db, CSV_JOB_IDENTITY_REPLAY_SCHEMA_VERSION)
+      ) {
+        createPreMigrationStateBackupLocked(
+          paths,
+          STATE_PRE_V19_BACKUP_FILENAME,
+          CSV_JOB_IDENTITY_REPLAY_SCHEMA_VERSION,
+          "pre-v19",
         );
       }
     }
@@ -343,7 +359,10 @@ function hasUserStateTables(db: SqliteDatabase): boolean {
   return (row?.count ?? 0) > 0;
 }
 
-function maxAppliedMigrationVersion(db: SqliteDatabase): number {
+function hasAppliedMigrationVersion(
+  db: SqliteDatabase,
+  targetVersion: number,
+): boolean {
   const table = db
     .prepare<[], { name: string }>(
       `SELECT name
@@ -351,13 +370,13 @@ function maxAppliedMigrationVersion(db: SqliteDatabase): number {
        WHERE type = 'table' AND name = 'schema_migrations'`,
     )
     .get();
-  if (!table) return 0;
+  if (!table) return false;
   return (
     db
-      .prepare<[], { version: number | null }>(
-        "SELECT MAX(version) AS version FROM schema_migrations",
+      .prepare<[number], { present: number }>(
+        "SELECT 1 AS present FROM schema_migrations WHERE version = ?",
       )
-      .get()?.version ?? 0
+      .get(targetVersion) !== undefined
   );
 }
 
@@ -377,9 +396,7 @@ function validatePreMigrationStateBackup(
     ) {
       throw new Error(`state backup failed integrity check: ${path}`);
     }
-    if (
-      maxAppliedMigrationVersion(backup) >= targetVersion
-    ) {
+    if (hasAppliedMigrationVersion(backup, targetVersion)) {
       throw new Error(`state backup is not a ${label} database: ${path}`);
     }
   } finally {

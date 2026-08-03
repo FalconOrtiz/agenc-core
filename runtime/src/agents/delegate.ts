@@ -19,8 +19,18 @@
 import type { Session } from "../session/session.js";
 import type { LLMMessage } from "../llm/types.js";
 import type { LLMContentPart } from "../llm/types.js";
+import {
+  assertAgentInvocationEnvelope,
+  type AgentInvocationEnvelope,
+} from "../contracts/agent-invocation-envelope.js";
 import type { AgentControl, LiveAgent } from "./control.js";
-import type { AgentRegistry, AgentPath } from "./registry.js";
+import {
+  AgentCapacityQueueFullError,
+  AgentConcurrencyLimitError,
+  type AgentCapacityPermit,
+  type AgentRegistry,
+  type AgentPath,
+} from "./registry.js";
 import type { ForkMode } from "./fork-context.js";
 import type { WorktreeHandle } from "./worktree.js";
 import type { AgentThread } from "./thread.js";
@@ -62,6 +72,7 @@ export interface DelegateOpts {
   /** Correlation id for the initial task/assignment. */
   readonly taskId?: string;
   readonly taskContent?: readonly LLMContentPart[];
+  readonly invocationEnvelope?: AgentInvocationEnvelope;
   readonly role?: string;
   readonly agentName?: string;
   readonly model?: string;
@@ -78,6 +89,8 @@ export interface DelegateOpts {
   readonly depthCap?: number;
   readonly maxTurns?: number;
   readonly externalSignal?: AbortSignal;
+  readonly capacityPermit?: AgentCapacityPermit;
+  readonly capacityOwnerId?: string;
   readonly silent?: boolean;
   readonly resumeManager?: ResumeManager;
   /**
@@ -99,7 +112,21 @@ export type DelegateOutcome =
       readonly thread: AgentThread;
     }
   | { readonly kind: "async_launched"; readonly thread: AgentThread }
-  | { readonly kind: "rejected"; readonly reason: string };
+  | {
+      readonly kind: "rejected";
+      readonly code:
+        | "INVALID_DELEGATE_REQUEST"
+        | "WORKTREE_UNAVAILABLE"
+        | "AGENT_CONCURRENCY_LIMIT"
+        | "AGENT_CAPACITY_QUEUE_FULL"
+        | "AGENT_SPAWN_REJECTED";
+      readonly category:
+        | "invalid_request"
+        | "environment"
+        | "retryable_capacity"
+        | "spawn_failed";
+      readonly reason: string;
+    };
 
 // ─────────────────────────────────────────────────────────────────────
 // delegate — main entry
@@ -109,15 +136,41 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
   const isolation = opts.isolation ?? "none";
   const forkMode = opts.forkMode;
   const runInBackground = opts.runInBackground ?? true;
+  const reject = (
+    code: Extract<DelegateOutcome, { kind: "rejected" }>["code"],
+    category: Extract<DelegateOutcome, { kind: "rejected" }>["category"],
+    reason: string,
+  ): Extract<DelegateOutcome, { kind: "rejected" }> => {
+    opts.capacityPermit?.cancel();
+    return { kind: "rejected", code, category, reason };
+  };
+
+  if (opts.invocationEnvelope !== undefined) {
+    try {
+      assertAgentInvocationEnvelope(opts.invocationEnvelope);
+      if (opts.taskContent !== undefined) {
+        throw new TypeError(
+          "agent invocation envelope cannot be combined with legacy taskContent",
+        );
+      }
+    } catch (error) {
+      return reject(
+        "INVALID_DELEGATE_REQUEST",
+        "invalid_request",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
 
   if (
     isolation === "worktree" &&
     (!opts.worktreeSlug || opts.worktreeSlug.trim().length === 0)
   ) {
-    return {
-      kind: "rejected",
-      reason: "worktree isolation requires a non-empty worktreeSlug",
-    };
+    return reject(
+      "INVALID_DELEGATE_REQUEST",
+      "invalid_request",
+      "worktree isolation requires a non-empty worktreeSlug",
+    );
   }
 
   // Set up worktree if requested.
@@ -133,11 +186,11 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
       process.cwd();
     const canonicalGitRoot = findGitRoot(workspaceRoot);
     if (!canonicalGitRoot) {
-      return {
-        kind: "rejected",
-        reason:
-          "worktree isolation requested but cwd is not inside a git repository",
-      };
+      return reject(
+        "WORKTREE_UNAVAILABLE",
+        "environment",
+        "worktree isolation requested but cwd is not inside a git repository",
+      );
     }
     try {
       const parentSandboxExecutionBroker =
@@ -157,10 +210,11 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         worktreeSandboxExecutionBroker,
       );
     } catch (err) {
-      return {
-        kind: "rejected",
-        reason: `worktree setup failed: ${err instanceof Error ? err.message : String(err)}`,
-      };
+      return reject(
+        "WORKTREE_UNAVAILABLE",
+        "environment",
+        `worktree setup failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -172,6 +226,12 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
       ...(opts.role !== undefined ? { roleName: opts.role } : {}),
       ...(opts.agentName !== undefined ? { agentName: opts.agentName } : {}),
       ...(opts.depthCap !== undefined ? { depthCap: opts.depthCap } : {}),
+      ...(opts.capacityPermit !== undefined
+        ? { capacityPermit: opts.capacityPermit }
+        : {}),
+      ...(opts.capacityOwnerId !== undefined
+        ? { capacityOwnerId: opts.capacityOwnerId }
+        : {}),
     });
   } catch (err) {
     // Teardown worktree if we created one — slot reservation rolled back.
@@ -188,28 +248,83 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
           ),
       }).catch(() => {});
     }
-    return {
-      kind: "rejected",
-      reason: err instanceof Error ? err.message : String(err),
-    };
+    const reason = err instanceof Error ? err.message : String(err);
+    if (err instanceof AgentConcurrencyLimitError) {
+      return reject("AGENT_CONCURRENCY_LIMIT", "retryable_capacity", reason);
+    }
+    if (err instanceof AgentCapacityQueueFullError) {
+      return reject("AGENT_CAPACITY_QUEUE_FULL", "retryable_capacity", reason);
+    }
+    return reject("AGENT_SPAWN_REJECTED", "spawn_failed", reason);
   }
 
   // Build the fork context.
-  const parentMessages =
-    opts.parentMessagesOverride ?? opts.parent.snapshotHistoryMessages();
-  const fork = await forkSubagent({
-    parent: opts.parent,
-    parentMessages,
-    ...(forkMode !== undefined ? { mode: forkMode } : {}),
-    ...(opts.parentMessagesOverride !== undefined
-      ? { useProvidedParentMessages: true }
-      : {}),
-    taskPrompt: opts.taskPrompt,
-    ...(opts.taskContent !== undefined
-      ? { taskContent: opts.taskContent }
-      : {}),
-    ...(worktree?.path !== undefined ? { worktreePath: worktree.path } : {}),
-  });
+  let fork: Awaited<ReturnType<typeof forkSubagent>>;
+  try {
+    const parentMessages =
+      opts.parentMessagesOverride ?? opts.parent.snapshotHistoryMessages();
+    fork = await forkSubagent({
+      parent: opts.parent,
+      parentMessages,
+      ...(forkMode !== undefined ? { mode: forkMode } : {}),
+      ...(opts.parentMessagesOverride !== undefined
+        ? { useProvidedParentMessages: true }
+        : {}),
+      taskPrompt: opts.taskPrompt,
+      ...(opts.taskContent !== undefined
+        ? { taskContent: opts.taskContent }
+        : {}),
+      ...(opts.invocationEnvelope !== undefined
+        ? { invocationEnvelope: opts.invocationEnvelope }
+        : {}),
+      ...(worktree?.path !== undefined ? { worktreePath: worktree.path } : {}),
+    });
+  } catch (error) {
+    const cleanupFailures: string[] = [];
+    await opts.control
+      .shutdown(live.agentId, "delegate_fork_failed")
+      .catch((shutdownError) => {
+        cleanupFailures.push(
+          shutdownError instanceof Error
+            ? shutdownError.message
+            : String(shutdownError),
+        );
+      });
+    if (worktree?.created) {
+      await removeAgentWorktree({
+        path: worktree.path,
+        branch: worktree.branch,
+        gitRoot: worktree.gitRoot,
+        sandboxExecutionBroker:
+          worktreeSandboxExecutionBroker ??
+          requireChildWorktreeSandboxExecutionBroker(
+            opts.parent,
+            worktree.gitRoot,
+          ),
+      }).catch((worktreeError) => {
+        cleanupFailures.push(
+          worktreeError instanceof Error
+            ? worktreeError.message
+            : String(worktreeError),
+        );
+      });
+    }
+    if (cleanupFailures.length > 0) {
+      emitWarning(
+        opts.parent.eventLog,
+        opts.parent.nextInternalSubId(),
+        "delegate_fork_cleanup_failed",
+        cleanupFailures.join("; "),
+      );
+    }
+    return reject(
+      "AGENT_SPAWN_REJECTED",
+      "spawn_failed",
+      `agent fork setup failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 
   const buildThread = (
     wiring: ConstructorParameters<typeof AgentThreadClass>[1] = {},

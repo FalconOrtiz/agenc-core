@@ -26,6 +26,71 @@ LIVE multi-agent surface):
 | `list_agents` | Read the live agent tree and current statuses |
 | `spawn_agents_on_csv` | Fan out workers from CSV rows (job orchestrator) |
 | `report_agent_job_result` | Report a CSV/job worker result back to the orchestrator |
+| `inspect_csv_agent_job` | Read a bounded job summary and keyset item page |
+| `read_csv_agent_job_result` | Read one bounded base64 result chunk |
+| `list_csv_job_reviews` | List a bounded page of unknown-outcome reviews |
+| `show_csv_job_review` | Read one bounded review record |
+| `resolve_csv_job_review` | Approval-gated operator resolution with canonical evidence |
+
+### CSV job contract
+
+CSV fan-out keeps three identities separate. A configured `source_id` is exact
+user data, `item_id` is an opaque runtime-owned content identity, and worker
+names use a safe runtime prefix plus row/hash material. Without `id_column`, no
+source identity is invented. Duplicate, blank, oversized, malformed, or
+reserved input is rejected before the atomic import visibility fence opens.
+
+The approved instruction is passed unchanged in the task-instruction channel.
+Runtime policy, approved task text, and every exact field from each inert,
+null-prototype CSV row are digest-bound in a versioned invocation envelope.
+Runtime policy uses the provider's privileged channel; task text and row data
+use separate, non-merging user channels. Each row field carries its column,
+row/item identity, byte length, and digest, so field contents cannot become
+privileged instructions. Malformed envelopes fail before a child slot is
+reserved. The spawn response contains contract version `1`, aggregate counters,
+and at most the first 20 item summaries without result bodies.
+`inspect_csv_agent_job` provides keyset pages (maximum 100 items), and
+returns an opaque `next_cursor` when another page exists. Supply that token
+unchanged as the next call's `cursor`; it is bound to the job and item-status
+filter, and forged, stale, or cross-job tokens are rejected. Do not decode it or
+construct pagination from row/item IDs. `read_csv_agent_job_result` returns at
+most 64 KiB of one result as base64.
+
+Dispatch is at-most-once by default. A process restart replays a dispatched
+item only when a registered versioned idempotency profile, its persisted
+operation key, provider acknowledgement, and a bounded authoritative lookup
+all prove the retry safe. Other interrupted dispatches enter
+`unknown_outcome` and hold the job in `needs_review`. Cancellation leaves
+undispatched rows cancelled and treats unresolved dispatched rows as
+ambiguous; capacity is released only after the worker exits or is explicitly
+retired.
+
+#### Unknown-outcome operator review
+
+The daemon and SDK expose the same durable operator workflow through
+`csvJob.review.list`, `csvJob.review.show`, and `csvJob.review.resolve`.
+`AgencClient` provides `listCsvJobReviews`, `showCsvJobReview`, and
+`resolveCsvJobReview`; the SDK fills an omitted `cwd` with the client's current
+absolute working directory. List pages contain at most 100 bounded summaries
+and use the repository's opaque, scope-bound cursor. Show responses bound long
+source IDs, reasons, and evidence; oversized evidence is represented by its
+byte count and SHA-256 digest instead of being embedded.
+
+Resolution accepts an external evidence reference and lowercase SHA-256 digest
+and persists the exact A1 operator-evidence record. Callers choose only the
+disposition; the runtime derives the domain action:
+
+| Disposition | Durable action |
+| --- | --- |
+| `confirmed_committed` | `mark_completed` (optionally with a recovered result object) |
+| `confirmed_no_effect` | `retry_new_attempt` |
+| `remains_unknown` | `abandon_item` |
+
+The model-facing resolver is mutating and always requires explicit approval.
+An identical request is idempotent across daemon restarts; the response reports
+`already_resolved`. A different disposition, evidence identity, reviewer, or
+recovered-result digest fails closed with `CSV_REVIEW_CONFLICT`. Operator
+reason text is an audit annotation; evidence identity is the replay key.
 
 ### Worker lifecycle
 
