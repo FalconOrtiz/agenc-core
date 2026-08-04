@@ -16,6 +16,80 @@ env:
   NPM_VERSION: "11.17.0"
 
 jobs:
+  release-rpm-inventory-probe:
+    name: release-rpm-inventory-probe (linux-arm64)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: rockylinux@sha256:9794037624aaa6212aeada1d28861ef5e0a935adaf93e4ef79837119f2a2d04c
+    timeout-minutes: 10
+    steps:
+      - name: Install the exact release build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y --setopt=gpgcheck=1 \
+            libatomic-8.5.0-28.el8_10 \
+            libgcc-8.5.0-28.el8_10 \
+            gcc-toolset-12-gcc-c++-12.2.1-7.8.el8_10 \
+            gcc-toolset-12-binutils-2.38-17.el8 \
+            python3.12-3.12.13-2.el8_10 \
+            make-4.2.1-11.el8 \
+            git-2.43.7-1.el8_10 \
+            tar-1.30-11.el8_10 \
+            gzip-1.9-13.el8_5
+          dnf clean all
+
+      - name: Authenticate and print the canonical RPM inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw="$RUNNER_TEMP/rpm-content-inventory.raw"
+          rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}|%{SHA256HEADER}|%{PAYLOADDIGEST}|%{PAYLOADDIGESTALGO}|%{RSAHEADER:pgpsig}\n' \
+            > "$raw"
+          python3.12 - <<'PY'
+          import hashlib
+          import os
+          import re
+
+          allowed_signers = {"15af5dac6d745a60"}
+          with open(
+              os.path.join(os.environ["RUNNER_TEMP"], "rpm-content-inventory.raw"),
+              encoding="utf-8",
+          ) as source:
+              lines = [line.rstrip("\n") for line in source if line.rstrip("\n")]
+          lines = [line for line in lines if line.split("|", 1)[0] != "gpg-pubkey"]
+          observed_signers = set()
+          for line in lines:
+              fields = line.split("|")
+              if len(fields) != 9:
+                  raise SystemExit("malformed RPM content inventory line")
+              name, epoch, version, release, arch, header_sha, payload_sha, algorithm, signature = fields
+              match = re.search(r"(?:^|, )Key ID ([0-9a-f]{16})$", signature)
+              if (
+                  not re.fullmatch(r"[A-Za-z0-9+_.-]+", name)
+                  or not epoch.isdigit()
+                  or not version
+                  or not release
+                  or arch not in {"aarch64", "noarch", "x86_64"}
+                  or not re.fullmatch(r"[0-9a-f]{64}", header_sha)
+                  or not re.fullmatch(r"[0-9a-f]{64}", payload_sha)
+                  or algorithm != "8"
+                  or match is None
+                  or match.group(1) not in allowed_signers
+              ):
+                  raise SystemExit(f"unapproved signed RPM content identity: {name}")
+              observed_signers.add(match.group(1))
+          if observed_signers != allowed_signers:
+              raise SystemExit("installed RPM signer set does not match the reviewed contract")
+          canonical = "\n".join(sorted(lines, key=lambda value: value.encode("utf-8"))) + "\n"
+          digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+          print(f"authenticated {len(lines)} RPMs; sha256={digest}")
+          print("::group::canonical signed RPM inventory")
+          print(canonical, end="")
+          print("::endgroup::")
+          PY
+
   linux-kernel-sandbox:
     name: linux-kernel-sandbox
     runs-on: ubuntu-24.04
