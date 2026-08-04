@@ -117,6 +117,8 @@ import type {
   AgenCDaemonResultByMethod,
   JsonObject,
   SessionPartialCompactFromMessageResult,
+  SessionRollbackCompactionResult,
+  SessionExtendCompactionRollbackRetentionResult,
   SessionRewindConversationToMessageResult,
 } from "../app-server/protocol/index.js";
 import { JSON_RPC_VERSION } from "../app-server/protocol/index.js";
@@ -202,6 +204,8 @@ function createClient(): AgenCDaemonTuiClient & {
     ): Promise<
       | AgenCDaemonResultByMethod[AgenCDaemonMethod]
       | SessionPartialCompactFromMessageResult
+      | SessionRollbackCompactionResult
+      | SessionExtendCompactionRollbackRetentionResult
       | SessionRewindConversationToMessageResult
     > {
       requests.push({
@@ -214,6 +218,35 @@ function createClient(): AgenCDaemonTuiClient & {
           sessionId: "session_1",
           ok: true,
           eventAlreadyEmitted: true,
+        };
+      }
+      if (method === "session.rollbackCompaction") {
+        return {
+          sessionId: "session_1",
+          ok: true,
+          eventAlreadyEmitted: true,
+          attemptId: "attempt-1",
+          mode: "same_session",
+          targetSessionId: "session_1",
+          displayText: "restored",
+          event: {
+            id: "history-replaced-rollback",
+            type: "history_replaced",
+            acceptedAt: "2030-01-01T00:00:00.000Z",
+            payload: {
+              reason: "compaction_rollback",
+              messages: [],
+            },
+          },
+        };
+      }
+      if (method === "session.extendCompactionRollbackRetention") {
+        return {
+          sessionId: "session_1",
+          ok: true,
+          attemptId: "attempt-1",
+          extendedUntilMs: 1_900_000_000_000,
+          displayText: "extended",
         };
       }
       if (method === "session.rewindConversationToMessage") {
@@ -1027,6 +1060,53 @@ describe("AgenC TUI daemon session adapter", () => {
           feedback: "keep decisions",
         },
         signal: abortController.signal,
+      },
+    ]);
+  });
+
+  it("routes compaction operator requests through the daemon session", async () => {
+    const client = createClient();
+    const session = createDaemonTuiSession({
+      baseSession: createBaseSession(),
+      client,
+      sessionId: "session_1",
+      clientId: "tui_1",
+    });
+
+    const rollback = await session.rollbackCompaction({
+      attemptId: "attempt-1",
+      reviewedBranchTargetSessionId: "reviewed-1",
+    });
+    await session.extendCompactionRollbackRetention({
+      attemptId: "attempt-1",
+      extendedUntilMs: 1_900_000_000_000,
+    });
+
+    expect(rollback).toMatchObject({
+      ok: true,
+      eventAlreadyEmitted: true,
+      event: {
+        type: "history_replaced",
+        payload: { reason: "compaction_rollback" },
+      },
+    });
+
+    expect(client.requests).toEqual([
+      {
+        method: "session.rollbackCompaction",
+        params: {
+          sessionId: "session_1",
+          attemptId: "attempt-1",
+          reviewedBranchTargetSessionId: "reviewed-1",
+        },
+      },
+      {
+        method: "session.extendCompactionRollbackRetention",
+        params: {
+          sessionId: "session_1",
+          attemptId: "attempt-1",
+          extendedUntilMs: 1_900_000_000_000,
+        },
       },
     ]);
   });

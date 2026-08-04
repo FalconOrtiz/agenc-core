@@ -428,6 +428,14 @@ describe("strict canonical journal contract", () => {
   it("keeps an exhaustive fail-closed schema for every rollout discriminant", () => {
     expect(CANONICAL_ROLLOUT_SCHEMA_TYPES).toEqual([
       "compacted",
+      "compaction_cleanup_pending",
+      "compaction_committed",
+      "compaction_failed",
+      "compaction_intent",
+      "compaction_payload_chunk",
+      "compaction_retention_extended",
+      "compaction_rollback_committed",
+      "compaction_source_release",
       "event_msg",
       "response_item",
       "session_meta",

@@ -137,6 +137,60 @@ Benchmarks compare deterministic and provider-native candidates on held-out
 conversations for quality, shrink, calls, tokens, latency, RSS, and operation
 counts under the same safety contract.
 
+### Implementation evidence
+
+The local, provider-independent acceptance surface is split by failure phase:
+
+| Phase | Required durable result |
+| --- | --- |
+| Source preparation, attachment preflight, or pin before intent | No compaction event; original history remains active. |
+| Provider, accounting, schema, provenance, abort, or shrink after intent | Exactly one typed `compaction_failed`; original history remains active. |
+| Durable commit append/flush | Ordinary adapter failures are classified as `commit_failed`; an indeterminate storage result remains pinned for startup reconciliation. |
+| Projection after commit | The committed replacement remains authoritative and the session becomes `reconstruction_required`. |
+| Cleanup after projection | The commit remains authoritative and `cleanup_pending` is repaired idempotently. |
+| Abort after provider dispatch | The attempt-scoped admission tail and transaction lease remain open until the physical provider promise settles. |
+
+The focused contract suite is
+[`runtime/tests/services/compact/transaction-contract.test.ts`](../../../runtime/tests/services/compact/transaction-contract.test.ts).
+Restart, rollback, retention, DAG, and source-authority mutation coverage is in
+[`runtime/tests/session/rollout-store.compaction-transaction.test.ts`](../../../runtime/tests/session/rollout-store.compaction-transaction.test.ts).
+Canonical payload chunking and maximum-input operation counts are covered by
+[`runtime/tests/services/compact/payload-manifest.test.ts`](../../../runtime/tests/services/compact/payload-manifest.test.ts).
+
+Run the reproducible maximum-scale algorithm benchmark with:
+
+```sh
+npm --workspace=@tetsuo-ai/runtime run benchmark:compaction
+```
+
+It exercises 100,000 compact active-history references, a 64 MiB canonical
+source payload, the maximum 64-leaf/73-call DAG, and a 63-chunk near-maximum
+admissible planner input. The benchmark reports deterministic splitter and
+planner work, elapsed time, and RSS.
+
+The versioned provider-independent replay is:
+
+```sh
+npm --workspace=@tetsuo-ai/runtime run check:compaction-offline
+```
+
+Its SHA-256-bound
+[`held-out-corpus.v1.json`](../../../runtime/benchmarks/compaction/held-out-corpus.v1.json)
+contains three maintenance conversations, 16 factual checks, 14
+recovery-critical checks, and three injection canaries. The committed
+[`offline-results.v1.json`](../../../runtime/benchmarks/compaction/offline-results.v1.json)
+records quality, shrink, planned and executed calls, tokens, local latency, RSS,
+and deterministic operation counts under common quality, injection,
+provenance, shrink, and recovery gates. The C2 planner plus deterministic
+extractive proxy passes every gate; the tail-window baseline demonstrates that
+shrink alone can still lose facts, retain an injection canary, and fail
+recovery.
+
+This is explicitly `deterministic_offline` evidence: both labeled candidates
+are non-provider-native, execute zero provider calls, and make no provider
+quality claim. Provider-native quality, cost, and network-latency evidence
+remains a separate, credentialed evaluation obligation.
+
 Primary references: [The Instruction Hierarchy](https://arxiv.org/abs/2404.13208),
 [ACON](https://arxiv.org/abs/2510.00615),
 [Context as a Tool](https://aclanthology.org/2026.findings-acl.1032/),

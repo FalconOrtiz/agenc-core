@@ -67,6 +67,10 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
+import {
+  MAX_RECOVERY_CANONICAL_LINE_BYTES,
+  RECOVERY_SCAN_CHUNK_BYTES,
+} from "../state/recovery-contract.js";
 import { monotonicMs } from "./_deps/utils.js";
 import {
   ROLLOUT_SCHEMA_VERSION,
@@ -80,6 +84,21 @@ import {
   serializeRolloutItem,
   type RolloutItem,
 } from "./rollout-item.js";
+import type {
+  CompactionActiveHistoryEntryV1,
+  CompactionPayloadChunkV1,
+  CompactionPayloadKind,
+} from "../services/compact/transaction-types.js";
+import {
+  hydrateActiveHistoryRefs,
+  reconstructCompactionPayloadV1,
+} from "../services/compact/payload-manifest.js";
+import {
+  readCompactionPersistedCommittedV1,
+  readCompactionPersistedIntentV1,
+  readCompactionPersistedRollbackCommittedV1,
+  readCompactionRolloutPayload,
+} from "./compaction-event-reader.js";
 import { DegradedStore } from "./degraded-store.js";
 import {
   createTrajectoryExportSink,
@@ -88,6 +107,19 @@ import {
 
 export const I4_FSYNC_RETRY_MS = 100;
 const I83_SUSPEND_DETECTION_MS = 10_000;
+
+type RolloutPhysicalLineExclusion = {
+  readonly lineNumber: number;
+  readonly encodedBytes: number;
+  readonly sha256: string;
+} & (
+  | { readonly itemType: "response_item" | "compacted" }
+  | {
+      readonly itemType: "compaction_payload_chunk";
+      readonly attemptId: string;
+      readonly payloadKind: CompactionPayloadKind;
+    }
+);
 
 // OOM: bound the per-session monotonic indices (`toolResultBytesByTurn`,
 // `tokenEstimateByTurn`, `toolCallTurnIds`, `offsetsBySeq`). These are advisory
@@ -722,6 +754,193 @@ export function rewriteAtomically(
   }
 }
 
+/** Read exactly the first newline-terminated canonical row with a hard cap. */
+function readBoundedCanonicalHeader(path: string): Buffer {
+  const fd = openSync(path, fsConstants.O_RDONLY);
+  const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
+  const parts: Buffer[] = [];
+  let totalBytes = 0;
+  let position = 0;
+  try {
+    for (;;) {
+      const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, position);
+      if (bytesRead === 0) {
+        throw new Error("canonical rollout header is unterminated");
+      }
+      const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
+      const selectedBytes = newline < 0 ? bytesRead : newline + 1;
+      totalBytes += selectedBytes;
+      if (totalBytes - 1 > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
+        throw new Error("canonical rollout header exceeds its line limit");
+      }
+      parts.push(Buffer.from(chunk.subarray(0, selectedBytes)));
+      if (newline >= 0) return Buffer.concat(parts);
+      position += bytesRead;
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutItem[] {
+  const chunks = new Map<
+    string,
+    Map<CompactionPayloadKind, CompactionPayloadChunkV1[]>
+  >();
+  for (const item of items) {
+    if (item.type !== "compaction_payload_chunk") continue;
+    const byKind = chunks.get(item.payload.attempt_id) ?? new Map();
+    const ordered = byKind.get(item.payload.payload_kind) ?? [];
+    ordered.push(item.payload);
+    byKind.set(item.payload.payload_kind, ordered);
+    chunks.set(item.payload.attempt_id, byKind);
+  }
+  const releasedAttemptIds = new Set(items.flatMap((item) =>
+    item.type === "compaction_source_release" ? [item.payload.attempt_id] : []
+  ));
+  const payloadChunks = (
+    manifest: Parameters<typeof reconstructCompactionPayloadV1>[0],
+  ): readonly CompactionPayloadChunkV1[] =>
+    chunks.get(manifest.attempt_id)?.get(manifest.payload_kind) ?? [];
+  const reconstruct = (
+    manifest: Parameters<typeof reconstructCompactionPayloadV1>[0],
+  ): unknown => reconstructCompactionPayloadV1(
+    manifest,
+    payloadChunks(manifest),
+  );
+  const hydratedIntents = new Map<string, Extract<
+    RolloutItem,
+    { readonly type: "compaction_intent" }
+  >["payload"]>();
+  return items.map((item) => {
+    if (item.type === "compaction_intent") {
+      const raw = item.payload as unknown;
+      if (typeof raw !== "object" || raw === null ||
+          !("source_history_manifest" in raw)) {
+        hydratedIntents.set(item.payload.attempt_id, item.payload);
+        return item;
+      }
+      const persisted = readCompactionPersistedIntentV1(raw);
+      const entries = reconstruct(
+        persisted.source.active_history_refs_manifest,
+      );
+      if (!Array.isArray(entries)) {
+        throw new Error("active-history payload manifest did not reconstruct an array");
+      }
+      const { active_history_refs_manifest: _manifest, ...sourceBase } =
+        persisted.source;
+      const sourceHistoryChunks = payloadChunks(persisted.source_history_manifest);
+      if (sourceHistoryChunks.length > 0 ||
+          !releasedAttemptIds.has(persisted.attempt_id)) {
+        const sourceHistory = reconstruct(persisted.source_history_manifest);
+        readCompactionRolloutPayload("compaction_rollback_committed", {
+          format_version: persisted.format_version,
+          minimum_reader_runtime: persisted.minimum_reader_runtime,
+          attempt_id: persisted.attempt_id,
+          recorded_at_ms: persisted.recorded_at_ms,
+          commit_sha256: "0".repeat(64),
+          source_sha256: persisted.source.source_sha256,
+          history_digest: persisted.source.history_digest,
+          source_session_id: persisted.source.session_id,
+          source_epoch: persisted.source.epoch,
+          rollback_mode: "same_session",
+          target_session_id: persisted.source.session_id,
+          source_history: sourceHistory,
+        });
+      }
+      const payload = readCompactionRolloutPayload("compaction_intent", {
+        format_version: persisted.format_version,
+        minimum_reader_runtime: persisted.minimum_reader_runtime,
+        attempt_id: persisted.attempt_id,
+        recorded_at_ms: persisted.recorded_at_ms,
+        source: {
+          ...sourceBase,
+          active_history_refs: hydrateActiveHistoryRefs(
+            sourceBase,
+            entries as readonly CompactionActiveHistoryEntryV1[],
+          ),
+        },
+        policy_digest: persisted.policy_digest,
+        configuration_digest: persisted.configuration_digest,
+        accounting_ref: persisted.accounting_ref,
+        automatic: persisted.automatic,
+        selected_history_indexes: persisted.selected_history_indexes,
+        admission_required: persisted.admission_required,
+        planned_provider_calls: persisted.planned_provider_calls,
+      }) as Extract<RolloutItem, { type: "compaction_intent" }>["payload"];
+      hydratedIntents.set(persisted.attempt_id, payload);
+      return { ...item, payload };
+    }
+    if (item.type === "compaction_committed") {
+      const raw = item.payload as unknown;
+      if (typeof raw !== "object" || raw === null ||
+          !("final_summary_manifest" in raw)) return item;
+      const persisted = readCompactionPersistedCommittedV1(raw);
+      const intent = hydratedIntents.get(persisted.attempt_id);
+      if (intent === undefined) {
+        throw new Error("manifest compaction commit has no hydrated intent");
+      }
+      const payload = readCompactionRolloutPayload("compaction_committed", {
+        format_version: persisted.format_version,
+        minimum_reader_runtime: persisted.minimum_reader_runtime,
+        attempt_id: persisted.attempt_id,
+        recorded_at_ms: persisted.recorded_at_ms,
+        committed_at_ms: persisted.committed_at_ms,
+        rollback_retention_deadline_ms: persisted.rollback_retention_deadline_ms,
+        source: intent.source,
+        selected_history_indexes: persisted.selected_history_indexes,
+        policy_digest: persisted.policy_digest,
+        configuration_digest: persisted.configuration_digest,
+        summary: reconstruct(persisted.final_summary_manifest),
+        summary_dag: reconstruct(persisted.summary_dag_manifest),
+        accounting: persisted.accounting,
+        replacement_history: reconstruct(persisted.replacement_history_manifest),
+        cleanup_state: persisted.cleanup_state,
+      }) as Extract<RolloutItem, { type: "compaction_committed" }>["payload"];
+      return { ...item, payload };
+    }
+    if (item.type === "compaction_rollback_committed") {
+      const raw = item.payload as unknown;
+      if (typeof raw !== "object" || raw === null ||
+          !("source_history_manifest" in raw)) return item;
+      const persisted = readCompactionPersistedRollbackCommittedV1(raw);
+      const sourceHistoryChunks = payloadChunks(persisted.source_history_manifest);
+      if (sourceHistoryChunks.length === 0 &&
+          releasedAttemptIds.has(persisted.attempt_id)) {
+        // The release tombstone proves that no live rollback owner remains.
+        // Preserve the manifest-backed rollback row as audit evidence without
+        // reconstructing payload bytes that were durably garbage-collected.
+        return item;
+      }
+      const payload = readCompactionRolloutPayload(
+        "compaction_rollback_committed",
+        {
+          format_version: persisted.format_version,
+          minimum_reader_runtime: persisted.minimum_reader_runtime,
+          attempt_id: persisted.attempt_id,
+          recorded_at_ms: persisted.recorded_at_ms,
+          commit_sha256: persisted.commit_sha256,
+          source_sha256: persisted.source_sha256,
+          history_digest: persisted.history_digest,
+          source_session_id: persisted.source_session_id,
+          source_epoch: persisted.source_epoch,
+          rollback_mode: persisted.rollback_mode,
+          target_session_id: persisted.target_session_id,
+          source_history: reconstructCompactionPayloadV1(
+            persisted.source_history_manifest,
+            sourceHistoryChunks,
+          ),
+        },
+      ) as Extract<
+        RolloutItem,
+        { type: "compaction_rollback_committed" }
+      >["payload"];
+      return { ...item, payload };
+    }
+    return item;
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Tail truncation on corrupt trailing line (I-24 recovery)
 // ─────────────────────────────────────────────────────────────────────
@@ -1028,6 +1247,26 @@ export class SessionStore {
       this.lock.release();
       throw err;
     }
+  }
+
+  /**
+   * Acquire the canonical writer lock without creating a rollout. Reviewed
+   * branch creation uses this as a no-clobber reservation before its source
+   * authorization is durable. A subsequent open() reuses the same lock.
+   */
+  acquireExclusiveReservation(): void {
+    if (this.closed) {
+      throw new Error("cannot reserve a closed session store");
+    }
+    this.lock.acquire();
+  }
+
+  /** Release a reservation that has not been promoted through open(). */
+  releaseExclusiveReservation(): void {
+    if (this.opened) {
+      throw new Error("an opened session store must be closed, not unreserved");
+    }
+    this.lock.release();
   }
 
   /**
@@ -1578,11 +1817,25 @@ export class SessionStore {
    * refresh the metadata cached by future tail re-appends. This is the only
    * supported publication seam for the A3 legacy-to-v2 upgrade.
    */
-  rewriteRolloutItemsAtomically(items: ReadonlyArray<RolloutItem>): void {
+  rewriteRolloutItemsAtomically(
+    items: ReadonlyArray<RolloutItem>,
+    exactEncodedLines?: ReadonlyArray<string>,
+  ): void {
     if (this.pending.length > 0) {
       throw new Error("cannot atomically replace rollout with pending appends");
     }
-    const lines = items.map(serializeRolloutItem);
+    if (
+      exactEncodedLines !== undefined &&
+      exactEncodedLines.length !== items.length
+    ) {
+      throw new Error("exact rollout line count does not match item count");
+    }
+    const lines = exactEncodedLines === undefined
+      ? items.map(serializeRolloutItem)
+      : [...exactEncodedLines];
+    if (lines.some((line) => !line.endsWith("\n"))) {
+      throw new Error("exact rollout lines must include their newline terminator");
+    }
     const nextOffsetsBySeq = new Map<EventSeq, number>();
     let nextLastSeq: EventSeq = 0;
     let offset = 0;
@@ -1609,6 +1862,212 @@ export class SessionStore {
       if (item.type === "session_meta") latestMeta = item.payload;
     }
     this.lastSessionMeta = latestMeta ?? null;
+  }
+
+  /**
+   * Stream an exact physical-row deletion into a durable inode replacement.
+   * This keeps compaction retention bounded by one canonical line instead of
+   * loading the complete rollout into memory.
+   */
+  rewriteRolloutExcludingPhysicalLinesAtomically(
+    exclusions: readonly RolloutPhysicalLineExclusion[],
+    digestDomain: string,
+  ): void {
+    if (!this.opened || this.closed) {
+      throw new Error("streaming rollout rewrite requires an open store");
+    }
+    if (this.pending.length > 0) {
+      throw new Error("cannot stream-rewrite rollout with pending appends");
+    }
+    const byLine = new Map<number, (typeof exclusions)[number]>();
+    for (const exclusion of exclusions) {
+      const existing = byLine.get(exclusion.lineNumber);
+      if (existing !== undefined &&
+          (existing.encodedBytes !== exclusion.encodedBytes ||
+            existing.sha256 !== exclusion.sha256 ||
+            existing.itemType !== exclusion.itemType ||
+            (existing.itemType === "compaction_payload_chunk" &&
+              exclusion.itemType === "compaction_payload_chunk" &&
+              (existing.attemptId !== exclusion.attemptId ||
+                existing.payloadKind !== exclusion.payloadKind)))) {
+        throw new Error("conflicting physical-row exclusion authority");
+      }
+      byLine.set(exclusion.lineNumber, exclusion);
+    }
+    if (byLine.size === 0) return;
+
+    const temporaryPath = `${this.rolloutPath}.tmp`;
+    try { unlinkSync(temporaryPath); } catch { /* no stale temporary */ }
+    const sourceFd = openSync(this.rolloutPath, fsConstants.O_RDONLY);
+    let targetFd: number;
+    try {
+      targetFd = openSync(
+        temporaryPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        0o600,
+      );
+    } catch (error) {
+      closeSync(sourceFd);
+      throw error;
+    }
+    const matched = new Set<number>();
+    const nextOffsetsBySeq = new Map<EventSeq, number>();
+    let nextLastSeq: EventSeq = 0;
+    let latestMeta: SessionMetaLine | undefined;
+    let outputOffset = 0;
+    let lineNumber = 0;
+    let pending = Buffer.alloc(0);
+    const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
+    const writePhysical = (physical: Buffer): void => {
+      lineNumber += 1;
+      const exclusion = byLine.get(lineNumber);
+      const content = physical.subarray(0, physical.byteLength - 1);
+      const item = parseRolloutLine(
+        new TextDecoder("utf-8", { fatal: true }).decode(content),
+      );
+      if (item === null) throw new Error("canonical rollout rewrite found a blank row");
+      if (exclusion !== undefined) {
+        const digest = createHash("sha256")
+          .update(digestDomain, "utf8")
+          .update(physical)
+          .digest("hex");
+        if (physical.byteLength !== exclusion.encodedBytes ||
+            digest !== exclusion.sha256 ||
+            item.type !== exclusion.itemType ||
+            (exclusion.itemType === "compaction_payload_chunk" &&
+              (item.type !== "compaction_payload_chunk" ||
+                item.payload.attempt_id !== exclusion.attemptId ||
+                item.payload.payload_kind !== exclusion.payloadKind))) {
+          throw new Error("physical-row exclusion no longer matches canonical source");
+        }
+        matched.add(lineNumber);
+        return;
+      }
+      let written = 0;
+      while (written < physical.byteLength) {
+        const count = writeSync(
+          targetFd,
+          physical,
+          written,
+          physical.byteLength - written,
+        );
+        if (count <= 0) throw new Error("short write during streaming rollout rewrite");
+        written += count;
+      }
+      if (item.type === "event_msg" && item.payload.seq !== undefined) {
+        nextOffsetsBySeq.set(item.payload.seq, outputOffset);
+        nextLastSeq = Math.max(nextLastSeq, item.payload.seq);
+      }
+      if (item.type === "session_meta") latestMeta = item.payload;
+      outputOffset += physical.byteLength;
+    };
+    let rewriteFailed = false;
+    let rewriteError: unknown;
+    try {
+      for (;;) {
+        const bytesRead = readSync(sourceFd, chunk, 0, chunk.byteLength, null);
+        if (bytesRead === 0) break;
+        const available = pending.byteLength === 0
+          ? chunk.subarray(0, bytesRead)
+          : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+        let start = 0;
+        for (;;) {
+          const newline = available.indexOf(0x0a, start);
+          if (newline < 0) break;
+          writePhysical(available.subarray(start, newline + 1));
+          start = newline + 1;
+        }
+        pending = Buffer.from(available.subarray(start));
+        if (pending.byteLength > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
+          throw new Error("canonical row exceeds the streaming rewrite line limit");
+        }
+      }
+      if (pending.byteLength !== 0) {
+        throw new Error("canonical rollout ends with an unterminated row");
+      }
+      if (matched.size !== byLine.size) {
+        throw new Error("streaming rewrite did not find every authorized source row");
+      }
+      fsyncSync(targetFd);
+    } catch (error) {
+      rewriteFailed = true;
+      rewriteError = error;
+    } finally {
+      closeSync(sourceFd);
+      closeSync(targetFd);
+    }
+    if (rewriteFailed) {
+      // Windows refuses to unlink an open file, so cleanup must happen only
+      // after both descriptors are closed.
+      try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+      throw rewriteError;
+    }
+    try {
+      renameSync(temporaryPath, this.rolloutPath);
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+      throw error;
+    }
+    try {
+      const directoryFd = openSync(dirname(this.rolloutPath), fsConstants.O_RDONLY);
+      try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+    } catch {
+      /* best effort on filesystems that cannot fsync directories */
+    }
+    this.fileSize = outputOffset;
+    this.offsetsBySeq.clear();
+    for (const [sequence, offset] of nextOffsetsBySeq) {
+      this.offsetsBySeq.set(sequence, offset);
+    }
+    this.boundIndexMap(this.offsetsBySeq);
+    this.lastSeqWritten = nextLastSeq;
+    this.lastSessionMeta = latestMeta ?? null;
+  }
+
+  /**
+   * Upgrade the legacy-visible first session_meta gate under this store's
+   * lifetime-exclusive rollout lease. Older runtimes inspect this first row
+   * before parsing any later item, so a C2 writer must publish schema 3 here
+   * before it can append a compaction intent.
+   */
+  upgradeCanonicalSchemaHeader(targetVersion: number): void {
+    if (
+      !Number.isSafeInteger(targetVersion) ||
+      targetVersion <= 0 ||
+      targetVersion > ROLLOUT_SCHEMA_VERSION
+    ) {
+      throw new Error(`unsupported rollout schema upgrade ${targetVersion}`);
+    }
+    this.syncCanonicalTail();
+    const physicalHeader = readBoundedCanonicalHeader(this.rolloutPath);
+    const headerText = new TextDecoder("utf-8", { fatal: true }).decode(
+      physicalHeader.subarray(0, physicalHeader.byteLength - 1),
+    );
+    const header = parseRolloutLine(headerText);
+    if (header?.type !== "session_meta") {
+      throw new Error("canonical rollout does not begin with session_meta");
+    }
+    if (header.payload.rolloutSchemaVersion >= targetVersion) return;
+    const upgraded: RolloutItem = {
+      ...header,
+      payload: {
+        ...header.payload,
+        rolloutSchemaVersion: targetVersion,
+      },
+    };
+    // Legacy upgrades are one-time migrations. Keep the common current-schema
+    // C2 path header-bounded; the A3 migration path still owns its full atomic
+    // rewrite and exact typed-index rebuild.
+    const bytes = readFileSync(this.rolloutPath);
+    if (!bytes.subarray(0, physicalHeader.byteLength).equals(physicalHeader)) {
+      throw new Error("canonical rollout header changed during schema upgrade");
+    }
+    const replacement = Buffer.concat([
+      Buffer.from(serializeRolloutItem(upgraded), "utf8"),
+      bytes.subarray(physicalHeader.byteLength),
+    ]);
+    this.rewriteRolloutAtomically(replacement);
+    this.lastSessionMeta = upgraded.payload;
   }
 
   /**
@@ -1751,7 +2210,7 @@ export class SessionStore {
     if (malformed > 0) {
       // Intentional: caller can surface as warning.
     }
-    return items;
+    return hydrateManifestCompactionItems(items);
   }
 
   close(): void {
