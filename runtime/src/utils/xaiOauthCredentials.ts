@@ -13,6 +13,7 @@
 
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 import {
   discoverXaiOauthEndpoints,
@@ -25,7 +26,10 @@ import {
 import type { XaiOauthTokens } from '../services/xai/oauth.js'
 import { getAgenCConfigHomeDir, isBareMode } from './envUtils.js'
 import * as lockfile from './lockfile.js'
-import { getSecureStorage } from './secureStorage/index.js'
+import {
+  getSecureStorage,
+  withCredentialMutationLock,
+} from './secureStorage/index.js'
 
 export const XAI_OAUTH_STORAGE_KEY = 'xaiOauth' as const
 
@@ -108,29 +112,89 @@ export function saveXaiOauthCredentials(
   if (!blob.accessToken?.trim()) {
     return { success: false, warning: 'Access token is empty.' }
   }
-  const secureStorage = getSecureStorage()
-  const prev = (secureStorage.read() || {}) as StorageShape
-  const merged = { ...prev, [XAI_OAUTH_STORAGE_KEY]: blob }
-  const result = secureStorage.update(merged as typeof prev)
-  if (result.success) {
-    readCache = { at: Date.now(), blob }
+  try {
+    return withCredentialMutationLock(() => {
+      const secureStorage = getSecureStorage()
+      const prev = (secureStorage.read() || {}) as StorageShape
+      const merged = { ...prev, [XAI_OAUTH_STORAGE_KEY]: blob }
+      const result = secureStorage.update(merged as typeof prev)
+      if (result.success) {
+        readCache = { at: Date.now(), blob }
+      }
+      return result
+    })
+  } catch {
+    return {
+      success: false,
+      warning: 'Credential storage is busy; the xAI OAuth grant was not saved.',
+    }
   }
-  return result
 }
 
 export function clearXaiOauthCredentials(): { success: boolean; warning?: string } {
   if (isBareMode()) {
     return { success: true }
   }
-  const secureStorage = getSecureStorage()
-  const prev = (secureStorage.read() || {}) as StorageShape
-  const next = { ...prev }
-  delete next[XAI_OAUTH_STORAGE_KEY]
-  const result = secureStorage.update(next as typeof prev)
-  if (result.success) {
-    readCache = { at: Date.now(), blob: undefined }
+  try {
+    return withCredentialMutationLock(() => {
+      const secureStorage = getSecureStorage()
+      const prev = (secureStorage.read() || {}) as StorageShape
+      const next = { ...prev }
+      delete next[XAI_OAUTH_STORAGE_KEY]
+      const result = secureStorage.update(next as typeof prev)
+      if (result.success) {
+        readCache = { at: Date.now(), blob: undefined }
+      }
+      return result
+    })
+  } catch {
+    return {
+      success: false,
+      warning: 'Credential storage is busy; the xAI OAuth grant was not cleared.',
+    }
   }
-  return result
+}
+
+type ConditionalSaveResult =
+  | { state: 'saved'; blob: XaiOauthCredentialBlob }
+  | { state: 'changed'; blob: XaiOauthCredentialBlob | undefined }
+  | { state: 'failed' }
+
+/**
+ * Persist a rotating grant only when the xAI credential record is still the
+ * exact record that was exchanged. Login/logout use the same shared mutation
+ * lock, so a user action landing while the token endpoint is in flight wins
+ * instead of being overwritten by the older refresh operation.
+ */
+function saveXaiOauthCredentialsIfCurrent(
+  expected: XaiOauthCredentialBlob,
+  next: XaiOauthCredentialBlob,
+): ConditionalSaveResult {
+  if (isBareMode()) return { state: 'failed' }
+  try {
+    return withCredentialMutationLock(() => {
+      const secureStorage = getSecureStorage()
+      const previous = (secureStorage.read() || {}) as StorageShape
+      const current = previous.xaiOauth?.accessToken?.trim()
+        ? previous.xaiOauth
+        : undefined
+      if (!isDeepStrictEqual(current, expected)) {
+        readCache = { at: Date.now(), blob: current }
+        return { state: 'changed', blob: current }
+      }
+      const result = secureStorage.update({
+        ...previous,
+        [XAI_OAUTH_STORAGE_KEY]: next,
+      } as typeof previous)
+      if (!result.success) return { state: 'failed' }
+      const verified = (secureStorage.read() as StorageShape | null)?.xaiOauth
+      if (!isDeepStrictEqual(verified, next)) return { state: 'failed' }
+      readCache = { at: Date.now(), blob: next }
+      return { state: 'saved', blob: next }
+    })
+  } catch {
+    return { state: 'failed' }
+  }
 }
 
 export function xaiOauthTokensToBlob(
@@ -213,20 +277,24 @@ export async function refreshXaiOauthCredentialsIfNeeded(): Promise<
  * quarantined the blob, clobbering the winner's freshly rotated grant and
  * killing the live session ("Not logged in" mid-turn).
  *
- * Best-effort: when the lock cannot be acquired the refresh still proceeds,
- * protected by the adopt-on-conflict checks in {@link doRefresh}.
+ * A refresh never proceeds when the lock cannot be acquired. Rotating refresh
+ * tokens are single-use; an unlocked exchange is more dangerous than a
+ * transient refresh failure and can also race credential-storage migration.
  */
-async function acquireRefreshLock(): Promise<() => Promise<void>> {
+async function acquireRefreshLock(): Promise<(() => Promise<void>) | undefined> {
   try {
     const dir = getAgenCConfigHomeDir()
     await mkdir(dir, { recursive: true })
     return await lockfile.lock(join(dir, '.xai-oauth-refresh'), {
       realpath: false,
-      stale: 30_000,
+      // Vault helpers may block the event loop for several bounded 20-second
+      // operations. Keep this above the whole exchange+persistence path so a
+      // sibling cannot steal a rotating-token lock while heartbeats pause.
+      stale: 10 * 60_000,
       retries: { retries: 5, minTimeout: 200, maxTimeout: 2_000 },
     })
   } catch {
-    return async () => {}
+    return undefined
   }
 }
 
@@ -239,6 +307,7 @@ async function doRefresh(): Promise<XaiOauthCredentialBlob | undefined> {
   if (!refreshToken) return undefined
 
   const release = await acquireRefreshLock()
+  if (release === undefined) return undefined
   try {
     // Re-read under the lock: a sibling process may have rotated the grant
     // while we waited. Exchanging the stale token would burn the account's
@@ -274,14 +343,16 @@ async function doRefresh(): Promise<XaiOauthCredentialBlob | undefined> {
         tokenEndpoint,
         previous: current,
       })
-      saveXaiOauthCredentials(next)
-      return next
+      const persisted = saveXaiOauthCredentialsIfCurrent(current, next)
+      if (persisted.state === 'changed') return persisted.blob
+      return persisted.state === 'saved' ? persisted.blob : undefined
     } catch (error) {
       if (
         error instanceof XaiOauthError &&
         (error.code === 'invalid_grant' ||
           error.code === 'access_denied' ||
-          error.code === 'expired_token')
+          error.code === 'expired_token' ||
+          error.code === 'refresh_unknown')
       ) {
         // Terminal for OUR refresh token — but only quarantine when the
         // stored grant is still the one that just failed. If a sibling
@@ -299,11 +370,19 @@ async function doRefresh(): Promise<XaiOauthCredentialBlob | undefined> {
         }
         // Quarantine so no caller replays a doomed refresh; the user must
         // run the login again.
-        saveXaiOauthCredentials({
-          ...(latest ?? current),
+        const expected = latest ?? current
+        const quarantined = saveXaiOauthCredentialsIfCurrent(expected, {
+          ...expected,
           quarantinedAt: Date.now(),
           quarantineReason: error.message,
         })
+        if (
+          quarantined.state === 'changed' &&
+          quarantined.blob !== undefined &&
+          quarantined.blob.quarantinedAt === undefined
+        ) {
+          return quarantined.blob
+        }
       }
       // Transport/transient failures leave the blob untouched: the refresh
       // token may not have been consumed, and a retry would burn it if it

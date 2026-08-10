@@ -217,6 +217,48 @@ describe("Secure Storage Platform Implementations", () => {
 
       expect(result).toEqual(testData);
     });
+
+    test("falls back to isolated Python Secret Service when secret-tool is absent", () => {
+      mockExecaSync
+        .mockImplementationOnce(() => {
+          throw Object.assign(new Error("not found"), { code: "ENOENT" });
+        })
+        .mockReturnValueOnce({ exitCode: 0, stdout: JSON.stringify(testData) });
+
+      expect(linuxSecretStorage.read()).toEqual(testData);
+      const [command, args, options] = getExecaCall(1);
+      expect(command).toBe("python3");
+      expect(args[0]).toBe("-I");
+      expect(args).toContain("read");
+      expect(args.join(" ")).not.toContain("secret-token");
+      expect(options?.input).toBeUndefined();
+    });
+
+    test("passes fallback update payload only through Python stdin", () => {
+      mockExecaSync
+        .mockReturnValueOnce({ exitCode: 127, stdout: "" })
+        .mockReturnValueOnce({ exitCode: 0, stdout: "" });
+
+      expect(linuxSecretStorage.update(testData)).toEqual({ success: true });
+      const [command, args, options] = getExecaCall(1);
+      expect(command).toBe("python3");
+      expect(args[0]).toBe("-I");
+      expect(args).toContain("update");
+      expect(args.join(" ")).not.toContain("secret-token");
+      expect(options?.input).toContain("secret-token");
+    });
+
+    test("uses Python Secret Service to clear when secret-tool is unavailable", () => {
+      mockExecaSync
+        .mockReturnValueOnce({ exitCode: 127, stdout: "" })
+        .mockReturnValueOnce({ exitCode: 0, stdout: "" });
+
+      expect(linuxSecretStorage.delete()).toBe(true);
+      const [command, args, options] = getExecaCall(1);
+      expect(command).toBe("python3");
+      expect(args).toContain("delete");
+      expect(options?.input).toBeUndefined();
+    });
   });
 
   describe("Platform Selection", () => {

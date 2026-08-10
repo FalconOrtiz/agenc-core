@@ -1,0 +1,70 @@
+{
+  "protocol": {
+    "name": "agenc.xai.imagine",
+    "version": 1
+  },
+  "requests": [
+    {
+      "protocol_version": 1,
+      "id": "version-1",
+      "method": "protocol.version",
+      "params": {}
+    },
+    {
+      "protocol_version": 1,
+      "id": "image-1",
+      "method": "images.generate",
+      "params": {
+        "idempotency_key": "shot-0001-attempt-0001",
+        "prompt": "A locked cinematic frame",
+        "destinations": ["/project/artifacts/shot-0001.png"]
+      }
+    },
+    {
+      "protocol_version": 1,
+      "id": "resume-1",
+      "method": "artifacts.download",
+      "params": {
+        "recovery_handle": "recovery_00000000-0000-4000-8000-000000000000"
+      }
+    },
+    {
+      "protocol_version": 1,
+      "id": "status-1",
+      "method": "operations.status",
+      "params": {
+        "operation": "images.generate",
+        "key": "shot-0001-attempt-0001"
+      }
+    }
+  ],
+  "success_response": {
+    "protocol_version": 1,
+    "id": "resume-1",
+    "ok": true,
+    "result": {
+      "recovery_handle": "recovery_00000000-0000-4000-8000-000000000000",
+      "recovered": true,
+      "artifact": {
+        "destination": "/project/artifacts/shot-0001.png",
+        "bytes": 1234,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "mime_type": "image/png",
+        "downloaded_at": "2026-08-09T00:00:00.000Z"
+      }
+    }
+  },
+  "error_response": {
+    "protocol_version": 1,
+    "id": "image-1",
+    "ok": false,
+    "error": {
+      "code": "submission_unknown",
+      "message": "The paid submission outcome is unknown; do not resubmit blindly",
+      "retryable": false,
+      "details": {
+        "idempotency_key": "shot-0001-attempt-0001"
+      }
+    }
+  }
+}

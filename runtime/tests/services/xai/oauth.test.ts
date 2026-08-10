@@ -255,7 +255,24 @@ describe('refresh', () => {
         refreshToken: 'refresh-1',
         fetchImpl,
       }),
-    ).rejects.toThrow('connection reset')
+    ).rejects.toMatchObject({ code: 'refresh_unknown' })
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  test('bounds token endpoint response bodies and marks refresh ambiguous', async () => {
+    const fetchImpl = vi.fn(async () =>
+      new Response('x'.repeat(256 * 1024 + 1), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+    await expect(
+      refreshXaiOauthTokens({
+        tokenEndpoint: 'https://auth.x.ai/oauth2/token',
+        refreshToken: 'refresh-1',
+        fetchImpl,
+      }),
+    ).rejects.toMatchObject({ code: 'refresh_unknown' })
     expect(fetchImpl).toHaveBeenCalledTimes(1)
   })
 

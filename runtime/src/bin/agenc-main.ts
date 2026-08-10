@@ -147,6 +147,11 @@ import {
   runAgenCAuthCli,
 } from "./auth-cli.js";
 import {
+  formatAgenCXaiCliHelpText,
+  parseAgenCXaiCliArgs,
+  runAgenCXaiCli,
+} from "./xai-cli.js";
+import {
   formatAgenCMcpCliHelpText,
   parseAgenCMcpCliArgs,
   runAgenCMcpCli,
@@ -337,6 +342,8 @@ export function formatCliHelpText(): string {
     "       agenc run <status|result|replay|evidence|cancel> <run-id> [options]",
     "       agenc init [--force]",
     "       agenc <login|logout|whoami>",
+    "       agenc xai broker --stdio",
+    "       agenc xai auth <status|login|logout|migrate-storage>",
     "       agenc providers [--json] [--no-local-check]",
     "       agenc config <command> [args]",
     "       agenc plugin <command> [options]",
@@ -371,6 +378,7 @@ export function formatCliHelpText(): string {
     "  daemon                                  Manage the local AgenC daemon",
     "  agent                                   Start, attach, inspect, or stop background agents",
     "  mcp                                     Manage MCP servers or serve read-only AgenC tools over MCP",
+    "  xai                                     OAuth-only xAI media broker and authentication",
     "  help [command]                          Show top-level or command help",
     "",
     "Options:",
@@ -403,6 +411,7 @@ export function formatCliHelpText(): string {
     "  agenc config validate",
     "  agenc mcp serve --transport stdio",
     "  agenc mcp list",
+    "  agenc xai broker --stdio",
     "  agenc help permissions",
   ].join("\n");
 }
@@ -432,6 +441,8 @@ export function formatCliHelpTopicText(topic: string): string | null {
       return formatAgenCRemoteCliHelpText();
     case "mcp":
       return formatAgenCMcpCliHelpText();
+    case "xai":
+      return formatAgenCXaiCliHelpText();
     case "doctor":
       return formatAgenCDoctorCliHelpText();
     case "onboard":
@@ -5064,6 +5075,10 @@ export async function main(): Promise<number> {
       return code;
     }
     return runDefaultAgenCCliRoute(process.argv.slice(0, 2));
+  }
+  const xaiCommand = parseAgenCXaiCliArgs(argv);
+  if (xaiCommand !== null) {
+    return runAgenCXaiCli(xaiCommand);
   }
   const mcpConfig = shouldLoadMcpCliConfig(argv)
     ? await loadMcpCliConfig()

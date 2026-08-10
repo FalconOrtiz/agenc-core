@@ -61,6 +61,7 @@ history; the linked pages below are current product truth.
 | [reference/workflows.md](reference/workflows.md) | Version-2 agent DAG manifests, scheduling, handoff artifacts, limits, and result outcomes |
 | [reference/memory.md](reference/memory.md) | Persona, AGENC.md, auto-memory paths, privacy |
 | [reference/mcp.md](reference/mcp.md) | MCP client and server |
+| [reference/xai-media-broker.md](reference/xai-media-broker.md) | OAuth-only xAI Imagine/TTS NDJSON broker contract |
 | [reference/skills-plugins.md](reference/skills-plugins.md) | Skills load paths, plugin CLI, registration surfaces |
 | [reference/hooks.md](reference/hooks.md) | Session lifecycle hooks vs gateway HTTP hooks |
 | [reference/tools-permissions-sandbox.md](reference/tools-permissions-sandbox.md) | LIVE tool catalog (by family), dual catalog note, permission modes, OS sandbox |

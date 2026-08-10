@@ -17,6 +17,7 @@ import type { LoadedPlugin } from '../../types/plugin.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { logError } from '../log.js'
 import { getSecureStorage } from '../secureStorage/index.js'
+import { mutateSecureStorage } from '../secureStorage/mutation.js'
 import {
   getExecutionAuthoritySettings,
   getSettingsForSource,
@@ -112,31 +113,28 @@ export function savePluginOptions(
 
   // secureStorage FIRST — if keychain fails, throw before touching
   // settings.json so old plaintext (if any) stays as fallback.
-  const storage = getSecureStorage()
-  const existingInSecureStorage =
-    storage.read()?.pluginSecrets?.[pluginId] ?? undefined
-  const secureScrubbed = existingInSecureStorage
-    ? Object.fromEntries(
-        Object.entries(existingInSecureStorage).filter(
-          ([k]) => !nonSensitiveKeysInThisSave.has(k),
-        ),
+  let needSecureScrub = false
+  if (Object.keys(sensitive).length > 0 || nonSensitiveKeysInThisSave.size > 0) {
+    const result = mutateSecureStorage(existing => {
+      const existingInSecureStorage = existing.pluginSecrets?.[pluginId]
+      const secureScrubbed = existingInSecureStorage
+        ? Object.fromEntries(
+            Object.entries(existingInSecureStorage).filter(
+              ([k]) => !nonSensitiveKeysInThisSave.has(k),
+            ),
+          )
+        : undefined
+      needSecureScrub = Boolean(
+        secureScrubbed &&
+          existingInSecureStorage &&
+          Object.keys(secureScrubbed).length !==
+            Object.keys(existingInSecureStorage).length,
       )
-    : undefined
-  const needSecureScrub =
-    secureScrubbed &&
-    existingInSecureStorage &&
-    Object.keys(secureScrubbed).length !==
-      Object.keys(existingInSecureStorage).length
-  if (Object.keys(sensitive).length > 0 || needSecureScrub) {
-    const existing = storage.read() ?? {}
-    if (!existing.pluginSecrets) {
-      existing.pluginSecrets = {}
-    }
-    existing.pluginSecrets[pluginId] = {
-      ...secureScrubbed,
-      ...sensitive,
-    }
-    const result = storage.update(existing)
+      if (Object.keys(sensitive).length === 0 && !needSecureScrub) return null
+      if (!existing.pluginSecrets) existing.pluginSecrets = {}
+      existing.pluginSecrets[pluginId] = { ...secureScrubbed, ...sensitive }
+      return existing
+    })
     if (!result.success) {
       const err = new Error(
         `Failed to save sensitive plugin options for ${pluginId} to secure storage`,
@@ -239,9 +237,8 @@ export function deletePluginOptions(pluginId: string): void {
   // saveMcpServerUserConfig's sensitive split). `/` prefix match is safe:
   // plugin IDs are `name@marketplace`, never contain `/`, so
   // startsWith(`${id}/`) can't false-positive on a different plugin.
-  const storage = getSecureStorage()
-  const existing = storage.read()
-  if (existing?.pluginSecrets) {
+  const result = mutateSecureStorage(existing => {
+    if (!existing.pluginSecrets) return null
     const prefix = `${pluginId}/`
     const survivingEntries = Object.entries(existing.pluginSecrets).filter(
       ([k]) => k !== pluginId && !k.startsWith(prefix),
@@ -249,20 +246,21 @@ export function deletePluginOptions(pluginId: string): void {
     if (
       survivingEntries.length !== Object.keys(existing.pluginSecrets).length
     ) {
-      const result = storage.update({
+      return {
         ...existing,
         pluginSecrets:
           survivingEntries.length > 0
             ? Object.fromEntries(survivingEntries)
             : undefined,
-      })
-      if (!result.success) {
-        logForDebugging(
-          `deletePluginOptions: failed to clear pluginSecrets for ${pluginId} from keychain`,
-          { level: 'warn' },
-        )
       }
     }
+    return null
+  })
+  if (!result.success) {
+    logForDebugging(
+      `deletePluginOptions: failed to clear pluginSecrets for ${pluginId} from keychain`,
+      { level: 'warn' },
+    )
   }
 
   clearPluginOptionsCache()

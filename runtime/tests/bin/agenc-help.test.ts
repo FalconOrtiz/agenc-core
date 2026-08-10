@@ -26,6 +26,8 @@ describe("agenc CLI help", () => {
     expect(help).toContain("agenc config validate");
     expect(help).toContain("agenc daemon <stop|status|reload|restart>");
     expect(help).toContain("agenc mcp serve --transport stdio");
+    expect(help).toContain("agenc xai broker --stdio");
+    expect(help).toContain("agenc xai auth <status|login|logout|migrate-storage>");
     expect(help).toContain("-p, --print");
     expect(help).toContain("--autonomous, --proactive");
     expect(help).toContain("--yolo");
@@ -44,6 +46,7 @@ describe("agenc CLI help", () => {
       "plugin",
       "providers",
       "state",
+      "xai",
     ]) {
       const text = formatCliHelpTopicText(topic);
       expect(text, topic).not.toBeNull();
@@ -160,6 +163,28 @@ describe("agenc CLI help", () => {
         .join("");
       expect(stdout).toContain("agenc permissions approve");
       expect(stdout).toContain("Examples:");
+      expect(stderrSpy).not.toHaveBeenCalled();
+    } finally {
+      process.argv = prevArgv;
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it("routes xai help before prompt/TUI routing", async () => {
+    const prevArgv = [...process.argv];
+    const stdoutSpy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    process.argv = ["/usr/bin/node", "/opt/agenc/bin/agenc.js", "xai", "--help"];
+    try {
+      expect(await main()).toBe(0);
+      expect(
+        stdoutSpy.mock.calls.map(([chunk]) => String(chunk)).join(""),
+      ).toContain("agenc xai broker --stdio");
       expect(stderrSpy).not.toHaveBeenCalled();
     } finally {
       process.argv = prevArgv;

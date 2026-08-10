@@ -679,6 +679,34 @@ its working directory.
 
 ---
 
+## `xai`
+
+```text
+agenc xai broker --stdio
+agenc xai auth status
+agenc xai auth login [--device]
+agenc xai auth logout
+agenc xai auth migrate-storage
+```
+
+`broker --stdio` runs the stable, versioned OAuth-only xAI media broker. It
+uses NDJSON on standard input/output, pins inference to `https://api.x.ai/v1`,
+and never falls back to `XAI_API_KEY` or another API key. Its artifact root is
+the command's startup working directory. The public launcher does not start
+the AgenC daemon for any `agenc xai` command.
+
+The `auth` commands are non-TUI. Status and successful operations emit one
+safe JSON object on stdout; failures emit typed JSON on stderr and return a
+nonzero status. Browser/device login instructions appear only on stderr and
+tokens are never printed. `migrate-storage` writes the complete authoritative
+credential blob to the native OS vault, verifies an exact read-back, and only
+then removes the plaintext fallback file.
+
+See [xai-media-broker.md](xai-media-broker.md) for the protocol, method
+schemas, idempotency rules, artifact rules, and typed errors.
+
+---
+
 ## See also
 
 - Documentation map: [`../INDEX.md`](../INDEX.md)

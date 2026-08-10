@@ -54,6 +54,7 @@ import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
 import { memoizeWithTTLAsync } from './memoize.js'
 import { getSecureStorage } from './secureStorage/index.js'
+import { mutateSecureStorage } from './secureStorage/mutation.js'
 import {
   clearLegacyApiKeyPrefetch,
   getLegacyApiKeyPrefetchResult,
@@ -1175,27 +1176,24 @@ export function saveOAuthTokensIfNeeded(tokens: OAuthTokens): {
     return { success: true }
   }
 
-  const secureStorage = getSecureStorage()
-
   try {
-    const storageData = secureStorage.read() || {}
-    const existingOauth = storageData.agencAiOauth
-
-    storageData.agencAiOauth = {
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      expiresAt: tokens.expiresAt,
-      scopes: tokens.scopes,
-      // Profile fetch in refreshOAuthToken swallows errors and returns null on
-      // transient failures (network, 5xx, rate limit). Don't clobber a valid
-      // stored subscription with null — fall back to the existing value.
-      subscriptionType:
-        tokens.subscriptionType ?? existingOauth?.subscriptionType ?? null,
-      rateLimitTier:
-        tokens.rateLimitTier ?? existingOauth?.rateLimitTier ?? null,
-    }
-
-    const updateStatus = secureStorage.update(storageData)
+    const updateStatus = mutateSecureStorage(storageData => {
+      const existingOauth = storageData.agencAiOauth
+      storageData.agencAiOauth = {
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresAt: tokens.expiresAt,
+        scopes: tokens.scopes,
+        // Profile fetch in refreshOAuthToken swallows errors and returns null on
+        // transient failures (network, 5xx, rate limit). Don't clobber a valid
+        // stored subscription with null — fall back to the existing value.
+        subscriptionType:
+          tokens.subscriptionType ?? existingOauth?.subscriptionType ?? null,
+        rateLimitTier:
+          tokens.rateLimitTier ?? existingOauth?.rateLimitTier ?? null,
+      }
+      return storageData
+    })
 
     getAgenCAIOAuthTokens.cache?.clear?.()
     clearBetasCaches()

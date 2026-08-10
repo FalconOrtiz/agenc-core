@@ -14,6 +14,10 @@ describe("agenc top-level help surface", () => {
     );
     expect(source).toContain('"       agenc plugin <command> [options]",');
     expect(source).toContain('"       agenc permissions <command>",');
+    expect(source).toContain('"       agenc xai broker --stdio",');
+    expect(source).toContain(
+      '"       agenc xai auth <status|login|logout|migrate-storage>",',
+    );
     expect(source).toContain(
       '"  -p, --print                             Run in headless one-shot print mode",',
     );

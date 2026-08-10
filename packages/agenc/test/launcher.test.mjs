@@ -6,6 +6,7 @@ import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import {
   ensureDaemonForLaunch,
+  isDaemonIndependentCommand,
   main,
   readDaemonPid,
   resolveAgenCHome,
@@ -100,6 +101,22 @@ test("ensureDaemonForLaunch skips daemon management commands", async () => {
     },
   });
   assert.equal(result.status, "skipped-daemon-command");
+  assert.equal(started, false);
+});
+
+test("xai commands are daemon-independent and never trigger daemon startup", async () => {
+  assert.equal(isDaemonIndependentCommand(["xai", "broker", "--stdio"]), true);
+  assert.equal(isDaemonIndependentCommand(["xai", "auth", "status"]), true);
+  assert.equal(isDaemonIndependentCommand(["mcp", "list"]), false);
+  let started = false;
+  const result = await ensureDaemonForLaunch({
+    argv: ["xai", "broker", "--stdio"],
+    runtimeBin: "/tmp/runtime-bin",
+    spawnDaemonFn: async () => {
+      started = true;
+    },
+  });
+  assert.equal(result.status, "skipped-daemon-independent-command");
   assert.equal(started, false);
 });
 

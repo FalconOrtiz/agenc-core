@@ -1,5 +1,6 @@
 import { isBareMode } from './envUtils.js'
 import { getSecureStorage } from './secureStorage/index.js'
+import { mutateSecureStorage } from './secureStorage/mutation.js'
 import {
   asTrimmedString,
   PROVIDER_CODE_REFRESH_URL as AGENC_REFRESH_URL,
@@ -189,19 +190,20 @@ export function saveAgencCredentials(
   }
 
   const secureStorage = getAgencSecureStorage()
-  const previous = secureStorage.read() || {}
-  const previousAgenc = normalizeAgencCredentialBlob(previous[AGENC_STORAGE_KEY])
-  const next = {
-    ...(previous as Record<string, unknown>),
-    [AGENC_STORAGE_KEY]: {
+  let storedAgenc: AgencCredentialBlob | undefined
+  const result = mutateSecureStorage(previous => {
+    const previousAgenc = normalizeAgencCredentialBlob(previous[AGENC_STORAGE_KEY])
+    storedAgenc = {
       ...normalized,
       profileId: normalized.profileId ?? previousAgenc?.profileId,
       lastRefreshAt: normalized.lastRefreshAt ?? Date.now(),
-    },
-  }
-  const result = secureStorage.update(next as typeof previous)
+    }
+    return {
+      ...(previous as Record<string, unknown>),
+      [AGENC_STORAGE_KEY]: storedAgenc,
+    }
+  }, { storage: secureStorage })
   if (result.success) {
-    const storedAgenc = normalizeAgencCredentialBlob(next[AGENC_STORAGE_KEY])
     inMemoryLastRefreshFailureAt = storedAgenc?.lastRefreshFailureAt ?? null
   }
   return result
@@ -251,10 +253,11 @@ export function clearAgencCredentials(): {
   }
 
   const secureStorage = getAgencSecureStorage()
-  const previous = secureStorage.read() || {}
-  const next = { ...(previous as Record<string, unknown>) }
-  delete next[AGENC_STORAGE_KEY]
-  const result = secureStorage.update(next as typeof previous)
+  const result = mutateSecureStorage(previous => {
+    const next = { ...(previous as Record<string, unknown>) }
+    delete next[AGENC_STORAGE_KEY]
+    return next
+  }, { storage: secureStorage })
   if (result.success) {
     inMemoryLastRefreshFailureAt = null
   }

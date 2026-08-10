@@ -69,6 +69,10 @@ export function isDaemonCommand(argv) {
   return argv[0] === "daemon";
 }
 
+export function isDaemonIndependentCommand(argv) {
+  return argv[0] === "xai";
+}
+
 // Dev path: the `file:`-linked @tetsuo-ai/runtime resolves locally. Returns
 // null in a published install where runtime is NOT an npm dependency (it's the
 // downloaded GitHub-Releases artifact instead).
@@ -241,6 +245,9 @@ export async function ensureDaemonForLaunch({
   waitForReadyFn = waitForDaemonReady,
 } = {}) {
   if (isDaemonCommand(argv)) return { status: "skipped-daemon-command" };
+  if (isDaemonIndependentCommand(argv)) {
+    return { status: "skipped-daemon-independent-command" };
+  }
   if (!shouldAutostartDaemon(env)) return { status: "disabled" };
 
   if (

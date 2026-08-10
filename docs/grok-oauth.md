@@ -16,6 +16,16 @@ Inside the TUI:
 /grok-logout         # delete the stored tokens
 ```
 
+Non-TUI automation uses the equivalent safe CLI surface:
+
+```text
+agenc xai auth status
+agenc xai auth login
+agenc xai auth login --device
+agenc xai auth logout
+agenc xai auth migrate-storage
+```
+
 The browser flow opens `auth.x.ai` and returns through a loopback callback
 on `127.0.0.1:56121`. On headless/SSH hosts (or when that port is taken,
 e.g. by the Grok CLI) the device-code flow is used automatically.
@@ -32,9 +42,13 @@ request carries `referrer=agenc` so xAI can attribute usage (their request).
 - Env BYOK applies only when no OAuth token is available (never signed in, or
   after `/grok-logout`). Credential order is then:
   explicit session key → `XAI_API_KEY` → `GROK_API_KEY` → `AGENC_XAI_API_KEY`.
-- Tokens are stored in AgenC secure storage (OS keychain / libsecret, with
-  the usual plaintext fallback), refresh automatically (~6 h access tokens,
-  rotating refresh tokens), and recover transparently on 401.
+- Tokens are stored in AgenC secure storage (OS keychain / Secret Service /
+  Credential Locker, with a guarded plaintext fallback), refresh automatically
+  (~6 h access tokens, rotating refresh tokens), and recover transparently on
+  401. On Linux, AgenC can reach Secret Service through either `secret-tool`
+  or an isolated Python `secretstorage` binding. `agenc xai auth status`
+  reports the actual storage security. `migrate-storage` verifies a native
+  read-back before deleting plaintext.
 - The OAuth bearer is only ever sent to `api.x.ai` / `*.grok.com`. A custom
   grok base-URL override refuses to start in OAuth mode — set a real API
   key (and no OAuth token) to use gateways.

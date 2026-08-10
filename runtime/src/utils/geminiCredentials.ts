@@ -1,6 +1,7 @@
 import { isBareMode, isEnvTruthy } from './envUtils.js'
 import { getGeminiAuthMode } from './geminiAuth.js'
 import { getSecureStorage } from './secureStorage/index.js'
+import { mutateSecureStorage } from './secureStorage/mutation.js'
 
 export const GEMINI_TOKEN_STORAGE_KEY = 'gemini' as const
 export const GEMINI_HYDRATED_ENV_MARKER =
@@ -61,13 +62,10 @@ export function saveGeminiAccessToken(token: string): {
   if (!trimmed) {
     return { success: false, warning: 'Token is empty.' }
   }
-  const secureStorage = getSecureStorage()
-  const previous = secureStorage.read() || {}
-  const next = {
+  return mutateSecureStorage(previous => ({
     ...(previous as Record<string, unknown>),
     [GEMINI_TOKEN_STORAGE_KEY]: { accessToken: trimmed },
-  }
-  return secureStorage.update(next as typeof previous)
+  }))
 }
 
 export function clearGeminiAccessToken(): {
@@ -77,9 +75,9 @@ export function clearGeminiAccessToken(): {
   if (isBareMode()) {
     return { success: true }
   }
-  const secureStorage = getSecureStorage()
-  const previous = secureStorage.read() || {}
-  const next = { ...(previous as Record<string, unknown>) }
-  delete next[GEMINI_TOKEN_STORAGE_KEY]
-  return secureStorage.update(next as typeof previous)
+  return mutateSecureStorage(previous => {
+    const next = { ...(previous as Record<string, unknown>) }
+    delete next[GEMINI_TOKEN_STORAGE_KEY]
+    return next
+  })
 }

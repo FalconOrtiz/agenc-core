@@ -7,6 +7,7 @@ const oauthServiceModulePath = '../../src/services/xai/oauth.js'
 const originalEnv = { ...process.env }
 const originalArgv = [...process.argv]
 let storageState: MockStorageData = {}
+let storageWritesSucceed = true
 
 const refreshMock = vi.fn()
 const discoveryMock = vi.fn()
@@ -14,11 +15,13 @@ const discoveryMock = vi.fn()
 async function importFreshModule() {
   vi.resetModules()
   vi.doMock(secureStorageModulePath, () => ({
+    withCredentialMutationLock: <T>(operation: () => T) => operation(),
     getSecureStorage: () => ({
       name: 'mock-secure-storage',
       read: () => storageState,
       readAsync: async () => storageState,
       update: (next: MockStorageData) => {
+        if (!storageWritesSucceed) return { success: false }
         storageState = next
         return { success: true }
       },
@@ -65,6 +68,7 @@ beforeEach(async () => {
   process.env.AGENC_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'xai-oauth-test-'))
   process.argv = originalArgv.filter(arg => arg !== '--bare')
   storageState = {}
+  storageWritesSucceed = true
   refreshMock.mockReset()
   discoveryMock.mockReset()
 })
@@ -163,6 +167,51 @@ test('refresh response without a rotated token keeps the previous grant', async 
   expect(readXaiOauthCredentials()?.refreshToken).toBe('refresh-1')
 })
 
+test('refresh never overwrites a login that lands while the exchange is in flight', async () => {
+  const {
+    forceRefreshXaiOauthCredentials,
+    readXaiOauthCredentials,
+    saveXaiOauthCredentials,
+  } = await importFreshModule()
+
+  saveXaiOauthCredentials(storedBlob())
+  refreshMock.mockImplementation(async () => {
+    storageState = {
+      xaiOauth: storedBlob({
+        accessToken: 'access-new-login',
+        refreshToken: 'refresh-new-login',
+      }),
+    }
+    return {
+      accessToken: 'access-old-chain-rotated',
+      refreshToken: 'refresh-old-chain-rotated',
+    }
+  })
+
+  const result = await forceRefreshXaiOauthCredentials()
+  expect(result?.accessToken).toBe('access-new-login')
+  expect(readXaiOauthCredentials()).toMatchObject({
+    accessToken: 'access-new-login',
+    refreshToken: 'refresh-new-login',
+  })
+})
+
+test('does not report a rotated grant when secure persistence fails', async () => {
+  const {
+    forceRefreshXaiOauthCredentials,
+    readXaiOauthCredentials,
+    saveXaiOauthCredentials,
+  } = await importFreshModule()
+  saveXaiOauthCredentials(storedBlob())
+  storageWritesSucceed = false
+  refreshMock.mockResolvedValue({
+    accessToken: 'access-2',
+    refreshToken: 'refresh-2',
+  })
+  expect(await forceRefreshXaiOauthCredentials()).toBeUndefined()
+  expect(readXaiOauthCredentials()?.refreshToken).toBe('refresh-1')
+})
+
 test('terminal invalid_grant quarantines instead of retrying', async () => {
   const module = await importFreshModule()
   const {
@@ -185,6 +234,26 @@ test('terminal invalid_grant quarantines instead of retrying', async () => {
   expect(readXaiOauthAccessToken()).toBeUndefined()
 
   // Quarantined: further refreshes bail without touching the endpoint.
+  refreshMock.mockClear()
+  expect(await forceRefreshXaiOauthCredentials()).toBeUndefined()
+  expect(refreshMock).not.toHaveBeenCalled()
+})
+
+test('ambiguous rotating refresh is quarantined and never replayed', async () => {
+  const {
+    forceRefreshXaiOauthCredentials,
+    readXaiOauthCredentials,
+    saveXaiOauthCredentials,
+  } = await importFreshModule()
+  const { XaiOauthError } = await vi.importActual<
+    typeof import('../../src/services/xai/oauth.ts')
+  >(oauthServiceModulePath)
+  saveXaiOauthCredentials(storedBlob())
+  refreshMock.mockRejectedValue(
+    new XaiOauthError('refresh_unknown', 'outcome unknown'),
+  )
+  expect(await forceRefreshXaiOauthCredentials()).toBeUndefined()
+  expect(readXaiOauthCredentials()?.quarantinedAt).toBeTypeOf('number')
   refreshMock.mockClear()
   expect(await forceRefreshXaiOauthCredentials()).toBeUndefined()
   expect(refreshMock).not.toHaveBeenCalled()

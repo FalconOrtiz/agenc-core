@@ -1,5 +1,6 @@
 import { isBareMode, isEnvTruthy } from './envUtils.js'
 import { getSecureStorage } from './secureStorage/index.js'
+import { mutateSecureStorage } from './secureStorage/mutation.js'
 import { exchangeForCopilotToken } from '../services/github/deviceFlow.js'
 
 /** JSON key in the shared AgenC secure storage blob. */
@@ -165,34 +166,31 @@ export function saveGithubModelsToken(
   if (!trimmed) {
     return { success: false, warning: 'Token is empty.' }
   }
-  const secureStorage = getSecureStorage()
-  const prev = secureStorage.read() || {}
-  const prevGithubModels = (prev as Record<string, unknown>)[
-    GITHUB_MODELS_STORAGE_KEY
-  ] as GithubModelsCredentialBlob | undefined
-  const oauthTrimmed = oauthToken?.trim()
-  const mergedBlob: GithubModelsCredentialBlob = {
-    accessToken: trimmed,
-  }
-  if (oauthTrimmed) {
-    mergedBlob.oauthAccessToken = oauthTrimmed
-  } else if (prevGithubModels?.oauthAccessToken?.trim()) {
-    mergedBlob.oauthAccessToken = prevGithubModels.oauthAccessToken.trim()
-  }
-  const merged = {
-    ...(prev as Record<string, unknown>),
-    [GITHUB_MODELS_STORAGE_KEY]: mergedBlob,
-  }
-  return secureStorage.update(merged as typeof prev)
+  return mutateSecureStorage(prev => {
+    const prevGithubModels = (prev as Record<string, unknown>)[
+      GITHUB_MODELS_STORAGE_KEY
+    ] as GithubModelsCredentialBlob | undefined
+    const oauthTrimmed = oauthToken?.trim()
+    const mergedBlob: GithubModelsCredentialBlob = { accessToken: trimmed }
+    if (oauthTrimmed) {
+      mergedBlob.oauthAccessToken = oauthTrimmed
+    } else if (prevGithubModels?.oauthAccessToken?.trim()) {
+      mergedBlob.oauthAccessToken = prevGithubModels.oauthAccessToken.trim()
+    }
+    return {
+      ...(prev as Record<string, unknown>),
+      [GITHUB_MODELS_STORAGE_KEY]: mergedBlob,
+    }
+  })
 }
 
 export function clearGithubModelsToken(): { success: boolean; warning?: string } {
   if (isBareMode()) {
     return { success: true }
   }
-  const secureStorage = getSecureStorage()
-  const prev = secureStorage.read() || {}
-  const next = { ...(prev as Record<string, unknown>) }
-  delete next[GITHUB_MODELS_STORAGE_KEY]
-  return secureStorage.update(next as typeof prev)
+  return mutateSecureStorage(prev => {
+    const next = { ...(prev as Record<string, unknown>) }
+    delete next[GITHUB_MODELS_STORAGE_KEY]
+    return next
+  })
 }

@@ -59,6 +59,8 @@ const DEFAULT_DEVICE_TIMEOUT_S = 300
 /** Cloudflare challenge pages on the token endpoint get a bounded retry. */
 const CLOUDFLARE_CHALLENGE_MAX_RETRIES = 3
 const CLOUDFLARE_CHALLENGE_RETRY_DELAY_MS = 250
+const TOKEN_ENDPOINT_TIMEOUT_MS = 60_000
+const TOKEN_RESPONSE_LIMIT_BYTES = 256 * 1024
 
 export type XaiOauthEndpoints = {
   authorizationEndpoint: string
@@ -99,6 +101,7 @@ export type XaiOauthErrorCode =
   | 'malformed_response'
   | 'callback_failed'
   | 'timeout'
+  | 'refresh_unknown'
   | 'oauth_error'
 
 export class XaiOauthError extends Error {
@@ -286,15 +289,62 @@ async function postTokenEndpoint(
   }
   let attempt = 0
   for (;;) {
-    const res = await fetchFn(tokenEndpoint, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: body.toString(),
-    })
-    const text = await res.text().catch(() => '')
+    const signal = AbortSignal.timeout(TOKEN_ENDPOINT_TIMEOUT_MS)
+    let res: Response
+    try {
+      res = await fetchFn(tokenEndpoint, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+        signal,
+      })
+    } catch (error) {
+      if (signal.aborted) {
+        throw new XaiOauthError('timeout', 'xAI token endpoint timed out')
+      }
+      throw error
+    }
+    const declared = Number(res.headers.get('content-length'))
+    if (Number.isFinite(declared) && declared > TOKEN_RESPONSE_LIMIT_BYTES) {
+      await res.body?.cancel().catch(() => {})
+      throw new XaiOauthError(
+        'malformed_response',
+        'xAI token endpoint response exceeded its safety limit',
+        res.status,
+      )
+    }
+    const chunks: Buffer[] = []
+    let bytes = 0
+    const reader = res.body?.getReader()
+    try {
+      if (reader !== undefined) {
+        for (;;) {
+          const next = await reader.read()
+          if (next.done) break
+          const chunk = Buffer.from(next.value)
+          bytes += chunk.length
+          if (bytes > TOKEN_RESPONSE_LIMIT_BYTES) {
+            await reader.cancel().catch(() => {})
+            throw new XaiOauthError(
+              'malformed_response',
+              'xAI token endpoint response exceeded its safety limit',
+              res.status,
+            )
+          }
+          chunks.push(chunk)
+        }
+      }
+    } catch (error) {
+      await reader?.cancel().catch(() => {})
+      if (signal.aborted) {
+        throw new XaiOauthError('timeout', 'xAI token endpoint timed out')
+      }
+      throw error
+    }
+    const text = Buffer.concat(chunks, bytes).toString('utf8')
     if (
       options?.retryCloudflareChallenges === true &&
       looksLikeCloudflareChallenge(res.status, text) &&
@@ -546,17 +596,32 @@ export async function refreshXaiOauthTokens(params: {
   refreshToken: string
   fetchImpl?: FetchLike
 }): Promise<XaiOauthTokens> {
-  const data = await postTokenEndpoint(
-    params.tokenEndpoint,
-    new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: XAI_OAUTH_CLIENT_ID,
-      refresh_token: params.refreshToken,
-    }),
-    params.fetchImpl ?? fetch,
-    { retryCloudflareChallenges: true },
-  )
-  return parseTokenResponse(data, { requireRefreshToken: false })
+  try {
+    const data = await postTokenEndpoint(
+      params.tokenEndpoint,
+      new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: XAI_OAUTH_CLIENT_ID,
+        refresh_token: params.refreshToken,
+      }),
+      params.fetchImpl ?? fetch,
+      { retryCloudflareChallenges: true },
+    )
+    return parseTokenResponse(data, { requireRefreshToken: false })
+  } catch (error) {
+    if (
+      error instanceof XaiOauthError &&
+      (error.code === 'invalid_grant' ||
+        error.code === 'access_denied' ||
+        error.code === 'expired_token')
+    ) {
+      throw error
+    }
+    throw new XaiOauthError(
+      'refresh_unknown',
+      'xAI rotating refresh submission outcome is unknown; re-authentication is required',
+    )
+  }
 }
 
 const CALLBACK_ALLOWED_ORIGINS = new Set([

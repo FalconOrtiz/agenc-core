@@ -23,7 +23,10 @@ import { isEnvTruthy } from '../../utils/envUtils.js'
 import { toError } from '../../utils/errors.js'
 import { logMCPDebug } from '../../utils/log.js'
 import { getPlatform } from '../../utils/platform.js'
-import { getSecureStorage } from '../../utils/secureStorage/index.js'
+import {
+  getSecureStorage,
+} from '../../utils/secureStorage/index.js'
+import { mutateSecureStorage } from '../../utils/secureStorage/mutation.js'
 import { getExecutionAuthoritySettings } from '../../utils/settings/settings.js'
 import { jsonParse } from '../../utils/slowOperations.js'
 import { buildRedirectUri, findAvailablePort } from './oauthPort.js'
@@ -110,15 +113,13 @@ function saveIdpIdToken(
   idToken: string,
   expiresAt: number,
 ): void {
-  const storage = getSecureStorage()
-  const existing = storage.read() || {}
-  storage.update({
+  mutateSecureStorage(existing => ({
     ...existing,
     mcpXaaIdp: {
       ...existing.mcpXaaIdp,
       [issuerKey(idpIssuer)]: { idToken, expiresAt },
     },
-  })
+  }))
 }
 
 /**
@@ -140,12 +141,12 @@ export function saveIdpIdTokenFromJwt(
 }
 
 export function clearIdpIdToken(idpIssuer: string): void {
-  const storage = getSecureStorage()
-  const existing = storage.read()
   const key = issuerKey(idpIssuer)
-  if (!existing?.mcpXaaIdp?.[key]) return
-  delete existing.mcpXaaIdp[key]
-  storage.update(existing)
+  mutateSecureStorage(existing => {
+    if (!existing.mcpXaaIdp?.[key]) return null
+    delete existing.mcpXaaIdp[key]
+    return existing
+  })
 }
 
 /**
@@ -159,15 +160,13 @@ export function saveIdpClientSecret(
   idpIssuer: string,
   clientSecret: string,
 ): { success: boolean; warning?: string } {
-  const storage = getSecureStorage()
-  const existing = storage.read() || {}
-  return storage.update({
+  return mutateSecureStorage(existing => ({
     ...existing,
     mcpXaaIdpConfig: {
       ...existing.mcpXaaIdpConfig,
       [issuerKey(idpIssuer)]: { clientSecret },
     },
-  })
+  }))
 }
 
 /**
@@ -184,12 +183,12 @@ export function getIdpClientSecret(idpIssuer: string): string | undefined {
  * Used by `agenc mcp xaa clear`.
  */
 export function clearIdpClientSecret(idpIssuer: string): void {
-  const storage = getSecureStorage()
-  const existing = storage.read()
   const key = issuerKey(idpIssuer)
-  if (!existing?.mcpXaaIdpConfig?.[key]) return
-  delete existing.mcpXaaIdpConfig[key]
-  storage.update(existing)
+  mutateSecureStorage(existing => {
+    if (!existing.mcpXaaIdpConfig?.[key]) return null
+    delete existing.mcpXaaIdpConfig[key]
+    return existing
+  })
 }
 
 // OIDC Discovery §4.1 says `{issuer}/.well-known/openid-configuration` — path

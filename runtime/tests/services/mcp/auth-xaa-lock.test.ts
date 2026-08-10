@@ -42,6 +42,7 @@ vi.mock('../../utils/envUtils.js', async importOriginal => ({
 
 vi.mock('../../utils/lockfile.js', () => ({
   lock: probes.lock,
+  lockSync: () => () => {},
 }))
 
 vi.mock('../../utils/log.js', () => ({
