@@ -39,7 +39,7 @@ Existing directories only (missing roots skipped). Project walk: cwd up to home.
 `getSkillsPath` (settings source → path) also maps policy/user/project to
 managed / config-home / `.agenc/skills`.
 
-Slash: `/skills` — list roots, manage project skills.
+Slash: `/skills` — list roots, manage project skills; also lists bundled skills (tagged `[bundled]`).
 
 ### Bundled skills
 
@@ -47,6 +47,7 @@ Slash: `/skills` — list roots, manage project skills.
 | --- | --- |
 | `browser-automation` | Snapshot → act → re-snapshot workflow for the LIVE `Browser` tool ([browser.md](../browser.md)) |
 | `agenc-marketplace-kit-installer` | Marketplace kit install helper |
+| `iot-builder` | IoT/embedded project builder: measurement-first hardware identification, toolchain selection (PlatformIO, Arduino CLI, ESP-IDF, MicroPython, SBC cross-compile), build → flash → serial-monitor loop, flash backup before first overwrite, and an electrical-safety checklist. Extracts per-board and per-toolchain reference files on first invoke |
 
 ### `SKILL.md` frontmatter (high level)
 

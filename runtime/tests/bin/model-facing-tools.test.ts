@@ -2935,6 +2935,8 @@ describe("model-facing tools", () => {
       const missing = await skill.execute({ skill: "missing-skill" });
 
       expect(missing.isError).toBe(true);
+      // Full parity: every name `/skills` shows the user is a name the model
+      // can actually load, bundled ones included.
       expect(JSON.parse(missing.content).available).toEqual(
         slashSnapshot.availableSkills.map((entry) => entry.name),
       );
@@ -2945,6 +2947,9 @@ describe("model-facing tools", () => {
         "<command-name>legacy-visible</command-name>",
       );
       expect(loaded.content).toContain("Use legacy-visible.");
+      // Loading a bundled skill through this tool is covered by
+      // tests/bin/skill-tool-bundled.test.ts — invoking one extracts its
+      // reference files, which needs the MACRO stub this file does not set.
     } finally {
       await rm(agencHome, { recursive: true, force: true });
       await rm(workspaceRoot, { recursive: true, force: true });

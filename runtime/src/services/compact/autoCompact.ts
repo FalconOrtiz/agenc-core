@@ -28,6 +28,35 @@ export type AutoCompactOptions = {
 };
 
 export const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
+
+/**
+ * Ceiling on how much of the context window may be used before auto-compaction
+ * must fire, expressed as a fraction rather than a fixed token buffer.
+ *
+ * A fixed buffer assumes compaction's view of "full" matches admission's. It
+ * does not. Admission compares accountingResult.totalTokens — which is
+ * inputTokens ALREADY inflated by safetyMarginForTokens() (10% + 256) plus the
+ * reserved output — against its own contextWindowTokens, resolved from
+ * options/profile/session before REGISTERED_MODEL_CATALOG. Observed on
+ * grok-4.5 (catalogued at 500k): a turn counted 435,227 was admitted and the
+ * next at 444,458 was denied `context_window_exceeded`, putting the real cut
+ * near 476k — while `window - 13_000` would not have compacted until 487k.
+ *
+ * The safety net sat 11k BEHIND the trap, so it could never fire: two long
+ * sessions were killed mid-run with compaction_retention_pins still at 0.
+ * Taking the stricter of the two keeps compaction ahead of admission without
+ * having to predict admission's exact number.
+ */
+// 0.85 was not enough. Measured on the third session killed by
+// `context_window_exceeded` (grok-4.5, 500k window): the last admitted turn
+// carried 423,740 input tokens — one turn UNDER the 425k threshold — and the
+// very next user message weighed 445,857 + 32,000 reserved output and was
+// denied. Admission compares margin-inflated totals (input × 1.1 + 256 +
+// 32k output), so its effective ceiling sits ~75k below the catalog window.
+// 0.75 fires ~50k before the measured kill line, leaving room for BOTH one
+// more oversized turn AND the compaction request itself, whose input is the
+// full history it is trying to shrink.
+export const AUTOCOMPACT_MAX_WINDOW_FRACTION = 0.75;
 const WARNING_THRESHOLD_BUFFER_TOKENS = 20_000;
 const ERROR_THRESHOLD_BUFFER_TOKENS = 20_000;
 export const MANUAL_COMPACT_BUFFER_TOKENS = 3_000;
@@ -123,9 +152,16 @@ export function getAutoCompactThreshold(
 ): number {
   const contextWindow = getEffectiveContextWindowSize(modelOrContext);
   const percentOverride = positiveNumber(process.env.AGENC_AUTOCOMPACT_PCT_OVERRIDE);
-  const defaultThreshold = contextWindow > AUTOCOMPACT_BUFFER_TOKENS
+  const bufferThreshold = contextWindow > AUTOCOMPACT_BUFFER_TOKENS
     ? contextWindow - AUTOCOMPACT_BUFFER_TOKENS
     : Math.floor(contextWindow * 0.8);
+  // Whichever fires first. See AUTOCOMPACT_MAX_WINDOW_FRACTION: on a large
+  // window the fixed buffer lands past the point where admission already
+  // denies the turn, and compaction never gets to run.
+  const defaultThreshold = Math.min(
+    bufferThreshold,
+    Math.floor(contextWindow * AUTOCOMPACT_MAX_WINDOW_FRACTION),
+  );
   if (percentOverride !== undefined && percentOverride > 0 && percentOverride <= 100) {
     return Math.max(1, Math.min(
       Math.floor(contextWindow * (percentOverride / 100)),

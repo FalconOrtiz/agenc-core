@@ -10,6 +10,7 @@ import type { HooksSettings } from '../utils/settings/types.js'
 // Pure data (type-only back-reference to this module — no runtime cycle).
 import { AGENC_MARKETPLACE_KIT_INSTALLER_SKILL } from './bundled/agencMarketplaceKitInstaller.js'
 import { BROWSER_AUTOMATION_SKILL } from './bundled/browserAutomation.js'
+import { IOT_BUILDER_SKILL } from './bundled/iotBuilder.js'
 
 /**
  * Definition for a bundled skill that ships with the CLI.
@@ -56,11 +57,10 @@ const bundledSkills: Command[] = []
 export function registerBundledSkill(definition: BundledSkillDefinition): void {
   const { files } = definition
 
-  let skillRoot: string | undefined
+  const hasFiles = files !== undefined && Object.keys(files).length > 0
   let getPromptForCommand = definition.getPromptForCommand
 
-  if (files && Object.keys(files).length > 0) {
-    skillRoot = getBundledSkillExtractDir(definition.name)
+  if (hasFiles) {
     // Closure-local memoization: extract once per process.
     // Memoize the promise (not the result) so concurrent callers await
     // the same extraction instead of racing into separate writes.
@@ -91,7 +91,15 @@ export function registerBundledSkill(definition: BundledSkillDefinition): void {
     source: 'bundled',
     loadedFrom: 'bundled',
     hooks: definition.hooks,
-    skillRoot,
+    // Lazy on purpose. getBundledSkillExtractDir() reads the build-time
+    // MACRO.VERSION define, so resolving it here — at module load, since
+    // registration runs at import — would make merely IMPORTING this module
+    // throw wherever MACRO is absent, and take every bundled skill down with
+    // it (the `/skills` listing, the command palette). Nothing needs the path
+    // until the files are actually extracted on first invocation.
+    get skillRoot(): string | undefined {
+      return hasFiles ? getBundledSkillExtractDir(definition.name) : undefined
+    },
     context: definition.context,
     agent: definition.agent,
     isEnabled: definition.isEnabled,
@@ -225,3 +233,4 @@ function prependBaseDir(
 // Register in-tree bundled skills once, at module load.
 registerBundledSkill(BROWSER_AUTOMATION_SKILL)
 registerBundledSkill(AGENC_MARKETPLACE_KIT_INSTALLER_SKILL)
+registerBundledSkill(IOT_BUILDER_SKILL)
