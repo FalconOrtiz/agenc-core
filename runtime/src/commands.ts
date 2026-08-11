@@ -484,11 +484,32 @@ export async function getCommands(
     ],
   );
   const commands = [...dynamicCommands.flat(), ...builtInCommands()];
+
+  // Plugin skills are registered both as plugin-scoped commands
+  // (`plugin:skill`) and as local skills (`skill`) when the plugin root is
+  // inside the workspace. Drop the local copy so the TUI shows one entry.
+  const pluginScopedBaseNames = new Set<string>();
+  for (const command of commands) {
+    if (command.source === "plugin" && command.name.includes(":")) {
+      const baseName = command.name.split(":").pop();
+      if (baseName !== undefined && baseName.length > 0) {
+        pluginScopedBaseNames.add(baseName);
+      }
+    }
+  }
+
   const seen = new Set<string>();
   return commands.filter(command => {
     if (!isCommandEnabled(command)) return false;
     const key = command.name.toLowerCase();
     if (seen.has(key)) return false;
+    if (
+      command.loadedFrom === "plugin" &&
+      command.source !== "plugin" &&
+      pluginScopedBaseNames.has(command.name)
+    ) {
+      return false;
+    }
     seen.add(key);
     return true;
   });

@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1400,11 +1400,13 @@ describe("plugin loader", () => {
       const workspaceRoot = join(root, "workspace");
       const userPlugin = join(agencHome, "plugins", "user");
       const workspacePlugin = join(workspaceRoot, ".agents", "plugins", "workspace");
+      const workspacePluginsDirPlugin = join(workspaceRoot, "plugins", "workspace-plugins");
       const configuredPlugin = join(workspaceRoot, "vendor", "configured");
       const disabledPlugin = join(workspaceRoot, "vendor", "disabled");
       for (const [name, pluginRoot] of [
         ["user", userPlugin],
         ["workspace", workspacePlugin],
+        ["workspace-plugins", workspacePluginsDirPlugin],
         ["configured", configuredPlugin],
         ["disabled", disabledPlugin],
       ] as const) {
@@ -1439,17 +1441,75 @@ describe("plugin loader", () => {
         },
       });
 
-      expect(roots.map((entry) => entry.path).sort()).toEqual([
-        configuredPlugin,
-        disabledPlugin,
-        userPlugin,
-        workspacePlugin,
-      ].sort());
-      expect(skillRoots.sort()).toEqual([
-        join(configuredPlugin, "skills"),
-        join(userPlugin, "skills"),
-        join(workspacePlugin, "skills"),
-      ].sort());
+      const expectedRoots = await Promise.all([
+        realpath(configuredPlugin),
+        realpath(disabledPlugin),
+        realpath(userPlugin),
+        realpath(workspacePlugin),
+        realpath(workspacePluginsDirPlugin),
+      ]);
+      expect(roots.map((entry) => entry.path).sort()).toEqual(expectedRoots.sort());
+      const expectedSkillRoots = await Promise.all([
+        realpath(join(configuredPlugin, "skills")),
+        realpath(join(userPlugin, "skills")),
+        realpath(join(workspacePlugin, "skills")),
+        realpath(join(workspacePluginsDirPlugin, "skills")),
+      ]);
+      expect(skillRoots.sort()).toEqual(expectedSkillRoots.sort());
+    });
+  });
+
+  test("discovers workspace plugins from the git root when running in a subdirectory", async () => {
+    await withTempDir(async (root) => {
+      const agencHome = join(root, "home");
+      const gitRoot = join(root, "repo");
+      const workspaceRoot = join(gitRoot, "runtime");
+      const repoPlugin = join(gitRoot, "plugins", "zeroday-hunter");
+      await mkdir(join(gitRoot, ".git"), { recursive: true });
+      await mkdir(workspaceRoot, { recursive: true });
+      await writePluginManifest(repoPlugin, { name: "zeroday-hunter" });
+      await writeFileAt(join(repoPlugin, "skills", "zeroday-hunter", "SKILL.md"), "---\nname: x\n---\n");
+
+      const roots = await discoverPluginRoots({
+        agencHome,
+        workspaceRoot,
+        config: { plugins: { enabled: true } },
+      });
+      const skillRoots = await discoverPluginSkillRoots({
+        agencHome,
+        workspaceRoot,
+        config: { plugins: { enabled: true } },
+      });
+
+      expect(roots.map((entry) => entry.path)).toContain(await realpath(repoPlugin));
+      expect(skillRoots).toContain(await realpath(join(repoPlugin, "skills")));
+    });
+  });
+
+  test("discovers workspace plugins from a git worktree root", async () => {
+    await withTempDir(async (root) => {
+      const agencHome = join(root, "home");
+      const gitRoot = join(root, "repo");
+      const workspaceRoot = join(gitRoot, "runtime");
+      const repoPlugin = join(gitRoot, "plugins", "zeroday-hunter");
+      await writeFileAt(join(gitRoot, ".git"), "gitdir: /tmp/fake-gitdir\n");
+      await mkdir(workspaceRoot, { recursive: true });
+      await writePluginManifest(repoPlugin, { name: "zeroday-hunter" });
+      await writeFileAt(join(repoPlugin, "skills", "zeroday-hunter", "SKILL.md"), "---\nname: x\n---\n");
+
+      const roots = await discoverPluginRoots({
+        agencHome,
+        workspaceRoot,
+        config: { plugins: { enabled: true } },
+      });
+      const skillRoots = await discoverPluginSkillRoots({
+        agencHome,
+        workspaceRoot,
+        config: { plugins: { enabled: true } },
+      });
+
+      expect(roots.map((entry) => entry.path)).toContain(await realpath(repoPlugin));
+      expect(skillRoots).toContain(await realpath(join(repoPlugin, "skills")));
     });
   });
 
