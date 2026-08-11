@@ -244,7 +244,12 @@ function createPluginCommand(
     frontmatter.allowedTools ??
     metadata?.allowedTools;
   const argNames = splitList(frontmatter.arguments ?? frontmatter.argNames);
-  const aliases = namespacedAliases(plugin.name, splitList(frontmatter.aliases));
+  const baseAliases = namespacedAliases(plugin.name, splitList(frontmatter.aliases));
+  const commandBaseName = commandName.split(":").pop();
+  const aliases = commandBaseName === plugin.name &&
+      baseAliases?.includes(commandBaseName) !== true
+    ? [...(baseAliases ?? []), commandBaseName]
+    : baseAliases;
   const userInvocable =
     frontmatter["user-invocable"] === undefined
       ? true
@@ -259,7 +264,7 @@ function createPluginCommand(
     type: "prompt",
     name: commandName,
     description,
-    ...(aliases !== undefined ? { aliases } : {}),
+    ...(aliases !== undefined && aliases.length > 0 ? { aliases } : {}),
     argumentHint: coerceString(frontmatter["argument-hint"] ?? frontmatter.argumentHint),
     argNames: argNames.length > 0 ? argNames : undefined,
     allowedTools: repositoryControlled

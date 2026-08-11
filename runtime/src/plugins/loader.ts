@@ -395,6 +395,23 @@ async function installedPluginDependencyIdentity(pluginRoot: string): Promise<st
   return pluginDependencyIdentityFromSource(metadata.source);
 }
 
+async function findGitRepoRoot(start: string): Promise<string | undefined> {
+  let current = resolve(start);
+  for (;;) {
+    try {
+      // In worktrees `.git` is a file, in regular checkouts it is a directory.
+      // Either way, its presence marks the project root for plugin discovery.
+      await stat(join(current, ".git"));
+      return current;
+    } catch {
+      // Continue walking.
+    }
+    const parent = resolve(current, "..");
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
 export async function discoverPluginRoots(
   options: PluginLoaderOptions,
 ): Promise<readonly DiscoveredPluginRoot[]> {
@@ -402,6 +419,11 @@ export async function discoverPluginRoots(
   const autoDiscoveryEnabled = pluginAutoDiscoveryEnabled(options.config);
   const featureEnabled = pluginFeatureEnabled(options.config);
   const roots: DiscoveredPluginRoot[] = [];
+  const gitRoot = await findGitRepoRoot(options.workspaceRoot);
+  const workspacePluginDirs = [join(options.workspaceRoot, "plugins")];
+  if (gitRoot !== undefined && gitRoot !== options.workspaceRoot) {
+    workspacePluginDirs.push(join(gitRoot, "plugins"));
+  }
   roots.push(
     ...(await discoverRootsUnder(
       join(options.agencHome, "plugins"),
@@ -418,6 +440,17 @@ export async function discoverPluginRoots(
       enabled: root.enabled && autoDiscoveryEnabled,
     })),
   );
+  for (const workspacePluginDir of workspacePluginDirs) {
+    roots.push(
+      ...(await discoverRootsUnder(
+        workspacePluginDir,
+        "repository-controlled",
+      )).map((root) => ({
+        ...root,
+        enabled: root.enabled && autoDiscoveryEnabled,
+      })),
+    );
+  }
 
   for (const [key, value] of Object.entries(configured).sort(([a], [b]) => a.localeCompare(b))) {
     const path = configEntryPath(value);
