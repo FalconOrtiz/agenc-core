@@ -245,6 +245,7 @@ describe("cost helpers", () => {
     // DEFAULT_UNKNOWN_MODEL_COST. Since DEFAULT_MODEL_COSTS feeds dollar_cap
     // enforcement, mispricing here enforces budgets at the wrong threshold.
     const nonReasoningModels = [
+      "grok-4.6",
       "grok-4.5",
       "grok-4.3",
       "grok-build-0.1",
@@ -293,7 +294,7 @@ describe("cost helpers", () => {
 
     // The grok provider default specifically must be a known cost.
     const defaultModel = BUILT_IN_PROVIDER_DEFAULT_MODELS.grok;
-    expect(defaultModel).toBe("grok-4.5");
+    expect(defaultModel).toBe("grok-4.6");
     expect(
       resolveModelCostEntry(
         { model: defaultModel, provider: "grok" },

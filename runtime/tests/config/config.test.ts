@@ -85,7 +85,7 @@ describe("schema: defaultConfig", () => {
   test("returns frozen snapshot with sane defaults", () => {
     const cfg = defaultConfig();
     expect(cfg.configVersion).toBe(CURRENT_CONFIG_FILE_VERSION);
-    expect(cfg.model).toBe("grok-4.5");
+    expect(cfg.model).toBe("grok-4.6");
     expect(cfg.model_provider).toBe("grok");
     expect(resolveProviderSelection({ config: cfg })).toBe("grok");
     expect(cfg.approval_policy).toBe("on-request");
@@ -1540,7 +1540,7 @@ describe("loader: loadConfig", () => {
   test("missing file returns defaults with exists:false", async () => {
     const out = await loadConfig({ home: dir });
     expect(out.exists).toBe(false);
-    expect(out.config.model).toBe("grok-4.5");
+    expect(out.config.model).toBe("grok-4.6");
   });
 
   test("corrupt TOML warns + falls back to defaults with parseError set", async () => {
@@ -1550,7 +1550,7 @@ describe("loader: loadConfig", () => {
     expect(out.exists).toBe(true);
     expect(out.parseError).toBeTruthy();
     expect(warnings.length).toBeGreaterThan(0);
-    expect(out.config.model).toBe("grok-4.5"); // defaulted
+    expect(out.config.model).toBe("grok-4.6"); // defaulted
   });
 
   test("valid TOML merges onto defaults", async () => {

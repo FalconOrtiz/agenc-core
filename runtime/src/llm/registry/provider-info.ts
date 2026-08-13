@@ -50,7 +50,7 @@ const DEFAULT_REQUEST_MAX_RETRIES = 4;
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;
 
 export const BUILT_IN_PROVIDER_DEFAULT_MODELS = Object.freeze({
-  grok: "grok-4.5",
+  grok: "grok-4.6",
   openai: "gpt-5",
   anthropic: "claude-opus-4-7",
   ollama: "llama3.3",
