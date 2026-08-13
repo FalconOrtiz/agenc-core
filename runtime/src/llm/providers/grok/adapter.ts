@@ -146,6 +146,8 @@ type ProviderFallbackWaitDecision = Extract<
  * client function tools on that family (built-ins + remote MCP only).
  */
 const VISION_MODELS_WITH_TOOLS = new Set([
+  "grok-4.6",
+  "grok-4.6-latest",
   "grok-4.5",
   "grok-4.5-latest",
   "grok-4-0709",

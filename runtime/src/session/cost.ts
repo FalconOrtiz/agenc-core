@@ -245,6 +245,12 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     // grok-4.3 is the grok provider default (provider-info.ts); pricing these
     // explicitly stops the blanket grok-4* → reasoning collapse from charging
     // them the reasoning rate and skewing dollar_cap budget enforcement.
+    // grok-4.6 bills at the SAME rate as 4.5 below 200k prompt tokens
+    // ($2 in / $0.50 cached / $6 out per 1M). Above 200k xAI doubles it
+    // ($4 / $1 / $12); this table has no prompt-size tier, so a >200k turn is
+    // under-counted. Under-counting is the deliberate side to err on — the
+    // alternative trips dollar_cap budgets early on every short turn.
+    ...grokCostAliases("grok-4.6", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.5", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.3", COST_TIER_GROK_4X_NON_REASONING),
     ...grokCostAliases("grok-build-0.1", COST_TIER_GROK_4X_NON_REASONING),

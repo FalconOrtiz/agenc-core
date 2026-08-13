@@ -77,9 +77,12 @@ describe("xAI model options", () => {
 
     const options = getModelOptions(false);
     // The grok picker is derived from REGISTERED_MODEL_CATALOG, with the
-    // current frontier model leading the older catalog entries.
+    // current frontier model leading the older catalog entries. grok-4.6
+    // leads as the newest; the DEFAULT stays grok-4.5 (asserted above) —
+    // listing a model and defaulting to it are separate decisions.
     expect(options.map((option) => option.value)).toEqual([
       null,
+      "grok-4.6",
       "grok-4.5",
       "grok-build-0.1",
       "grok-4.3",

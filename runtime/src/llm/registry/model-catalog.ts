@@ -81,6 +81,17 @@ const GROK_REASONING_LEVELS = Object.freeze([
   "medium",
   "high",
 ] as const satisfies readonly ReasoningEffort[]);
+/**
+ * Grok 4.6 adds `xhigh` on top of the levels every earlier Grok exposes.
+ * Reusing GROK_REASONING_LEVELS would silently drop the level xAI documents,
+ * leaving the highest effort tier unreachable from the picker.
+ */
+const GROK_4_6_REASONING_LEVELS = Object.freeze([
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+] as const satisfies readonly ReasoningEffort[]);
 const GROK_MULTI_AGENT_REASONING_LEVELS = Object.freeze([
   "low",
   "medium",
@@ -260,6 +271,27 @@ export const REGISTERED_MODEL_CATALOG: readonly RegisteredModelCatalogEntry[] =
       additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
       priority: 29,
       visibility: "hide",
+    },
+    {
+      provider: "grok",
+      model: "grok-4.6",
+      displayName: "Grok 4.6",
+      contextWindow: 500_000,
+      maxContextWindow: 500_000,
+      inputModalities: TEXT_IMAGE_MODALITIES,
+      supportsToolUse: true,
+      supportsParallelToolCalls: true,
+      supportsStructuredOutput: true,
+      supportsSearchTool: true,
+      supportsVerbosity: false,
+      webSearchToolType: "none",
+      supportsReasoningSummaries: false,
+      defaultReasoningSummary: "none",
+      supportedReasoningLevels: GROK_4_6_REASONING_LEVELS,
+      defaultReasoningLevel: "high",
+      additionalSpeedTiers: NO_ADDITIONAL_SPEED_TIERS,
+      priority: 29,
+      visibility: "list",
     },
     {
       provider: "grok",

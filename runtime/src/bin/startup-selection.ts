@@ -16,7 +16,7 @@ import type { AgenCConfig } from "../config/schema.js";
 import { tokenizeCliOptionRegion } from "./cli-option-region.js";
 import { extractFlagValue } from "./route.js";
 
-const DEFAULT_MODEL = "grok-4.5";
+const DEFAULT_MODEL = "grok-4.6";
 
 export const PROVIDER_MODEL_CATALOG = BUILT_IN_PROVIDER_MODEL_CATALOG;
 

@@ -1993,7 +1993,7 @@ describe("createProvider", () => {
       () => createProvider("grok", { apiKey: "test-key" }),
     );
 
-    expect(readProviderFactoryOptions(provider).model).toBe("grok-4.5");
+    expect(readProviderFactoryOptions(provider).model).toBe("grok-4.6");
   });
 
   test("'openai' without apiKey throws explanatory error", () => {
