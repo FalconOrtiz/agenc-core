@@ -192,7 +192,10 @@ describe("model SoT: grok-4.3 context window is consistent (1M everywhere)", () 
 
 describe("model SoT: grok-4.5", () => {
   it("is listed with its official context and reasoning controls", async () => {
-    expect(deriveFlatCatalog().grok[0]).toBe(GROK_45);
+    // grok-4.6 now leads the grok list; 4.5 stays catalogued right behind it
+    // with its own official context and reasoning controls, which is what this
+    // case is about.
+    expect(deriveFlatCatalog().grok).toContain(GROK_45);
     expect(BUILT_IN_PROVIDER_MODEL_CATALOG.grok).toContain(GROK_45);
 
     const adapter = await resolveContextWindowProfile({
