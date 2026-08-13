@@ -56,7 +56,20 @@ type UsableNeovim = Extract<NeovimDiscoveryResult, { readonly usable: true }>;
 let dir: string;
 let neovim: UsableNeovim;
 
-const REAL_NEOVIM_STARTUP_TIMEOUT_MS = 20_000;
+/**
+ * Ceiling on embedded-Neovim startup.
+ *
+ * This bound exists to catch a hung Neovim, not to assert how fast a machine
+ * boots one. A hosted macOS ARM runner has been observed exceeding 20s just to
+ * attach the embedded UI, and it took down a DIFFERENT test on each attempt --
+ * one that had passed in 718ms on the run before. A fixed bound turns runner
+ * variance into red PRs on healthy changes, which trains reviewers to ignore
+ * the only gate this repository has. Kept as a pinned literal rather than made
+ * configurable: reproducible-build.test.ts asserts this exact line so the
+ * hosted lanes cannot drift, and an env override would reintroduce precisely
+ * the drift that contract exists to prevent.
+ */
+const REAL_NEOVIM_STARTUP_TIMEOUT_MS = 60_000;
 
 function startEmbeddedNeovim(
   options: StartEmbeddedNeovimOptions,
@@ -561,7 +574,7 @@ describe("real embedded Neovim lifecycle", () => {
       workspaceRoot: dir,
       agencHome,
       beforeOpenFile,
-      startupTimeoutMs: 20_000,
+      startupTimeoutMs: REAL_NEOVIM_STARTUP_TIMEOUT_MS,
       size: { rows: 4, columns: 32 },
       onSnapshot: () => {},
       onError: (error) => {
@@ -600,7 +613,7 @@ describe("real embedded Neovim lifecycle", () => {
       workspaceRoot: dir,
       agencHome,
       beforeOpenFile,
-      startupTimeoutMs: 20_000,
+      startupTimeoutMs: REAL_NEOVIM_STARTUP_TIMEOUT_MS,
       size: { rows: 4, columns: 32 },
       onSnapshot: () => {},
       onRecoveryDetected: (event) => recoveryEvents.push(event),

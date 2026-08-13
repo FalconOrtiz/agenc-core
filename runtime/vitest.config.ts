@@ -619,7 +619,18 @@ export function createAgenCVitestConfig(mode: AgenCVitestMode = "default") {
       // Default mode strips ambient credentials/state and installs the public
       // network tripwire before test modules load. Live mode has no setup.
       ...discovery,
-      testTimeout: 30000,
+      // The real-Neovim lane boots an actual editor per test on hosted runners
+      // whose speed varies by more than an order of magnitude. At the shared
+      // 30s the per-test timeout fires BEFORE the suite's own startup bound,
+      // replacing "Embedded Neovim startup timed out" with an opaque "Test
+      // timed out" and hiding which stage was slow. The startup bound has to
+      // stay the tighter of the two to remain the diagnostic.
+      // The PowerShell lane has the same disease in milder form: its bounded
+      // HTTPS trust case does real I/O and has been observed finishing at
+      // 30,159ms against the 30,000ms bound -- 159ms over, on a run whose only
+      // diff was a comment in this file. Neither lane is asserting speed.
+      testTimeout:
+        mode === "neovim" ? 120_000 : mode === "powershell" ? 90_000 : 30_000,
       deps: {
         interopDefault: true,
       },
