@@ -1133,6 +1133,51 @@ describe.skipIf(process.platform === "win32")("install.sh", () => {
     };
   }
 
+  test("resolve_system_tool accepts the platform's stock tools, including hardlinked ones", () => {
+    // Regression: the resolver required nlink === 1, but macOS ships
+    // /usr/bin/unzip and /usr/bin/zipinfo as two names for a single inode, so
+    // the stock unzip reports nlink 2 and no user can change it (/usr/bin is
+    // immutable under SIP). Every macOS install therefore failed at provenance
+    // verification, because the pinned gh archive is a zip on darwin while
+    // Linux takes the tar branch and never exercised this path.
+    const script = readFileSync(INSTALL_SH, "utf8");
+    const start = script.indexOf("resolve_system_tool() {");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = script.indexOf("\n}\n", start);
+    expect(end).toBeGreaterThan(start);
+    const probe = join(work, "resolve-system-tool.sh");
+    writeFileSync(
+      probe,
+      `${script.slice(start, end + 3)}\nresolve_system_tool "$@"\n`,
+    );
+
+    // Every stock system tool the installer depends on must resolve on the
+    // host it is running on, whatever its link count happens to be.
+    for (const tool of ["tar", "unzip"]) {
+      const candidates = [`/usr/bin/${tool}`, `/bin/${tool}`].filter(
+        (candidate) => {
+          if (!existsSync(candidate)) return false;
+          const stats = lstatSync(candidate);
+          return stats.isFile() && stats.uid === 0;
+        },
+      );
+      // A host without a root-owned copy of the tool has nothing to assert.
+      if (candidates.length === 0) continue;
+
+      const result = spawnSync("sh", [probe, ...candidates], {
+        encoding: "utf8",
+      });
+      expect(
+        result.status,
+        `${tool} must resolve; the installer needs it for official provenance ` +
+          `verification (link counts: ${candidates
+            .map((c) => `${c}=${lstatSync(c).nlink}`)
+            .join(", ")})`,
+      ).toBe(0);
+      expect(candidates).toContain(result.stdout.trim());
+    }
+  });
+
   test("fresh install: downloads, verifies, extracts, writes marker + working wrapper", () => {
     const home = join(work, "home");
     mkdirSync(home, { recursive: true });
@@ -2890,7 +2935,25 @@ test("official standalone paths pin gh and bind Sigstore verification to the sou
   expect(powershell).toContain('$env:DO_NOT_TRACK = "1"');
   expect(powershell).toContain('$env:GH_SPINNER_DISABLED = "1"');
   expect(shell).not.toContain("command -v gh");
-  expect(shell).toContain("file.nlink !== 1");
+  // Single-link is required of every artifact the installer downloads into its
+  // own private tree: it creates those files, so a second link is a genuine
+  // TOCTOU signal and must keep failing closed.
+  expect(shell.match(/nlink !== 1n/gu)).toHaveLength(4);
+  // It is deliberately NOT required of stock system tools. macOS and Linux both
+  // ship /usr/bin/unzip and /usr/bin/zipinfo as two names for one inode, so a
+  // legitimate system unzip reports nlink 2 and no user can change it under
+  // SIP. Requiring one link here failed every macOS install at provenance
+  // verification, since the pinned gh archive is a zip on darwin. Root
+  // ownership plus a fully root-owned, non-group/other-writable parent chain
+  // is what buys the guarantee; re-adding a link count would break macOS again.
+  const resolver = shell.slice(
+    shell.indexOf("resolve_system_tool() {"),
+    shell.indexOf("\n}\n", shell.indexOf("resolve_system_tool() {")),
+  );
+  // Matches a link-count rejection, not the comment explaining why there is none.
+  expect(resolver).not.toMatch(/nlink\s*!==/u);
+  expect(resolver).toContain("file.uid !== 0");
+  expect(resolver).toContain("metadata.uid !== 0");
   expect(shell).toContain("(file.mode & 0o022) !== 0");
   expect(powershell).not.toContain("Get-Command gh");
 });
