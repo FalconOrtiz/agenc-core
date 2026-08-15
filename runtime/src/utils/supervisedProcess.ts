@@ -86,6 +86,26 @@ export interface SupervisedProcessResult {
 const DEFAULT_TERMINATE_GRACE_MS = 500;
 const DEFAULT_SETTLE_BACKSTOP_MS = 1_000;
 const PROCESS_TREE_POLL_INTERVAL_MS = 20;
+/**
+ * How long a Linux-cgroup member still visible when the leader closes is given
+ * to finish exiting before it counts as residue.
+ *
+ * The leader's `close` fires once its own stdio is done and it has been reaped,
+ * which says nothing about a helper it spawned moments earlier: that helper can
+ * still populate the cgroup while it tears itself down. On a loaded machine
+ * that gap widens enough to be observed routinely, so an instantaneous look
+ * reports residue for a tree that is already on its way out. A real leak is
+ * still inside the cgroup when this window closes -- containment guarantees it
+ * cannot slip away unseen -- so the distinction costs nothing but a bounded
+ * wait, paid only when anything is alive at close at all.
+ *
+ * This window applies ONLY to the cgroup boundary. The other containment
+ * paths either report residue authoritatively (Linux subreaper, Windows job)
+ * or can observe it only in the instant of close (the darwin POSIX gate
+ * settles its own process group during teardown), so they classify
+ * synchronously; waiting there erases the signal instead of de-noising it.
+ */
+const RESIDUAL_SETTLE_WINDOW_MS = 250;
 const PROCESS_TABLE_TIMEOUT_MS = 2_000;
 const MAX_PROCESS_TABLE_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_TABLE_RECORDS = 32_768;
@@ -1655,14 +1675,74 @@ export function runSupervisedProcess(
       exitCode = code;
       exitSignal = signal;
       closed = true;
-      if (stopReason === undefined) {
-        if (linuxSubreaperBoundaries.get(child)?.residual === true) {
-          stopReason = "residual_process";
-        } else if (isProcessTreeAlive(child)) {
+      if (stopReason !== undefined) {
+        maybeFinish();
+        return;
+      }
+      // An authoritative boundary already decided; no need to observe again.
+      if (linuxSubreaperBoundaries.get(child)?.residual === true) {
+        stopReason = "residual_process";
+        maybeFinish();
+        return;
+      }
+      // The settle window below is safe only where liveness at close and
+      // liveness moments later answer the same question. That holds for the
+      // Linux cgroup boundary alone: it is authoritative containment, so a
+      // member seen at close that is gone shortly after really did finish
+      // exiting on its own. Every other path must classify in the instant of
+      // close. The darwin POSIX gate settles its own process group as it
+      // tears down, so there the residue is visible ONLY at that instant --
+      // waiting out the gate's cleanup reads a genuine leak as a clean tree
+      // (observed: the red-probe audit exiting 0 over a lingering
+      // descendant). Windows job objects likewise decide synchronously.
+      if (!linuxCgroupBoundaries.has(child)) {
+        if (isProcessTreeAlive(child)) {
           requestStop("residual_process");
         }
+        maybeFinish();
+        return;
       }
-      maybeFinish();
+      if (!isProcessTreeAlive(child)) {
+        maybeFinish();
+        return;
+      }
+      // A cgroup member is alive right now. Let it settle before calling it
+      // residue: git and similar leaders routinely outlive a helper by a few
+      // scheduler quanta, and on a loaded machine that gap is observed
+      // routinely. Deciding at this instant reports a leak for a helper that
+      // is already exiting, which surfaced as exit=0 commits classified
+      // residual_process under CI contention.
+      //
+      // The timer stays REFERENCED deliberately. After `close`, a standalone
+      // runner may have nothing else on its event loop; an unref'd timer then
+      // never fires and the process exits without any verdict at all. The
+      // reference is bounded by the deadline below, so it can prolong the
+      // process by at most the settle window plus one poll.
+      const settleDeadline = Date.now() + RESIDUAL_SETTLE_WINDOW_MS;
+      let quietPolls = 0;
+      const settleTimer = setInterval(() => {
+        if (stopReason !== undefined) {
+          clearInterval(settleTimer);
+          return;
+        }
+        if (!isProcessTreeAlive(child)) {
+          // Two consecutive quiet polls, so a single anomalous read of
+          // cgroup.procs cannot turn a live member into a clean exit; a tree
+          // that is genuinely done stays quiet for both.
+          quietPolls += 1;
+          if (quietPolls >= 2) {
+            clearInterval(settleTimer);
+            maybeFinish();
+          }
+          return;
+        }
+        quietPolls = 0;
+        if (Date.now() >= settleDeadline) {
+          clearInterval(settleTimer);
+          requestStop("residual_process");
+          maybeFinish();
+        }
+      }, PROCESS_TREE_POLL_INTERVAL_MS);
     });
   });
 }
