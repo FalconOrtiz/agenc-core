@@ -23,6 +23,8 @@ import { sanitizeSandboxLauncherEnvironment } from "../launcher-environment.js";
 
 const BUBBLEWRAP_HELP_PROBE_TIMEOUT_MS = 3_000;
 const BUBBLEWRAP_HELP_PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+const BUBBLEWRAP_NAMESPACE_PROBE_TIMEOUT_MS = 3_000;
+const BUBBLEWRAP_NAMESPACE_PROBE_MAX_OUTPUT_BYTES = 64 * 1024;
 
 export interface BubblewrapLauncher {
   readonly program: string;
@@ -30,28 +32,93 @@ export interface BubblewrapLauncher {
   readonly supportsBindFd?: boolean;
 }
 
+export interface BubblewrapNamespaceProbeResult {
+  readonly ok: boolean;
+  readonly diagnostic: string;
+}
+
+export interface PreferredBubblewrapLauncherOptions {
+  readonly searchPath?: string;
+  readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly trustedDirectories?: readonly string[];
+  readonly probeArgv0?: (program: string) => boolean;
+  /** Require the outer launcher's user/pid/network namespace rung to work. */
+  readonly requireNamespaces?: boolean;
+}
+
 export interface SpawnBubblewrapOptions extends SpawnOptions {
   readonly seccompMode?: NetworkSeccompMode | null;
   readonly inheritedCwdFd?: number;
 }
 
-export function preferredBubblewrapLauncher(options: {
-  readonly searchPath?: string;
-  readonly cwd?: string;
-  readonly trustedDirectories?: readonly string[];
-  readonly probeArgv0?: (program: string) => boolean;
-} = {}): BubblewrapLauncher | null {
+export function preferredBubblewrapLauncher(
+  options: PreferredBubblewrapLauncherOptions = {},
+): BubblewrapLauncher | null {
+  const cwd = options.cwd ?? process.cwd();
+  const env = options.env ?? process.env;
   const program = findSystemBubblewrapInPath(
-    options.searchPath ?? process.env["PATH"],
-    options.cwd ?? process.cwd(),
+    options.searchPath ?? env["PATH"],
+    cwd,
     options.trustedDirectories,
   );
   if (program === null) return null;
+  if (
+    options.requireNamespaces === true &&
+    !probeSystemBubblewrapNamespaces(program, env, cwd).ok
+  ) {
+    return null;
+  }
   const probe = options.probeArgv0 ?? systemBubblewrapSupportsArgv0;
   return {
     program,
     supportsArgv0: probe(program),
     supportsBindFd: systemBubblewrapSupportsBindFd(program),
+  };
+}
+
+/**
+ * Exercise the namespace set required by the outer sandbox stage. `--help`
+ * alone is not sufficient: AppArmor and container policy can allow discovery
+ * while denying namespace creation at launch time.
+ */
+export function probeSystemBubblewrapNamespaces(
+  program: string,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+): BubblewrapNamespaceProbeResult {
+  const result = spawnSync(
+    program,
+    [
+      "--die-with-parent",
+      "--unshare-user",
+      "--unshare-pid",
+      "--unshare-net",
+      "--ro-bind",
+      "/",
+      "/",
+      "--",
+      "/bin/true",
+    ],
+    {
+      cwd,
+      env: sanitizeSandboxLauncherEnvironment(env),
+      encoding: "utf8",
+      killSignal: "SIGKILL",
+      maxBuffer: BUBBLEWRAP_NAMESPACE_PROBE_MAX_OUTPUT_BYTES,
+      timeout: BUBBLEWRAP_NAMESPACE_PROBE_TIMEOUT_MS,
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
+  if (result.error === undefined && result.status === 0) {
+    return { ok: true, diagnostic: "" };
+  }
+  return {
+    ok: false,
+    diagnostic:
+      result.error?.message ??
+      result.stderr ??
+      `exit status ${String(result.status)}`,
   };
 }
 
