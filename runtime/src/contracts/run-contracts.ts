@@ -64,6 +64,125 @@ export interface RunTerminalResult {
   readonly finishedAt: string;
 }
 
+/** Internal lifecycle reasons are protocol values, never caller prose. */
+export const RUN_SUSPENSION_REASONS = ["daemon_shutdown_idle"] as const;
+export type RunSuspensionReason = (typeof RUN_SUSPENSION_REASONS)[number];
+
+export const RUN_RESUME_REASONS = [
+  "daemon_startup_restore",
+  "explicit_continue",
+] as const;
+export type RunResumeReason = (typeof RUN_RESUME_REASONS)[number];
+
+/**
+ * A daemon-owned writer may relinquish an otherwise-open run while it is
+ * provably idle. Suspension is deliberately not a terminal result: the run
+ * keeps the same epoch and may be resumed only by a matching durable
+ * `run_resumed` boundary. Cancelled and unknown-outcome terminal epochs remain
+ * permanently outside this state machine.
+ */
+export interface RunSuspendedBoundary {
+  readonly runId: RunId;
+  readonly epoch: number;
+  readonly eventId: string;
+  readonly reason: RunSuspensionReason;
+  readonly suspendedAt: string;
+}
+
+export interface RunResumedBoundary {
+  readonly runId: RunId;
+  readonly epoch: number;
+  readonly eventId: string;
+  readonly suspensionEventId: string;
+  readonly reason: RunResumeReason;
+  readonly resumedAt: string;
+}
+
+/**
+ * Canonical permission modes that may govern a root daemon session. `bubble`
+ * is deliberately excluded: it is child-only authority and must never be
+ * revived onto a recovered root run.
+ */
+export const RUN_RUNTIME_PERMISSION_MODES = [
+  "default",
+  "plan",
+  "acceptEdits",
+  "bypassPermissions",
+  "dontAsk",
+  "auto",
+  "unattended",
+] as const;
+export type RunRuntimePermissionMode =
+  (typeof RUN_RUNTIME_PERMISSION_MODES)[number];
+
+export const RUN_RUNTIME_REASONING_EFFORTS = [
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "none",
+] as const;
+export type RunRuntimeReasoningEffort =
+  (typeof RUN_RUNTIME_REASONING_EFFORTS)[number];
+
+export const RUN_RUNTIME_MODEL_VERBOSITIES = ["low", "medium", "high"] as const;
+export type RunRuntimeModelVerbosity =
+  (typeof RUN_RUNTIME_MODEL_VERBOSITIES)[number];
+
+export const RUN_RUNTIME_SERVICE_TIERS = ["fast", "priority", "flex"] as const;
+export type RunRuntimeServiceTier = (typeof RUN_RUNTIME_SERVICE_TIERS)[number];
+
+/**
+ * Complete desired session overlay. It intentionally omits permission rules:
+ * those are recomputed from current trusted policy on recovery. A bypass
+ * authorization is retained only while it is transition-critical and is
+ * bound to the exact canonical workspace spelling.
+ */
+export interface RunRuntimeSettingsSnapshot {
+  readonly permissionMode: RunRuntimePermissionMode;
+  readonly prePlanMode: RunRuntimePermissionMode | null;
+  readonly autoModeActive: boolean;
+  readonly bypassPermissionsWorkspace: string | null;
+  readonly model: string;
+  readonly provider: string;
+  readonly profile: string | null;
+  readonly reasoningEffort: RunRuntimeReasoningEffort | null;
+  readonly modelVerbosity: RunRuntimeModelVerbosity | null;
+  readonly serviceTier: RunRuntimeServiceTier | null;
+  readonly hooksDisabled: boolean;
+}
+
+export const RUN_RUNTIME_SETTINGS_CHANGE_REASONS = [
+  "initial",
+  "permission_mode_changed",
+  "model_provider_changed",
+  "config_applied",
+  "hooks_changed",
+  "compensating_rollback",
+] as const;
+export type RunRuntimeSettingsChangeReason =
+  (typeof RUN_RUNTIME_SETTINGS_CHANGE_REASONS)[number];
+
+export interface RunRuntimeSettingsBoundary extends RunRuntimeSettingsSnapshot {
+  readonly runId: RunId;
+  readonly epoch: number;
+  readonly eventId: string;
+  readonly previousSettingsEventId: string | null;
+  /** Present only on an exact compensating rollback of the preceding event. */
+  readonly rollbackOfSettingsEventId: string | null;
+  readonly reason: RunRuntimeSettingsChangeReason;
+  readonly changedAt: string;
+}
+
+export interface RunStartupActivatedBoundary {
+  readonly runId: RunId;
+  readonly epoch: number;
+  readonly eventId: string;
+  readonly resumeEventId: string;
+  readonly activatedAt: string;
+}
+
 export interface RunUsageTotals {
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -192,8 +311,7 @@ export const EFFECT_REVIEW_ACTOR_KINDS = [
   "system_settlement",
   "operator",
 ] as const;
-export type EffectReviewActorKind =
-  (typeof EFFECT_REVIEW_ACTOR_KINDS)[number];
+export type EffectReviewActorKind = (typeof EFFECT_REVIEW_ACTOR_KINDS)[number];
 
 export const EFFECT_REVIEW_EVIDENCE_KINDS = [
   "provider_receipt",
@@ -224,9 +342,7 @@ export interface EffectNoEffectProof {
   readonly version: 1;
   readonly kind: "effect_no_effect_proof";
   readonly evidenceKind:
-    | "provider_receipt"
-    | "idempotency_lookup"
-    | "boundary_not_crossed";
+    "provider_receipt" | "idempotency_lookup" | "boundary_not_crossed";
   readonly evidenceRef: string;
   readonly evidenceSha256: string;
   readonly observedAt: string;
@@ -256,10 +372,7 @@ export interface EffectReviewResolution {
  */
 export interface ToolEffectDispositionEvidence {
   readonly disposition: EffectReviewDisposition;
-  readonly evidenceKind: Exclude<
-    EffectReviewEvidenceKind,
-    "operator_evidence"
-  >;
+  readonly evidenceKind: Exclude<EffectReviewEvidenceKind, "operator_evidence">;
   readonly evidenceRef: string;
   readonly evidenceSha256: string;
 }
@@ -442,10 +555,7 @@ export interface WorkflowSpec {
   /** Pinned reviewer configuration; resolved at intake, never re-resolved. */
   readonly reviewerModel: string;
   readonly permissionMode:
-    | "default"
-    | "plan"
-    | "acceptEdits"
-    | "bypassPermissions";
+    "default" | "plan" | "acceptEdits" | "bypassPermissions";
   readonly unattendedAllow?: readonly string[];
   readonly unattendedDeny?: readonly string[];
   readonly budget: {

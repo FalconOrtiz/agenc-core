@@ -58,7 +58,7 @@ describe("state migration registry", () => {
   it("loads state migrations from numbered migration files in order", () => {
     expect(STATE_DB_MIGRATIONS.map((migration) => migration.version)).toEqual([
       1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
-      22, 23, 24, 25, 26,
+      22, 23, 24, 25, 26, 27,
     ]);
     expect(STATE_DB_MIGRATIONS.map((migration) => migration.name)).toEqual([
       "initial_state_schema",
@@ -87,6 +87,7 @@ describe("state migration registry", () => {
       "compaction_transaction",
       "csv_output_writer_identity",
       "csv_output_orphan_accounting",
+      "run_suspension_schema",
     ]);
     expectMigrationVersionsAreUnique(STATE_DB_MIGRATIONS);
   });
@@ -131,6 +132,7 @@ describe("state migration registry", () => {
       "024_compaction_transaction.ts",
       "025_csv_output_writer_identity.ts",
       "026_csv_output_orphan_accounting.ts",
+      "027_run_suspension_schema.ts",
     ]);
   });
 
@@ -673,6 +675,8 @@ describe("state migration registry", () => {
         "run_recovery_deferred",
         "run_recovery_quarantine",
         "run_recovery_quarantine_observations",
+        "run_runtime_settings",
+        "run_suspensions",
         "run_terminal_results",
       ]);
       expect(tables).not.toContain("run_journal_events");

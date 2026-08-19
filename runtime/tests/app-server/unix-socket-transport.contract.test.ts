@@ -4,7 +4,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createConnection, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { describe, expect, it, vi } from "vitest";
 import { JSON_RPC_VERSION } from "./protocol/index.js";
 import {
@@ -55,9 +55,11 @@ function hasNativePeerCredentialBuildInputs(): boolean {
   if (!includeCandidates.some((candidate) => existsSync(candidate))) {
     return false;
   }
-  return spawnSync("cc", ["--version"], {
-    stdio: "ignore",
-  }).status === 0;
+  return (
+    spawnSync("cc", ["--version"], {
+      stdio: "ignore",
+    }).status === 0
+  );
 }
 
 describe("AgenC Unix socket transport", () => {
@@ -106,70 +108,81 @@ describe("AgenC Unix socket transport", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  itUnix("fails closed before binding when a configured native addon cannot load", async () => {
-    const dir = await tempDir();
-    const socketPath = join(dir, "daemon.sock");
-    const server = new AgenCUnixSocketServer({
-      socketPath,
-      nativePeerCredentialAddonPath: join(dir, "missing.node"),
-      onMessage: () => {},
-    });
+  itUnix(
+    "fails closed before binding when a configured native addon cannot load",
+    async () => {
+      const dir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        nativePeerCredentialAddonPath: join(dir, "missing.node"),
+        onMessage: () => {},
+      });
 
-    await expect(server.listen()).rejects.toThrow(
-      /configured peer credential native binding unavailable/,
-    );
-    expect(existsSync(socketPath)).toBe(false);
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  itUnix("rejects conflicting configured and injected native bindings", async () => {
-    const dir = await tempDir();
-    const socketPath = join(dir, "daemon.sock");
-    const server = new AgenCUnixSocketServer({
-      socketPath,
-      nativePeerCredentialAddonPath: join(dir, "configured.node"),
-      nativePeerCredentialBinding: { getPeerUid: () => process.getuid?.() ?? 0 },
-      onMessage: () => {},
-    });
-
-    await expect(server.listen()).rejects.toThrow(/mutually exclusive/);
-    expect(existsSync(socketPath)).toBe(false);
-    await rm(dir, { recursive: true, force: true });
-  });
-
-  itUnix("closes accepted sockets when required native credentials return no uid", async () => {
-    const dir = await tempDir();
-    const socketPath = join(dir, "daemon.sock");
-    const onMessage = vi.fn();
-    const onError = vi.fn();
-    const onFatal = vi.fn();
-    const server = new AgenCUnixSocketServer({
-      socketPath,
-      nativePeerCredentialBinding: { getPeerUid: () => null },
-      requireNativePeerCredentialForConnections: true,
-      onError,
-      onRequiredNativePeerCredentialFailure: onFatal,
-      onMessage,
-    });
-
-    await server.listen();
-    try {
-      const client = createConnection(socketPath);
-      await once(client, "connect");
-      await expect(waitForSocketClose(client)).resolves.toBe("closed");
-      expect(onMessage).not.toHaveBeenCalled();
-      expect(onError).toHaveBeenCalledWith(
-        expect.objectContaining({
-          message: expect.stringContaining("could not identify"),
-        }),
-        1,
+      await expect(server.listen()).rejects.toThrow(
+        /configured peer credential native binding unavailable/,
       );
-      expect(onFatal).toHaveBeenCalledOnce();
-    } finally {
-      await server.close();
+      expect(existsSync(socketPath)).toBe(false);
       await rm(dir, { recursive: true, force: true });
-    }
-  });
+    },
+  );
+
+  itUnix(
+    "rejects conflicting configured and injected native bindings",
+    async () => {
+      const dir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        nativePeerCredentialAddonPath: join(dir, "configured.node"),
+        nativePeerCredentialBinding: {
+          getPeerUid: () => process.getuid?.() ?? 0,
+        },
+        onMessage: () => {},
+      });
+
+      await expect(server.listen()).rejects.toThrow(/mutually exclusive/);
+      expect(existsSync(socketPath)).toBe(false);
+      await rm(dir, { recursive: true, force: true });
+    },
+  );
+
+  itUnix(
+    "closes accepted sockets when required native credentials return no uid",
+    async () => {
+      const dir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const onMessage = vi.fn();
+      const onError = vi.fn();
+      const onFatal = vi.fn();
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        nativePeerCredentialBinding: { getPeerUid: () => null },
+        requireNativePeerCredentialForConnections: true,
+        onError,
+        onRequiredNativePeerCredentialFailure: onFatal,
+        onMessage,
+      });
+
+      await server.listen();
+      try {
+        const client = createConnection(socketPath);
+        await once(client, "connect");
+        await expect(waitForSocketClose(client)).resolves.toBe("closed");
+        expect(onMessage).not.toHaveBeenCalled();
+        expect(onError).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: expect.stringContaining("could not identify"),
+          }),
+          1,
+        );
+        expect(onFatal).toHaveBeenCalledOnce();
+      } finally {
+        await server.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   itUnix("accepts newline-delimited JSON over a Unix socket", async () => {
     const dir = await tempDir();
@@ -199,7 +212,9 @@ describe("AgenC Unix socket transport", () => {
 
     await server.listen();
     expect(existsSync(socketPath)).toBe(true);
-    await expect(resolveAgenCPrivateUnixSocketOwnerUid(socketPath)).resolves.toBe(
+    await expect(
+      resolveAgenCPrivateUnixSocketOwnerUid(socketPath),
+    ).resolves.toBe(
       typeof process.getuid === "function" ? process.getuid() : null,
     );
 
@@ -219,65 +234,71 @@ describe("AgenC Unix socket transport", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  itLinuxNative("loads native SO_PEERCRED from an accepted Unix socket", async () => {
-    const dir = await tempDir();
-    const cacheDir = await tempDir();
-    const socketPath = join(dir, "daemon.sock");
-    const binding = compileAndLoadAgenCNativePeerCredentialBinding({
-      cacheDir,
-      platform: "linux",
-    });
-    const server = new AgenCUnixSocketServer({
-      socketPath,
-      allowRuntimeNativePeerCredentialBuild: false,
-      nativePeerCredentialBinding: binding,
-      onMessage: async (_message, connection) => {
-        expect(connection.peerUid).toBe(process.getuid?.());
-        await connection.send({
-          jsonrpc: JSON_RPC_VERSION,
-          id: "native-peer",
-          result: { accepted: true },
-        });
-      },
-    });
+  itLinuxNative(
+    "loads native SO_PEERCRED from an accepted Unix socket",
+    async () => {
+      const dir = await tempDir();
+      const cacheDir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const binding = compileAndLoadAgenCNativePeerCredentialBinding({
+        cacheDir,
+        platform: "linux",
+      });
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        allowRuntimeNativePeerCredentialBuild: false,
+        nativePeerCredentialBinding: binding,
+        onMessage: async (_message, connection) => {
+          expect(connection.peerUid).toBe(process.getuid?.());
+          await connection.send({
+            jsonrpc: JSON_RPC_VERSION,
+            id: "native-peer",
+            result: { accepted: true },
+          });
+        },
+      });
 
-    await server.listen();
-    try {
-      const client = createConnection(socketPath);
-      await once(client, "connect");
-      client.write(
-        '{"jsonrpc":"2.0","id":"native-peer","method":"agent.list","params":{}}\n',
-      );
-      await expect(nextChunk(client)).resolves.toBe(
-        '{"jsonrpc":"2.0","id":"native-peer","result":{"accepted":true}}\n',
-      );
-      client.end();
-    } finally {
-      await server.close();
-      await rm(dir, { recursive: true, force: true });
-      await rm(cacheDir, { recursive: true, force: true });
-    }
-  });
+      await server.listen();
+      try {
+        const client = createConnection(socketPath);
+        await once(client, "connect");
+        client.write(
+          '{"jsonrpc":"2.0","id":"native-peer","method":"agent.list","params":{}}\n',
+        );
+        await expect(nextChunk(client)).resolves.toBe(
+          '{"jsonrpc":"2.0","id":"native-peer","result":{"accepted":true}}\n',
+        );
+        client.end();
+      } finally {
+        await server.close();
+        await rm(dir, { recursive: true, force: true });
+        await rm(cacheDir, { recursive: true, force: true });
+      }
+    },
+  );
 
-  itUnix("does not use non-private socket ownership as same-user proof", async () => {
-    const dir = await tempDir();
-    const socketPath = join(dir, "daemon.sock");
-    const server = new AgenCUnixSocketServer({
-      socketPath,
-      onMessage: () => {},
-    });
+  itUnix(
+    "does not use non-private socket ownership as same-user proof",
+    async () => {
+      const dir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        onMessage: () => {},
+      });
 
-    await server.listen();
-    try {
-      await chmod(dir, 0o755);
-      await expect(
-        resolveAgenCPrivateUnixSocketOwnerUid(socketPath),
-      ).resolves.toBeNull();
-    } finally {
-      await server.close();
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
+      await server.listen();
+      try {
+        await chmod(dir, 0o755);
+        await expect(
+          resolveAgenCPrivateUnixSocketOwnerUid(socketPath),
+        ).resolves.toBeNull();
+      } finally {
+        await server.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   itUnix("authenticates the first socket message before dispatch", async () => {
     const dir = await tempDir();
@@ -396,4 +417,42 @@ describe("AgenC Unix socket transport", () => {
     await server.close();
     await rm(dir, { recursive: true, force: true });
   });
+
+  itUnix(
+    "does not unlink a replacement socket bound while the old server closes",
+    async () => {
+      const dir = await tempDir();
+      const socketPath = join(dir, "daemon.sock");
+      const replacement = createServer((socket) => socket.end());
+      let replacementListening = false;
+      const server = new AgenCUnixSocketServer({
+        socketPath,
+        onMessage: () => {},
+        beforeSocketPathRemoval: async () => {
+          // Node normally unlinks the old Unix path as the server closes. Remove
+          // it explicitly as a portability fallback, then bind a new generation
+          // in the exact historical close -> cleanup interposition window.
+          await rm(socketPath, { force: true });
+          replacement.listen(socketPath);
+          await once(replacement, "listening");
+          replacementListening = true;
+        },
+      });
+
+      await server.listen();
+      try {
+        await server.close();
+        expect(replacementListening).toBe(true);
+        const client = createConnection(socketPath);
+        await once(client, "connect");
+        client.destroy();
+      } finally {
+        if (replacementListening) {
+          replacement.close();
+          await once(replacement, "close");
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });

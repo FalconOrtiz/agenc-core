@@ -126,13 +126,19 @@ describe("EventLog", () => {
           eventId: "duplicate",
           id: "first",
           seq: 1,
-          msg: { type: "warning", payload: { cause: "test", message: "first" } },
+          msg: {
+            type: "warning",
+            payload: { cause: "test", message: "first" },
+          },
         },
         {
           eventId: "duplicate",
           id: "second",
           seq: 2,
-          msg: { type: "warning", payload: { cause: "test", message: "second" } },
+          msg: {
+            type: "warning",
+            payload: { cause: "test", message: "second" },
+          },
         },
       ]),
     ).toThrow(/canonical rollout reuses eventId/);
@@ -143,7 +149,10 @@ describe("EventLog", () => {
       eventId,
       id,
       seq,
-      msg: { type: "warning" as const, payload: { cause: "test", message: id } },
+      msg: {
+        type: "warning" as const,
+        payload: { cause: "test", message: id },
+      },
     });
 
     expect(() =>
@@ -253,12 +262,7 @@ describe("EventLog", () => {
       seen.push(`compat:${published.seq}`);
     });
 
-    expect(seen).toEqual([
-      "listener:1",
-      "compat:1",
-      "listener:2",
-      "compat:2",
-    ]);
+    expect(seen).toEqual(["listener:1", "compat:1", "listener:2", "compat:2"]);
   });
 
   test("an owning emitter can converge legacy EventLog producers", () => {
@@ -368,8 +372,10 @@ describe("I-8 emitError helper", () => {
 
 describe("I-26 forward-compat + schema version", () => {
   test("KNOWN_EVENT_TYPES contains all known variants", () => {
-    expect(KNOWN_EVENT_TYPES.size).toBeGreaterThanOrEqual(24);
+    expect(KNOWN_EVENT_TYPES.size).toBe(82);
     expect(isKnownEventType("entered_review_mode")).toBe(true);
+    expect(isKnownEventType("run_suspended")).toBe(true);
+    expect(isKnownEventType("run_resumed")).toBe(true);
   });
 
   test("isKnownEventType detects known + unknown", () => {
@@ -477,64 +483,74 @@ describe("I-4 durable event classification", () => {
       recoveryCategory: "side-effecting" as const,
       recordedAt: "2026-07-18T00:00:00.000Z",
     };
-    expect(isDurableEvent({
-      id: "effect-intent-id",
-      msg: {
-        type: "effect_intent",
-        payload: { ...base, intentDigest: "a".repeat(64), attempt: 1 },
-      },
-    })).toBe(true);
-    expect(isDurableEvent({
-      id: "effect-result-id",
-      msg: {
-        type: "effect_result",
-        payload: { ...base, intentEventSeq: 7, outcome: "committed" },
-      },
-    })).toBe(true);
-    expect(isDurableEvent({
-      id: "effect-unknown-id",
-      msg: {
-        type: "effect_unknown_outcome",
-        payload: {
-          ...base,
-          intentEventSeq: 7,
-          outcome: "unknown_outcome",
-          reason: "lost_acknowledgement",
-          requiresReview: true,
+    expect(
+      isDurableEvent({
+        id: "effect-intent-id",
+        msg: {
+          type: "effect_intent",
+          payload: { ...base, intentDigest: "a".repeat(64), attempt: 1 },
         },
-      },
-    })).toBe(true);
+      }),
+    ).toBe(true);
+    expect(
+      isDurableEvent({
+        id: "effect-result-id",
+        msg: {
+          type: "effect_result",
+          payload: { ...base, intentEventSeq: 7, outcome: "committed" },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isDurableEvent({
+        id: "effect-unknown-id",
+        msg: {
+          type: "effect_unknown_outcome",
+          payload: {
+            ...base,
+            intentEventSeq: 7,
+            outcome: "unknown_outcome",
+            reason: "lost_acknowledgement",
+            requiresReview: true,
+          },
+        },
+      }),
+    ).toBe(true);
   });
 
   test("permission requests and decisions are durable audit boundaries", () => {
-    expect(isDurableEvent({
-      id: "permission-request",
-      msg: {
-        type: "request_permissions",
-        payload: {
-          callId: "call-1",
-          toolName: "Bash",
-          permissions: ["tool.use"],
-          turnId: "turn-1",
+    expect(
+      isDurableEvent({
+        id: "permission-request",
+        msg: {
+          type: "request_permissions",
+          payload: {
+            callId: "call-1",
+            toolName: "Bash",
+            permissions: ["tool.use"],
+            turnId: "turn-1",
+          },
         },
-      },
-    })).toBe(true);
-    expect(isDurableEvent({
-      id: "permission-decision",
-      msg: {
-        type: "permission_decision",
-        payload: {
-          runId: "run-1",
-          callId: "call-1",
-          toolName: "Bash",
-          turnId: "turn-1",
-          requestEventId: "event:7",
-          requestEventSeq: 7,
-          decision: "approved",
-          recordedAt: "2026-07-18T00:00:00.000Z",
+      }),
+    ).toBe(true);
+    expect(
+      isDurableEvent({
+        id: "permission-decision",
+        msg: {
+          type: "permission_decision",
+          payload: {
+            runId: "run-1",
+            callId: "call-1",
+            toolName: "Bash",
+            turnId: "turn-1",
+            requestEventId: "event:7",
+            requestEventSeq: 7,
+            decision: "approved",
+            recordedAt: "2026-07-18T00:00:00.000Z",
+          },
         },
-      },
-    })).toBe(true);
+      }),
+    ).toBe(true);
   });
 });
 

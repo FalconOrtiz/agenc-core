@@ -7,6 +7,9 @@
  * land.
  */
 
+import { isAbsolute } from "node:path";
+import { isSafeSessionIdSegment } from "../session/session-store.js";
+
 import {
   AgenCDaemonAgentLifecycleError,
   type AgenCDaemonAgentManager,
@@ -107,6 +110,8 @@ import {
   type CommandExecTerminateParams,
   type CommandExecWriteParams,
   type DaemonReloadResult,
+  type DaemonInstanceIdentity,
+  type DaemonShutdownParams,
   type ElicitationRespondParams,
   type FuzzyFileSearchParams,
   type InitializeParams,
@@ -252,6 +257,7 @@ interface AgenCDaemonServerCapabilityInputs {
   readonly allowUnadmittedCommandExecStart: boolean;
   readonly authHandlers: AgenCDaemonAuthHandlers | undefined;
   readonly daemonControl: AgenCDaemonDispatcherOptions["daemonControl"];
+  readonly daemonIdentity: AgenCDaemonDispatcherOptions["daemonIdentity"];
   readonly health: Pick<AgenCDaemonHealthService, "ping" | "ready" | "stats">;
   readonly realtime: AgenCRealtimeRpcHandlers;
   readonly runInspection: AgenCDaemonDispatcherOptions["runInspection"];
@@ -324,6 +330,10 @@ function buildServerCapabilities(
     "daemon.reload":
       inputs.daemonControl !== undefined &&
       inputs.initializeAuthenticator !== undefined,
+    "daemon.shutdown":
+      hasMethod(inputs.daemonControl, "shutdown") &&
+      inputs.initializeAuthenticator !== undefined &&
+      inputs.daemonIdentity !== undefined,
     "auth.login": inputs.authHandlers !== undefined,
     "auth.whoami": inputs.authHandlers !== undefined,
     "auth.logout": inputs.authHandlers !== undefined,
@@ -460,6 +470,8 @@ export interface AgenCDaemonDispatcherOptions {
     params: InitializeParams,
   ) =>
     AgenCDaemonInitializeAuthResult | Promise<AgenCDaemonInitializeAuthResult>;
+  /** Identity returned only after initialize authentication succeeds. */
+  readonly daemonIdentity?: DaemonInstanceIdentity;
   readonly clientMultiplexer?: Pick<
     AgenCDaemonClientMultiplexer,
     | "attachClientToSession"
@@ -487,6 +499,11 @@ export interface AgenCDaemonDispatcherOptions {
   readonly authBackend?: AuthBackend;
   readonly daemonControl?: {
     reloadConfig(): DaemonReloadResult | Promise<DaemonReloadResult>;
+    shutdown?(
+      instanceId: string,
+    ):
+      | { readonly shuttingDown: true; readonly instanceId: string }
+      | Promise<{ readonly shuttingDown: true; readonly instanceId: string }>;
   };
   readonly health?: Pick<AgenCDaemonHealthService, "ping" | "ready" | "stats">;
   readonly realtime?: AgenCRealtimeRpcHandlers;
@@ -554,6 +571,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         | AgenCDaemonInitializeAuthResult
         | Promise<AgenCDaemonInitializeAuthResult>)
     | undefined;
+  readonly #daemonIdentity: DaemonInstanceIdentity | undefined;
   readonly #clientMultiplexer:
     | Pick<
         AgenCDaemonClientMultiplexer,
@@ -585,6 +603,12 @@ export class AgenCDaemonJsonRpcDispatcher {
   readonly #daemonControl:
     | {
         reloadConfig(): DaemonReloadResult | Promise<DaemonReloadResult>;
+        shutdown?(instanceId: string):
+          | { readonly shuttingDown: true; readonly instanceId: string }
+          | Promise<{
+              readonly shuttingDown: true;
+              readonly instanceId: string;
+            }>;
       }
     | undefined;
   readonly #health: Pick<AgenCDaemonHealthService, "ping" | "ready" | "stats">;
@@ -605,6 +629,7 @@ export class AgenCDaemonJsonRpcDispatcher {
   constructor(options: AgenCDaemonDispatcherOptions) {
     this.#agentManager = options.agentManager;
     this.#initializeAuthenticator = options.initializeAuthenticator;
+    this.#daemonIdentity = options.daemonIdentity;
     this.#clientMultiplexer = options.clientMultiplexer;
     this.#sessionManager = options.sessionManager;
     this.#createMessageId =
@@ -640,6 +665,7 @@ export class AgenCDaemonJsonRpcDispatcher {
       allowUnadmittedCommandExecStart: this.#allowUnadmittedCommandExecStart,
       commandExec: this.#commandExec,
       daemonControl: this.#daemonControl,
+      daemonIdentity: this.#daemonIdentity,
       fuzzyFileSearch: this.#fuzzyFileSearch,
       health: this.#health,
       initializeAuthenticator: this.#initializeAuthenticator,
@@ -754,6 +780,9 @@ export class AgenCDaemonJsonRpcDispatcher {
           protocolVersion: negotiated.state.serverProtocol.version,
           protocol: negotiated.state.protocol,
           capabilities: negotiated.state.serverCapabilities,
+          ...(this.#daemonIdentity !== undefined
+            ? { daemonIdentity: this.#daemonIdentity }
+            : {}),
         });
       }
       if (!connection.initialized) {
@@ -1414,6 +1443,8 @@ export class AgenCDaemonJsonRpcDispatcher {
         return successResponse(id, await this.#health.stats());
       case "daemon.reload":
         return this.#reloadDaemonConfig(id);
+      case "daemon.shutdown":
+        return this.#shutdownDaemon(id, validateDaemonShutdownParams(params));
       case "auth.login":
       case "auth.whoami":
       case "auth.logout":
@@ -1436,6 +1467,36 @@ export class AgenCDaemonJsonRpcDispatcher {
       );
     }
     return successResponse(id, await this.#daemonControl.reloadConfig());
+  }
+
+  async #shutdownDaemon(
+    id: RequestId,
+    params: DaemonShutdownParams,
+  ): Promise<AgenCDaemonResponse> {
+    if (
+      this.#daemonControl === undefined ||
+      this.#daemonControl.shutdown === undefined ||
+      this.#daemonIdentity === undefined
+    ) {
+      return methodNotImplementedResponse(id, "daemon.shutdown");
+    }
+    if (this.#initializeAuthenticator === undefined) {
+      return errorResponse(
+        id,
+        -32000,
+        "daemon shutdown requires authenticated daemon transport",
+        { code: "DAEMON_SHUTDOWN_AUTHENTICATION_REQUIRED" },
+      );
+    }
+    if (params.instanceId !== this.#daemonIdentity.instanceId) {
+      return errorResponse(id, -32000, "daemon instance identity changed", {
+        code: "DAEMON_INSTANCE_IDENTITY_MISMATCH",
+      });
+    }
+    return successResponse(
+      id,
+      await this.#daemonControl.shutdown(params.instanceId),
+    );
   }
 
   async #dispatchAuthMethod(
@@ -2043,6 +2104,17 @@ function validateInitializeParams(params: JsonObject): InitializeParams {
   return validated as InitializeParams;
 }
 
+function validateDaemonShutdownParams(
+  params: JsonObject,
+): DaemonShutdownParams {
+  const validated = validateObjectShape(params, {
+    methodName: "daemon.shutdown",
+    stringFields: ["instanceId"],
+  });
+  validateRequiredString(validated, "daemon.shutdown", "instanceId");
+  return validated as DaemonShutdownParams;
+}
+
 function negotiateInitializeProtocol(
   params: InitializeParams,
   serverCapabilities: AgenCDaemonServerCapabilities,
@@ -2138,6 +2210,8 @@ function validateAgentCreateParams(params: JsonObject): AgentCreateParams {
     methodName: "agent.create",
     stringFields: [
       "objective",
+      "resumeSessionId",
+      "resumeRolloutPath",
       "cwd",
       "model",
       "provider",
@@ -2146,7 +2220,12 @@ function validateAgentCreateParams(params: JsonObject): AgentCreateParams {
       "permissionMode",
     ],
     stringArrayFields: ["unattendedAllow", "unattendedDeny"],
-    objectFields: ["metadata", "envOverrides", "initialEditorInteraction"],
+    objectFields: [
+      "metadata",
+      "envOverrides",
+      "initialEditorInteraction",
+      "resumeSourceProof",
+    ],
     valueFields: [
       "initialContent",
       "deferInitialTurn",
@@ -2168,6 +2247,83 @@ function validateAgentCreateParams(params: JsonObject): AgentCreateParams {
       "agent.create",
       "initialContent",
       validated.initialContent,
+    );
+  }
+  if (
+    validated.resumeSessionId !== undefined &&
+    (typeof validated.resumeSessionId !== "string" ||
+      validated.resumeSessionId.trim().length === 0)
+  ) {
+    throw invalidParams(
+      "agent.create param 'resumeSessionId' must be a non-empty string",
+    );
+  }
+  if (
+    (validated.resumeSessionId === undefined) !==
+    (validated.resumeRolloutPath === undefined)
+  ) {
+    throw invalidParams(
+      "agent.create params 'resumeSessionId' and 'resumeRolloutPath' must be provided together",
+    );
+  }
+  if (
+    (validated.resumeSessionId === undefined) !==
+    (validated.resumeSourceProof === undefined)
+  ) {
+    throw invalidParams(
+      "agent.create params 'resumeSessionId' and 'resumeSourceProof' must be provided together",
+    );
+  }
+  if (isPlainJsonObject(validated.resumeSourceProof)) {
+    const proof = validateObjectShape(validated.resumeSourceProof, {
+      methodName: "agent.create resumeSourceProof",
+      stringFields: ["dev", "ino", "size", "sha256", "cwdDev", "cwdIno"],
+    });
+    for (const key of ["dev", "ino", "size", "sha256", "cwdDev", "cwdIno"]) {
+      if (typeof proof[key] !== "string" || proof[key].length === 0) {
+        throw invalidParams(
+          `agent.create resumeSourceProof param '${key}' must be a non-empty string`,
+        );
+      }
+    }
+    if (!/^[a-f0-9]{64}$/u.test(proof.sha256 as string)) {
+      throw invalidParams(
+        "agent.create resumeSourceProof param 'sha256' must be a lowercase SHA-256 digest",
+      );
+    }
+    for (const key of ["dev", "ino", "size", "cwdDev", "cwdIno"]) {
+      if (!/^[0-9]+$/u.test(proof[key] as string)) {
+        throw invalidParams(
+          `agent.create resumeSourceProof param '${key}' must be an unsigned decimal integer`,
+        );
+      }
+    }
+  }
+  if (
+    typeof validated.resumeSessionId === "string" &&
+    !isSafeSessionIdSegment(validated.resumeSessionId)
+  ) {
+    throw invalidParams(
+      "agent.create param 'resumeSessionId' must be a safe single path segment",
+    );
+  }
+  if (
+    typeof validated.resumeRolloutPath === "string" &&
+    !isAbsolute(validated.resumeRolloutPath)
+  ) {
+    throw invalidParams(
+      "agent.create param 'resumeRolloutPath' must be an absolute path",
+    );
+  }
+  if (
+    validated.resumeSessionId !== undefined &&
+    (validated.initialContent !== undefined ||
+      validated.deferInitialTurn !== undefined ||
+      validated.initialDisplayUserMessage !== undefined ||
+      validated.initialEditorInteraction !== undefined)
+  ) {
+    throw invalidParams(
+      "agent.create param 'resumeSessionId' cannot be combined with initial turn content or metadata",
     );
   }
   if (
@@ -2211,10 +2367,12 @@ function validateAgentCreateParams(params: JsonObject): AgentCreateParams {
       value !== "default" &&
       value !== "plan" &&
       value !== "acceptEdits" &&
-      value !== "bypassPermissions"
+      value !== "bypassPermissions" &&
+      value !== "dontAsk" &&
+      value !== "auto"
     ) {
       throw invalidParams(
-        `agent.create param 'permissionMode' must be one of "default" | "plan" | "acceptEdits" | "bypassPermissions"`,
+        `agent.create param 'permissionMode' must be a user-addressable permission mode`,
       );
     }
   }

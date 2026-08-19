@@ -31,6 +31,16 @@ import {
   canonicalizeJson,
   digestWithDomain,
 } from "../services/compact/summary-v1.js";
+import {
+  RUN_RESUME_REASONS,
+  RUN_RUNTIME_MODEL_VERBOSITIES,
+  RUN_RUNTIME_PERMISSION_MODES,
+  RUN_RUNTIME_REASONING_EFFORTS,
+  RUN_RUNTIME_SERVICE_TIERS,
+  RUN_RUNTIME_SETTINGS_CHANGE_REASONS,
+  RUN_SUSPENSION_REASONS,
+  type RunRuntimeSettingsSnapshot,
+} from "../contracts/run-contracts.js";
 
 export type CanonicalJournalFormat =
   "empty" | "sequenced_v1" | "legacy_unsequenced_v1";
@@ -53,6 +63,24 @@ export interface StrictCanonicalJournal {
   readonly physicalLineCount: number;
   readonly eventCount: number;
   readonly terminalCount: number;
+  /** Final canonical lifecycle epoch after every validated reopen boundary. */
+  readonly activeEpoch: number;
+  /** Final writer state for the active epoch. */
+  readonly activeLifecycleState: "open" | "suspended" | "terminal";
+  /** Sticky status only when activeLifecycleState is terminal. */
+  readonly activeTerminalStatus?:
+    "completed" | "failed" | "cancelled" | "unknown_outcome";
+  /** Exact suspend boundary that must be named by a same-epoch resume. */
+  readonly activeSuspensionEventId?: string;
+  /** Sticky operator cancellation boundary for the active epoch. */
+  readonly activeCancellationRequestEventId?: string;
+  /** Resume boundary whose deferred startup work still awaits first input. */
+  readonly activeStartupActivationResumeEventId?: string;
+  /** Latest complete canonical desired session overlay, when one exists. */
+  readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+  readonly activeRuntimeSettingsEventId?: string;
+  /** Conservative compatibility inference for journals predating settings. */
+  readonly legacyPermissionMode?: "plan";
   readonly digestAnchored: boolean;
 }
 
@@ -143,27 +171,47 @@ export class StrictCanonicalJournalValidator {
   #recordCount = 0;
   #terminalCount = 0;
   #matchingTerminalCount = 0;
+  #activeEpoch = 1;
+  #activeEpochTerminal = false;
+  #activeTerminalStatus:
+    "completed" | "failed" | "cancelled" | "unknown_outcome" | undefined;
+  #activeSuspensionEventId: string | undefined;
+  #activeCancellationRequestEventId: string | undefined;
+  #activeStartupActivationResumeEventId: string | undefined;
+  #activeRuntimeSettings: RunRuntimeSettingsSnapshot | undefined;
+  #activeRuntimeSettingsEventId: string | undefined;
+  #previousRuntimeSettings: RunRuntimeSettingsSnapshot | undefined;
+  #canonicalWorkspace: string | undefined;
+  #legacyPlanActive = false;
+  readonly #toolNamesByCallId = new Map<string, string>();
+  readonly #unsettledEffectSteps = new Map<string, Set<string>>();
   #format: CanonicalJournalFormat = "empty";
   #nextSequence = 1;
   #finished = false;
-  readonly #compactionAttempts = new Map<string, {
-    intent?: Readonly<Record<string, unknown>>;
-    terminal?: "failed" | "committed";
-    commitSha256?: string;
-    retentionDeadlineMs?: number;
-    retentionExtensionDigests?: Set<string>;
-    rollback?: true;
-    release?: true;
-    payloadChunks?: Map<CompactionPayloadKind, {
-      payloadSha256: string;
-      chunkCount: number;
-      nextIndex: number;
-      previousChunkSha256: string;
-      fragmentUtf8Bytes: number;
-      complete: boolean;
-    }>;
-    lastPayloadKind?: CompactionPayloadKind;
-  }>();
+  readonly #compactionAttempts = new Map<
+    string,
+    {
+      intent?: Readonly<Record<string, unknown>>;
+      terminal?: "failed" | "committed";
+      commitSha256?: string;
+      retentionDeadlineMs?: number;
+      retentionExtensionDigests?: Set<string>;
+      rollback?: true;
+      release?: true;
+      payloadChunks?: Map<
+        CompactionPayloadKind,
+        {
+          payloadSha256: string;
+          chunkCount: number;
+          nextIndex: number;
+          previousChunkSha256: string;
+          fragmentUtf8Bytes: number;
+          complete: boolean;
+        }
+      >;
+      lastPayloadKind?: CompactionPayloadKind;
+    }
+  >();
 
   constructor(options: StrictCanonicalJournalOptions = {}) {
     this.#options = Object.freeze({ ...options });
@@ -284,6 +332,15 @@ export class StrictCanonicalJournalValidator {
         "canonical journal is missing its required terminal",
       );
     }
+    if (
+      this.#options.expectedEpoch !== undefined &&
+      this.#activeEpoch !== this.#options.expectedEpoch
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "canonical journal does not reach the expected run epoch",
+      );
+    }
     for (const attempt of this.#compactionAttempts.values()) {
       const sourceHistoryManifest = attempt.intent?.source_history_manifest;
       if (!isPlainRecord(sourceHistoryManifest)) continue;
@@ -305,6 +362,41 @@ export class StrictCanonicalJournalValidator {
       physicalLineCount: this.#physicalLineCount,
       eventCount: this.#eventCount,
       terminalCount: this.#terminalCount,
+      activeEpoch: this.#activeEpoch,
+      activeLifecycleState: this.#activeEpochTerminal
+        ? "terminal"
+        : this.#activeSuspensionEventId !== undefined
+          ? "suspended"
+          : "open",
+      ...(this.#activeTerminalStatus !== undefined
+        ? { activeTerminalStatus: this.#activeTerminalStatus }
+        : {}),
+      ...(this.#activeSuspensionEventId !== undefined
+        ? { activeSuspensionEventId: this.#activeSuspensionEventId }
+        : {}),
+      ...(this.#activeCancellationRequestEventId !== undefined
+        ? {
+            activeCancellationRequestEventId:
+              this.#activeCancellationRequestEventId,
+          }
+        : {}),
+      ...(this.#activeStartupActivationResumeEventId !== undefined
+        ? {
+            activeStartupActivationResumeEventId:
+              this.#activeStartupActivationResumeEventId,
+          }
+        : {}),
+      ...(this.#activeRuntimeSettings !== undefined
+        ? {
+            activeRuntimeSettings: Object.freeze({
+              ...this.#activeRuntimeSettings,
+            }),
+            activeRuntimeSettingsEventId: this.#activeRuntimeSettingsEventId!,
+          }
+        : {}),
+      ...(this.#activeRuntimeSettings === undefined && this.#legacyPlanActive
+        ? { legacyPermissionMode: "plan" as const }
+        : {}),
       digestAnchored: this.#options.trustedSourceSha256 !== undefined,
     });
   }
@@ -452,14 +544,17 @@ export class StrictCanonicalJournalValidator {
     const current = this.#compactionAttempts.get(attemptId) ?? {};
     if (item.type === "compaction_intent") {
       if (current.intent !== undefined || current.terminal !== undefined) {
-        this.#fail("identity_conflict", "duplicate or out-of-order compaction intent", facts);
+        this.#fail(
+          "identity_conflict",
+          "duplicate or out-of-order compaction intent",
+          facts,
+        );
       }
       const source = payload.source as Readonly<Record<string, unknown>>;
       if (
         (this.#options.expectedRunId !== undefined &&
           source.session_id !== this.#options.expectedRunId) ||
-        (this.#options.expectedEpoch !== undefined &&
-          source.epoch !== this.#options.expectedEpoch)
+        source.epoch !== this.#activeEpoch
       ) {
         this.#fail(
           "identity_conflict",
@@ -490,14 +585,15 @@ export class StrictCanonicalJournalValidator {
       const kind = item.payload.payload_kind;
       const chunks = current.payloadChunks ?? new Map();
       const existing = chunks.get(kind);
-      const previousKindState = current.lastPayloadKind === undefined
-        ? undefined
-        : chunks.get(current.lastPayloadKind);
+      const previousKindState =
+        current.lastPayloadKind === undefined
+          ? undefined
+          : chunks.get(current.lastPayloadKind);
       if (
         previousKindState?.complete === false ||
-        current.lastPayloadKind !== undefined &&
-        current.lastPayloadKind !== kind &&
-        existing !== undefined
+        (current.lastPayloadKind !== undefined &&
+          current.lastPayloadKind !== kind &&
+          existing !== undefined)
       ) {
         this.#fail(
           "identity_conflict",
@@ -546,16 +642,29 @@ export class StrictCanonicalJournalValidator {
       return;
     }
     if (current.intent === undefined) {
-      this.#fail("identity_conflict", "compaction terminal precedes its intent", facts);
+      this.#fail(
+        "identity_conflict",
+        "compaction terminal precedes its intent",
+        facts,
+      );
     }
-    if (item.type === "compaction_failed" || item.type === "compaction_committed") {
+    if (
+      item.type === "compaction_failed" ||
+      item.type === "compaction_committed"
+    ) {
       if (current.terminal !== undefined) {
-        this.#fail("identity_conflict", "compaction attempt has conflicting terminals", facts);
+        this.#fail(
+          "identity_conflict",
+          "compaction attempt has conflicting terminals",
+          facts,
+        );
       }
       if (item.type === "compaction_committed") {
-        if ([...(current.payloadChunks?.values() ?? [])].some(
-          (chunkState) => !chunkState.complete
-        )) {
+        if (
+          [...(current.payloadChunks?.values() ?? [])].some(
+            (chunkState) => !chunkState.complete,
+          )
+        ) {
           this.#fail(
             "identity_conflict",
             "compaction commit follows an incomplete payload chunk chain",
@@ -563,14 +672,26 @@ export class StrictCanonicalJournalValidator {
           );
         }
         const source = payload.source as Readonly<Record<string, unknown>>;
-        const intentSource = current.intent.source as Readonly<Record<string, unknown>>;
+        const intentSource = current.intent.source as Readonly<
+          Record<string, unknown>
+        >;
         for (const key of [
-          "attempt_id", "session_id", "epoch", "source_binding",
-          "first_sequence", "last_sequence", "source_sha256",
-          "source_bytes", "history_digest",
+          "attempt_id",
+          "session_id",
+          "epoch",
+          "source_binding",
+          "first_sequence",
+          "last_sequence",
+          "source_sha256",
+          "source_bytes",
+          "history_digest",
         ] as const) {
           if (source[key] !== intentSource[key]) {
-            this.#fail("identity_conflict", `compaction commit source conflicts at ${key}`, facts);
+            this.#fail(
+              "identity_conflict",
+              `compaction commit source conflicts at ${key}`,
+              facts,
+            );
           }
         }
         const persistedManifestCommit =
@@ -589,7 +710,11 @@ export class StrictCanonicalJournalValidator {
         }
         for (const key of ["policy_digest", "configuration_digest"] as const) {
           if (payload[key] !== current.intent[key]) {
-            this.#fail("identity_conflict", `compaction commit conflicts at ${key}`, facts);
+            this.#fail(
+              "identity_conflict",
+              `compaction commit conflicts at ${key}`,
+              facts,
+            );
           }
         }
         if (persistedManifestCommit) {
@@ -618,7 +743,9 @@ export class StrictCanonicalJournalValidator {
             facts,
           );
         } else {
-          const summaryDag = payload.summary_dag as Readonly<Record<string, unknown>>;
+          const summaryDag = payload.summary_dag as Readonly<
+            Record<string, unknown>
+          >;
           if (
             summaryDag.planned_provider_calls !==
             current.intent.planned_provider_calls
@@ -632,13 +759,20 @@ export class StrictCanonicalJournalValidator {
         }
       } else if (
         payload.source_sha256 !==
-          (current.intent.source as Readonly<Record<string, unknown>>).source_sha256 ||
+          (current.intent.source as Readonly<Record<string, unknown>>)
+            .source_sha256 ||
         payload.history_digest !==
-          (current.intent.source as Readonly<Record<string, unknown>>).history_digest
+          (current.intent.source as Readonly<Record<string, unknown>>)
+            .history_digest
       ) {
-        this.#fail("identity_conflict", "compaction failure conflicts with its intent", facts);
+        this.#fail(
+          "identity_conflict",
+          "compaction failure conflicts with its intent",
+          facts,
+        );
       }
-      current.terminal = item.type === "compaction_failed" ? "failed" : "committed";
+      current.terminal =
+        item.type === "compaction_failed" ? "failed" : "committed";
       if (item.type === "compaction_committed") {
         if (payload.final_summary_manifest === undefined) {
           current.commitSha256 = digestWithDomain(
@@ -646,23 +780,32 @@ export class StrictCanonicalJournalValidator {
             payload,
           );
         }
-        current.retentionDeadlineMs = payload.rollback_retention_deadline_ms as number;
+        current.retentionDeadlineMs =
+          payload.rollback_retention_deadline_ms as number;
         current.retentionExtensionDigests = new Set();
       }
       return;
     }
     if (current.terminal !== "committed") {
-      this.#fail("identity_conflict", "compaction post-commit event has no commit", facts);
+      this.#fail(
+        "identity_conflict",
+        "compaction post-commit event has no commit",
+        facts,
+      );
     }
-    if (current.commitSha256 !== undefined &&
-        payload.commit_sha256 !== current.commitSha256) {
+    if (
+      current.commitSha256 !== undefined &&
+      payload.commit_sha256 !== current.commitSha256
+    ) {
       this.#fail(
         "identity_conflict",
         "compaction post-commit event is not bound to its canonical commit",
         facts,
       );
     }
-    const intentSource = current.intent.source as Readonly<Record<string, unknown>>;
+    const intentSource = current.intent.source as Readonly<
+      Record<string, unknown>
+    >;
     if (
       (item.type === "compaction_rollback_committed" ||
         item.type === "compaction_retention_extended" ||
@@ -705,7 +848,8 @@ export class StrictCanonicalJournalValidator {
       }
       const sameSession = payload.rollback_mode === "same_session";
       if (
-        (sameSession && payload.target_session_id !== intentSource.session_id) ||
+        (sameSession &&
+          payload.target_session_id !== intentSource.session_id) ||
         (!sameSession && payload.target_session_id === intentSource.session_id)
       ) {
         this.#fail(
@@ -725,7 +869,8 @@ export class StrictCanonicalJournalValidator {
         );
       }
       if (
-        payload.previous_retention_deadline_ms !== current.retentionDeadlineMs ||
+        payload.previous_retention_deadline_ms !==
+          current.retentionDeadlineMs ||
         typeof payload.effective_retention_deadline_ms !== "number" ||
         payload.effective_retention_deadline_ms <=
           (current.retentionDeadlineMs ?? Number.MAX_SAFE_INTEGER)
@@ -741,10 +886,11 @@ export class StrictCanonicalJournalValidator {
       delete extensionMaterial.extension_sha256;
       if (
         typeof extensionSha256 !== "string" ||
-        extensionSha256 !== digestWithDomain(
-          COMPACTION_RETENTION_EXTENSION_DIGEST_DOMAIN,
-          extensionMaterial,
-        ) ||
+        extensionSha256 !==
+          digestWithDomain(
+            COMPACTION_RETENTION_EXTENSION_DIGEST_DOMAIN,
+            extensionMaterial,
+          ) ||
         current.retentionExtensionDigests?.has(extensionSha256) === true
       ) {
         this.#fail(
@@ -758,7 +904,11 @@ export class StrictCanonicalJournalValidator {
     }
     if (item.type === "compaction_source_release") {
       if (current.release === true) {
-        this.#fail("identity_conflict", "duplicate compaction source release", facts);
+        this.#fail(
+          "identity_conflict",
+          "duplicate compaction source release",
+          facts,
+        );
       }
       if (payload.retention_deadline_ms !== current.retentionDeadlineMs) {
         this.#fail(
@@ -773,19 +923,21 @@ export class StrictCanonicalJournalValidator {
 
   #assertPayloadManifestComplete(
     current: {
-      readonly payloadChunks?: Map<CompactionPayloadKind, {
-        readonly payloadSha256: string;
-        readonly chunkCount: number;
-        readonly previousChunkSha256: string;
-        readonly fragmentUtf8Bytes: number;
-        readonly complete: boolean;
-      }>;
+      readonly payloadChunks?: Map<
+        CompactionPayloadKind,
+        {
+          readonly payloadSha256: string;
+          readonly chunkCount: number;
+          readonly previousChunkSha256: string;
+          readonly fragmentUtf8Bytes: number;
+          readonly complete: boolean;
+        }
+      >;
     },
     value: unknown,
     facts: RecoveryIntegrityFacts,
   ): void {
-    if (!isPlainRecord(value) ||
-        typeof value.payload_kind !== "string") {
+    if (!isPlainRecord(value) || typeof value.payload_kind !== "string") {
       this.#fail(
         "schema_invalid",
         "compaction payload manifest is missing",
@@ -868,6 +1020,7 @@ export class StrictCanonicalJournalValidator {
         facts,
       );
     }
+    this.#canonicalWorkspace ??= payload.cwd as string;
   }
 
   #validateEvent(
@@ -953,8 +1106,52 @@ export class StrictCanonicalJournalValidator {
         facts,
       );
     }
+    if (
+      this.#activeSuspensionEventId !== undefined &&
+      payload.msg.type !== "run_resumed"
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "a suspended run must resume before another event is appended",
+        facts,
+      );
+    }
+    if (
+      this.#activeStartupActivationResumeEventId !== undefined &&
+      (payload.msg.type === "message_submission" ||
+        payload.msg.type === "user_message" ||
+        payload.msg.type === "turn_started")
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "ordinary input cannot precede durable resumed-startup activation",
+        facts,
+      );
+    }
+    this.#trackLegacyPlanLifecycle(payload.msg.type, payload.msg.payload);
+    this.#trackEffectLifecycle(payload.msg.type, payload.msg.payload);
     if (payload.msg.type === "run_terminal") {
       this.#validateTerminal(payload.msg.payload, facts);
+    } else if (payload.msg.type === "run_reopened") {
+      this.#validateReopened(payload.msg.payload, facts);
+    } else if (payload.msg.type === "run_suspended") {
+      this.#validateSuspended(payload.msg.payload, payload.eventId, facts);
+    } else if (payload.msg.type === "run_resumed") {
+      this.#validateResumed(payload.msg.payload, payload.eventId, facts);
+    } else if (payload.msg.type === "run_startup_activated") {
+      this.#validateStartupActivated(payload.msg.payload, facts);
+    } else if (payload.msg.type === "run_runtime_settings_changed") {
+      this.#validateRuntimeSettingsChanged(
+        payload.msg.payload,
+        payload.eventId,
+        facts,
+      );
+    } else if (payload.msg.type === "run_cancel_requested") {
+      this.#validateCancellationRequested(
+        payload.msg.payload,
+        payload.eventId,
+        facts,
+      );
     }
   }
 
@@ -995,7 +1192,8 @@ export class StrictCanonicalJournalValidator {
       );
     }
     if (
-      (reserved === undefined || this.#options.identityRegistry !== undefined) &&
+      (reserved === undefined ||
+        this.#options.identityRegistry !== undefined) &&
       this.#options.identityPolicy !== "trusted_replay" &&
       !this.#claimEventId(eventId)
     ) {
@@ -1034,13 +1232,28 @@ export class StrictCanonicalJournalValidator {
         facts,
       );
     }
+    if (payload.epoch !== this.#activeEpoch) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run terminal is out of order for the active epoch",
+        facts,
+      );
+    }
+    if (this.#activeSuspensionEventId !== undefined) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run terminal cannot be appended while the active epoch is suspended",
+        facts,
+      );
+    }
     if (
-      this.#options.expectedEpoch !== undefined &&
-      payload.epoch !== this.#options.expectedEpoch
+      this.#activeCancellationRequestEventId !== undefined &&
+      payload.status !== "cancelled" &&
+      payload.status !== "unknown_outcome"
     ) {
       this.#fail(
         "terminal_binding_mismatch",
-        "run terminal belongs to another epoch",
+        "a cancellation request must end in a cancelled or unknown-outcome terminal",
         facts,
       );
     }
@@ -1056,7 +1269,486 @@ export class StrictCanonicalJournalValidator {
       );
     }
     this.#terminalCount += 1;
-    this.#matchingTerminalCount += 1;
+    if (
+      this.#options.expectedEpoch === undefined ||
+      payload.epoch === this.#options.expectedEpoch
+    ) {
+      this.#matchingTerminalCount += 1;
+    }
+    this.#activeEpochTerminal = true;
+    this.#activeTerminalStatus = payload.status as
+      "completed" | "failed" | "cancelled" | "unknown_outcome";
+    this.#activeStartupActivationResumeEventId = undefined;
+  }
+
+  #validateReopened(payload: unknown, facts: RecoveryIntegrityFacts): void {
+    if (!isPlainRecord(payload)) {
+      this.#fail(
+        "schema_invalid",
+        "run reopen payload must be an object",
+        facts,
+      );
+    }
+    if (
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.previousEpoch) ||
+      !Number.isSafeInteger(payload.epoch)
+    ) {
+      this.#fail("schema_invalid", "run reopen binding is invalid", facts);
+    }
+    if (
+      this.#options.expectedRunId !== undefined &&
+      payload.runId !== this.#options.expectedRunId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run reopen belongs to another run",
+        facts,
+      );
+    }
+    if (
+      payload.previousEpoch !== this.#activeEpoch ||
+      payload.epoch !== this.#activeEpoch + 1 ||
+      !this.#activeEpochTerminal ||
+      this.#activeSuspensionEventId !== undefined ||
+      this.#activeCancellationRequestEventId !== undefined
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run reopen does not follow the active terminal epoch",
+        facts,
+      );
+    }
+    this.#assertNoUnsettledEffects(
+      payload.runId as string,
+      "run reopen follows an unsettled effect",
+      facts,
+    );
+    if (
+      this.#activeTerminalStatus === "cancelled" ||
+      this.#activeTerminalStatus === "unknown_outcome"
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        `run reopen cannot follow a ${this.#activeTerminalStatus} terminal`,
+        facts,
+      );
+    }
+    this.#activeEpoch = payload.epoch as number;
+    this.#activeEpochTerminal = false;
+    this.#activeTerminalStatus = undefined;
+    this.#activeStartupActivationResumeEventId = undefined;
+  }
+
+  #validateSuspended(
+    payload: unknown,
+    eventId: unknown,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if (!isPlainRecord(payload)) {
+      this.#fail(
+        "schema_invalid",
+        "run suspend payload must be an object",
+        facts,
+      );
+    }
+    if (
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.epoch) ||
+      !RUN_SUSPENSION_REASONS.includes(
+        payload.reason as (typeof RUN_SUSPENSION_REASONS)[number],
+      ) ||
+      typeof eventId !== "string" ||
+      eventId.length === 0 ||
+      typeof payload.suspendedAt !== "string" ||
+      payload.suspendedAt.length === 0 ||
+      !Number.isFinite(Date.parse(payload.suspendedAt))
+    ) {
+      this.#fail("schema_invalid", "run suspend binding is invalid", facts);
+    }
+    if (
+      this.#options.expectedRunId !== undefined &&
+      payload.runId !== this.#options.expectedRunId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run suspend belongs to another run",
+        facts,
+      );
+    }
+    if (
+      payload.epoch !== this.#activeEpoch ||
+      this.#activeEpochTerminal ||
+      this.#activeSuspensionEventId !== undefined ||
+      this.#activeCancellationRequestEventId !== undefined
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run suspend does not belong to an open active epoch",
+        facts,
+      );
+    }
+    this.#assertNoUnsettledEffects(
+      payload.runId as string,
+      "run suspend follows an unsettled effect",
+      facts,
+    );
+    // A clean shutdown supersedes an unactivated startup from the process
+    // being relinquished. Its next resume receives a fresh activation id.
+    this.#activeStartupActivationResumeEventId = undefined;
+    this.#activeSuspensionEventId = eventId as string;
+  }
+
+  #validateResumed(
+    payload: unknown,
+    eventId: unknown,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if (!isPlainRecord(payload)) {
+      this.#fail(
+        "schema_invalid",
+        "run resume payload must be an object",
+        facts,
+      );
+    }
+    if (
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.epoch) ||
+      typeof payload.suspensionEventId !== "string" ||
+      payload.suspensionEventId.length === 0 ||
+      typeof eventId !== "string" ||
+      eventId.length === 0 ||
+      !RUN_RESUME_REASONS.includes(
+        payload.reason as (typeof RUN_RESUME_REASONS)[number],
+      ) ||
+      typeof payload.resumedAt !== "string" ||
+      payload.resumedAt.length === 0 ||
+      !Number.isFinite(Date.parse(payload.resumedAt))
+    ) {
+      this.#fail("schema_invalid", "run resume binding is invalid", facts);
+    }
+    if (
+      this.#options.expectedRunId !== undefined &&
+      payload.runId !== this.#options.expectedRunId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run resume belongs to another run",
+        facts,
+      );
+    }
+    if (
+      payload.epoch !== this.#activeEpoch ||
+      this.#activeEpochTerminal ||
+      this.#activeCancellationRequestEventId !== undefined ||
+      payload.suspensionEventId !== this.#activeSuspensionEventId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run resume does not match the active suspension",
+        facts,
+      );
+    }
+    this.#activeSuspensionEventId = undefined;
+    this.#activeStartupActivationResumeEventId = eventId as string;
+  }
+
+  #validateStartupActivated(
+    payload: unknown,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if (
+      !isPlainRecord(payload) ||
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.epoch) ||
+      typeof payload.resumeEventId !== "string" ||
+      payload.resumeEventId.length === 0 ||
+      typeof payload.activatedAt !== "string" ||
+      payload.activatedAt.length === 0 ||
+      !Number.isFinite(Date.parse(payload.activatedAt))
+    ) {
+      this.#fail(
+        "schema_invalid",
+        "run startup activation binding is invalid",
+        facts,
+      );
+    }
+    if (
+      (this.#options.expectedRunId !== undefined &&
+        payload.runId !== this.#options.expectedRunId) ||
+      payload.epoch !== this.#activeEpoch ||
+      this.#activeEpochTerminal ||
+      this.#activeSuspensionEventId !== undefined ||
+      this.#activeCancellationRequestEventId !== undefined ||
+      payload.resumeEventId !== this.#activeStartupActivationResumeEventId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run startup activation does not match the pending resume",
+        facts,
+      );
+    }
+    this.#activeStartupActivationResumeEventId = undefined;
+  }
+
+  #validateRuntimeSettingsChanged(
+    payload: unknown,
+    eventId: unknown,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if (!isPlainRecord(payload)) {
+      this.#fail(
+        "schema_invalid",
+        "run runtime settings payload must be an object",
+        facts,
+      );
+    }
+    const validTimestamp =
+      typeof payload.changedAt === "string" &&
+      payload.changedAt.length > 0 &&
+      Number.isFinite(Date.parse(payload.changedAt));
+    const validNullableString = (value: unknown, maxBytes: number): boolean =>
+      value === null || validBoundedSettingString(value, maxBytes);
+    if (
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.epoch) ||
+      typeof eventId !== "string" ||
+      eventId.length === 0 ||
+      (payload.previousSettingsEventId !== null &&
+        (typeof payload.previousSettingsEventId !== "string" ||
+          payload.previousSettingsEventId.length === 0)) ||
+      (payload.rollbackOfSettingsEventId !== null &&
+        (typeof payload.rollbackOfSettingsEventId !== "string" ||
+          payload.rollbackOfSettingsEventId.length === 0)) ||
+      !RUN_RUNTIME_SETTINGS_CHANGE_REASONS.includes(payload.reason as never) ||
+      !validTimestamp ||
+      !RUN_RUNTIME_PERMISSION_MODES.includes(payload.permissionMode as never) ||
+      (payload.prePlanMode !== null &&
+        !RUN_RUNTIME_PERMISSION_MODES.includes(payload.prePlanMode as never)) ||
+      typeof payload.autoModeActive !== "boolean" ||
+      !validNullableString(payload.bypassPermissionsWorkspace, 4_096) ||
+      !validBoundedSettingString(payload.model, 1_024) ||
+      !validBoundedSettingString(payload.provider, 256) ||
+      !validNullableString(payload.profile, 256) ||
+      (payload.reasoningEffort !== null &&
+        !RUN_RUNTIME_REASONING_EFFORTS.includes(
+          payload.reasoningEffort as never,
+        )) ||
+      (payload.modelVerbosity !== null &&
+        !RUN_RUNTIME_MODEL_VERBOSITIES.includes(
+          payload.modelVerbosity as never,
+        )) ||
+      (payload.serviceTier !== null &&
+        !RUN_RUNTIME_SERVICE_TIERS.includes(payload.serviceTier as never)) ||
+      typeof payload.hooksDisabled !== "boolean"
+    ) {
+      this.#fail(
+        "schema_invalid",
+        "run runtime settings binding is invalid",
+        facts,
+      );
+    }
+    const bypassTransitionCritical =
+      payload.permissionMode === "bypassPermissions" ||
+      payload.prePlanMode === "bypassPermissions";
+    const isFirstSettingsEvent =
+      this.#activeRuntimeSettingsEventId === undefined;
+    const isCompensatingRollback = payload.reason === "compensating_rollback";
+    if (
+      (this.#options.expectedRunId !== undefined &&
+        payload.runId !== this.#options.expectedRunId) ||
+      payload.epoch !== this.#activeEpoch ||
+      this.#activeEpochTerminal ||
+      this.#activeSuspensionEventId !== undefined ||
+      this.#activeCancellationRequestEventId !== undefined ||
+      payload.previousSettingsEventId !==
+        (this.#activeRuntimeSettingsEventId ?? null) ||
+      (isFirstSettingsEvent
+        ? payload.reason !== "initial" ||
+          payload.previousSettingsEventId !== null ||
+          payload.rollbackOfSettingsEventId !== null
+        : payload.reason === "initial") ||
+      (isCompensatingRollback
+        ? payload.rollbackOfSettingsEventId !==
+            this.#activeRuntimeSettingsEventId ||
+          this.#previousRuntimeSettings === undefined
+        : payload.rollbackOfSettingsEventId !== null) ||
+      (payload.permissionMode === "plan"
+        ? payload.prePlanMode === null || payload.prePlanMode === "plan"
+        : payload.prePlanMode !== null) ||
+      (payload.permissionMode === "auto"
+        ? payload.autoModeActive !== true
+        : payload.permissionMode !== "plan" &&
+          payload.autoModeActive !== false) ||
+      (bypassTransitionCritical
+        ? payload.bypassPermissionsWorkspace !== this.#canonicalWorkspace
+        : payload.bypassPermissionsWorkspace !== null)
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run runtime settings do not follow the active canonical overlay",
+        facts,
+      );
+    }
+    const nextSettings = Object.freeze({
+      permissionMode: payload.permissionMode,
+      prePlanMode: payload.prePlanMode,
+      autoModeActive: payload.autoModeActive,
+      bypassPermissionsWorkspace: payload.bypassPermissionsWorkspace,
+      model: payload.model,
+      provider: payload.provider,
+      profile: payload.profile,
+      reasoningEffort: payload.reasoningEffort,
+      modelVerbosity: payload.modelVerbosity,
+      serviceTier: payload.serviceTier,
+      hooksDisabled: payload.hooksDisabled,
+    }) as RunRuntimeSettingsSnapshot;
+    if (
+      isCompensatingRollback &&
+      !runtimeSettingsEqual(nextSettings, this.#previousRuntimeSettings!)
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run runtime settings compensation does not restore the preceding snapshot",
+        facts,
+      );
+    }
+    this.#previousRuntimeSettings = this.#activeRuntimeSettings;
+    this.#activeRuntimeSettings = nextSettings;
+    this.#activeRuntimeSettingsEventId = eventId as string;
+  }
+
+  #validateCancellationRequested(
+    payload: unknown,
+    eventId: unknown,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if (!isPlainRecord(payload)) {
+      this.#fail(
+        "schema_invalid",
+        "run cancellation request payload must be an object",
+        facts,
+      );
+    }
+    if (
+      typeof payload.runId !== "string" ||
+      payload.runId.length === 0 ||
+      !Number.isSafeInteger(payload.epoch) ||
+      typeof payload.reason !== "string" ||
+      payload.reason.length === 0 ||
+      typeof payload.requestedAt !== "string" ||
+      payload.requestedAt.length === 0 ||
+      !Number.isFinite(Date.parse(payload.requestedAt)) ||
+      typeof eventId !== "string" ||
+      eventId.length === 0
+    ) {
+      this.#fail(
+        "schema_invalid",
+        "run cancellation request binding is invalid",
+        facts,
+      );
+    }
+    if (
+      this.#options.expectedRunId !== undefined &&
+      payload.runId !== this.#options.expectedRunId
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run cancellation request belongs to another run",
+        facts,
+      );
+    }
+    if (
+      payload.epoch !== this.#activeEpoch ||
+      this.#activeEpochTerminal ||
+      this.#activeSuspensionEventId !== undefined ||
+      this.#activeCancellationRequestEventId !== undefined
+    ) {
+      this.#fail(
+        "terminal_binding_mismatch",
+        "run cancellation request does not belong to an open uncancelled epoch",
+        facts,
+      );
+    }
+    this.#activeCancellationRequestEventId = eventId as string;
+  }
+
+  #trackLegacyPlanLifecycle(type: string, payload: unknown): void {
+    if (!isPlainRecord(payload)) return;
+    if (
+      type === "tool_call_started" &&
+      typeof payload.callId === "string" &&
+      typeof payload.toolName === "string"
+    ) {
+      this.#toolNamesByCallId.set(payload.callId, payload.toolName);
+      return;
+    }
+    if (type === "plan_started") {
+      this.#legacyPlanActive = true;
+      return;
+    }
+    if (type === "plan_exited") {
+      this.#legacyPlanActive = false;
+      return;
+    }
+    if (type !== "tool_call_completed") return;
+    const callId =
+      typeof payload.callId === "string" ? payload.callId : undefined;
+    const toolName =
+      typeof payload.toolName === "string"
+        ? payload.toolName
+        : callId === undefined
+          ? undefined
+          : this.#toolNamesByCallId.get(callId);
+    if (callId !== undefined) this.#toolNamesByCallId.delete(callId);
+    if (
+      toolName === "ExitPlanMode" &&
+      typeof payload.result === "string" &&
+      payload.result.includes("Remain in plan mode")
+    ) {
+      this.#legacyPlanActive = true;
+    }
+  }
+
+  #trackEffectLifecycle(type: string, payload: unknown): void {
+    if (
+      !isPlainRecord(payload) ||
+      typeof payload.runId !== "string" ||
+      typeof payload.stepId !== "string"
+    ) {
+      return;
+    }
+    const runId = payload.runId;
+    const stepId = payload.stepId;
+    if (type === "effect_intent" || type === "effect_unknown_outcome") {
+      const steps = this.#unsettledEffectSteps.get(runId) ?? new Set<string>();
+      steps.add(stepId);
+      this.#unsettledEffectSteps.set(runId, steps);
+      return;
+    }
+    const resolved =
+      type === "effect_result" ||
+      (type === "effect_review_resolved" &&
+        isPlainRecord(payload.resolution) &&
+        payload.resolution.workflowStatus !== "pending");
+    if (!resolved) return;
+    const steps = this.#unsettledEffectSteps.get(runId);
+    steps?.delete(stepId);
+    if (steps?.size === 0) this.#unsettledEffectSteps.delete(runId);
+  }
+
+  #assertNoUnsettledEffects(
+    runId: string,
+    message: string,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    if ((this.#unsettledEffectSteps.get(runId)?.size ?? 0) === 0) return;
+    this.#fail("terminal_binding_mismatch", message, facts);
   }
 
   #fail(
@@ -1123,6 +1815,33 @@ function decodeCanonicalUtf8(
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validBoundedSettingString(value: unknown, maxBytes: number): boolean {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    Buffer.byteLength(value, "utf8") <= maxBytes
+  );
+}
+
+function runtimeSettingsEqual(
+  left: RunRuntimeSettingsSnapshot,
+  right: RunRuntimeSettingsSnapshot,
+): boolean {
+  return (
+    left.permissionMode === right.permissionMode &&
+    left.prePlanMode === right.prePlanMode &&
+    left.autoModeActive === right.autoModeActive &&
+    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
+    left.model === right.model &&
+    left.provider === right.provider &&
+    left.profile === right.profile &&
+    left.reasoningEffort === right.reasoningEffort &&
+    left.modelVerbosity === right.modelVerbosity &&
+    left.serviceTier === right.serviceTier &&
+    left.hooksDisabled === right.hooksDisabled
+  );
 }
 
 function supportedItemVersion(type: string, version: unknown): boolean {

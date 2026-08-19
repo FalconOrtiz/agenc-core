@@ -62,8 +62,7 @@ import {
   readCompactionRolloutPayload,
 } from "./compaction-event-reader.js";
 
-const MAX_COMPACTION_LIFECYCLE_RECORDS =
-  MAX_COMPACTION_PIN_HISTORY_TOTAL * 6;
+const MAX_COMPACTION_LIFECYCLE_RECORDS = MAX_COMPACTION_PIN_HISTORY_TOTAL * 6;
 const COMPACTION_PAYLOAD_REGISTRY_CACHE_KIB = 1_024;
 
 /** Disk-backed payload spool keeps manifest replay bounded by one payload. */
@@ -123,30 +122,27 @@ class DiskCompactionPayloadRegistry {
 
   reconstruct(manifest: CompactionPayloadManifestV1): unknown {
     this.#assertOpen();
-    const chunks = this.#select.all(
-      manifest.attempt_id,
-      manifest.payload_kind,
-    ).map((row) => {
-      const payloadJson = (row as { readonly payload_json: string }).payload_json;
-      const payload = JSON.parse(payloadJson) as unknown;
-      const parsed = readCompactionRolloutPayload(
-        "compaction_payload_chunk",
-        payload,
-      );
-      if (!("payload_kind" in parsed)) {
-        throw new Error("payload registry row did not decode as a chunk");
-      }
-      return parsed;
-    });
+    const chunks = this.#select
+      .all(manifest.attempt_id, manifest.payload_kind)
+      .map((row) => {
+        const payloadJson = (row as { readonly payload_json: string })
+          .payload_json;
+        const payload = JSON.parse(payloadJson) as unknown;
+        const parsed = readCompactionRolloutPayload(
+          "compaction_payload_chunk",
+          payload,
+        );
+        if (!("payload_kind" in parsed)) {
+          throw new Error("payload registry row did not decode as a chunk");
+        }
+        return parsed;
+      });
     return reconstructCompactionPayloadV1(manifest, chunks);
   }
 
   hasComplete(manifest: CompactionPayloadManifestV1): boolean {
     this.#assertOpen();
-    const row = this.#count.get(
-      manifest.attempt_id,
-      manifest.payload_kind,
-    ) as {
+    const row = this.#count.get(manifest.attempt_id, manifest.payload_kind) as {
       readonly chunk_count: number;
     };
     return row.chunk_count === manifest.chunk_count;
@@ -245,11 +241,10 @@ export interface CanonicalRolloutScan {
   readonly historyAtAttempts: ReadonlyMap<string, readonly ResponseItem[]>;
 }
 
-export interface CanonicalRolloutScanOptions
-  extends Pick<
-    StrictCanonicalJournalOptions,
-    "expectedRunId" | "expectedEpoch" | "terminalPolicy"
-  > {
+export interface CanonicalRolloutScanOptions extends Pick<
+  StrictCanonicalJournalOptions,
+  "expectedRunId" | "expectedEpoch" | "terminalPolicy"
+> {
   readonly nowMilliseconds?: () => number;
   readonly maximumScanMilliseconds: number;
   readonly additionalSourceLines?: readonly number[];
@@ -288,13 +283,15 @@ export function scanCanonicalRollout(
     }
     checkOperationalBudget();
     const attempts = new Map<string, MutableAttemptScan>();
-    const capturedAttemptIds = new Set(options.captureHistoryAtAttemptIds ?? []);
+    const capturedAttemptIds = new Set(
+      options.captureHistoryAtAttemptIds ?? [],
+    );
     const capturedPayloadAttemptIds = new Set(
       options.capturePayloadRecordsAtAttemptIds ?? [],
     );
     const payloadLineAttempts = new Map<number, string>();
-    const trackHistory = options.captureActiveHistory === true ||
-      capturedAttemptIds.size > 0;
+    const trackHistory =
+      options.captureActiveHistory === true || capturedAttemptIds.size > 0;
     let reducedState = emptyReducedState();
     let activePositions: CanonicalActiveHistoryPosition[] = [];
     const activeLineBytes = new Map<number, number>();
@@ -304,10 +301,7 @@ export function scanCanonicalRollout(
     let activeAdmissionAttempt: MutableAttemptScan | undefined;
     let latestCommittedAttempt: MutableAttemptScan | undefined;
     let postCommitBookkeeping:
-      | "await_context"
-      | "await_meta"
-      | "complete"
-      | undefined;
+      "await_context" | "await_meta" | "complete" | undefined;
     checkOperationalBudget();
     const identityRegistry = new DiskCanonicalIdentityRegistry();
     const payloadRegistry = new DiskCompactionPayloadRegistry();
@@ -321,23 +315,30 @@ export function scanCanonicalRollout(
           let record = physicalRecord;
           let item = record.item;
           const persistedIntent = persistedIntentPayload(item);
-          const attemptId = item.type.startsWith("compaction_") &&
-              "attempt_id" in item.payload
-            ? item.payload.attempt_id
-            : undefined;
+          const attemptId =
+            item.type.startsWith("compaction_") && "attempt_id" in item.payload
+              ? item.payload.attempt_id
+              : undefined;
 
           if (latestCommittedAttempt !== undefined) {
-            const committedAttemptId = latestCommittedAttempt.intent?.attempt_id;
-            if (item.type === "compaction_cleanup_pending" &&
-                item.payload.attempt_id === committedAttemptId) {
+            const committedAttemptId =
+              latestCommittedAttempt.intent?.attempt_id;
+            if (
+              item.type === "compaction_cleanup_pending" &&
+              item.payload.attempt_id === committedAttemptId
+            ) {
               // Cleanup evidence is part of the commit transaction itself.
-            } else if (postCommitBookkeeping === "await_context" &&
-                latestCommittedAttempt.intent?.automatic === true &&
-                isCausalAutoCompactionBoundary(item)) {
+            } else if (
+              postCommitBookkeeping === "await_context" &&
+              latestCommittedAttempt.intent?.automatic === true &&
+              isCausalAutoCompactionBoundary(item)
+            ) {
               postCommitBookkeeping = "await_meta";
-            } else if (postCommitBookkeeping === "await_meta" &&
-                item.type === "session_meta" &&
-                item.payload.sessionId === options.expectedRunId) {
+            } else if (
+              postCommitBookkeeping === "await_meta" &&
+              item.type === "session_meta" &&
+              item.payload.sessionId === options.expectedRunId
+            ) {
               postCommitBookkeeping = "complete";
             } else {
               latestCommittedAttempt.laterWork = true;
@@ -345,8 +346,12 @@ export function scanCanonicalRollout(
               postCommitBookkeeping = undefined;
             }
           }
-          if (trackHistory && item.type === "compaction_intent" &&
-              attemptId !== undefined && capturedAttemptIds.has(attemptId)) {
+          if (
+            trackHistory &&
+            item.type === "compaction_intent" &&
+            attemptId !== undefined &&
+            capturedAttemptIds.has(attemptId)
+          ) {
             checkOperationalBudget();
             historyAtAttempts.set(
               attemptId,
@@ -363,7 +368,10 @@ export function scanCanonicalRollout(
               item.payload.payload_kind === "source_history" &&
               capturedPayloadAttemptIds.has(item.payload.attempt_id)
             ) {
-              payloadLineAttempts.set(record.lineNumber, item.payload.attempt_id);
+              payloadLineAttempts.set(
+                record.lineNumber,
+                item.payload.attempt_id,
+              );
             }
             retainedLifecycleRecords += 1;
             if (retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
@@ -374,10 +382,14 @@ export function scanCanonicalRollout(
             }
             const pending = attempts.get(item.payload.attempt_id);
             const pendingIntent = pending?.persistedIntent;
-            if (pending !== undefined && pendingIntent !== undefined &&
-                payloadRegistry.hasComplete(
-                  pendingIntent.source.active_history_refs_manifest,
-                ) && pending.intent === undefined) {
+            if (
+              pending !== undefined &&
+              pendingIntent !== undefined &&
+              payloadRegistry.hasComplete(
+                pendingIntent.source.active_history_refs_manifest,
+              ) &&
+              pending.intent === undefined
+            ) {
               const hydrated = hydratePersistedIntentRecord(
                 pending.intentRecord!,
                 pendingIntent,
@@ -385,18 +397,17 @@ export function scanCanonicalRollout(
               );
               pending.intent = hydrated.intent;
               pending.records.push(hydrated.record);
-              pending.sourceHistoryManifest = pendingIntent.source_history_manifest;
+              pending.sourceHistoryManifest =
+                pendingIntent.source_history_manifest;
               activeAdmissionAttempt = pending;
             }
-            if (pending !== undefined && pendingIntent !== undefined &&
-                item.payload.payload_kind === "source_history" &&
-                payloadRegistry.hasComplete(
-                  pendingIntent.source_history_manifest,
-                )) {
-              validatePersistedSourceHistory(
-                pendingIntent,
-                payloadRegistry,
-              );
+            if (
+              pending !== undefined &&
+              pendingIntent !== undefined &&
+              item.payload.payload_kind === "source_history" &&
+              payloadRegistry.hasComplete(pendingIntent.source_history_manifest)
+            ) {
+              validatePersistedSourceHistory(pendingIntent, payloadRegistry);
               pending.sourceHistoryValidated = true;
             }
             return;
@@ -428,8 +439,10 @@ export function scanCanonicalRollout(
           }
 
           const incompleteAttempt = [...attempts.values()].find(
-            (attempt) => attempt.persistedIntent !== undefined &&
-              attempt.intent === undefined && !attempt.terminal,
+            (attempt) =>
+              attempt.persistedIntent !== undefined &&
+              attempt.intent === undefined &&
+              !attempt.terminal,
           );
           if (incompleteAttempt !== undefined) {
             throw new Error(
@@ -441,7 +454,9 @@ export function scanCanonicalRollout(
           if (persistedCommit !== undefined) {
             const attempt = attempts.get(persistedCommit.attempt_id);
             if (attempt?.intent === undefined) {
-              throw new Error("persisted compaction commit has no hydrated intent");
+              throw new Error(
+                "persisted compaction commit has no hydrated intent",
+              );
             }
             record = hydratePersistedCommitRecord(
               record,
@@ -450,9 +465,11 @@ export function scanCanonicalRollout(
               payloadRegistry,
             );
             item = record.item;
-            if (item.type !== "compaction_committed" ||
-                item.payload.summary_dag.planned_provider_calls !==
-                  attempt.intent.planned_provider_calls) {
+            if (
+              item.type !== "compaction_committed" ||
+              item.payload.summary_dag.planned_provider_calls !==
+                attempt.intent.planned_provider_calls
+            ) {
               throw new Error(
                 "canonical compaction commit provider-call plan conflicts with its intent",
               );
@@ -460,9 +477,11 @@ export function scanCanonicalRollout(
           }
           const persistedRollback = persistedRollbackPayload(item);
           if (persistedRollback !== undefined) {
-            if (payloadRegistry.hasComplete(
-              persistedRollback.source_history_manifest,
-            )) {
+            if (
+              payloadRegistry.hasComplete(
+                persistedRollback.source_history_manifest,
+              )
+            ) {
               record = hydratePersistedRollbackRecord(
                 record,
                 persistedRollback,
@@ -483,7 +502,10 @@ export function scanCanonicalRollout(
                 recordMessageIndex: 0,
               });
               if (!activeLineBytes.has(record.lineNumber)) {
-                activeLineBytes.set(record.lineNumber, record.encodedByteLength + 1);
+                activeLineBytes.set(
+                  record.lineNumber,
+                  record.encodedByteLength + 1,
+                );
                 activeSourceBytes += record.encodedByteLength + 1;
               }
             } else if (
@@ -500,7 +522,10 @@ export function scanCanonicalRollout(
                 recordMessageIndex,
               }));
               activeLineBytes.clear();
-              activeLineBytes.set(record.lineNumber, record.encodedByteLength + 1);
+              activeLineBytes.set(
+                record.lineNumber,
+                record.encodedByteLength + 1,
+              );
               activeSourceBytes = record.encodedByteLength + 1;
             } else if (next.history.length < activePositions.length) {
               activePositions = activePositions.slice(0, next.history.length);
@@ -508,7 +533,8 @@ export function scanCanonicalRollout(
                 activePositions.map((position) => position.lineNumber),
               );
               for (const lineNumber of activeLineBytes.keys()) {
-                if (!retainedLines.has(lineNumber)) activeLineBytes.delete(lineNumber);
+                if (!retainedLines.has(lineNumber))
+                  activeLineBytes.delete(lineNumber);
               }
               activeSourceBytes = [...activeLineBytes.values()].reduce(
                 (total, bytes) => total + bytes,
@@ -516,16 +542,21 @@ export function scanCanonicalRollout(
               );
             }
             reducedState = next;
-            if (reducedState.history.length > MAX_COMPACTION_SOURCE_MESSAGES ||
-                activeSourceBytes > MAX_COMPACTION_SOURCE_BYTES) {
+            if (
+              reducedState.history.length > MAX_COMPACTION_SOURCE_MESSAGES ||
+              activeSourceBytes > MAX_COMPACTION_SOURCE_BYTES
+            ) {
               throw new RecoveryOperationalError(
                 "recovery_history_storage_limit",
                 "canonical active history exceeds its bounded compaction scan budget",
               );
             }
           }
-          if (!item.type.startsWith("compaction_") ||
-              !("attempt_id" in item.payload)) return;
+          if (
+            !item.type.startsWith("compaction_") ||
+            !("attempt_id" in item.payload)
+          )
+            return;
           retainedLifecycleRecords += 1;
           if (retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
             throw new RecoveryOperationalError(
@@ -552,16 +583,20 @@ export function scanCanonicalRollout(
           }
           const attempt = attempts.get(lifecycleAttemptId);
           if (attempt === undefined) return;
-          if (attempt.commitSha256 !== undefined &&
-              "commit_sha256" in item.payload &&
-              item.payload.commit_sha256 !== attempt.commitSha256) {
+          if (
+            attempt.commitSha256 !== undefined &&
+            "commit_sha256" in item.payload &&
+            item.payload.commit_sha256 !== attempt.commitSha256
+          ) {
             throw new Error(
               "canonical compaction post-commit event is not bound to its hydrated commit",
             );
           }
           attempt.records.push(record);
-          if (item.type === "compaction_committed" ||
-              item.type === "compaction_failed") {
+          if (
+            item.type === "compaction_committed" ||
+            item.type === "compaction_failed"
+          ) {
             attempt.terminal = true;
             if (item.type === "compaction_committed") {
               attempt.commitSha256 = digestWithDomain(
@@ -585,8 +620,10 @@ export function scanCanonicalRollout(
       }
     }
 
-    if (latestCommittedAttempt !== undefined &&
-        postCommitBookkeeping === "await_meta") {
+    if (
+      latestCommittedAttempt !== undefined &&
+      postCommitBookkeeping === "await_meta"
+    ) {
       latestCommittedAttempt.laterWork = true;
     }
     for (const attempt of attempts.values()) {
@@ -595,11 +632,13 @@ export function scanCanonicalRollout(
           "canonical compaction intent did not reconstruct its source manifests",
         );
       }
-      if (attempt.persistedIntent !== undefined &&
-          attempt.sourceHistoryValidated !== true &&
-          !attempt.records.some((record) =>
-            record.item.type === "compaction_source_release"
-          )) {
+      if (
+        attempt.persistedIntent !== undefined &&
+        attempt.sourceHistoryValidated !== true &&
+        !attempt.records.some(
+          (record) => record.item.type === "compaction_source_release",
+        )
+      ) {
         throw new Error(
           "canonical compaction source history is missing without a durable release",
         );
@@ -633,7 +672,11 @@ export function scanCanonicalRollout(
       identityPolicy: "trusted_replay",
       onRecord: (record) => {
         const payloadAttemptId = payloadLineAttempts.get(record.lineNumber);
-        if (!sourceLines.has(record.lineNumber) && payloadAttemptId === undefined) return;
+        if (
+          !sourceLines.has(record.lineNumber) &&
+          payloadAttemptId === undefined
+        )
+          return;
         checkOperationalBudget();
         const physical = readPhysicalRecord(fd, record);
         const item = record.item;
@@ -653,9 +696,11 @@ export function scanCanonicalRollout(
           });
         }
         if (payloadAttemptId !== undefined) {
-          if (item.type !== "compaction_payload_chunk" ||
-              item.payload.attempt_id !== payloadAttemptId ||
-              item.payload.payload_kind !== "source_history") {
+          if (
+            item.type !== "compaction_payload_chunk" ||
+            item.payload.attempt_id !== payloadAttemptId ||
+            item.payload.payload_kind !== "source_history"
+          ) {
             throw new Error(
               "captured compaction source-history row changed during canonical scan",
             );
@@ -677,16 +722,19 @@ export function scanCanonicalRollout(
     return {
       proof: withoutRecords(first),
       attempts: new Map(
-        [...attempts].map(([attemptId, attempt]) => [attemptId, {
-          intent: attempt.intent!,
-          records: Object.freeze(attempt.records.slice()),
-          admissionValid: validAdmission(attempt),
-          hasLaterCanonicalWork: attempt.laterWork,
-          sourceHistoryRetained: attempt.sourceHistoryValidated === true,
-          ...(attempt.sourceHistoryManifest !== undefined
-            ? { sourceHistoryManifest: attempt.sourceHistoryManifest }
-            : {}),
-        }]),
+        [...attempts].map(([attemptId, attempt]) => [
+          attemptId,
+          {
+            intent: attempt.intent!,
+            records: Object.freeze(attempt.records.slice()),
+            admissionValid: validAdmission(attempt),
+            hasLaterCanonicalWork: attempt.laterWork,
+            sourceHistoryRetained: attempt.sourceHistoryValidated === true,
+            ...(attempt.sourceHistoryManifest !== undefined
+              ? { sourceHistoryManifest: attempt.sourceHistoryManifest }
+              : {}),
+          },
+        ]),
       ),
       sourceRecords,
       payloadRecordsAtAttempts: new Map(
@@ -696,10 +744,12 @@ export function scanCanonicalRollout(
         ]),
       ),
       ...(options.captureActiveHistory === true
-        ? { activeHistory: {
-            messages: Object.freeze(reducedState.history.slice()),
-            positions: Object.freeze(activePositions.slice()),
-          } }
+        ? {
+            activeHistory: {
+              messages: Object.freeze(reducedState.history.slice()),
+              positions: Object.freeze(activePositions.slice()),
+            },
+          }
         : {}),
       historyAtAttempts,
     };
@@ -729,12 +779,17 @@ function hydratePersistedIntentRecord(
   record: StrictCanonicalJournalRecord,
   persisted: CompactionPersistedIntentV1,
   payloadRegistry: DiskCompactionPayloadRegistry,
-): { readonly record: StrictCanonicalJournalRecord; readonly intent: CompactionIntentV1 } {
+): {
+  readonly record: StrictCanonicalJournalRecord;
+  readonly intent: CompactionIntentV1;
+} {
   const activeEntries = payloadRegistry.reconstruct(
     persisted.source.active_history_refs_manifest,
   );
   if (!Array.isArray(activeEntries)) {
-    throw new Error("active-history payload manifest did not reconstruct an array");
+    throw new Error(
+      "active-history payload manifest did not reconstruct an array",
+    );
   }
   const { active_history_refs_manifest: _manifest, ...sourceBase } =
     persisted.source;
@@ -756,8 +811,7 @@ function hydratePersistedIntentRecord(
     admission_required: persisted.admission_required,
     planned_provider_calls: persisted.planned_provider_calls,
   });
-  if (!("source" in hydrated) ||
-      !("active_history_refs" in hydrated.source)) {
+  if (!("source" in hydrated) || !("active_history_refs" in hydrated.source)) {
     throw new Error("persisted compaction intent did not hydrate inline");
   }
   const intent = hydrated as CompactionIntentV1;
@@ -842,22 +896,25 @@ function hydratePersistedRollbackRecord(
   persisted: CompactionPersistedRollbackCommittedV1,
   payloadRegistry: DiskCompactionPayloadRegistry,
 ): StrictCanonicalJournalRecord {
-  const hydrated = readCompactionRolloutPayload("compaction_rollback_committed", {
-    format_version: persisted.format_version,
-    minimum_reader_runtime: persisted.minimum_reader_runtime,
-    attempt_id: persisted.attempt_id,
-    recorded_at_ms: persisted.recorded_at_ms,
-    commit_sha256: persisted.commit_sha256,
-    source_sha256: persisted.source_sha256,
-    history_digest: persisted.history_digest,
-    source_session_id: persisted.source_session_id,
-    source_epoch: persisted.source_epoch,
-    rollback_mode: persisted.rollback_mode,
-    target_session_id: persisted.target_session_id,
-    source_history: payloadRegistry.reconstruct(
-      persisted.source_history_manifest,
-    ),
-  });
+  const hydrated = readCompactionRolloutPayload(
+    "compaction_rollback_committed",
+    {
+      format_version: persisted.format_version,
+      minimum_reader_runtime: persisted.minimum_reader_runtime,
+      attempt_id: persisted.attempt_id,
+      recorded_at_ms: persisted.recorded_at_ms,
+      commit_sha256: persisted.commit_sha256,
+      source_sha256: persisted.source_sha256,
+      history_digest: persisted.history_digest,
+      source_session_id: persisted.source_session_id,
+      source_epoch: persisted.source_epoch,
+      rollback_mode: persisted.rollback_mode,
+      target_session_id: persisted.target_session_id,
+      source_history: payloadRegistry.reconstruct(
+        persisted.source_history_manifest,
+      ),
+    },
+  );
   if (!("source_history" in hydrated)) {
     throw new Error("persisted compaction rollback did not hydrate inline");
   }
@@ -876,8 +933,12 @@ function persistedIntentPayload(
 ): CompactionPersistedIntentV1 | undefined {
   if (item.type !== "compaction_intent") return undefined;
   const payload = item.payload as unknown;
-  if (typeof payload !== "object" || payload === null ||
-      !("source_history_manifest" in payload)) return undefined;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("source_history_manifest" in payload)
+  )
+    return undefined;
   return readCompactionPersistedIntentV1(payload);
 }
 
@@ -886,8 +947,12 @@ function persistedCommitPayload(
 ): CompactionPersistedCommittedV1 | undefined {
   if (item.type !== "compaction_committed") return undefined;
   const payload = item.payload as unknown;
-  if (typeof payload !== "object" || payload === null ||
-      !("final_summary_manifest" in payload)) return undefined;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("final_summary_manifest" in payload)
+  )
+    return undefined;
   return readCompactionPersistedCommittedV1(payload);
 }
 
@@ -896,18 +961,24 @@ function persistedRollbackPayload(
 ): CompactionPersistedRollbackCommittedV1 | undefined {
   if (item.type !== "compaction_rollback_committed") return undefined;
   const payload = item.payload as unknown;
-  if (typeof payload !== "object" || payload === null ||
-      !("source_history_manifest" in payload)) return undefined;
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("source_history_manifest" in payload)
+  )
+    return undefined;
   return readCompactionPersistedRollbackCommittedV1(payload);
 }
 
 function isCausalAutoCompactionBoundary(item: RolloutItem): boolean {
-  return item.type === "event_msg" &&
+  return (
+    item.type === "event_msg" &&
     item.payload.msg.type === "context_compacted" &&
     typeof item.payload.msg.payload.summary === "string" &&
     /^auto-compact boundary \(turnId=[^)]+\)$/u.test(
       item.payload.msg.payload.summary,
-    );
+    )
+  );
 }
 
 function strictOptions(
@@ -943,7 +1014,9 @@ function scanPass(
     options.checkOperationalBudget?.();
     const remaining = size - BigInt(offset);
     const requested = Number(
-      remaining < BigInt(chunk.byteLength) ? remaining : BigInt(chunk.byteLength),
+      remaining < BigInt(chunk.byteLength)
+        ? remaining
+        : BigInt(chunk.byteLength),
     );
     const bytesRead = readSync(fd, chunk, 0, requested, offset);
     if (bytesRead <= 0) {
@@ -962,17 +1035,22 @@ function observeAdmission(
   if (attempt.terminal) return;
   const item = record.item;
   if (
-    (item.type === "compaction_committed" || item.type === "compaction_failed") &&
+    (item.type === "compaction_committed" ||
+      item.type === "compaction_failed") &&
     item.payload.attempt_id === attempt.intent?.attempt_id
   ) {
     return;
   }
-  if (item.type === "compaction_payload_chunk" &&
-      item.payload.attempt_id === attempt.intent?.attempt_id) {
+  if (
+    item.type === "compaction_payload_chunk" &&
+    item.payload.attempt_id === attempt.intent?.attempt_id
+  ) {
     return;
   }
-  if (item.type !== "event_msg" ||
-      item.payload.msg.type !== "execution_admission") {
+  if (
+    item.type !== "event_msg" ||
+    item.payload.msg.type !== "execution_admission"
+  ) {
     attempt.contaminated = true;
     return;
   }
@@ -994,7 +1072,8 @@ function advanceAdmission(
     attempt.eventIds.has(admission.eventId) ||
     envelope.eventId !== admission.eventId ||
     envelope.id !== admission.eventId
-  ) return false;
+  )
+    return false;
   const callNumber = admissionCallNumber(admission, intent);
   if (callNumber === undefined || callNumber < attempt.latestCall) return false;
   attempt.latestAdmissionSequence = admission.sequence;
@@ -1011,7 +1090,8 @@ function advanceAdmission(
       scoped.parentRunId !== intent.source.session_id) ||
     (scoped.sessionId !== undefined &&
       scoped.sessionId !== intent.source.session_id)
-  ) return false;
+  )
+    return false;
   const state = attempt.calls.get(callNumber) ?? {
     queued: false,
     allowed: false,
@@ -1019,7 +1099,8 @@ function advanceAdmission(
     reconciled: false,
     heldUnknown: false,
   };
-  if (!advanceAdmissionState(state, admission, attempt.reservationIds)) return false;
+  if (!advanceAdmissionState(state, admission, attempt.reservationIds))
+    return false;
   attempt.calls.set(callNumber, state);
   attempt.latestCall = callNumber;
   return true;
@@ -1048,37 +1129,67 @@ function advanceAdmissionState(
 ): boolean {
   switch (admission.event) {
     case "queued":
-      if (state.queued || state.allowed || state.dispatched ||
-          state.reconciled || state.heldUnknown) return false;
+      if (
+        state.queued ||
+        state.allowed ||
+        state.dispatched ||
+        state.reconciled ||
+        state.heldUnknown
+      )
+        return false;
       state.queued = true;
       return true;
     case "allowed":
-      if (!state.queued || state.allowed || state.dispatched ||
-          state.reconciled || state.heldUnknown ||
-          admission.reservationId === undefined ||
-          admission.reservationId.length === 0 ||
-          reservationIds.has(admission.reservationId)) return false;
+      if (
+        !state.queued ||
+        state.allowed ||
+        state.dispatched ||
+        state.reconciled ||
+        state.heldUnknown ||
+        admission.reservationId === undefined ||
+        admission.reservationId.length === 0 ||
+        reservationIds.has(admission.reservationId)
+      )
+        return false;
       state.reservationId = admission.reservationId;
       reservationIds.add(admission.reservationId);
       state.allowed = true;
       return true;
     case "fallback":
-      return state.allowed && !state.reconciled && !state.heldUnknown &&
-        admission.reservationId === state.reservationId;
+      return (
+        state.allowed &&
+        !state.reconciled &&
+        !state.heldUnknown &&
+        admission.reservationId === state.reservationId
+      );
     case "dispatched":
-      if (!state.allowed || state.dispatched || state.reconciled ||
-          state.heldUnknown ||
-          admission.reservationId !== state.reservationId) return false;
+      if (
+        !state.allowed ||
+        state.dispatched ||
+        state.reconciled ||
+        state.heldUnknown ||
+        admission.reservationId !== state.reservationId
+      )
+        return false;
       state.dispatched = true;
       return true;
     case "reconciled":
-      if (!state.dispatched || state.reconciled ||
-          admission.reservationId !== state.reservationId) return false;
+      if (
+        !state.dispatched ||
+        state.reconciled ||
+        admission.reservationId !== state.reservationId
+      )
+        return false;
       state.reconciled = true;
       return true;
     case "held_unknown":
-      if (!state.dispatched || state.reconciled || state.heldUnknown ||
-          admission.reservationId !== state.reservationId) return false;
+      if (
+        !state.dispatched ||
+        state.reconciled ||
+        state.heldUnknown ||
+        admission.reservationId !== state.reservationId
+      )
+        return false;
       state.heldUnknown = true;
       return true;
     default:
@@ -1091,13 +1202,22 @@ function validAdmission(attempt: MutableAttemptScan): boolean {
   if (intent === undefined) return false;
   if (attempt.contaminated) return false;
   if (attempt.calls.size === 0) return !intent.admission_required;
-  if (!intent.admission_required ||
-      attempt.calls.size !== intent.planned_provider_calls ||
-      attempt.latestCall !== attempt.calls.size) return false;
+  if (
+    !intent.admission_required ||
+    attempt.calls.size !== intent.planned_provider_calls ||
+    attempt.latestCall !== attempt.calls.size
+  )
+    return false;
   for (let call = 1; call <= attempt.latestCall; call += 1) {
     const state = attempt.calls.get(call);
-    if (state === undefined || !state.queued || !state.allowed ||
-        !state.dispatched || (!state.reconciled && !state.heldUnknown)) return false;
+    if (
+      state === undefined ||
+      !state.queued ||
+      !state.allowed ||
+      !state.dispatched ||
+      (!state.reconciled && !state.heldUnknown)
+    )
+      return false;
   }
   return true;
 }
@@ -1119,23 +1239,41 @@ function assertMatchingProof(
   first: StrictCanonicalJournal,
   second: StrictCanonicalJournal,
 ): void {
-  if (first.sourceSha256 !== second.sourceSha256 ||
-      first.sourceByteLength !== second.sourceByteLength ||
-      first.recordCount !== second.recordCount ||
-      first.eventCount !== second.eventCount) {
+  if (
+    first.sourceSha256 !== second.sourceSha256 ||
+    first.sourceByteLength !== second.sourceByteLength ||
+    first.recordCount !== second.recordCount ||
+    first.eventCount !== second.eventCount ||
+    first.activeEpoch !== second.activeEpoch ||
+    first.activeLifecycleState !== second.activeLifecycleState ||
+    first.activeTerminalStatus !== second.activeTerminalStatus ||
+    first.activeSuspensionEventId !== second.activeSuspensionEventId ||
+    first.activeCancellationRequestEventId !==
+      second.activeCancellationRequestEventId ||
+    first.activeStartupActivationResumeEventId !==
+      second.activeStartupActivationResumeEventId ||
+    first.activeRuntimeSettingsEventId !==
+      second.activeRuntimeSettingsEventId ||
+    first.legacyPermissionMode !== second.legacyPermissionMode ||
+    JSON.stringify(first.activeRuntimeSettings) !==
+      JSON.stringify(second.activeRuntimeSettings)
+  ) {
     throw new Error("canonical rollout proof changed between scan passes");
   }
 }
 
-function assertPinnedSnapshot(
-  fd: number,
-  before: BigIntStats,
-): void {
+function assertPinnedSnapshot(fd: number, before: BigIntStats): void {
   const after = fstatSync(fd, { bigint: true });
-  if (before.dev !== after.dev || before.ino !== after.ino ||
-      before.size !== after.size || before.mtimeNs !== after.mtimeNs ||
-      before.ctimeNs !== after.ctimeNs) {
-    throw new Error("canonical rollout changed during compaction reconciliation");
+  if (
+    before.dev !== after.dev ||
+    before.ino !== after.ino ||
+    before.size !== after.size ||
+    before.mtimeNs !== after.mtimeNs ||
+    before.ctimeNs !== after.ctimeNs
+  ) {
+    throw new Error(
+      "canonical rollout changed during compaction reconciliation",
+    );
   }
 }
 

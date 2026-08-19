@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   AgenCBackgroundAgentMessageError,
+  AgenCBackgroundAgentSuspensionShutdownError,
   AgenCDelegateBackgroundAgentRunner,
   daemonEventFromUnboundSessionEvent,
   notificationFromDaemonEvent,
@@ -25,6 +26,7 @@ import {
 import { JSON_RPC_VERSION } from "./protocol/index.js";
 import { requestApproval } from "../tools/orchestrator.js";
 import type { CsvAgentJobsRepositoryProvider } from "./csv-agent-jobs-authority.js";
+import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
 
 const backgroundAgentRunnerSourcePath = new URL(
   "../../src/app-server/background-agent-runner.ts",
@@ -97,6 +99,7 @@ function makeStubConversationThreadManager(opts: {
   readonly threadId: string;
   readonly agentPath?: string;
   readonly submit?: ReturnType<typeof vi.fn>;
+  readonly appendMessage?: ReturnType<typeof vi.fn>;
   readonly shutdown?: ReturnType<typeof vi.fn>;
   readonly initialStatus?: AgentStatus;
   readonly totalTokenUsage?: () => {
@@ -129,7 +132,7 @@ function makeStubConversationThreadManager(opts: {
       };
     },
     submit,
-    appendMessage: vi.fn(async () => opts.threadId),
+    appendMessage: opts.appendMessage ?? vi.fn(async () => opts.threadId),
     shutdown,
     totalTokenUsage:
       opts.totalTokenUsage ??
@@ -182,7 +185,12 @@ function makeAuthBackend(
 function makeTopLevelRunner(opts: {
   readonly conversationId: string;
   readonly bootstrapShutdown?: ReturnType<typeof vi.fn>;
+  readonly bootstrapShutdownAfterFinalizers?: ReturnType<typeof vi.fn>;
+  readonly emitAfterAppendError?: Error;
+  readonly syncCanonicalTail?: ReturnType<typeof vi.fn>;
   readonly threadShutdown?: ReturnType<typeof vi.fn>;
+  readonly threadAppendMessage?: ReturnType<typeof vi.fn>;
+  readonly hydrateStateWith?: ReturnType<typeof vi.fn>;
   readonly authBackend?: AuthBackend;
   readonly env?: NodeJS.ProcessEnv;
   readonly argv?: readonly string[];
@@ -197,21 +205,46 @@ function makeTopLevelRunner(opts: {
     readonly outputTokens: number;
     readonly totalTokens: number;
   };
+  readonly canonicalRuntimeSettings?: boolean;
 }) {
   const shutdownImpl = opts.bootstrapShutdown ?? vi.fn(async () => {});
   const durableOperations = new Set<Promise<unknown>>();
   const beforeDurableClose = new Set<() => void | Promise<void>>();
   const permissionUpdates: ToolPermissionContext[] = [];
+  let permissionContext = createEmptyToolPermissionContext();
+  let permissionBeforeUpdate:
+    | ((
+        next: ToolPermissionContext,
+        current: ToolPermissionContext,
+        metadata: unknown,
+      ) => void | Promise<void>)
+    | undefined;
   const permissionModeRegistry = {
-    current: () => createEmptyToolPermissionContext(),
-    update: vi.fn(async (context: ToolPermissionContext) => {
-      permissionUpdates.push(context);
+    current: () =>
+      opts.canonicalRuntimeSettings === true
+        ? permissionContext
+        : createEmptyToolPermissionContext(),
+    update: vi.fn(
+      async (context: ToolPermissionContext, metadata?: unknown) => {
+        await permissionBeforeUpdate?.(context, permissionContext, metadata);
+        if (opts.canonicalRuntimeSettings === true) permissionContext = context;
+        permissionUpdates.push(context);
+      },
+    ),
+    installBeforeUpdateHook: vi.fn((hook: typeof permissionBeforeUpdate) => {
+      permissionBeforeUpdate = hook;
+      return () => {
+        if (permissionBeforeUpdate === hook) permissionBeforeUpdate = undefined;
+      };
     }),
   };
   const stub = makeStubConversationThreadManager({
     threadId: opts.conversationId,
     ...(opts.threadShutdown !== undefined
       ? { shutdown: opts.threadShutdown }
+      : {}),
+    ...(opts.threadAppendMessage !== undefined
+      ? { appendMessage: opts.threadAppendMessage }
       : {}),
     ...(opts.totalTokenUsage !== undefined
       ? { totalTokenUsage: opts.totalTokenUsage }
@@ -232,6 +265,13 @@ function makeTopLevelRunner(opts: {
   const rolloutStore = {
     rolloutPath: `/tmp/${opts.conversationId}.jsonl`,
     readAll: () => [...rolloutItems],
+    assertRunSuspendable: vi.fn(() => {}),
+    recordRunSuspensionEvent: vi.fn(() => {}),
+    recordRunStartupActivationEvent: vi.fn(() => {}),
+    ...(opts.canonicalRuntimeSettings === true
+      ? { recordRunRuntimeSettingsEvent: vi.fn(() => {}) }
+      : {}),
+    syncCanonicalTail: opts.syncCanonicalTail ?? vi.fn(() => {}),
   };
   let activeTurnValue: { readonly turnId: string } | null = null;
   const abortTurnIfActive = vi.fn(async (turnId: string) => {
@@ -242,9 +282,41 @@ function makeTopLevelRunner(opts: {
   const activeTurn = {
     unsafePeek: () => activeTurnValue,
   };
+  const sessionState = {
+    sessionConfiguration: {
+      cwd: "/workspace",
+      collaborationMode: { model: "base-model" },
+      provider: { slug: "base-provider" },
+    },
+    history: [] as unknown[],
+  };
   const session = {
     conversationId: opts.conversationId,
     permissionModeRegistry,
+    get sessionConfiguration() {
+      return sessionState.sessionConfiguration;
+    },
+    pendingProviderSwitch: null as {
+      provider: string;
+      model: string;
+      profile?: string;
+    } | null,
+    setPendingProviderSwitch(
+      spec: {
+        provider: string;
+        model: string;
+        profile?: string;
+      } | null,
+    ) {
+      this.pendingProviderSwitch = spec;
+    },
+    syncPermissionContextFromRegistry: vi.fn(async () => {}),
+    state: {
+      with: vi.fn(async (apply: (state: typeof sessionState) => void) => {
+        await apply(sessionState);
+      }),
+      unsafePeek: () => sessionState,
+    },
     abortAllTasks: vi.fn(async () => {}),
     trackDurableOperation: <T>(operation: Promise<T>): Promise<T> => {
       durableOperations.add(operation);
@@ -297,11 +369,17 @@ function makeTopLevelRunner(opts: {
       };
       rolloutItems.push({ type: "event_msg", payload: stamped });
       publishSessionEvent(stamped);
+      if (opts.emitAfterAppendError !== undefined) {
+        throw opts.emitAfterAppendError;
+      }
       return stamped;
     }),
     rolloutStore,
     services: { conversationThreadManager: stub },
   };
+  if (opts.hydrateStateWith !== undefined) {
+    Object.assign(session, { state: { with: opts.hydrateStateWith } });
+  }
   if (opts.scopedTurnCancellation === true) {
     Object.assign(session, { abortTurnIfActive, activeTurn });
   }
@@ -313,15 +391,18 @@ function makeTopLevelRunner(opts: {
     const finalizers = [...beforeDurableClose];
     beforeDurableClose.clear();
     for (const finalize of finalizers) await finalize();
+    await opts.bootstrapShutdownAfterFinalizers?.();
   });
   const control = {
     shutdown: vi.fn(async () => {}),
     sendInput: vi.fn(async () => {}),
     interrupt: vi.fn(),
     openThreadSpawnChildren: vi.fn(() => []),
+    liveThreadSpawnChildren: vi.fn(() => new Map()),
     clearConversationHistory: vi.fn(async () => {}),
   };
   const bootstrap = vi.fn(async () => ({
+    workspaceRoot: "/workspace",
     session,
     rolloutStore,
     registry: {
@@ -366,6 +447,7 @@ function makeTopLevelRunner(opts: {
     permissionUpdates,
     permissionModeRegistry,
     rolloutItems,
+    rolloutStore,
     abortTurnIfActive,
     activeTurn,
     setActiveTurn(turnId: string | null) {
@@ -375,6 +457,528 @@ function makeTopLevelRunner(opts: {
 }
 
 describe("AgenC delegate background-agent runner", () => {
+  it("waits for the exact terminal generation cleanup before explicit restore", async () => {
+    let releaseShutdown!: () => void;
+    const shutdownBlocked = new Promise<void>((resolve) => {
+      releaseShutdown = resolve;
+    });
+    const bootstrapShutdown = vi.fn(() => shutdownBlocked);
+    const { runner, stub, bootstrap } = makeTopLevelRunner({
+      conversationId: "session-generation-race",
+      bootstrapShutdown,
+    });
+    await runner.startAgent({
+      objective: "retained objective",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({
+      status: "completed",
+      turnId: "turn-generation-race",
+      endedAtMs: 2,
+      lastMessage: "done",
+    });
+    await vi.waitFor(() => expect(bootstrapShutdown).toHaveBeenCalledOnce());
+
+    const restoring = runner.restoreAgent({
+      agentId: "session-generation-race",
+      objective: "retained objective",
+      reopenTerminalRun: true,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(bootstrap).toHaveBeenCalledOnce();
+    await expect(
+      runner.restoreAgent({
+        agentId: "session-generation-race",
+        objective: "retained objective",
+        reopenTerminalRun: true,
+      }),
+    ).rejects.toThrow("already being restored");
+
+    stub.pushStatus({
+      status: "running",
+      turnId: "turn-restored-generation",
+      startedAtMs: 3,
+    });
+    releaseShutdown();
+    await expect(restoring).resolves.toBe(true);
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+    await expect(
+      runner.getAgentSnapshot("session-generation-race"),
+    ).resolves.not.toBeNull();
+  });
+
+  it("retires a failed restore generation so an exact retry can proceed", async () => {
+    let harness: ReturnType<typeof makeTopLevelRunner>;
+    let hydrationAttempts = 0;
+    const hydrateStateWith = vi.fn(
+      async (apply: (state: { history?: unknown }) => void | Promise<void>) => {
+        hydrationAttempts += 1;
+        if (hydrationAttempts === 1) {
+          throw new Error("injected recovered-history hydration failure");
+        }
+        await apply({ history: [] });
+      },
+    );
+    const bootstrapShutdown = vi.fn(async () => {
+      harness.stub.pushStatus({
+        status: "completed",
+        turnId: "turn-failed-restore",
+        endedAtMs: 2,
+        lastMessage: "retired",
+      });
+    });
+    harness = makeTopLevelRunner({
+      conversationId: "session-restore-hydration-retry",
+      hydrateStateWith,
+      bootstrapShutdown,
+    });
+    const params = {
+      agentId: "session-restore-hydration-retry",
+      objective: "retained objective",
+      explicitColdResume: true,
+      initialMessages: [{ role: "user" as const, content: "retained" }],
+    };
+
+    await expect(harness.runner.restoreAgent(params)).rejects.toThrow(
+      "injected recovered-history hydration failure",
+    );
+    await expect(
+      harness.runner.getAgentSnapshot("session-restore-hydration-retry"),
+    ).resolves.toBeNull();
+    expect(
+      harness.session.emit.mock.calls.some(
+        ([event]) =>
+          (event as { msg?: { type?: unknown } }).msg?.type === "run_terminal",
+      ),
+    ).toBe(false);
+    expect(harness.shutdown).toHaveBeenCalledOnce();
+
+    harness.stub.pushStatus({
+      status: "running",
+      turnId: "turn-restored-retry",
+      startedAtMs: 3,
+    });
+    await expect(harness.runner.restoreAgent(params)).resolves.toBe(true);
+    await expect(
+      harness.runner.getAgentSnapshot("session-restore-hydration-retry"),
+    ).resolves.not.toBeNull();
+    expect(hydrateStateWith).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the hydration failure primary when restore cleanup also fails", async () => {
+    const harness = makeTopLevelRunner({
+      conversationId: "session-restore-hydration-cleanup-error",
+      hydrateStateWith: vi.fn(async () => {
+        throw new Error("primary hydration failure");
+      }),
+      bootstrapShutdown: vi.fn(async () => {
+        throw new Error("secondary shutdown failure");
+      }),
+    });
+
+    const error = await harness.runner
+      .restoreAgent({
+        agentId: "session-restore-hydration-cleanup-error",
+        objective: "retained objective",
+        explicitColdResume: true,
+        initialMessages: [{ role: "user", content: "retained" }],
+      })
+      .then(
+        () => null,
+        (reason: unknown) => reason,
+      );
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors[0]).toMatchObject({
+      message: "primary hydration failure",
+    });
+    expect(
+      harness.session.emit.mock.calls.some(
+        ([event]) =>
+          (event as { msg?: { type?: unknown } }).msg?.type === "run_terminal",
+      ),
+    ).toBe(false);
+    await expect(
+      harness.runner.getAgentSnapshot(
+        "session-restore-hydration-cleanup-error",
+      ),
+    ).resolves.toBeNull();
+  });
+
+  it("defers startup side effects while restoring a suspended generation", async () => {
+    const { runner, bootstrap } = makeTopLevelRunner({
+      conversationId: "session-suspended-side-effects",
+    });
+
+    await expect(
+      runner.restoreAgent({
+        agentId: "session-suspended-side-effects",
+        objective: "retained objective",
+        resumeSuspendedRun: true,
+        suspendedResumeReason: "daemon_startup_restore",
+      }),
+    ).resolves.toBe(true);
+
+    expect(bootstrap).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resumeSuspendedConversation: true,
+        suspendedResumeReason: "daemon_startup_restore",
+        deferSessionStartHooks: true,
+        deferAgentStartupSideEffects: true,
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: "without an override",
+      permissionMode: undefined,
+      expectedMode: "default" as const,
+      expectedSettingsEvents: 1,
+    },
+    {
+      label: "with an explicit plan override",
+      permissionMode: "plan" as const,
+      expectedMode: "plan" as const,
+      expectedSettingsEvents: 2,
+    },
+  ])(
+    "keeps a fresh default run cold-resumable $label",
+    async ({ permissionMode, expectedMode, expectedSettingsEvents }) => {
+      const runId = `session-default-cold-${expectedMode}`;
+      const harness = makeTopLevelRunner({
+        conversationId: runId,
+        canonicalRuntimeSettings: true,
+      });
+      const baseline: RunRuntimeSettingsSnapshot = {
+        permissionMode: "default",
+        prePlanMode: null,
+        autoModeActive: false,
+        bypassPermissionsWorkspace: null,
+        model: "base-model",
+        provider: "base-provider",
+        profile: null,
+        reasoningEffort: null,
+        modelVerbosity: null,
+        serviceTier: null,
+        hooksDisabled: false,
+      };
+
+      await harness.runner.startAgent({ objective: "stay cold resumable" });
+      const initialSettings = harness.rolloutItems.find(
+        (item) =>
+          (item as { payload?: { msg?: { type?: unknown } } }).payload?.msg
+            ?.type === "run_runtime_settings_changed",
+      ) as
+        | {
+            payload: {
+              eventId: string;
+              msg: { payload: RunRuntimeSettingsSnapshot };
+            };
+          }
+        | undefined;
+      expect(initialSettings?.payload.msg.payload).toMatchObject(baseline);
+      expect(harness.permissionModeRegistry.current().mode).toBe("unattended");
+
+      harness.stub.pushStatus({
+        status: "idle",
+        turnId: "turn-before-cold-resume",
+        endedAtMs: 1,
+      });
+      const suspended =
+        await harness.runner.suspendIdleAgentForDaemonShutdown(runId);
+      expect(suspended.disposition).toBe("suspended");
+      if (suspended.disposition !== "suspended") {
+        throw new Error("expected a suspended run");
+      }
+      harness.session.emit({
+        eventId: `run-resumed:${runId}:1:test`,
+        id: `run-resumed:${runId}:1:test`,
+        msg: {
+          type: "run_resumed",
+          payload: {
+            runId,
+            epoch: 1,
+            suspensionEventId: suspended.suspension.eventId,
+            reason: "explicit_continue",
+            resumedAt: "2026-05-09T00:01:00.000Z",
+          },
+        },
+      });
+
+      await expect(
+        harness.runner.restoreAgent({
+          agentId: runId,
+          objective: "stay cold resumable",
+          explicitColdResume: true,
+          resumeSuspendedRun: true,
+          suspendedResumeReason: "explicit_continue",
+          runtimeSettings: baseline,
+          ...(permissionMode !== undefined ? { permissionMode } : {}),
+        }),
+      ).resolves.toBe(true);
+
+      const settingsEvents = harness.rolloutItems.flatMap((item) => {
+        const event = item as {
+          payload?: {
+            eventId?: string;
+            msg?: { type?: unknown; payload?: Record<string, unknown> };
+          };
+        };
+        return event.payload?.msg?.type === "run_runtime_settings_changed"
+          ? [event.payload]
+          : [];
+      });
+      expect(settingsEvents).toHaveLength(expectedSettingsEvents);
+      expect(settingsEvents[0]?.msg?.payload).toMatchObject(baseline);
+      if (permissionMode !== undefined) {
+        expect(settingsEvents[1]?.msg?.payload).toMatchObject({
+          permissionMode,
+          prePlanMode: "default",
+          previousSettingsEventId: initialSettings?.payload.eventId,
+          reason: "permission_mode_changed",
+        });
+      }
+      expect(harness.permissionModeRegistry.current().mode).toBe(expectedMode);
+    },
+  );
+
+  it("binds explicit bypass startup authority to the exact durable workspace", async () => {
+    const runId = "session-explicit-bypass-startup";
+    const harness = makeTopLevelRunner({
+      conversationId: runId,
+      canonicalRuntimeSettings: true,
+    });
+    await harness.permissionModeRegistry.update(
+      createEmptyToolPermissionContext({
+        mode: "bypassPermissions",
+        isBypassPermissionsModeAvailable: true,
+      }),
+    );
+
+    await harness.runner.startAgent({
+      objective: "honor explicit yolo",
+      permissionMode: "bypassPermissions",
+    });
+
+    expect(harness.permissionModeRegistry.current()).toMatchObject({
+      mode: "bypassPermissions",
+      bypassPermissionsAcceptedIn: ["/workspace"],
+    });
+    const settingsEvents = harness.rolloutItems.flatMap((item) => {
+      const event = item as {
+        payload?: { msg?: { type?: unknown; payload?: unknown } };
+      };
+      return event.payload?.msg?.type === "run_runtime_settings_changed"
+        ? [event.payload.msg.payload]
+        : [];
+    });
+    expect(settingsEvents).toHaveLength(1);
+    expect(settingsEvents[0]).toMatchObject({
+      permissionMode: "bypassPermissions",
+      bypassPermissionsWorkspace: "/workspace",
+    });
+  });
+
+  it("durably applies explicit restore overrides after the canonical settings baseline", async () => {
+    const baseline = {
+      permissionMode: "default" as const,
+      prePlanMode: null,
+      autoModeActive: false,
+      bypassPermissionsWorkspace: null,
+      model: "base-model",
+      provider: "base-provider",
+      profile: null,
+      reasoningEffort: null,
+      modelVerbosity: null,
+      serviceTier: null,
+      hooksDisabled: false,
+    };
+    const rolloutItems: unknown[] = [
+      {
+        type: "event_msg",
+        payload: {
+          id: "runtime-settings-baseline",
+          eventId: "runtime-settings-baseline",
+          seq: 1,
+          msg: {
+            type: "run_runtime_settings_changed",
+            payload: {
+              runId: "session-settings-override",
+              epoch: 1,
+              previousSettingsEventId: null,
+              rollbackOfSettingsEventId: null,
+              reason: "initial",
+              changedAt: "2026-05-09T00:00:00.000Z",
+              ...baseline,
+            },
+          },
+        },
+      },
+    ];
+    const harness = makeTopLevelRunner({
+      conversationId: "session-settings-override",
+      rolloutItems,
+      canonicalRuntimeSettings: true,
+    });
+
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-settings-override",
+        objective: "resume with explicit settings",
+        explicitColdResume: true,
+        runtimeSettings: baseline,
+        model: "override-model",
+        provider: "override-provider",
+        profile: "override-profile",
+        permissionMode: "plan",
+      }),
+    ).resolves.toBe(true);
+
+    const settingsEvents = rolloutItems.flatMap((item) => {
+      const event = item as {
+        type?: unknown;
+        payload?: { msg?: { type?: unknown } };
+      };
+      return event.type === "event_msg" &&
+        event.payload?.msg?.type === "run_runtime_settings_changed"
+        ? [event.payload]
+        : [];
+    });
+    expect(settingsEvents).toHaveLength(2);
+    expect(settingsEvents[1]).toMatchObject({
+      msg: {
+        payload: {
+          previousSettingsEventId: "runtime-settings-baseline",
+          reason: "permission_mode_changed",
+          permissionMode: "plan",
+          prePlanMode: "default",
+          model: "override-model",
+          provider: "override-provider",
+          profile: "override-profile",
+        },
+      },
+    });
+    expect(harness.permissionModeRegistry.current()).toMatchObject({
+      mode: "plan",
+      prePlanMode: "default",
+    });
+    expect(harness.session.pendingProviderSwitch).toEqual({
+      provider: "override-provider",
+      model: "override-model",
+      profile: "override-profile",
+    });
+  });
+
+  it("commits startup activation before the first resumed user input", async () => {
+    const rolloutItems: unknown[] = [
+      {
+        type: "event_msg",
+        payload: {
+          id: "resume-event",
+          eventId: "resume-event",
+          seq: 1,
+          msg: {
+            type: "run_resumed",
+            payload: {
+              runId: "session-activation-order",
+              epoch: 1,
+              suspensionEventId: "suspension-event",
+              reason: "daemon_startup_restore",
+              resumedAt: "2026-05-09T00:00:00.000Z",
+            },
+          },
+        },
+      },
+    ];
+    const harness = makeTopLevelRunner({
+      conversationId: "session-activation-order",
+      rolloutItems,
+    });
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-activation-order",
+        objective: "resume lazily",
+        explicitColdResume: true,
+        resumeStartupActivationPending: true,
+      }),
+    ).resolves.toBe(true);
+
+    await harness.runner.submitAgentMessage("session-activation-order", {
+      sessionId: "session-activation-order",
+      content: "first resumed input",
+      originalContent: "first resumed input",
+      messageId: "message-after-resume",
+      streamId: "stream-after-resume",
+      acceptedAt: "2026-05-09T00:01:00.000Z",
+    });
+
+    const types = rolloutItems.flatMap((item) => {
+      const type = (item as { payload?: { msg?: { type?: string } } }).payload
+        ?.msg?.type;
+      return type === undefined ? [] : [type];
+    });
+    expect(types).toEqual([
+      "run_resumed",
+      "run_startup_activated",
+      "user_message",
+    ]);
+    expect(
+      harness.rolloutStore.recordRunStartupActivationEvent,
+    ).toHaveBeenCalledOnce();
+  });
+
+  it("rolls back only the exact unpublished restore generation without a poison boundary", async () => {
+    let harness: ReturnType<typeof makeTopLevelRunner>;
+    const bootstrapShutdown = vi.fn(async () => {
+      harness.stub.pushStatus({
+        status: "shutdown",
+        turnId: "turn-restore-publication-rollback",
+        endedAtMs: 2,
+      });
+    });
+    harness = makeTopLevelRunner({
+      conversationId: "session-restore-publication-rollback",
+      bootstrapShutdown,
+    });
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-restore-publication-rollback",
+        objective: "retained objective",
+        explicitColdResume: true,
+        restoreAttemptId: "restore-attempt-exact",
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      harness.runner.rollbackRestoredAgent(
+        "session-restore-publication-rollback",
+        "restore-attempt-other",
+      ),
+    ).rejects.toThrow("generation no longer owns");
+    await expect(
+      harness.runner.getAgentSnapshot("session-restore-publication-rollback"),
+    ).resolves.not.toBeNull();
+
+    await expect(
+      harness.runner.rollbackRestoredAgent(
+        "session-restore-publication-rollback",
+        "restore-attempt-exact",
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      harness.runner.getAgentSnapshot("session-restore-publication-rollback"),
+    ).resolves.toBeNull();
+    expect(bootstrapShutdown).toHaveBeenCalledOnce();
+    const lifecycleTypes = harness.rolloutItems.flatMap((item) => {
+      const type = (item as { payload?: { msg?: { type?: string } } }).payload
+        ?.msg?.type;
+      return type?.startsWith("run_") ? [type] : [];
+    });
+    expect(lifecycleTypes).toEqual([]);
+  });
+
   it("projects correlated worktree completion evidence from run-agent progress", () => {
     const worktree = {
       path: "/repo/.agenc-worktrees/reviewer",
@@ -992,6 +1596,267 @@ describe("AgenC delegate background-agent runner", () => {
     expect(canonical[terminalIndex]?.msg.payload).toMatchObject({
       stopReason: "user_stopped",
     });
+  });
+
+  it("suspends a daemon-shutdown idle run without poisoning it terminal", async () => {
+    let clock = "2026-05-09T00:00:00.000Z";
+    const { runner, stub, rolloutItems, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-daemon-suspend-idle",
+      now: () => clock,
+    });
+    await runner.startAgent({
+      objective: "stay resumable",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({
+      status: "idle",
+      turnId: "turn-finished",
+      endedAtMs: 1,
+    });
+    rolloutStore.assertRunSuspendable.mockImplementation(() => {
+      clock = "2026-05-09T00:05:00.000Z";
+    });
+
+    await expect(
+      runner.suspendIdleAgentForDaemonShutdown("session-daemon-suspend-idle"),
+    ).resolves.toMatchObject({
+      disposition: "suspended",
+      suspension: {
+        epoch: 1,
+        reason: "daemon_shutdown_idle",
+      },
+    });
+    const lifecycle = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string } } }).payload;
+      return event?.msg?.type?.startsWith("run_") ? [event.msg.type] : [];
+    });
+    expect(lifecycle).toEqual(["run_suspended"]);
+    expect(
+      rolloutItems.find(
+        (item) =>
+          (item as { payload?: { msg?: { type?: unknown } } }).payload?.msg
+            ?.type === "run_suspended",
+      ),
+    ).toMatchObject({
+      payload: {
+        msg: {
+          payload: { suspendedAt: "2026-05-09T00:05:00.000Z" },
+        },
+      },
+    });
+    expect(rolloutStore.assertRunSuspendable).toHaveBeenCalled();
+    expect(rolloutStore.recordRunSuspensionEvent).toHaveBeenCalledOnce();
+  });
+
+  it("keeps committed suspension durable but rejects and retires authority when shutdown cleanup fails", async () => {
+    const bootstrapShutdownAfterFinalizers = vi.fn(async () => {
+      throw new Error("helper cleanup failed");
+    });
+    const { runner, stub, rolloutItems, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-daemon-suspend-cleanup-failure",
+      bootstrapShutdownAfterFinalizers,
+    });
+    await runner.startAgent({
+      objective: "retain honest suspension",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({ status: "idle", turnId: "turn-finished", endedAtMs: 1 });
+
+    await expect(
+      runner.suspendIdleAgentForDaemonShutdown(
+        "session-daemon-suspend-cleanup-failure",
+      ),
+    ).rejects.toMatchObject({
+      name: AgenCBackgroundAgentSuspensionShutdownError.name,
+      suspension: { epoch: 1, reason: "daemon_shutdown_idle" },
+    });
+
+    expect(bootstrapShutdownAfterFinalizers).toHaveBeenCalledOnce();
+    expect(rolloutStore.recordRunSuspensionEvent).toHaveBeenCalledOnce();
+    expect(
+      rolloutItems.filter(
+        (item) =>
+          (item as { payload?: { msg?: { type?: unknown } } }).payload?.msg
+            ?.type === "run_suspended",
+      ),
+    ).toHaveLength(1);
+    await expect(
+      runner.getAgentSnapshot("session-daemon-suspend-cleanup-failure"),
+    ).resolves.toBeNull();
+  });
+
+  it("does not accept readable suspension bytes when the fsync proof and retry fail", async () => {
+    const syncCanonicalTail = vi.fn(() => {
+      throw new Error("persistent fsync failure");
+    });
+    const { runner, stub, rolloutItems, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-daemon-suspend-fsync-failure",
+      emitAfterAppendError: new Error("append completed but fsync failed"),
+      syncCanonicalTail,
+    });
+    await runner.startAgent({
+      objective: "never claim page-cache bytes",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({ status: "idle", turnId: "turn-finished", endedAtMs: 1 });
+
+    await expect(
+      runner.suspendIdleAgentForDaemonShutdown(
+        "session-daemon-suspend-fsync-failure",
+      ),
+    ).rejects.toThrow();
+
+    expect(syncCanonicalTail).toHaveBeenCalled();
+    expect(rolloutStore.recordRunSuspensionEvent).not.toHaveBeenCalled();
+    expect(
+      rolloutItems.some(
+        (item) =>
+          (item as { payload?: { msg?: { type?: unknown } } }).payload?.msg
+            ?.type === "run_suspended",
+      ),
+    ).toBe(true);
+    await expect(
+      runner.getAgentSnapshot("session-daemon-suspend-fsync-failure"),
+    ).resolves.toBeNull();
+  });
+
+  it("allocates a fresh suspension identity for repeated same-epoch restarts", async () => {
+    const { runner, stub, session, rolloutItems } = makeTopLevelRunner({
+      conversationId: "session-daemon-suspend-cycles",
+    });
+    await runner.startAgent({
+      objective: "restart twice",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({ status: "idle", turnId: "turn-1", endedAtMs: 1 });
+    const first = await runner.suspendIdleAgentForDaemonShutdown(
+      "session-daemon-suspend-cycles",
+    );
+    expect(first.disposition).toBe("suspended");
+    if (first.disposition !== "suspended") throw new Error("not suspended");
+    session.emit({
+      eventId: `run-resumed:session-daemon-suspend-cycles:1:${first.suspension.eventId}`,
+      id: `run-resumed:session-daemon-suspend-cycles:1:${first.suspension.eventId}`,
+      msg: {
+        type: "run_resumed",
+        payload: {
+          runId: "session-daemon-suspend-cycles",
+          epoch: 1,
+          suspensionEventId: first.suspension.eventId,
+          reason: "daemon_startup_restore",
+          resumedAt: "2026-05-09T00:01:00.000Z",
+        },
+      },
+    });
+
+    await runner.startAgent({
+      objective: "restart twice",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({ status: "idle", turnId: "turn-2", endedAtMs: 2 });
+    const second = await runner.suspendIdleAgentForDaemonShutdown(
+      "session-daemon-suspend-cycles",
+    );
+    expect(second.disposition).toBe("suspended");
+    if (second.disposition !== "suspended") throw new Error("not suspended");
+    expect(second.suspension.epoch).toBe(1);
+    expect(second.suspension.eventId).not.toBe(first.suspension.eventId);
+    const lifecycle = rolloutItems.flatMap((item) => {
+      const event = (
+        item as {
+          payload?: { eventId?: string; msg?: { type?: string } };
+        }
+      ).payload;
+      return event?.msg?.type === "run_suspended" ||
+        event?.msg?.type === "run_resumed"
+        ? [{ type: event.msg.type, eventId: event.eventId }]
+        : [];
+    });
+    expect(lifecycle.map(({ type }) => type)).toEqual([
+      "run_suspended",
+      "run_resumed",
+      "run_suspended",
+    ]);
+  });
+
+  it("cancels instead of suspending when idle proof finds an unsettled effect", async () => {
+    const { runner, stub, rolloutItems, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-daemon-suspend-effect-gate",
+    });
+    await runner.startAgent({
+      objective: "has effect intent",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({
+      status: "idle",
+      turnId: "turn-effect",
+      endedAtMs: 1,
+    });
+    rolloutStore.assertRunSuspendable.mockImplementation(() => {
+      throw new Error("unsettled side effect");
+    });
+
+    await expect(
+      runner.suspendIdleAgentForDaemonShutdown(
+        "session-daemon-suspend-effect-gate",
+      ),
+    ).resolves.toMatchObject({ disposition: "cancelled" });
+    const lifecycle = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string } } }).payload;
+      return event?.msg?.type?.startsWith("run_") ? [event.msg.type] : [];
+    });
+    expect(lifecycle).toEqual(["run_terminal"]);
+  });
+
+  it("cancels and quiesces when the root is idle but a child remains open", async () => {
+    const bootstrapShutdown = vi.fn(async () => {});
+    const { runner, stub, control, rolloutItems, shutdown } =
+      makeTopLevelRunner({
+        conversationId: "session-daemon-suspend-child",
+        bootstrapShutdown,
+      });
+    await runner.startAgent({
+      objective: "wait for child",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    stub.pushStatus({
+      status: "idle",
+      turnId: "turn-parent",
+      endedAtMs: 1,
+    });
+    control.liveThreadSpawnChildren.mockReturnValue(
+      new Map([
+        [
+          "session-daemon-suspend-child",
+          [["child-running", { agentPath: "/root/child" }]],
+        ],
+      ]),
+    );
+
+    await expect(
+      runner.suspendIdleAgentForDaemonShutdown("session-daemon-suspend-child"),
+    ).resolves.toMatchObject({ disposition: "cancelled" });
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(bootstrapShutdown).toHaveBeenCalledOnce();
+    const lifecycle = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string } } }).payload;
+      return event?.msg?.type?.startsWith("run_") ? [event.msg.type] : [];
+    });
+    expect(lifecycle).toEqual(["run_terminal"]);
   });
 
   it("canonicalizes cancellation and admission decisions before the terminal tail", async () => {

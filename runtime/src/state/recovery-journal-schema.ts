@@ -1,4 +1,13 @@
 import type { EventMsg } from "../session/event-log.js";
+import type {
+  RunResumeReason,
+  RunRuntimeModelVerbosity,
+  RunRuntimePermissionMode,
+  RunRuntimeReasoningEffort,
+  RunRuntimeServiceTier,
+  RunRuntimeSettingsChangeReason,
+  RunSuspensionReason,
+} from "../contracts/run-contracts.js";
 import type { RolloutItem } from "../session/rollout-item.js";
 import {
   readCompactionRolloutPayload,
@@ -95,6 +104,49 @@ const LEGACY_EVENT_TYPES = Object.freeze({
 
 const isString: Validator<string> = (value): value is string =>
   typeof value === "string";
+const isRunSuspensionReason: Validator<RunSuspensionReason> = (
+  value,
+): value is RunSuspensionReason => value === "daemon_shutdown_idle";
+const isRunResumeReason: Validator<RunResumeReason> = (
+  value,
+): value is RunResumeReason =>
+  value === "daemon_startup_restore" || value === "explicit_continue";
+const isRunRuntimePermissionMode: Validator<RunRuntimePermissionMode> = (
+  value,
+): value is RunRuntimePermissionMode =>
+  value === "default" ||
+  value === "plan" ||
+  value === "acceptEdits" ||
+  value === "bypassPermissions" ||
+  value === "dontAsk" ||
+  value === "auto" ||
+  value === "unattended";
+const isRunRuntimeReasoningEffort: Validator<RunRuntimeReasoningEffort> = (
+  value,
+): value is RunRuntimeReasoningEffort =>
+  value === "minimal" ||
+  value === "low" ||
+  value === "medium" ||
+  value === "high" ||
+  value === "xhigh" ||
+  value === "none";
+const isRunRuntimeModelVerbosity: Validator<RunRuntimeModelVerbosity> = (
+  value,
+): value is RunRuntimeModelVerbosity =>
+  value === "low" || value === "medium" || value === "high";
+const isRunRuntimeServiceTier: Validator<RunRuntimeServiceTier> = (
+  value,
+): value is RunRuntimeServiceTier =>
+  value === "fast" || value === "priority" || value === "flex";
+const isRunRuntimeSettingsChangeReason: Validator<
+  RunRuntimeSettingsChangeReason
+> = (value): value is RunRuntimeSettingsChangeReason =>
+  value === "initial" ||
+  value === "permission_mode_changed" ||
+  value === "model_provider_changed" ||
+  value === "config_applied" ||
+  value === "hooks_changed" ||
+  value === "compensating_rollback";
 const isBoolean: Validator<boolean> = (value): value is boolean =>
   typeof value === "boolean";
 const isNumber: Validator<number> = (value): value is number =>
@@ -983,6 +1035,44 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
     epoch: isPositiveInteger,
     reason: isString,
     reopenedAt: isString,
+  }),
+  run_suspended: objectShape({
+    runId: isString,
+    epoch: isPositiveInteger,
+    reason: isRunSuspensionReason,
+    suspendedAt: isString,
+  }),
+  run_resumed: objectShape({
+    runId: isString,
+    epoch: isPositiveInteger,
+    suspensionEventId: isString,
+    reason: isRunResumeReason,
+    resumedAt: isString,
+  }),
+  run_startup_activated: objectShape({
+    runId: isString,
+    epoch: isPositiveInteger,
+    resumeEventId: isString,
+    activatedAt: isString,
+  }),
+  run_runtime_settings_changed: objectShape({
+    runId: isString,
+    epoch: isPositiveInteger,
+    previousSettingsEventId: nullable(isString),
+    rollbackOfSettingsEventId: nullable(isString),
+    reason: isRunRuntimeSettingsChangeReason,
+    changedAt: isString,
+    permissionMode: isRunRuntimePermissionMode,
+    prePlanMode: nullable(isRunRuntimePermissionMode),
+    autoModeActive: isBoolean,
+    bypassPermissionsWorkspace: nullable(isString),
+    model: isString,
+    provider: isString,
+    profile: nullable(isString),
+    reasoningEffort: nullable(isRunRuntimeReasoningEffort),
+    modelVerbosity: nullable(isRunRuntimeModelVerbosity),
+    serviceTier: nullable(isRunRuntimeServiceTier),
+    hooksDisabled: isBoolean,
   }),
   run_cancel_requested: objectShape({
     runId: isString,

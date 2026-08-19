@@ -1,11 +1,24 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  lstatSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgenCSessionSnapshotPolicy } from "../state/snapshot-policy.js";
 import { upsertAgentRun } from "../state/agent-runs.js";
 import { RolloutStore } from "../session/rollout-store.js";
 import type { RolloutItem } from "../session/rollout-item.js";
+import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
 import { FileThreadStore } from "../thread-store/store.js";
 import {
   openStateDatabases,
@@ -15,6 +28,7 @@ import { StateRunDurabilityRepository } from "../state/run-durability.js";
 import { listUnresolvedUnknownOutcomeEffects } from "../state/unknown-outcome-gate.js";
 import { recordInFlightToolCallUnknownOutcome } from "../state/tool-output-rotation.js";
 import {
+  __setAgentLifecycleResumeSourceTestHooksForTest,
   AgenCDaemonAgentLifecycleError,
   AgenCDaemonAgentManager,
 } from "./agent-lifecycle.js";
@@ -39,6 +53,7 @@ import type {
   AgenCBackgroundAgentSessionEventBinding,
   AgenCBackgroundAgentStartParams,
 } from "./background-agent-runner.js";
+import { AgenCBackgroundAgentSuspensionShutdownError } from "./background-agent-runner.js";
 
 function sequence(values: readonly string[]): () => string {
   let index = 0;
@@ -71,7 +86,12 @@ function createThreadStoreTestDirs(): {
   };
 }
 
-function openRollout(cwd: string, sessionId: string): RolloutStore {
+function openRollout(
+  cwd: string,
+  sessionId: string,
+  originator = "agenc-cli",
+  source: string | null = "interactive-root",
+): RolloutStore {
   const rollout = new RolloutStore({
     cwd,
     sessionId,
@@ -81,13 +101,253 @@ function openRollout(cwd: string, sessionId: string): RolloutStore {
     sessionId,
     timestamp: "2026-05-01T12:30:00.000Z",
     cwd,
-    originator: "agent-lifecycle-test",
+    originator,
+    ...(source !== null ? { source } : {}),
     agencVersion: "0.2.0",
     model: "grok-4",
     modelProvider: "xai",
   });
   return rollout;
 }
+
+const resumeFixtureCleanups: Array<() => void> = [];
+
+function createResumeFixture(
+  sessionId: string,
+  options: {
+    readonly originator?: string;
+    readonly objective?: string;
+    readonly source?: string | null;
+    readonly cancelRequested?: boolean;
+    readonly runtimeSettings?:
+      | RunRuntimeSettingsSnapshot
+      | ((cwd: string) => RunRuntimeSettingsSnapshot);
+    readonly legacyRejectedExitPlanMode?: boolean;
+    readonly reopenedTerminal?: boolean;
+    readonly terminalStatus?:
+      "completed" | "failed" | "cancelled" | "unknown_outcome";
+  } = {},
+): {
+  readonly cwd: string;
+  readonly rolloutPath: string;
+  readonly sourceProof: {
+    readonly dev: string;
+    readonly ino: string;
+    readonly size: string;
+    readonly sha256: string;
+    readonly cwdDev: string;
+    readonly cwdIno: string;
+  };
+} {
+  const dirs = createThreadStoreTestDirs();
+  mkdirSync(join(dirs.cwd, ".git"));
+  const rollout = openRollout(
+    dirs.cwd,
+    sessionId,
+    options.originator ?? "agenc-cli",
+    options.source === null ? null : (options.source ?? "interactive-root"),
+  );
+  rollout.appendRollout({
+    type: "response_item",
+    payload: {
+      role: "user",
+      content: options.objective ?? "retained canonical objective",
+    },
+  });
+  let eventSequence = 0;
+  if (options.legacyRejectedExitPlanMode === true) {
+    const callId = `exit-plan:${sessionId}`;
+    eventSequence += 1;
+    rollout.append(
+      {
+        eventId: `tool-started:${sessionId}`,
+        id: `tool-started:${sessionId}`,
+        seq: eventSequence,
+        msg: {
+          type: "tool_call_started",
+          payload: { callId, toolName: "ExitPlanMode", args: "{}" },
+        },
+      },
+      { durable: true },
+    );
+    eventSequence += 1;
+    rollout.append(
+      {
+        eventId: `tool-completed:${sessionId}`,
+        id: `tool-completed:${sessionId}`,
+        seq: eventSequence,
+        msg: {
+          type: "tool_call_completed",
+          payload: {
+            callId,
+            toolName: "ExitPlanMode",
+            result:
+              "User wants you to keep planning. Remain in plan mode before editing.",
+            isError: false,
+          },
+        },
+      },
+      { durable: true },
+    );
+  }
+  const runtimeSettings =
+    typeof options.runtimeSettings === "function"
+      ? options.runtimeSettings(dirs.cwd)
+      : options.runtimeSettings;
+  if (runtimeSettings !== undefined) {
+    eventSequence += 1;
+    const eventId = `runtime-settings:${sessionId}`;
+    rollout.append(
+      {
+        eventId,
+        id: eventId,
+        seq: eventSequence,
+        msg: {
+          type: "run_runtime_settings_changed",
+          payload: {
+            runId: sessionId,
+            epoch: 1,
+            previousSettingsEventId: null,
+            rollbackOfSettingsEventId: null,
+            reason: "initial",
+            changedAt: "2026-05-01T12:30:30.000Z",
+            ...runtimeSettings,
+          },
+        },
+      },
+      { durable: true },
+    );
+  }
+  eventSequence += 1;
+  rollout.append(
+    options.cancelRequested === true
+      ? {
+          eventId: `run-cancel-request:${sessionId}:1`,
+          id: `run-cancel-request:${sessionId}:1`,
+          seq: eventSequence,
+          msg: {
+            type: "run_cancel_requested",
+            payload: {
+              runId: sessionId,
+              epoch: 1,
+              reason: "operator",
+              requestedAt: "2026-05-01T12:31:00.000Z",
+            },
+          },
+        }
+      : {
+          eventId: `run-terminal:${sessionId}:1`,
+          id: `run-terminal:${sessionId}:1`,
+          seq: eventSequence,
+          msg: {
+            type: "run_terminal",
+            payload: {
+              runId: sessionId,
+              epoch: 1,
+              status: options.terminalStatus ?? "completed",
+              exitCode: 0,
+              stopReason: "turn_completed",
+              finalMessage: "done",
+              usage: null,
+              lastSequenceBeforeTerminal: null,
+              finishedAt: "2026-05-01T12:31:00.000Z",
+            },
+          },
+        },
+    { durable: true },
+  );
+  if (options.reopenedTerminal === true) {
+    eventSequence += 1;
+    rollout.append(
+      {
+        eventId: `run-reopened:${sessionId}:2`,
+        id: `run-reopened:${sessionId}:2`,
+        seq: eventSequence,
+        msg: {
+          type: "run_reopened",
+          payload: {
+            runId: sessionId,
+            previousEpoch: 1,
+            epoch: 2,
+            reason: "test continuation",
+            reopenedAt: "2026-05-01T12:32:00.000Z",
+          },
+        },
+      },
+      { durable: true },
+    );
+    eventSequence += 1;
+    rollout.append(
+      {
+        eventId: `run-terminal:${sessionId}:2`,
+        id: `run-terminal:${sessionId}:2`,
+        seq: eventSequence,
+        msg: {
+          type: "run_terminal",
+          payload: {
+            runId: sessionId,
+            epoch: 2,
+            status: "completed",
+            exitCode: 0,
+            stopReason: "turn_completed",
+            finalMessage: "done again",
+            usage: null,
+            lastSequenceBeforeTerminal: null,
+            finishedAt: "2026-05-01T12:33:00.000Z",
+          },
+        },
+      },
+      { durable: true },
+    );
+  }
+  const rolloutPath = rollout.rolloutPath;
+  rollout.close();
+  const sourceStats = lstatSync(rolloutPath, { bigint: true });
+  const cwdStats = lstatSync(dirs.cwd, { bigint: true });
+  const sourceProof = {
+    dev: sourceStats.dev.toString(10),
+    ino: sourceStats.ino.toString(10),
+    size: sourceStats.size.toString(10),
+    sha256: createHash("sha256")
+      .update(readFileSync(rolloutPath))
+      .digest("hex"),
+    cwdDev: cwdStats.dev.toString(10),
+    cwdIno: cwdStats.ino.toString(10),
+  };
+  resumeFixtureCleanups.push(() => {
+    dirs.restoreEnv();
+    rmSync(dirs.home, { recursive: true, force: true });
+    rmSync(dirs.cwd, { recursive: true, force: true });
+  });
+  return { cwd: dirs.cwd, rolloutPath, sourceProof };
+}
+
+function canonicalRuntimeSettings(
+  permissionMode: RunRuntimeSettingsSnapshot["permissionMode"],
+  cwd: string,
+  overrides: Partial<RunRuntimeSettingsSnapshot> = {},
+): RunRuntimeSettingsSnapshot {
+  return {
+    permissionMode,
+    prePlanMode: permissionMode === "plan" ? "default" : null,
+    autoModeActive: permissionMode === "auto",
+    bypassPermissionsWorkspace:
+      permissionMode === "bypassPermissions" ? cwd : null,
+    model: "grok-5",
+    provider: "xai",
+    profile: null,
+    reasoningEffort: null,
+    modelVerbosity: null,
+    serviceTier: null,
+    hooksDisabled: false,
+    ...overrides,
+  };
+}
+
+afterEach(() => {
+  __setAgentLifecycleResumeSourceTestHooksForTest();
+  while (resumeFixtureCleanups.length > 0) resumeFixtureCleanups.pop()?.();
+});
 
 function createDeferred<T = void>(): {
   readonly promise: Promise<T>;
@@ -2013,6 +2273,1190 @@ describe("AgenC background agent lifecycle", () => {
     });
   });
 
+  it("agent.create explicitly reopens a retained canonical session", async () => {
+    const fixture = createResumeFixture("conv-retained1");
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence(["session_resumed"]),
+      now: sequence(["2026-08-19T12:00:01.000Z"]),
+    });
+    const startAgent = vi.fn(async () => ({
+      agentId: "unexpected_fresh_agent",
+      startedAt: "2026-08-19T12:00:00.500Z",
+      status: "running" as const,
+    }));
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      now: sequence(["2026-08-19T12:00:00.000Z"]),
+      runner: { startAgent, restoreAgent },
+      sessionManager: sessions,
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-retained1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+        model: "grok-4.3",
+        provider: "grok",
+        permissionMode: "acceptEdits",
+        envOverrides: { AGENC_MODEL: "grok-4.3" },
+      }),
+    ).resolves.toMatchObject({
+      agentId: "conv-retained1",
+      objective: "retained canonical objective",
+      status: "running",
+      activeSessionIds: ["session_resumed"],
+      metadata: {
+        resumedFromSessionId: "conv-retained1",
+      },
+    });
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(restoreAgent).toHaveBeenCalledWith({
+      agentId: "conv-retained1",
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeRolloutLease: expect.objectContaining({
+        rolloutPath: fixture.rolloutPath,
+      }),
+      resumeCwdIdentity: expect.objectContaining({
+        dev: expect.any(String),
+        ino: expect.any(String),
+      }),
+      resumeCwdFd: expect.any(Number),
+      objective: "retained canonical objective",
+      cwd: fixture.cwd,
+      startedAt: "2026-05-01T12:30:00.000Z",
+      metadata: {
+        resumedFromSessionId: "conv-retained1",
+        agentPath: "/root",
+        model: "grok-4.3",
+        provider: "grok",
+        permissionMode: "acceptEdits",
+        unattendedAllow: [],
+        unattendedDeny: [],
+      },
+      restoreAttemptId: expect.any(String),
+      reopenTerminalRun: true,
+      explicitColdResume: true,
+      model: "grok-4.3",
+      provider: "grok",
+      permissionMode: "acceptEdits",
+      envOverrides: { AGENC_MODEL: "grok-4.3" },
+    });
+    await expect(sessions.getSession("session_resumed")).resolves.toMatchObject(
+      {
+        agentId: "conv-retained1",
+        metadata: {
+          source: "agent.resume",
+          objective: "retained canonical objective",
+        },
+      },
+    );
+  });
+
+  it("restores the latest canonical runtime overlay instead of stale agent metadata", async () => {
+    const fixture = createResumeFixture("conv-runtime-overlay1", {
+      runtimeSettings: (cwd) =>
+        canonicalRuntimeSettings("plan", cwd, {
+          prePlanMode: "acceptEdits",
+          model: "grok-5-fast",
+          provider: "xai",
+          profile: "deep-work",
+          reasoningEffort: "high",
+          modelVerbosity: "low",
+          serviceTier: "priority",
+          hooksDisabled: true,
+        }),
+    });
+    const expectedSettings = canonicalRuntimeSettings("plan", fixture.cwd, {
+      prePlanMode: "acceptEdits",
+      model: "grok-5-fast",
+      provider: "xai",
+      profile: "deep-work",
+      reasoningEffort: "high",
+      modelVerbosity: "low",
+      serviceTier: "priority",
+      hooksDisabled: true,
+    });
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+    await agents.restoreAgent({
+      agentId: "conv-runtime-overlay1",
+      objective: "retained canonical objective",
+      status: "stopped",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      metadata: {
+        agentPath: "/root",
+        model: "stale-model",
+        provider: "stale-provider",
+        profile: "stale-profile",
+        permissionMode: "default",
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-runtime-overlay1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({
+      metadata: {
+        model: "grok-5-fast",
+        provider: "xai",
+        profile: "deep-work",
+        permissionMode: "plan",
+      },
+    });
+    expect(restoreRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "grok-5-fast",
+        provider: "xai",
+        profile: "deep-work",
+        permissionMode: "plan",
+        runtimeSettings: expectedSettings,
+      }),
+    );
+  });
+
+  it.each([
+    "default",
+    "plan",
+    "acceptEdits",
+    "bypassPermissions",
+    "dontAsk",
+    "auto",
+  ] as const)("restores canonical %s permission mode", async (mode) => {
+    const sessionId = `conv-runtime-${mode.toLowerCase()}`;
+    const fixture = createResumeFixture(sessionId, {
+      runtimeSettings: (cwd) => canonicalRuntimeSettings(mode, cwd),
+    });
+    const expectedSettings = canonicalRuntimeSettings(mode, fixture.cwd);
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({
+      metadata: { permissionMode: mode },
+    });
+    expect(restoreRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        permissionMode: mode,
+        runtimeSettings: expectedSettings,
+      }),
+    );
+  });
+
+  it("keeps canonical settings proof separate from explicit resume overrides", async () => {
+    const sessionId = "conv-runtime-override1";
+    const fixture = createResumeFixture(sessionId, {
+      runtimeSettings: (cwd) => canonicalRuntimeSettings("plan", cwd),
+    });
+    const canonicalSettings = canonicalRuntimeSettings("plan", fixture.cwd);
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+        model: "override-model",
+        provider: "override-provider",
+        profile: "override-profile",
+        permissionMode: "dontAsk",
+      }),
+    ).resolves.toMatchObject({
+      metadata: {
+        model: "override-model",
+        provider: "override-provider",
+        profile: "override-profile",
+        permissionMode: "dontAsk",
+      },
+    });
+    expect(restoreRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeSettings: canonicalSettings,
+        model: "override-model",
+        provider: "override-provider",
+        profile: "override-profile",
+        permissionMode: "dontAsk",
+      }),
+    );
+  });
+
+  it("rejects canonical unattended authority before interactive restore", async () => {
+    const sessionId = "conv-runtime-unattended1";
+    const fixture = createResumeFixture(sessionId, {
+      runtimeSettings: (cwd) => canonicalRuntimeSettings("unattended", cwd),
+    });
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("is unattended and cannot be resumed");
+    expect(restoreRuntime).not.toHaveBeenCalled();
+  });
+
+  it("conservatively resumes a legacy rejected ExitPlanMode result in plan mode", async () => {
+    const sessionId = "conv-legacy-plan1";
+    const fixture = createResumeFixture(sessionId, {
+      legacyRejectedExitPlanMode: true,
+    });
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({
+      metadata: { permissionMode: "plan" },
+    });
+    const restoreParams = restoreRuntime.mock.calls[0]?.[0];
+    expect(restoreParams).toMatchObject({ permissionMode: "plan" });
+    expect(restoreParams).not.toHaveProperty("runtimeSettings");
+  });
+
+  it("rejects a SQLite runtime-settings projection ahead of canonical history", async () => {
+    const sessionId = "conv-runtime-sqlite-ahead1";
+    const fixture = createResumeFixture(sessionId);
+    const driver = openStateDatabases({ cwd: fixture.cwd });
+    try {
+      const repository = new StateRunDurabilityRepository(driver);
+      repository.ensureInitialEpoch({
+        runId: sessionId,
+        openedAt: "2026-05-01T12:30:00.000Z",
+      });
+      repository.recordRuntimeSettingsChanged({
+        runId: sessionId,
+        epoch: 1,
+        eventId: `sqlite-only-settings:${sessionId}`,
+        eventSequence: 99,
+        previousSettingsEventId: null,
+        rollbackOfSettingsEventId: null,
+        reason: "initial",
+        changedAt: "2026-05-01T12:30:30.000Z",
+        settings: canonicalRuntimeSettings("default", fixture.cwd),
+      });
+    } finally {
+      driver.close();
+    }
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("projection is ahead of or disagrees");
+    expect(restoreRuntime).not.toHaveBeenCalled();
+  });
+
+  it("accepts retained runtime settings from an earlier canonical epoch", async () => {
+    const sessionId = "conv-runtime-prior-epoch1";
+    const fixture = createResumeFixture(sessionId, {
+      runtimeSettings: (cwd) => canonicalRuntimeSettings("plan", cwd),
+      reopenedTerminal: true,
+    });
+    const settings = canonicalRuntimeSettings("plan", fixture.cwd);
+    const driver = openStateDatabases({ cwd: fixture.cwd });
+    try {
+      const repository = new StateRunDurabilityRepository(driver);
+      repository.ensureInitialEpoch({
+        runId: sessionId,
+        openedAt: "2026-05-01T12:30:00.000Z",
+      });
+      repository.recordRuntimeSettingsChanged({
+        runId: sessionId,
+        epoch: 1,
+        eventId: `runtime-settings:${sessionId}`,
+        eventSequence: 1,
+        previousSettingsEventId: null,
+        rollbackOfSettingsEventId: null,
+        reason: "initial",
+        changedAt: "2026-05-01T12:30:30.000Z",
+        settings,
+      });
+    } finally {
+      driver.close();
+    }
+    const restoreRuntime = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: restoreRuntime,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({ agentId: sessionId });
+    expect(restoreRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeSettings: settings,
+        reopenTerminalRun: true,
+      }),
+    );
+  });
+
+  it("accepts a canonical rollout beneath a symlinked AGENC_HOME root", async () => {
+    const fixture = createResumeFixture("conv-homealias-server1");
+    const canonicalHome = dirname(
+      dirname(dirname(dirname(dirname(fixture.rolloutPath)))),
+    );
+    const lexicalHome = `${canonicalHome}-lexical-alias`;
+    symlinkSync(canonicalHome, lexicalHome, "dir");
+    process.env.AGENC_HOME = lexicalHome;
+    resumeFixtureCleanups.push(() => rmSync(lexicalHome, { force: true }));
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-homealias-server1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({ agentId: "conv-homealias-server1" });
+    expect(restoreAgent).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a legacy symlink-spelled metadata cwd only for its canonical target", async () => {
+    const fixture = createResumeFixture("conv-cwdalias-server1");
+    const lexicalCwd = `${fixture.cwd}-lexical-alias`;
+    symlinkSync(fixture.cwd, lexicalCwd, "dir");
+    resumeFixtureCleanups.push(() => rmSync(lexicalCwd, { force: true }));
+    const lines = readFileSync(fixture.rolloutPath, "utf8")
+      .trimEnd()
+      .split("\n");
+    const header = JSON.parse(lines[0]!) as {
+      payload: { cwd: string };
+    };
+    header.payload.cwd = lexicalCwd;
+    lines[0] = JSON.stringify(header);
+    writeFileSync(fixture.rolloutPath, `${lines.join("\n")}\n`);
+    const sourceStats = lstatSync(fixture.rolloutPath, { bigint: true });
+    const sourceProof = {
+      ...fixture.sourceProof,
+      dev: sourceStats.dev.toString(10),
+      ino: sourceStats.ino.toString(10),
+      size: sourceStats.size.toString(10),
+      sha256: createHash("sha256")
+        .update(readFileSync(fixture.rolloutPath))
+        .digest("hex"),
+    };
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-cwdalias-server1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({ agentId: "conv-cwdalias-server1" });
+    expect(restoreAgent).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a canonical initial objective larger than the old 64 KiB scan cap", async () => {
+    const objective = `retained-${"x".repeat(70 * 1024)}`;
+    const fixture = createResumeFixture("conv-longobjective1", { objective });
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-longobjective1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({ objective });
+    expect(restoreAgent).toHaveBeenCalledOnce();
+  });
+
+  it.each(["objective", "createdAt", "model", "provider"] as const)(
+    "rejects stale retained %s that disagrees with canonical rollout authority",
+    async (field) => {
+      const sessionId = `conv-stale-${field.toLowerCase()}1`;
+      const fixture = createResumeFixture(sessionId);
+      const restoreAgent = vi.fn(async () => true);
+      const agents = new AgenCDaemonAgentManager({
+        runner: {
+          startAgent: vi.fn(async () => ({
+            agentId: "unused",
+            startedAt: "2026-08-19T12:00:00.000Z",
+            status: "running" as const,
+          })),
+          restoreAgent,
+        },
+      });
+      await agents.restoreAgent({
+        agentId: sessionId,
+        objective:
+          field === "objective"
+            ? "stale projected objective"
+            : "retained canonical objective",
+        status: "stopped",
+        createdAt:
+          field === "createdAt"
+            ? "2026-05-01T12:29:59.000Z"
+            : "2026-05-01T12:30:00.000Z",
+        startedAt: "2026-05-01T12:30:00.000Z",
+        lastActiveAt: "2026-05-01T12:31:00.000Z",
+        cwd: fixture.cwd,
+        metadata: {
+          agentPath: "/root",
+          model: field === "model" ? "stale-model" : "grok-4",
+          provider: field === "provider" ? "stale-provider" : "xai",
+        },
+      });
+
+      await expect(
+        agents.createAgent({
+          resumeSessionId: sessionId,
+          resumeRolloutPath: fixture.rolloutPath,
+          resumeSourceProof: fixture.sourceProof,
+          cwd: fixture.cwd,
+        }),
+      ).rejects.toThrow(
+        `retained ${field === "createdAt" ? "creation time" : field} disagrees`,
+      );
+      expect(restoreAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an attempted objective override before canonical resume", async () => {
+    const fixture = createResumeFixture("conv-objective-lock1");
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        objective: "replace retained work",
+        resumeSessionId: "conv-objective-lock1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("cannot override objective");
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects resume metadata and unattended-policy overrides", async () => {
+    const fixture = createResumeFixture("conv-policy-lock1");
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    for (const override of [
+      { metadata: { agentPath: "/root/promoted", permissionMode: "auto" } },
+      { unattendedAllow: ["Bash(*)"] },
+      { unattendedDeny: ["Edit(*)"] },
+    ] as const) {
+      await expect(
+        agents.createAgent({
+          resumeSessionId: "conv-policy-lock1",
+          resumeRolloutPath: fixture.rolloutPath,
+          resumeSourceProof: fixture.sourceProof,
+          cwd: fixture.cwd,
+          ...override,
+        }),
+      ).rejects.toThrow("cannot override");
+    }
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-top-level canonical provenance without a retained row", async () => {
+    const fixture = createResumeFixture("conv-child-source1", {
+      originator: "agenc-cli",
+      source: null,
+      objective: "child-only work",
+    });
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-child-source1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("not a top-level interactive session");
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "unknown_outcome"] as const)(
+    "rejects a %s canonical terminal before runner activation",
+    async (terminalStatus) => {
+      const sessionId = `conv-poison-${terminalStatus.replace("_", "-")}`;
+      const fixture = createResumeFixture(sessionId, { terminalStatus });
+      const restoreAgent = vi.fn(async () => true);
+      const agents = new AgenCDaemonAgentManager({
+        runner: {
+          startAgent: vi.fn(async () => ({
+            agentId: "unused",
+            startedAt: "2026-08-19T12:00:00.000Z",
+            status: "running" as const,
+          })),
+          restoreAgent,
+        },
+      });
+
+      await expect(
+        agents.createAgent({
+          resumeSessionId: sessionId,
+          resumeRolloutPath: fixture.rolloutPath,
+          resumeSourceProof: fixture.sourceProof,
+          cwd: fixture.cwd,
+        }),
+      ).rejects.toThrow(`ended with ${terminalStatus}`);
+      expect(restoreAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a canonical cancellation request before runner or session activation", async () => {
+    const fixture = createResumeFixture("conv-cancel-request1", {
+      cancelRequested: true,
+    });
+    const sessions = new AgenCDaemonSessionManager();
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+      sessionManager: sessions,
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: "conv-cancel-request1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("pending cancellation request");
+    expect(restoreAgent).not.toHaveBeenCalled();
+    await expect(sessions.listSessions()).resolves.toMatchObject({
+      sessions: [],
+    });
+  });
+
+  it("rejects outside, symlinked, and hard-linked resume sources before runner activation", async () => {
+    for (const variant of ["outside", "symlink", "hardlink"] as const) {
+      const sessionId = `conv-${variant}source1`;
+      const fixture = createResumeFixture(sessionId);
+      let rolloutPath = fixture.rolloutPath;
+      if (variant === "outside") {
+        rolloutPath = join(fixture.cwd, `rollout-outside-${sessionId}.jsonl`);
+        copyFileSync(fixture.rolloutPath, rolloutPath);
+      } else if (variant === "symlink") {
+        const target = `${fixture.rolloutPath}.target`;
+        renameSync(fixture.rolloutPath, target);
+        symlinkSync(target, fixture.rolloutPath);
+      } else {
+        linkSync(fixture.rolloutPath, `${fixture.rolloutPath}.alias`);
+      }
+      const restoreAgent = vi.fn(async () => true);
+      const agents = new AgenCDaemonAgentManager({
+        runner: {
+          startAgent: vi.fn(async () => ({
+            agentId: "unused",
+            startedAt: "2026-08-19T12:00:00.000Z",
+            status: "running" as const,
+          })),
+          restoreAgent,
+        },
+      });
+
+      await expect(
+        agents.createAgent({
+          resumeSessionId: sessionId,
+          resumeRolloutPath: rolloutPath,
+          resumeSourceProof: fixture.sourceProof,
+          cwd: fixture.cwd,
+        }),
+      ).rejects.toThrow();
+      expect(restoreAgent).not.toHaveBeenCalled();
+    }
+  });
+
+  it("rejects a direct RPC resume source outside daemon state with no runner side effect", async () => {
+    const sessionId = "conv-rpcoutside1";
+    const fixture = createResumeFixture(sessionId);
+    const outside = join(fixture.cwd, `rollout-outside-${sessionId}.jsonl`);
+    copyFileSync(fixture.rolloutPath, outside);
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    const dispatcher = new AgenCDaemonJsonRpcDispatcher({
+      agentManager: agents,
+    });
+    const connection = dispatcher.createConnection();
+    await connection.dispatch(createAgenCPortalDaemonInitializeRequest());
+
+    await expect(
+      connection.dispatch({
+        jsonrpc: JSON_RPC_VERSION,
+        id: "rpc-outside-resume",
+        method: "agent.create",
+        params: {
+          resumeSessionId: sessionId,
+          resumeRolloutPath: outside,
+          resumeSourceProof: fixture.sourceProof,
+          cwd: fixture.cwd,
+        },
+      }),
+    ).resolves.toMatchObject({
+      error: { data: { code: "INVALID_ARGUMENT" } },
+    });
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it.each(["NUL", "con.log", "a".repeat(256)])(
+    "rejects unsafe RPC resume session segment %s at the protocol boundary",
+    async (resumeSessionId) => {
+      const fixture = createResumeFixture("conv-validator-safe1");
+      const restoreAgent = vi.fn(async () => true);
+      const agents = new AgenCDaemonAgentManager({
+        runner: {
+          startAgent: vi.fn(async () => ({
+            agentId: "unused",
+            startedAt: "2026-08-19T12:00:00.000Z",
+            status: "running" as const,
+          })),
+          restoreAgent,
+        },
+      });
+      const dispatcher = new AgenCDaemonJsonRpcDispatcher({
+        agentManager: agents,
+      });
+      const connection = dispatcher.createConnection();
+      await connection.dispatch(createAgenCPortalDaemonInitializeRequest());
+
+      await expect(
+        connection.dispatch({
+          jsonrpc: JSON_RPC_VERSION,
+          id: "rpc-unsafe-resume-id",
+          method: "agent.create",
+          params: {
+            resumeSessionId,
+            resumeRolloutPath: fixture.rolloutPath,
+            resumeSourceProof: fixture.sourceProof,
+            cwd: fixture.cwd,
+          },
+        }),
+      ).resolves.toMatchObject({
+        error: { code: -32602 },
+      });
+      expect(restoreAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed when server resume discovery exceeds its entry budget", async () => {
+    const sessionId = "conv-serverlimit1";
+    const fixture = createResumeFixture(sessionId);
+    const sessionDir = join(fixture.rolloutPath, "..");
+    for (let index = 0; index < 4_097; index += 1) {
+      writeFileSync(join(sessionDir, `noise-${index}.tmp`), "");
+    }
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    __setAgentLifecycleResumeSourceTestHooksForTest({
+      beforeSessionDirectoryClose: (_sessionDir, closeEarly) => closeEarly(),
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow(/entry budget|time budget/);
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when authoritative session-directory cleanup fails", async () => {
+    const sessionId = "conv-serverclose1";
+    const fixture = createResumeFixture(sessionId);
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    __setAgentLifecycleResumeSourceTestHooksForTest({
+      beforeSessionDirectoryClose: (_sessionDir, closeEarly) => closeEarly(),
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("session directory could not be closed safely");
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it("rejects concurrent duplicate canonical resume attempts", async () => {
+    const fixture = createResumeFixture("conv-concurrent1");
+    const restored = createDeferred<boolean>();
+    const restoreAgent = vi.fn(() => restored.promise);
+    const agents = new AgenCDaemonAgentManager({
+      now: () => "2026-08-19T12:00:00.000Z",
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+    const params = {
+      resumeSessionId: "conv-concurrent1",
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    } as const;
+
+    const first = agents.createAgent(params);
+    await vi.waitFor(() => expect(restoreAgent).toHaveBeenCalledOnce());
+    await expect(agents.createAgent(params)).rejects.toThrow(
+      "canonical session conv-concurrent1 is already being resumed",
+    );
+    expect(restoreAgent).toHaveBeenCalledOnce();
+
+    restored.resolve(true);
+    await expect(first).resolves.toMatchObject({
+      agentId: "conv-concurrent1",
+      status: "running",
+    });
+  });
+
+  it.each([
+    { label: "rollout", failRollout: true, failCwd: false },
+    { label: "cwd", failRollout: false, failCwd: true },
+    { label: "rollout and cwd", failRollout: true, failCwd: true },
+  ])(
+    "releases resume/create authority when $label descriptor cleanup fails",
+    async ({ failRollout, failCwd }) => {
+      const sessionId = `conv-close-failure-${failRollout ? "r" : ""}${failCwd ? "c" : ""}`;
+      const fixture = createResumeFixture(sessionId, {
+        runtimeSettings: (cwd) => canonicalRuntimeSettings("unattended", cwd),
+      });
+      const restoreAgent = vi.fn(async () => true);
+      const agents = new AgenCDaemonAgentManager({
+        runner: {
+          startAgent: vi.fn(async () => ({
+            agentId: "unused",
+            startedAt: "2026-08-19T12:00:00.000Z",
+            status: "running" as const,
+          })),
+          restoreAgent,
+        },
+      });
+      const closeOrder: string[] = [];
+      __setAgentLifecycleResumeSourceTestHooksForTest({
+        afterResumeRolloutLeaseClose: () => {
+          closeOrder.push("rollout");
+          if (failRollout) throw new Error("rollout descriptor close failed");
+        },
+        afterResumeCwdClose: () => {
+          closeOrder.push("cwd");
+          if (failCwd) throw new Error("cwd descriptor close failed");
+        },
+      });
+      const params = {
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      } as const;
+
+      const failure = await agents.createAgent(params).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect(closeOrder).toEqual(["rollout", "cwd"]);
+      expect(
+        (failure as AggregateError).errors.map((error) =>
+          error instanceof Error ? error.message : String(error),
+        ),
+      ).toEqual([
+        `canonical session ${sessionId} is unattended and cannot be resumed as an interactive root`,
+        ...(failRollout ? ["rollout descriptor close failed"] : []),
+        ...(failCwd ? ["cwd descriptor close failed"] : []),
+      ]);
+      expect(restoreAgent).not.toHaveBeenCalled();
+
+      __setAgentLifecycleResumeSourceTestHooksForTest();
+      await expect(agents.createAgent(params)).rejects.toThrow(
+        "is unattended and cannot be resumed",
+      );
+      await expect(
+        agents.stopAll("test_cleanup", { disposition: "cancel" }),
+      ).resolves.toBe(0);
+    },
+  );
+
+  it("suspends a cold restore that races clean daemon shutdown", async () => {
+    const fixture = createResumeFixture("conv-shutdown-race1");
+    const restored = createDeferred<boolean>();
+    const restoreAgent = vi.fn(() => restored.promise);
+    const stopAgent = vi.fn(async () => undefined);
+    const suspendIdleAgentForDaemonShutdown = vi.fn(async () => ({
+      disposition: "suspended" as const,
+      suspension: {
+        openedAt: "2026-05-01T12:30:00.000Z",
+        epoch: 2,
+        eventId: "run-suspended:conv-shutdown-race1:2:test",
+        sequence: 3,
+        rolloutPath: fixture.rolloutPath,
+        reason: "daemon_shutdown_idle" as const,
+        suspendedAt: "2026-08-19T12:00:00.000Z",
+      },
+    }));
+    const agents = new AgenCDaemonAgentManager({
+      now: () => "2026-08-19T12:00:00.000Z",
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+        stopAgent,
+        suspendIdleAgentForDaemonShutdown,
+      },
+    });
+    const create = agents.createAgent({
+      resumeSessionId: "conv-shutdown-race1",
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    });
+    await vi.waitFor(() => expect(restoreAgent).toHaveBeenCalledOnce());
+    const shutdown = agents.stopAll("daemon_shutdown", {
+      disposition: "suspend_idle",
+    });
+
+    restored.resolve(true);
+
+    await expect(create).rejects.toThrow(
+      "agent.start cancelled because the daemon is shutting down",
+    );
+    await expect(shutdown).resolves.toBe(0);
+    expect(suspendIdleAgentForDaemonShutdown).toHaveBeenCalledWith(
+      "conv-shutdown-race1",
+    );
+    expect(stopAgent).not.toHaveBeenCalled();
+  });
+
+  it("rolls back an unpublished cold restore without poisoning retry or historical sessions", async () => {
+    const sessionId = "conv-publication-rollback1";
+    const fixture = createResumeFixture(sessionId);
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence([
+        "session_failed_publication",
+        "session_retry_publication",
+      ]),
+    });
+    await sessions.restoreSession({
+      sessionId: "session_historical_closed",
+      agentId: sessionId,
+      status: "closed",
+      cwd: fixture.cwd,
+    });
+    const rollbackRestoredAgent = vi.fn(async () => undefined);
+    const stopAgent = vi.fn(async () => undefined);
+    const restoreAgent = vi.fn(async () => true);
+    let publicationAttempts = 0;
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+        rollbackRestoredAgent,
+        stopAgent,
+      },
+      sessionManager: sessions,
+      recordAgentRun: () => {
+        publicationAttempts += 1;
+        if (publicationAttempts === 1) {
+          throw new Error("agent run publication failed");
+        }
+      },
+    });
+    await agents.restoreAgent({
+      agentId: sessionId,
+      objective: "retained canonical objective",
+      status: "stopped",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      sessionIds: ["session_historical_closed"],
+      metadata: {
+        agentPath: "/root",
+        model: "grok-4",
+        provider: "xai",
+      },
+    });
+    const params = {
+      resumeSessionId: sessionId,
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    } as const;
+
+    await expect(agents.createAgent(params)).rejects.toThrow(
+      "agent run publication failed",
+    );
+    expect(rollbackRestoredAgent).toHaveBeenCalledWith(
+      sessionId,
+      expect.any(String),
+    );
+    expect(stopAgent).not.toHaveBeenCalled();
+    await expect(
+      sessions.getSession("session_failed_publication"),
+    ).resolves.toMatchObject({ status: "closed" });
+    await expect(
+      sessions.getSession("session_historical_closed"),
+    ).resolves.toMatchObject({ status: "closed" });
+
+    await expect(agents.createAgent(params)).resolves.toMatchObject({
+      agentId: sessionId,
+      status: "running",
+    });
+    expect(restoreAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the primary cold-create failure when rollback cleanup also fails", async () => {
+    const sessionId = "conv-publication-cleanup-error1";
+    const fixture = createResumeFixture(sessionId);
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence(["session_cleanup_error"]),
+    });
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent: vi.fn(async () => true),
+        rollbackRestoredAgent: vi.fn(async () => {
+          throw new Error("restored generation rollback failed");
+        }),
+      },
+      sessionManager: sessions,
+      recordAgentRun: () => {
+        throw new Error("agent run publication failed");
+      },
+    });
+
+    let failure: unknown;
+    try {
+      await agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "agent run publication failed" }),
+      expect.objectContaining({
+        message: "restored generation rollback failed",
+      }),
+    ]);
+    expect((failure as Error).message).toContain(
+      "agent run publication failed",
+    );
+    await expect(
+      sessions.getSession("session_cleanup_error"),
+    ).resolves.toMatchObject({ status: "closed" });
+  });
+
   it("persists live agent run rows with current session ids and terminal stop state", async () => {
     const home = mkdtempSync(join(tmpdir(), "agenc-agent-run-home-"));
     const cwd = mkdtempSync(join(tmpdir(), "agenc-agent-run-cwd-"));
@@ -2323,6 +3767,116 @@ describe("AgenC background agent lifecycle", () => {
     await expect(sessions.getSession("session_2")).resolves.toMatchObject({
       status: "closed",
       closedAt: "2026-05-01T12:00:06.000Z",
+    });
+  });
+
+  it("uses the explicit daemon-only disposition and projects idle shutdown as suspended", async () => {
+    const transitions: unknown[] = [];
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence(["session_suspend"]),
+      now: sequence(["2026-05-01T12:00:01.000Z", "2026-05-01T12:00:03.000Z"]),
+    });
+    const suspendIdleAgentForDaemonShutdown = vi.fn(async () => ({
+      disposition: "suspended" as const,
+      suspension: {
+        openedAt: "2026-05-01T12:00:00.500Z",
+        epoch: 1,
+        eventId: "run-suspended:agent_suspend:1:cycle-1",
+        sequence: 17,
+        rolloutPath: "/workspace/rollout-agent_suspend.jsonl",
+        reason: "daemon_shutdown_idle" as const,
+        suspendedAt: "2026-05-01T12:00:02.000Z",
+      },
+    }));
+    const stopAgent = vi.fn(async () => {});
+    const runner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => ({
+        agentId: "agent_suspend",
+        startedAt: "2026-05-01T12:00:00.500Z",
+        status: "running",
+      }),
+      stopAgent,
+      suspendIdleAgentForDaemonShutdown,
+    };
+    const agents = new AgenCDaemonAgentManager({
+      defaultCwd: () => "/workspace",
+      now: sequence(["2026-05-01T12:00:00.000Z", "2026-05-01T12:00:02.000Z"]),
+      runner,
+      sessionManager: sessions,
+      recordAgentStatusTransition: async (transition) => {
+        transitions.push(transition);
+      },
+    });
+
+    await agents.createAgent({ cwd: process.cwd(), objective: "resume later" });
+    await expect(
+      agents.stopAll("daemon_shutdown", { disposition: "suspend_idle" }),
+    ).resolves.toBe(1);
+
+    expect(suspendIdleAgentForDaemonShutdown).toHaveBeenCalledOnce();
+    expect(suspendIdleAgentForDaemonShutdown).toHaveBeenCalledWith(
+      "agent_suspend",
+    );
+    expect(stopAgent).not.toHaveBeenCalled();
+    expect(transitions.at(-1)).toMatchObject({
+      sessionId: "session_suspend",
+      agentId: "agent_suspend",
+      status: "stopped",
+      runStatus: "suspended",
+      reason: "daemon_shutdown",
+    });
+  });
+
+  it("preserves suspended projection while surfacing daemon cleanup failure", async () => {
+    const transitions: unknown[] = [];
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence(["session_suspend_failure"]),
+      now: sequence(["2026-05-01T12:00:01.000Z", "2026-05-01T12:00:03.000Z"]),
+    });
+    const suspension = {
+      openedAt: "2026-05-01T12:00:00.500Z",
+      epoch: 1,
+      eventId: "run-suspended:agent_suspend_failure:1:cycle-1",
+      sequence: 17,
+      rolloutPath: "/workspace/rollout-agent_suspend_failure.jsonl",
+      reason: "daemon_shutdown_idle" as const,
+      suspendedAt: "2026-05-01T12:00:02.000Z",
+    };
+    const runner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => ({
+        agentId: "agent_suspend_failure",
+        startedAt: "2026-05-01T12:00:00.500Z",
+        status: "running",
+      }),
+      suspendIdleAgentForDaemonShutdown: async () => {
+        throw new AgenCBackgroundAgentSuspensionShutdownError(
+          suspension,
+          new Error("helper cleanup failed"),
+        );
+      },
+    };
+    const agents = new AgenCDaemonAgentManager({
+      defaultCwd: () => "/workspace",
+      now: sequence(["2026-05-01T12:00:00.000Z", "2026-05-01T12:00:02.000Z"]),
+      runner,
+      sessionManager: sessions,
+      recordAgentStatusTransition: async (transition) => {
+        transitions.push(transition);
+      },
+    });
+
+    await agents.createAgent({ cwd: process.cwd(), objective: "resume later" });
+    await expect(
+      agents.stopAll("daemon_shutdown", { disposition: "suspend_idle" }),
+    ).rejects.toThrow(
+      "AgenC daemon cleanup failed for 1 agent(s): agent_suspend_failure",
+    );
+
+    expect(transitions.at(-1)).toMatchObject({
+      agentId: "agent_suspend_failure",
+      status: "error",
+      runStatus: "suspended",
+      reason: "daemon_shutdown",
     });
   });
 

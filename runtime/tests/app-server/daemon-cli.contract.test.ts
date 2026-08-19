@@ -1,28 +1,45 @@
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import {
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { createConnection, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import type { AgenCShutdownSignal } from "../lifecycle/signal-handlers.js";
 import { openStateDatabases } from "../state/sqlite-driver.js";
+import { StateRunDurabilityRepository } from "../state/run-durability.js";
+import { ROLLOUT_SCHEMA_VERSION } from "../session/event-log.js";
+import { RolloutStore } from "../session/rollout-store.js";
 import { createAgenCJsonLineDaemonRequestClient } from "./agent-cli.js";
+import { AgenCDaemonSessionManager } from "./session-lifecycle.js";
+import { ensureAgenCDaemonAutostart } from "./daemon-autostart.js";
 import {
+  AGENC_DAEMON_PID_MAX_BYTES,
   AGENC_DAEMON_READY_TIMEOUT_MS_ENV,
   AGENC_DAEMON_WEBSOCKET_DEFAULT_HOST,
   AGENC_DAEMON_WEBSOCKET_DEFAULT_PATH,
   AGENC_DAEMON_WEBSOCKET_DEFAULT_PORT,
   AGENC_DAEMON_WEBSOCKET_PORT_ENV,
+  AgenCDaemonRpcShutdownCoordinator,
+  acquireAgenCDaemonLifecycleLock,
   DEFAULT_DAEMON_READY_TIMEOUT_MS,
   defaultAgenCDaemonPidPath,
   resolveAgenCDaemonReadyTimeoutMs,
@@ -37,6 +54,7 @@ import {
   resolveAgenCDaemonPidPath,
   resolveAgenCDaemonSnapshotPath,
   resolveAgenCDaemonSocketPath,
+  runAgenCDaemonAuthorityCleanup,
   runAgenCDaemonCli,
   validateAgenCDaemonWebSocketOrigin,
   writeAgenCDaemonPid,
@@ -71,6 +89,13 @@ import {
 } from "../conversation/realtime/conversation.js";
 import type { AuthBackend } from "../auth/backend.js";
 import type { AgenCRealtimeHeadersProvider } from "./realtime-transport.js";
+import {
+  daemonInstanceIdentityFromRuntimeInfo,
+  readDaemonRuntimeInfo,
+  resolveAgenCDaemonRuntimeInfoPath,
+  writeDaemonRuntimeInfo,
+} from "./daemon-runtime-info.js";
+import type { AgenCDaemonInstanceIdentity } from "./daemon-instance-identity.js";
 
 function createRecoveredSession(
   threadId: string,
@@ -78,11 +103,15 @@ function createRecoveredSession(
     current: () => ToolPermissionContext;
     update: (context: ToolPermissionContext) => Promise<void> | void;
   },
+  options: {
+    readonly rolloutStore?: RolloutStore;
+    readonly threadStatus?: "running" | "idle";
+    readonly enableDurableClose?: boolean;
+  } = {},
 ) {
   const state = { history: [] as unknown[] };
   const rolloutItems: unknown[] = [];
-  const eventLog = { lastSeq: 0 };
-  const rolloutStore = {
+  const fallbackRolloutStore = {
     rolloutPath: join(
       tmpdir(),
       `agenc-recovered-${process.pid}-${threadId.replaceAll("/", "_")}.jsonl`,
@@ -90,16 +119,37 @@ function createRecoveredSession(
     readAll: () => [...rolloutItems],
     assertToolAdmissionAllowed: () => {},
   };
+  const rolloutStore = options.rolloutStore ?? fallbackRolloutStore;
+  const eventLog = {
+    lastSeq: rolloutStore.readAll().reduce((maximum, item) => {
+      if (
+        typeof item === "object" &&
+        item !== null &&
+        (item as { type?: unknown }).type === "event_msg"
+      ) {
+        const sequence = (item as { payload?: { seq?: unknown } }).payload?.seq;
+        if (typeof sequence === "number") return Math.max(maximum, sequence);
+      }
+      return maximum;
+    }, 0),
+  };
+  const beforeDurableCloseListeners = new Set<() => void | Promise<void>>();
   const managedThread = {
     threadId,
     agentPath: "/root",
     kind: "root" as const,
     status: () =>
-      ({
-        status: "running",
-        turnId: "turn-recovered",
-        startedAtMs: 0,
-      }) as const,
+      options.threadStatus === "idle"
+        ? ({
+            status: "idle",
+            turnId: "turn-recovered",
+            endedAtMs: 1,
+          } as const)
+        : ({
+            status: "running",
+            turnId: "turn-recovered",
+            startedAtMs: 0,
+          } as const),
     subscribeStatus: () => () => {},
     submit: vi.fn(async () => threadId),
     appendMessage: vi.fn(async () => threadId),
@@ -124,8 +174,23 @@ function createRecoveredSession(
       const eventId = event.eventId ?? event.id ?? `recovered-event-${seq}`;
       const stamped = { ...event, eventId, id: eventId, seq };
       eventLog.lastSeq = seq;
-      rolloutItems.push({ type: "event_msg", payload: stamped });
+      if (options.rolloutStore === undefined) {
+        rolloutItems.push({ type: "event_msg", payload: stamped });
+      } else if (!options.rolloutStore.append(stamped, { durable: true })) {
+        throw new Error(`failed to append recovered event ${eventId}`);
+      }
       return stamped;
+    },
+    ...(options.enableDurableClose === true
+      ? {
+          onBeforeDurableClose: (listener: () => void | Promise<void>) => {
+            beforeDurableCloseListeners.add(listener);
+            return () => beforeDurableCloseListeners.delete(listener);
+          },
+        }
+      : {}),
+    runBeforeDurableClose: async () => {
+      for (const listener of [...beforeDurableCloseListeners]) await listener();
     },
     permissionModeRegistry,
     state: {
@@ -208,6 +273,7 @@ function createHost(agencHome: string): AgenCDaemonCliHost & {
       return nextPid;
     },
     isPidRunning: (pid) => runningPids.has(pid),
+    readProcessIdentity: (pid) => `test-process:${pid}:start`,
     terminatePid: (pid, signal = "SIGTERM") => {
       terminatedPids.push(pid);
       terminatedSignals.push({ pid, signal });
@@ -215,6 +281,53 @@ function createHost(agencHome: string): AgenCDaemonCliHost & {
     },
     sleep: async () => {},
   };
+}
+
+function inspectLegacyTestDaemon(pid: number) {
+  return { pid, processStart: `test-process:${pid}:start` };
+}
+
+function recordTestDaemon(
+  agencHome: string,
+  pid: number,
+  overrides: Partial<AgenCDaemonInstanceIdentity> = {},
+): AgenCDaemonInstanceIdentity {
+  const identity: AgenCDaemonInstanceIdentity = {
+    pid,
+    instanceId: `test-instance:${pid}`,
+    processStart: `test-process:${pid}:start`,
+    runtimeVersion: "test",
+    commit: "test",
+    buildTime: "2026-08-19T00:00:00.000Z",
+    ...overrides,
+  };
+  writeDaemonRuntimeInfo(resolveAgenCDaemonRuntimeInfoPath(agencHome), {
+    ...identity,
+    startedAt: "2026-08-19T00:00:00.000Z",
+  });
+  return identity;
+}
+
+function createReadyPublishedDaemonOptions(
+  agencHome: string,
+  host: AgenCDaemonCliHost,
+) {
+  let identity: AgenCDaemonInstanceIdentity | null = null;
+  return {
+    inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+    waitForDaemonReady: async () => {
+      const pid = await readAgenCDaemonPid(
+        resolveAgenCDaemonPidPath(host.env, host.userHome),
+      );
+      if (pid === null) return false;
+      if (identity?.pid !== pid) identity = recordTestDaemon(agencHome, pid);
+      return true;
+    },
+    requestDaemonInstanceIdentity: () => {
+      if (identity === null) throw new Error("test daemon is not published");
+      return identity;
+    },
+  } as const;
 }
 
 function createSignalProcess() {
@@ -743,6 +856,60 @@ describe("AgenC daemon CLI", () => {
     await rm(agencHome, { recursive: true, force: true });
   });
 
+  it.each([
+    "123junk",
+    "123\n456",
+    "+123",
+    "-123",
+    " 123",
+    "123 ",
+    "0",
+    "1",
+    "01",
+    "9007199254740992",
+    "123\n\n",
+  ])("rejects a non-canonical daemon pid file %j", async (contents) => {
+    const agencHome = await tempAgencHome();
+    const pidPath = join(agencHome, "daemon.pid");
+    await writeFile(pidPath, contents);
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it.each(["2", "123\n"])(
+    "accepts a canonical daemon pid file %j",
+    async (contents) => {
+      const agencHome = await tempAgencHome();
+      const pidPath = join(agencHome, "daemon.pid");
+      await writeFile(pidPath, contents);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(
+        Number(contents.trim()),
+      );
+      await rm(agencHome, { recursive: true, force: true });
+    },
+  );
+
+  it("rejects an oversized daemon pid file without parsing its prefix", async () => {
+    const agencHome = await tempAgencHome();
+    const pidPath = join(agencHome, "daemon.pid");
+    await writeFile(pidPath, `123${"0".repeat(AGENC_DAEMON_PID_MAX_BYTES)}`);
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a symlinked daemon pid file",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const target = join(agencHome, "pid-target");
+      const pidPath = join(agencHome, "daemon.pid");
+      await writeFile(target, "4242\n");
+      await symlink(target, pidPath);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+      await rm(agencHome, { recursive: true, force: true });
+    },
+  );
+
   it("parses daemon subcommands without claiming normal prompts", () => {
     expect(parseAgenCDaemonCliArgs(["hello"])).toBeNull();
     expect(parseAgenCDaemonCliArgs(["daemon", "start"])).toEqual({
@@ -820,7 +987,7 @@ describe("AgenC daemon CLI", () => {
     // The fake host never binds a real control socket, so stub the readiness
     // probe to report the spawned daemon as accepting; this test exercises the
     // pid/spawn bookkeeping, not the real socket readiness gate.
-    const ready = { waitForDaemonReady: async () => true } as const;
+    const ready = createReadyPublishedDaemonOptions(agencHome, host);
 
     await expect(
       runAgenCDaemonCli(
@@ -888,6 +1055,7 @@ describe("AgenC daemon CLI", () => {
           host,
           io,
           requestHealthStats,
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
           // Socket-ready: the fake host never binds a real socket, so stub the
           // readiness probe to report the running daemon as accepting.
           waitForDaemonReady: async () => true,
@@ -924,7 +1092,12 @@ describe("AgenC daemon CLI", () => {
     await expect(
       runAgenCDaemonCli(
         { kind: "command", action: "status" },
-        { host, io, requestHealthStats },
+        {
+          host,
+          io,
+          requestHealthStats,
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+        },
       ),
     ).resolves.toBe(0);
 
@@ -998,7 +1171,7 @@ describe("AgenC daemon CLI", () => {
     await expect(
       runAgenCDaemonCli(
         { kind: "command", action: "start" },
-        { host, io, waitForDaemonReady: async () => true },
+        { host, io, ...createReadyPublishedDaemonOptions(agencHome, host) },
       ),
     ).resolves.toBe(0);
 
@@ -1019,7 +1192,10 @@ describe("AgenC daemon CLI", () => {
     await writeAgenCDaemonPid(pidPath, 4300);
 
     await expect(
-      runAgenCDaemonCli({ kind: "command", action: "stop" }, { host, io }),
+      runAgenCDaemonCli(
+        { kind: "command", action: "stop" },
+        { host, io, inspectLegacyDaemonProcess: inspectLegacyTestDaemon },
+      ),
     ).resolves.toBe(0);
     expect(host.terminatedPids).toEqual([4300]);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
@@ -1029,6 +1205,326 @@ describe("AgenC daemon CLI", () => {
       runAgenCDaemonCli({ kind: "command", action: "status" }, { host, io }),
     ).resolves.toBe(1);
     expect(io.stdoutText()).toContain("AgenC daemon stopped");
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it.each([
+    { label: "missing", stalePid: null, stalePidRunning: false },
+    { label: "dead", stalePid: 4310, stalePidRunning: false },
+    { label: "live unrelated", stalePid: 4311, stalePidRunning: true },
+  ])(
+    "stops the authenticated sidecar daemon when daemon.pid is $label",
+    async ({ stalePid, stalePidRunning }) => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const io = createIo();
+      const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+      const daemonPid = 4312;
+      host.runningPids.add(daemonPid);
+      const identity = recordTestDaemon(agencHome, daemonPid);
+      if (stalePid !== null) {
+        await writeAgenCDaemonPid(pidPath, stalePid);
+        if (stalePidRunning) host.runningPids.add(stalePid);
+      }
+
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          {
+            host,
+            io,
+            requestDaemonInstanceIdentity: () => identity,
+            requestDaemonShutdown: (_host, expected) => {
+              expect(expected).toEqual(identity);
+              host.runningPids.delete(daemonPid);
+            },
+          },
+        ),
+      ).resolves.toBe(0);
+      expect(host.terminatedSignals).toEqual([]);
+      expect(
+        stalePid === null || !stalePidRunning
+          ? true
+          : host.runningPids.has(stalePid),
+      ).toBe(true);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+      expect(
+        readDaemonRuntimeInfo(resolveAgenCDaemonRuntimeInfoPath(agencHome)),
+      ).toBeNull();
+
+      await rm(agencHome, { recursive: true, force: true });
+    },
+  );
+
+  it("releases the lifecycle lock for authenticated cooperative cleanup", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    host.sleep = async () => delay(1);
+    const io = createIo();
+    const pid = 4313;
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const identity = recordTestDaemon(agencHome, pid);
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    let cleanupFinished!: () => void;
+    const cleanup = new Promise<void>((resolve) => {
+      cleanupFinished = resolve;
+    });
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          {
+            host,
+            io,
+            requestDaemonInstanceIdentity: () => identity,
+            requestDaemonShutdown: () => {
+              void (async () => {
+                const release = await acquireAgenCDaemonLifecycleLock(host);
+                host.runningPids.delete(pid);
+                await release();
+                cleanupFinished();
+              })();
+            },
+          },
+        ),
+      ).resolves.toBe(0);
+      await cleanup;
+      expect(host.terminatedSignals).toEqual([]);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("releases the lifecycle lock after TERM so cooperative cleanup avoids KILL", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const io = createIo();
+    const pid = 4314;
+    const pidPath = resolveAgenCDaemonPidPath(baseHost.env, baseHost.userHome);
+    const identity = recordTestDaemon(agencHome, pid);
+    baseHost.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    const host: typeof baseHost = {
+      ...baseHost,
+      sleep: async () => delay(1),
+      terminatePid: (targetPid, signal = "SIGTERM") => {
+        baseHost.terminatedPids.push(targetPid);
+        baseHost.terminatedSignals.push({ pid: targetPid, signal });
+        if (signal !== "SIGTERM") return;
+        void (async () => {
+          const release = await acquireAgenCDaemonLifecycleLock(baseHost);
+          baseHost.runningPids.delete(targetPid);
+          await release();
+        })();
+      },
+    };
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          {
+            host,
+            io,
+            stopTimeoutMs: 5,
+            inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+            requestDaemonInstanceIdentity: () => identity,
+            requestDaemonShutdown: () => {},
+          },
+        ),
+      ).resolves.toBe(0);
+      expect(baseHost.terminatedSignals).toEqual([{ pid, signal: "SIGTERM" }]);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("rebinds an authenticated Linux daemon before signalling after a hung shutdown ack", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(baseHost.env, baseHost.userHome);
+    const pid = 4316;
+    const identity = recordTestDaemon(agencHome, pid);
+    baseHost.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    let now = 0;
+    let shutdownAcknowledged = false;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const host = {
+      ...baseHost,
+      platform: "linux" as const,
+      sleep: async (ms: number) => {
+        now += ms;
+      },
+      terminatePid: (targetPid: number, signal: NodeJS.Signals = "SIGTERM") => {
+        baseHost.terminatedPids.push(targetPid);
+        baseHost.terminatedSignals.push({ pid: targetPid, signal });
+        if (signal === "SIGKILL") baseHost.runningPids.delete(targetPid);
+      },
+    };
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          {
+            host,
+            io,
+            stopTimeoutMs: 75,
+            inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+            requestDaemonInstanceIdentity: () => {
+              if (shutdownAcknowledged) {
+                throw new Error("daemon ingress closed after shutdown ack");
+              }
+              return identity;
+            },
+            requestDaemonShutdown: () => {
+              shutdownAcknowledged = true;
+            },
+          },
+        ),
+      ).resolves.toBe(0);
+      expect(baseHost.terminatedSignals).toEqual([
+        { pid, signal: "SIGTERM" },
+        { pid, signal: "SIGKILL" },
+      ]);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+      expect(io.stderrText()).toMatch(/forcing stop/u);
+    } finally {
+      nowSpy.mockRestore();
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("never signals an authenticated non-Linux daemon after a hung shutdown ack", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(baseHost.env, baseHost.userHome);
+    const pid = 4317;
+    const identity = recordTestDaemon(agencHome, pid);
+    baseHost.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    let now = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const host = {
+      ...baseHost,
+      platform: "darwin" as const,
+      sleep: async (ms: number) => {
+        now += ms;
+      },
+    };
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          {
+            host,
+            io,
+            stopTimeoutMs: 75,
+            requestDaemonInstanceIdentity: () => identity,
+            requestDaemonShutdown: () => {
+              // Acknowledged but deliberately remains alive.
+            },
+          },
+        ),
+      ).resolves.toBe(1);
+      expect(baseHost.terminatedSignals).toEqual([]);
+      expect(io.stderrText()).toMatch(/acknowledged.*unsafe numeric signal/u);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(pid);
+    } finally {
+      nowSpy.mockRestore();
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a reused pid whose process token does not match the sidecar", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const pid = 4313;
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    const identity = recordTestDaemon(agencHome, pid, {
+      processStart: `test-process:${pid}:original`,
+    });
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "stop" },
+        {
+          host,
+          io,
+          requestDaemonInstanceIdentity: () => identity,
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(host.terminatedSignals).toEqual([]);
+    expect(host.runningPids.has(pid)).toBe(true);
+    expect(io.stderrText()).toMatch(/process start identity/u);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("fails closed when the sidecar changes during direct stop proof", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const pid = 4314;
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    const original = recordTestDaemon(agencHome, pid);
+    let replacement: AgenCDaemonInstanceIdentity | null = null;
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "stop" },
+        {
+          host,
+          io,
+          requestDaemonInstanceIdentity: () => {
+            replacement = recordTestDaemon(agencHome, pid, {
+              instanceId: "replacement-instance",
+            });
+            return original;
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+    expect(host.terminatedSignals).toEqual([]);
+    expect(
+      readDaemonRuntimeInfo(resolveAgenCDaemonRuntimeInfoPath(agencHome))
+        ?.instanceId,
+    ).toBe(replacement?.instanceId);
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(pid);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("never numerically signals a legacy daemon on non-Linux hosts", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const host = { ...baseHost, platform: "darwin" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const pid = 4315;
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+
+    await expect(
+      runAgenCDaemonCli({ kind: "command", action: "stop" }, { host, io }),
+    ).resolves.toBe(1);
+    expect(host.terminatedSignals).toEqual([]);
+    expect(io.stderrText()).toMatch(/legacy daemon.*unsafe numeric signal/u);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -1059,7 +1555,10 @@ describe("AgenC daemon CLI", () => {
 
     try {
       await expect(
-        runAgenCDaemonCli({ kind: "command", action: "stop" }, { host, io }),
+        runAgenCDaemonCli(
+          { kind: "command", action: "stop" },
+          { host, io, inspectLegacyDaemonProcess: inspectLegacyTestDaemon },
+        ),
       ).resolves.toBe(0);
       expect(host.terminatedPids).toEqual([pid]);
       await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
@@ -1100,7 +1599,12 @@ describe("AgenC daemon CLI", () => {
       await expect(
         runAgenCDaemonCli(
           { kind: "command", action: "stop" },
-          { host, io, stopTimeoutMs: 75 },
+          {
+            host,
+            io,
+            stopTimeoutMs: 75,
+            inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+          },
         ),
       ).resolves.toBe(0);
       expect(host.terminatedSignals).toEqual([
@@ -1153,6 +1657,46 @@ describe("AgenC daemon CLI", () => {
     await rm(agencHome, { recursive: true, force: true });
   });
 
+  it.skipIf(process.platform === "win32")(
+    "refuses to report stopped or remove a stale pid while the control socket is active",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const io = createIo();
+      const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+      const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+      await writeAgenCDaemonPid(pidPath, 4400);
+      const server = createServer((socket) => socket.end());
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(socketPath, () => {
+          server.off("error", rejectListen);
+          resolveListen();
+        });
+      });
+
+      try {
+        await expect(
+          runAgenCDaemonCli({ kind: "command", action: "stop" }, { host, io }),
+        ).resolves.toBe(1);
+        await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4400);
+        expect(io.stdoutText()).not.toContain("already stopped");
+        expect(io.stderrText()).toMatch(
+          /control socket is active but its recorded pid is stale/u,
+        );
+        expect(host.terminatedPids).toEqual([]);
+      } finally {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((error) => {
+            if (error !== undefined) rejectClose(error);
+            else resolveClose();
+          });
+        });
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("restart tolerates a stopped daemon and starts a fresh pid", async () => {
     const agencHome = await tempAgencHome();
     const host = createHost(agencHome);
@@ -1165,13 +1709,88 @@ describe("AgenC daemon CLI", () => {
         // The fake host never binds a real control socket; stub readiness so
         // restart's start phase completes (this test covers restart's
         // tolerate-stopped + fresh-pid bookkeeping, not the socket gate).
-        { host, io, waitForDaemonReady: async () => true },
+        { host, io, ...createReadyPublishedDaemonOptions(agencHome, host) },
       ),
     ).resolves.toBe(0);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4201);
     expect(io.stdoutText()).toContain("AgenC daemon started (pid 4201)");
 
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("orders a concurrent start between restart stop and start phases", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const restartIo = createIo();
+    const concurrentIo = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const oldPid = 4450;
+    host.runningPids.add(oldPid);
+    await writeAgenCDaemonPid(pidPath, oldPid);
+    let currentIdentity = recordTestDaemon(agencHome, oldPid);
+    let spawnCount = 0;
+    const spawnDetachedDaemon = host.spawnDetachedDaemon;
+    host.spawnDetachedDaemon = (env) => {
+      spawnCount += 1;
+      const pid = spawnDetachedDaemon(env);
+      currentIdentity = recordTestDaemon(agencHome, pid);
+      return pid;
+    };
+    let shutdownEntered!: () => void;
+    const shutdownStarted = new Promise<void>((resolveStarted) => {
+      shutdownEntered = resolveStarted;
+    });
+    let finishShutdown!: () => void;
+    const shutdownGate = new Promise<void>((resolveShutdown) => {
+      finishShutdown = resolveShutdown;
+    });
+    const options = {
+      host,
+      waitForDaemonReady: async () => true,
+      inspectLegacyDaemonProcess: () => null,
+      requestDaemonInstanceIdentity: () => currentIdentity,
+      requestDaemonShutdown: async (
+        _host: AgenCDaemonCliHost,
+        expected: AgenCDaemonInstanceIdentity,
+      ) => {
+        expect(expected.pid).toBe(oldPid);
+        shutdownEntered();
+        await shutdownGate;
+        host.runningPids.delete(expected.pid);
+      },
+    } as const;
+
+    try {
+      const restart = runAgenCDaemonCli(
+        { kind: "command", action: "restart" },
+        { ...options, io: restartIo },
+      );
+      await shutdownStarted;
+      const concurrentStart = runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        { ...options, io: concurrentIo },
+      );
+      let concurrentSettled = false;
+      void concurrentStart.finally(() => {
+        concurrentSettled = true;
+      });
+      await delay(25);
+      expect(spawnCount).toBe(0);
+      expect(concurrentSettled).toBe(false);
+
+      finishShutdown();
+      await expect(Promise.all([restart, concurrentStart])).resolves.toEqual([
+        0, 0,
+      ]);
+      expect(spawnCount).toBe(1);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4201);
+      expect(currentIdentity.pid).toBe(4201);
+      expect(concurrentIo.stdoutText()).toContain("started (pid 4201)");
+      expect(restartIo.stdoutText()).toContain("already running (pid 4201)");
+    } finally {
+      finishShutdown();
+      await rm(agencHome, { recursive: true, force: true });
+    }
   });
 
   it("start does not report 'started' until the control socket is ready", async () => {
@@ -1218,13 +1837,568 @@ describe("AgenC daemon CLI", () => {
     await expect(
       runAgenCDaemonCli(
         { kind: "command", action: "start" },
-        { host, io, waitForDaemonReady: async () => true },
+        { host, io, ...createReadyPublishedDaemonOptions(agencHome, host) },
       ),
     ).resolves.toBe(0);
     expect(io.stdoutText()).toContain("AgenC daemon started (pid 4201)");
     expect(io.stderrText()).toBe("");
 
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("cancels the exact spawned child when PID publication fails", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const publicationError = new Error("injected durable pid fsync failure");
+    const cancelled: number[] = [];
+    host.cancelSpawnedDaemon = (pid) => {
+      cancelled.push(pid);
+      host.runningPids.delete(pid);
+    };
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "start" },
+          {
+            host,
+            io,
+            writeDaemonPid: async () => {
+              throw publicationError;
+            },
+          },
+        ),
+      ).rejects.toBe(publicationError);
+
+      expect(cancelled).toEqual([4201]);
+      expect(host.runningPids.has(4201)).toBe(false);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels the exact spawned child when lifecycle-lock handoff fails", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const releaseError = new Error("injected lifecycle release failure");
+    const cancelled: number[] = [];
+    host.cancelSpawnedDaemon = (pid) => {
+      cancelled.push(pid);
+      host.runningPids.delete(pid);
+    };
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "start" },
+          {
+            host,
+            io,
+            lifecycleLockHeld: true,
+            releaseLifecycleLockAfterStartMutation: async () => {
+              throw releaseError;
+            },
+          },
+        ),
+      ).rejects.toBe(releaseError);
+
+      expect(cancelled).toEqual([4201]);
+      expect(host.runningPids.has(4201)).toBe(false);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { label: "missing", stalePid: null, stalePidRunning: false },
+    { label: "dead", stalePid: 4451, stalePidRunning: false },
+    { label: "live unrelated", stalePid: 4452, stalePidRunning: true },
+  ])(
+    "adopts a live authenticated sidecar when daemon.pid is $label",
+    async ({ stalePid, stalePidRunning }) => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const io = createIo();
+      const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+      const daemonPid = 4453;
+      host.runningPids.add(daemonPid);
+      if (stalePid !== null) {
+        await writeAgenCDaemonPid(pidPath, stalePid);
+        if (stalePidRunning) host.runningPids.add(stalePid);
+      }
+      const identity = recordTestDaemon(agencHome, daemonPid);
+      const spawnDetachedDaemon = vi.fn(host.spawnDetachedDaemon);
+      host.spawnDetachedDaemon = spawnDetachedDaemon;
+
+      try {
+        await expect(
+          runAgenCDaemonCli(
+            { kind: "command", action: "start" },
+            {
+              host,
+              io,
+              waitForDaemonReady: async () => true,
+              requestDaemonInstanceIdentity: () => identity,
+              inspectLegacyDaemonProcess: () => null,
+            },
+          ),
+        ).resolves.toBe(0);
+
+        expect(spawnDetachedDaemon).not.toHaveBeenCalled();
+        await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(daemonPid);
+        expect(io.stdoutText()).toContain(
+          `AgenC daemon already running (pid ${daemonPid})`,
+        );
+        if (stalePid !== null && stalePidRunning) {
+          expect(host.runningPids.has(stalePid)).toBe(true);
+        }
+      } finally {
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    { platform: "linux" as const, expectedExit: 0 },
+    { platform: "darwin" as const, expectedExit: 1 },
+  ])(
+    "does not spawn over a pidless legacy sidecar on $platform",
+    async ({ platform, expectedExit }) => {
+      const agencHome = await tempAgencHome();
+      const baseHost = createHost(agencHome);
+      const host = { ...baseHost, platform };
+      const io = createIo();
+      const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+      const daemonPid = 4454;
+      host.runningPids.add(daemonPid);
+      await writeFile(
+        resolveAgenCDaemonRuntimeInfoPath(agencHome),
+        `${JSON.stringify({
+          pid: daemonPid,
+          runtimeVersion: "0.15.0",
+          commit: "legacy",
+          buildTime: "2026-01-01T00:00:00.000Z",
+          startedAt: "2026-01-01T00:00:00.000Z",
+        })}\n`,
+      );
+      const spawnDetachedDaemon = vi.fn(host.spawnDetachedDaemon);
+      host.spawnDetachedDaemon = spawnDetachedDaemon;
+
+      try {
+        await expect(
+          runAgenCDaemonCli(
+            { kind: "command", action: "start" },
+            {
+              host,
+              io,
+              waitForDaemonReady: async () => true,
+              inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+            },
+          ),
+        ).resolves.toBe(expectedExit);
+
+        expect(spawnDetachedDaemon).not.toHaveBeenCalled();
+        expect(host.runningPids.has(daemonPid)).toBe(true);
+        if (platform === "linux") {
+          await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(daemonPid);
+          expect(io.stdoutText()).toContain(
+            `already running (pid ${daemonPid})`,
+          );
+        } else {
+          await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+          expect(io.stderrText()).toMatch(/OS service\/process manager/u);
+        }
+      } finally {
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("adopts a proven untracked same-home Linux daemon without metadata", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const host = { ...baseHost, platform: "linux" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const daemonPid = 4455;
+    const process = inspectLegacyTestDaemon(daemonPid);
+    host.runningPids.add(daemonPid);
+    const spawnDetachedDaemon = vi.fn(host.spawnDetachedDaemon);
+    host.spawnDetachedDaemon = spawnDetachedDaemon;
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "start" },
+          {
+            host,
+            io,
+            findLegacyDaemonProcesses: () => [process],
+            inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
+            waitForDaemonReady: async () => true,
+          },
+        ),
+      ).resolves.toBe(0);
+
+      expect(spawnDetachedDaemon).not.toHaveBeenCalled();
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(daemonPid);
+      expect(io.stdoutText()).toContain(
+        `AgenC daemon already running (pid ${daemonPid})`,
+      );
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses direct start when an unbound control socket is active",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const baseHost = createHost(agencHome);
+      const host = { ...baseHost, platform: "darwin" as const };
+      const io = createIo();
+      const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+      const server = createServer((socket) => socket.end());
+      const spawnDetachedDaemon = vi.fn(host.spawnDetachedDaemon);
+      host.spawnDetachedDaemon = spawnDetachedDaemon;
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(socketPath, () => {
+          server.off("error", rejectListen);
+          resolveListen();
+        });
+      });
+
+      try {
+        await expect(
+          runAgenCDaemonCli({ kind: "command", action: "start" }, { host, io }),
+        ).resolves.toBe(1);
+        expect(spawnDetachedDaemon).not.toHaveBeenCalled();
+        expect(io.stderrText()).toMatch(
+          /control socket is active without portable process identity/u,
+        );
+      } finally {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((error) => {
+            if (error !== undefined) rejectClose(error);
+            else resolveClose();
+          });
+        });
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("makes a concurrent start wait for final identity publication", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const firstIo = createIo();
+    const secondIo = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    let spawnCount = 0;
+    const spawnDetachedDaemon = host.spawnDetachedDaemon;
+    host.spawnDetachedDaemon = (env) => {
+      spawnCount += 1;
+      return spawnDetachedDaemon(env);
+    };
+    let releaseReady!: () => void;
+    const ready = new Promise<void>((resolveReady) => {
+      releaseReady = resolveReady;
+    });
+    let readyWaiters = 0;
+    let publishedIdentity: AgenCDaemonInstanceIdentity | null = null;
+    const options = {
+      host,
+      inspectLegacyDaemonProcess: () => null,
+      waitForDaemonReady: async () => {
+        readyWaiters += 1;
+        await ready;
+        return true;
+      },
+      requestDaemonInstanceIdentity: () => {
+        if (publishedIdentity === null) {
+          throw new Error("test daemon identity is not published");
+        }
+        return publishedIdentity;
+      },
+    } as const;
+
+    try {
+      const first = runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        { ...options, io: firstIo },
+      );
+      await expect(waitForPid(pidPath)).resolves.toBe(4201);
+      const second = runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        { ...options, io: secondIo },
+      );
+      await vi.waitFor(() => expect(readyWaiters).toBe(2));
+      let secondSettled = false;
+      void second.finally(() => {
+        secondSettled = true;
+      });
+      await Promise.resolve();
+      expect(secondSettled).toBe(false);
+      publishedIdentity = recordTestDaemon(agencHome, 4201);
+      releaseReady();
+
+      await expect(Promise.all([first, second])).resolves.toEqual([0, 0]);
+      expect(spawnCount).toBe(1);
+      expect(firstIo.stdoutText()).toContain("started (pid 4201)");
+      expect(secondIo.stdoutText()).toContain("already running (pid 4201)");
+    } finally {
+      releaseReady();
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an already-running daemon whose generation changes before output", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const host = { ...baseHost, platform: "darwin" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const pid = 4460;
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    let processStart = `test-process:${pid}:original`;
+    let identity = recordTestDaemon(agencHome, pid, { processStart });
+    host.readProcessIdentity = () => processStart;
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        {
+          host,
+          io,
+          requestDaemonInstanceIdentity: () => identity,
+          waitForDaemonReady: async () => {
+            processStart = `test-process:${pid}:replacement`;
+            identity = recordTestDaemon(agencHome, pid, {
+              instanceId: "replacement-instance",
+              processStart,
+            });
+            return true;
+          },
+        },
+      ),
+    ).resolves.toBe(1);
+
+    expect(io.stdoutText()).not.toContain("already running");
+    expect(io.stderrText()).toMatch(/generation changed/u);
+    expect(host.runningPids.has(pid)).toBe(true);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("uses one mandatory Windows process query across start revalidation", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const pid = 4461;
+    const processStart = `test-process:${pid}:windows-start`;
+    const readProcessIdentity = vi.fn(() => processStart);
+    const host = {
+      ...baseHost,
+      platform: "win32" as const,
+      readProcessIdentity,
+    };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    const identity = recordTestDaemon(agencHome, pid, { processStart });
+    const requestIdentity = vi.fn(() => identity);
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        {
+          host,
+          io,
+          requestDaemonInstanceIdentity: requestIdentity,
+          waitForDaemonReady: async () => true,
+        },
+      ),
+    ).resolves.toBe(0);
+
+    expect(readProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(requestIdentity).toHaveBeenCalledTimes(2);
+    expect(io.stdoutText()).toContain(`already running (pid ${pid})`);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reclaims the lifecycle lock immediately after a killed owner",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const lockPath = join(agencHome, "daemon-lifecycle.lock.sqlite");
+      const sqliteLockUrl = pathToFileURL(
+        join(process.cwd(), "src/utils/sqlite-lock.ts"),
+      ).href;
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          "--input-type=module",
+          "--eval",
+          `import { acquireLocalSqliteLock } from ${JSON.stringify(sqliteLockUrl)}; await acquireLocalSqliteLock(${JSON.stringify(lockPath)}, { timeoutMs: 5_000, label: "test daemon lifecycle" }); process.stdout.write("locked\\n"); await new Promise(() => {});`,
+        ],
+        { cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"] },
+      );
+
+      try {
+        await Promise.race([
+          once(child.stdout, "data"),
+          once(child, "exit").then(([code]) => {
+            throw new Error(
+              `lock owner exited early with code ${String(code)}`,
+            );
+          }),
+          delay(5_000).then(() => {
+            throw new Error("lock owner did not acquire the lifecycle lock");
+          }),
+        ]);
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+
+        const startedAt = Date.now();
+        const release = await acquireAgenCDaemonLifecycleLock(host);
+        expect(Date.now() - startedAt).toBeLessThan(2_000);
+        await release();
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill("SIGKILL");
+          await once(child, "exit").catch(() => {});
+        }
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("honors startup cancellation immediately after a blocked lifecycle lock", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const io = createIo();
+    const releaseBlocker = await acquireAgenCDaemonLifecycleLock(baseHost);
+    const acknowledgeAfterCleanup = vi.fn(async () => {});
+    const beforeDaemonReady = vi.fn();
+    const host: AgenCDaemonCliHost = {
+      ...baseHost,
+      startupGuardReceiver: {
+        requested: Promise.resolve(),
+        wasRequested: () => true,
+        acknowledgeAfterCleanup,
+        close: () => {},
+      },
+    };
+
+    try {
+      const running = runAgenCDaemonCli(
+        { kind: "command", action: "run" },
+        { host, io, beforeDaemonReady },
+      );
+      let settled = false;
+      void running.finally(() => {
+        settled = true;
+      });
+      await delay(25);
+      expect(settled).toBe(false);
+
+      await releaseBlocker();
+      await expect(running).resolves.toBe(1);
+      expect(beforeDaemonReady).not.toHaveBeenCalled();
+      expect(acknowledgeAfterCleanup).toHaveBeenCalledExactlyOnceWith(true);
+      await expect(
+        readAgenCDaemonPid(resolveAgenCDaemonPidPath(host.env, host.userHome)),
+      ).resolves.toBeNull();
+      expect(
+        existsSync(resolveAgenCDaemonSocketPath(host.env, host.userHome)),
+      ).toBe(false);
+    } finally {
+      await releaseBlocker().catch(() => {});
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes a direct foreground launch against autostart", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    host.runningPids.add(host.pid);
+    let spawnCount = 0;
+    const spawnDetachedDaemon = host.spawnDetachedDaemon;
+    host.spawnDetachedDaemon = (env) => {
+      spawnCount += 1;
+      return spawnDetachedDaemon(env);
+    };
+    let foregroundEntered!: () => void;
+    const foregroundAtPublication = new Promise<void>((resolveEntered) => {
+      foregroundEntered = resolveEntered;
+    });
+    let publishForeground!: () => void;
+    const publicationGate = new Promise<void>((resolvePublication) => {
+      publishForeground = resolvePublication;
+    });
+    const foreground = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      {
+        host,
+        io,
+        signalProcess,
+        beforeDaemonReady: async () => {
+          foregroundEntered();
+          await publicationGate;
+        },
+      },
+    );
+    let stopped = false;
+
+    try {
+      await foregroundAtPublication;
+      const ensuring = ensureAgenCDaemonAutostart({
+        host,
+        isReady: () => true,
+        findOrphanDaemonPids: () => [],
+        findSupersededDaemonPids: () => [],
+      });
+      let ensureSettled = false;
+      void ensuring.finally(() => {
+        ensureSettled = true;
+      });
+      await delay(25);
+      expect(ensureSettled).toBe(false);
+      expect(spawnCount).toBe(0);
+
+      publishForeground();
+      await expect(ensuring).resolves.toMatchObject({
+        pid: host.pid,
+        status: "already-running",
+      });
+      expect(spawnCount).toBe(0);
+
+      signalProcess.emit("SIGTERM");
+      stopped = true;
+      await expect(foreground).resolves.toBe(0);
+    } finally {
+      publishForeground();
+      if (!stopped) {
+        signalProcess.emit("SIGTERM");
+        await foreground.catch(() => {});
+      }
+      await rm(agencHome, { recursive: true, force: true });
+    }
   });
 
   it("status flags a live pid whose control socket is not ready", async () => {
@@ -1243,6 +2417,7 @@ describe("AgenC daemon CLI", () => {
           io,
           // pid alive, socket not connectable.
           waitForDaemonReady: async () => false,
+          inspectLegacyDaemonProcess: inspectLegacyTestDaemon,
           // health.stats also unreachable in this window.
           requestHealthStats: async () => {
             throw new Error("socket not ready");
@@ -1260,37 +2435,108 @@ describe("AgenC daemon CLI", () => {
     await rm(agencHome, { recursive: true, force: true });
   });
 
-  it("reload waits for control-socket connectability before connecting", async () => {
+  it.skipIf(process.platform === "win32")(
+    "reports status indeterminate when an unbound control socket is active",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const io = createIo();
+      const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+      const server = createServer((socket) => socket.end());
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(socketPath, () => {
+          server.off("error", rejectListen);
+          resolveListen();
+        });
+      });
+
+      try {
+        await expect(
+          runAgenCDaemonCli(
+            { kind: "command", action: "status" },
+            { host, io },
+          ),
+        ).resolves.toBe(1);
+        expect(io.stdoutText()).not.toContain("daemon stopped");
+        expect(io.stderrText()).toMatch(
+          /control socket is active but no process identity is recorded/u,
+        );
+        expect(host.terminatedPids).toEqual([]);
+      } finally {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((error) => {
+            if (error !== undefined) rejectClose(error);
+            else resolveClose();
+          });
+        });
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("refuses to report an unrelated live pid as the daemon", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const host = { ...baseHost, platform: "darwin" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    host.runningPids.add(4602);
+    await writeAgenCDaemonPid(pidPath, 4602);
+    const requestHealthStats = vi.fn(async () => {
+      throw new Error("must not probe an unbound pid");
+    });
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "status" },
+        { host, io, requestHealthStats },
+      ),
+    ).resolves.toBe(1);
+
+    expect(io.stdoutText()).not.toContain("daemon running");
+    expect(io.stderrText()).toContain("indeterminate for unbound pid 4602");
+    expect(requestHealthStats).not.toHaveBeenCalled();
+    expect(host.runningPids.has(4602)).toBe(true);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("reload targets the authenticated sidecar instead of a live reused pid", async () => {
     const agencHome = await tempAgencHome();
     const host = createHost(agencHome);
     const io = createIo();
     const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
-    host.runningPids.add(4601);
-    await writeAgenCDaemonPid(pidPath, 4601);
+    const unrelatedPid = 4601;
+    const daemonPid = 4603;
+    host.runningPids.add(unrelatedPid);
+    host.runningPids.add(daemonPid);
+    await writeAgenCDaemonPid(pidPath, unrelatedPid);
+    const identity = recordTestDaemon(agencHome, daemonPid);
+    const requestDaemonReload = vi.fn(() => ({
+      reloaded: true as const,
+      configReloadedAt: "2026-08-19T00:00:00.000Z",
+      mcpServer: { status: "disabled" as const },
+    }));
 
-    // Socket never becomes connectable: reload must refuse via the readiness
-    // gate instead of racing into a connect ENOENT, and must not kill the pid.
-    let readinessProbed = false;
     await expect(
       runAgenCDaemonCli(
         { kind: "command", action: "reload" },
         {
           host,
           io,
-          waitForDaemonReady: async () => {
-            readinessProbed = true;
-            return false;
-          },
+          requestDaemonInstanceIdentity: () => identity,
+          requestDaemonReload,
         },
       ),
-    ).resolves.toBe(1);
+    ).resolves.toBe(0);
 
-    expect(readinessProbed).toBe(true);
-    expect(io.stderrText()).toContain(
-      "control socket did not become ready before timeout",
-    );
+    expect(requestDaemonReload).toHaveBeenCalledExactlyOnceWith(host, identity);
     expect(host.terminatedPids).toEqual([]);
-    await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4601);
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(unrelatedPid);
+    expect(io.stdoutText()).toContain(
+      `reloaded configuration (pid ${daemonPid})`,
+    );
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -1310,7 +2556,7 @@ describe("AgenC daemon CLI", () => {
     await rm(agencHome, { recursive: true, force: true });
   });
 
-  it("reload cleans a stale daemon pid", async () => {
+  it("reload leaves an unbound stale pid untouched", async () => {
     const agencHome = await tempAgencHome();
     const host = createHost(agencHome);
     const io = createIo();
@@ -1321,12 +2567,119 @@ describe("AgenC daemon CLI", () => {
       runAgenCDaemonCli({ kind: "command", action: "reload" }, { host, io }),
     ).resolves.toBe(1);
 
-    await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4400);
     expect(io.stdoutText()).toContain("AgenC daemon stopped");
     expect(host.terminatedPids).toEqual([]);
 
     await rm(agencHome, { recursive: true, force: true });
   });
+
+  it("reload refuses a live pid without authenticated identity and does not mutate it", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const pid = 4401;
+    host.runningPids.add(pid);
+    await writeAgenCDaemonPid(pidPath, pid);
+    const requestDaemonReload = vi.fn();
+
+    await expect(
+      runAgenCDaemonCli(
+        { kind: "command", action: "reload" },
+        { host, io, requestDaemonReload },
+      ),
+    ).resolves.toBe(1);
+
+    expect(requestDaemonReload).not.toHaveBeenCalled();
+    await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(pid);
+    expect(io.stderrText()).toContain(`unverified daemon (pid ${pid})`);
+    expect(host.terminatedPids).toEqual([]);
+
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reload validates the connection identity before sending the mutation",
+    async () => {
+      const agencHome = await tempAgencHome();
+      const host = createHost(agencHome);
+      const io = createIo();
+      const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+      const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+      const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
+      const pid = 4402;
+      host.runningPids.add(pid);
+      await writeAgenCDaemonPid(pidPath, pid);
+      await writeFile(cookiePath, "test-cookie\n");
+      const expected = recordTestDaemon(agencHome, pid);
+      const replacement = { ...expected, instanceId: "replacement-instance" };
+      const methods: string[] = [];
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => {
+          buffer += chunk;
+          while (true) {
+            const newline = buffer.indexOf("\n");
+            if (newline < 0) return;
+            const request = JSON.parse(buffer.slice(0, newline)) as {
+              readonly id: number;
+              readonly method: string;
+            };
+            buffer = buffer.slice(newline + 1);
+            methods.push(request.method);
+            if (request.method === "initialize") {
+              socket.write(
+                `${JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: request.id,
+                  result: {
+                    type: "initialized",
+                    protocolVersion: "1.2",
+                    protocol: { version: "1.2" },
+                    capabilities: {},
+                    daemonIdentity: replacement,
+                  },
+                })}\n`,
+              );
+            }
+          }
+        });
+      });
+      await new Promise<void>((resolveListen, rejectListen) => {
+        server.once("error", rejectListen);
+        server.listen(socketPath, () => {
+          server.off("error", rejectListen);
+          resolveListen();
+        });
+      });
+
+      try {
+        await expect(
+          runAgenCDaemonCli(
+            { kind: "command", action: "reload" },
+            {
+              host,
+              io,
+              requestDaemonInstanceIdentity: () => expected,
+            },
+          ),
+        ).resolves.toBe(1);
+        expect(methods).toEqual(["initialize"]);
+        expect(io.stderrText()).toMatch(/instance changed before reload/u);
+        await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(pid);
+      } finally {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((error) => {
+            if (error !== undefined) rejectClose(error);
+            else resolveClose();
+          });
+        });
+        await rm(agencHome, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("reload command re-reads config and starts configured mcp.server without shutdown", async () => {
     const agencHome = await tempAgencHome();
@@ -1639,14 +2992,21 @@ workspace = ${JSON.stringify(process.cwd())}
     const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
     host.runningPids.add(4400);
     await writeAgenCDaemonPid(pidPath, 4400);
+    const identity = recordTestDaemon(agencHome, 4400);
 
     await expect(
       runAgenCDaemonCli(
         { kind: "command", action: "reload" },
-        // Pid is alive but the control socket never becomes connectable (no
-        // cookie/socket bound yet). Reload must refuse rather than race into a
-        // connect ENOENT, and must not terminate the running daemon.
-        { host, io, waitForDaemonReady: async () => false },
+        {
+          host,
+          io,
+          requestDaemonInstanceIdentity: () => identity,
+          requestDaemonReload: () => {
+            throw new Error(
+              "control socket did not become ready before timeout",
+            );
+          },
+        },
       ),
     ).resolves.toBe(1);
 
@@ -1657,6 +3017,69 @@ workspace = ${JSON.stringify(process.cwd())}
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4400);
 
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("refuses a foreground overlap when a pidless authenticated daemon is live", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const daemonPid = 4463;
+    host.runningPids.add(daemonPid);
+    const identity = recordTestDaemon(agencHome, daemonPid);
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "run" },
+          {
+            host,
+            io,
+            requestDaemonInstanceIdentity: () => identity,
+          },
+        ),
+      ).resolves.toBe(1);
+
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(daemonPid);
+      expect(io.stderrText()).toContain(
+        `refusing foreground daemon start while authenticated daemon pid ${daemonPid} is active`,
+      );
+      expect(host.runningPids.has(daemonPid)).toBe(true);
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a foreground overlap with an untracked same-home Linux daemon", async () => {
+    const agencHome = await tempAgencHome();
+    const baseHost = createHost(agencHome);
+    const host = { ...baseHost, platform: "linux" as const };
+    const io = createIo();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const daemonPid = 4464;
+    const process = inspectLegacyTestDaemon(daemonPid);
+    host.runningPids.add(daemonPid);
+
+    try {
+      await expect(
+        runAgenCDaemonCli(
+          { kind: "command", action: "run" },
+          {
+            host,
+            io,
+            findLegacyDaemonProcesses: () => [process],
+          },
+        ),
+      ).resolves.toBe(1);
+
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(daemonPid);
+      expect(io.stderrText()).toContain(
+        `untracked same-home daemon pid ${daemonPid} is active`,
+      );
+      expect(host.runningPids.has(daemonPid)).toBe(true);
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
   });
 
   it("foreground daemon routes SIGHUP through cleanup and removes daemon.pid", async () => {
@@ -1684,6 +3107,316 @@ workspace = ${JSON.stringify(process.cwd())}
     );
 
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("foreground cleanup preserves a replacement pid and full identity published ahead of its lifecycle lock", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const runtimeInfoPath = resolveAgenCDaemonRuntimeInfoPath(agencHome);
+    let cleanupEntered!: () => void;
+    const cleanupAtAuthority = new Promise<void>((resolveEntered) => {
+      cleanupEntered = resolveEntered;
+    });
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      {
+        host,
+        io,
+        signalProcess,
+        beforeDaemonAuthorityCleanup: cleanupEntered,
+      },
+    );
+
+    let releaseLifecycleLock: (() => Promise<void>) | undefined;
+    try {
+      await expect(waitForPid(pidPath)).resolves.toBe(host.pid);
+      releaseLifecycleLock = await acquireAgenCDaemonLifecycleLock(host);
+      signalProcess.emit("SIGTERM");
+      await cleanupAtAuthority;
+
+      const replacement = recordTestDaemon(agencHome, 4999, {
+        instanceId: "replacement-after-old-cleanup-started",
+      });
+      await writeAgenCDaemonPid(pidPath, replacement.pid);
+      await releaseLifecycleLock();
+      releaseLifecycleLock = undefined;
+
+      await expect(running).resolves.toBe(0);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(replacement.pid);
+      expect(
+        daemonInstanceIdentityFromRuntimeInfo(
+          readDaemonRuntimeInfo(runtimeInfoPath),
+        ),
+      ).toEqual(replacement);
+    } finally {
+      await releaseLifecycleLock?.();
+      signalProcess.emit("SIGTERM");
+      await running.catch(() => {});
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates authority cleanup failures and releases the lifecycle lock", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const closeError = new Error("injected socket close failure");
+    const metadataError = new Error("injected metadata cleanup failure");
+
+    try {
+      const error = await runAgenCDaemonAuthorityCleanup({
+        host,
+        lifecycleLockHeld: false,
+        closeSocket: () => {
+          throw closeError;
+        },
+        removeMetadata: () => {
+          throw metadataError;
+        },
+      }).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).cause).toBe(closeError);
+      expect((error as AggregateError).errors).toEqual([
+        closeError,
+        metadataError,
+      ]);
+
+      const release = await acquireAgenCDaemonLifecycleLock(host);
+      await release();
+    } finally {
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("flushes authenticated self-shutdown acknowledgement before exiting", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+    const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io, signalProcess },
+    );
+
+    try {
+      await expect(waitForPid(pidPath)).resolves.toBe(4100);
+      const authCookie = (await readFile(cookiePath, "utf8")).trim();
+      const socket = createConnection(socketPath);
+      await once(socket, "connect");
+      socket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "initialize-shutdown",
+          method: "initialize",
+          params: {
+            protocolVersion: "1.2.0",
+            protocol: { version: "1.2.0" },
+            clientName: "agenc-shutdown-contract",
+            authCookie,
+            capabilities: {},
+          },
+        })}\n`,
+      );
+      const initialized = JSON.parse(await readSocketLine(socket)) as {
+        readonly result?: {
+          readonly daemonIdentity?: { readonly instanceId?: string };
+        };
+      };
+      const instanceId = initialized.result?.daemonIdentity?.instanceId;
+      expect(instanceId).toMatch(/^[0-9a-f-]{36}$/u);
+
+      socket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "shutdown",
+          method: "daemon.shutdown",
+          params: { instanceId },
+        })}\n`,
+      );
+      // The response must reach the client before cleanup closes the socket.
+      await expect(readSocketLine(socket)).resolves.toContain(
+        `"instanceId":"${instanceId}"`,
+      );
+      await expect(running).resolves.toBe(0);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+      await expect(
+        readFile(join(agencHome, "daemon-runtime.json"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if ((await readAgenCDaemonPid(pidPath)) !== null) {
+        signalProcess.emit("SIGTERM");
+        await running;
+      }
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("fences reload adoption before shutdown ACK and drains the admitted reload", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const io = createIo();
+    const signalProcess = createSignalProcess();
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
+    const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
+    let reloadPrepared!: () => void;
+    const reloadAtAdoption = new Promise<void>((resolve) => {
+      reloadPrepared = resolve;
+    });
+    let releaseReload!: () => void;
+    const reloadGate = new Promise<void>((resolve) => {
+      releaseReload = resolve;
+    });
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      {
+        host,
+        io,
+        signalProcess,
+        beforeDaemonReloadAdoption: async () => {
+          reloadPrepared();
+          await reloadGate;
+        },
+      },
+    );
+    let reloadSocket: Socket | undefined;
+    let shutdownSocket: Socket | undefined;
+
+    try {
+      await expect(waitForPid(pidPath)).resolves.toBe(4100);
+      const authCookie = (await readFile(cookiePath, "utf8")).trim();
+      const initialize = async (
+        socket: Socket,
+        id: string,
+      ): Promise<string> => {
+        await once(socket, "connect");
+        socket.write(
+          `${JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            method: "initialize",
+            params: {
+              protocolVersion: "1.2.0",
+              protocol: { version: "1.2.0" },
+              clientName: id,
+              authCookie,
+              capabilities: {},
+            },
+          })}\n`,
+        );
+        const response = JSON.parse(await readSocketLine(socket)) as {
+          readonly result?: {
+            readonly daemonIdentity?: { readonly instanceId?: string };
+          };
+        };
+        const instanceId = response.result?.daemonIdentity?.instanceId;
+        if (instanceId === undefined) {
+          throw new Error("test daemon identity missing");
+        }
+        return instanceId;
+      };
+
+      reloadSocket = createConnection(socketPath);
+      const instanceId = await initialize(reloadSocket, "initialize-reload");
+      reloadSocket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "reload-before-shutdown",
+          method: "daemon.reload",
+          params: {},
+        })}\n`,
+      );
+      await reloadAtAdoption;
+
+      shutdownSocket = createConnection(socketPath);
+      await initialize(shutdownSocket, "initialize-shutdown-drain");
+      shutdownSocket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: "shutdown-drain",
+          method: "daemon.shutdown",
+          params: { instanceId },
+        })}\n`,
+      );
+      await expect(readSocketLine(shutdownSocket)).resolves.toContain(
+        `"instanceId":"${instanceId}"`,
+      );
+      let settled = false;
+      void running.finally(() => {
+        settled = true;
+      });
+      await delay(25);
+      expect(settled).toBe(false);
+
+      releaseReload();
+      await expect(running).resolves.toBe(0);
+      await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
+    } finally {
+      releaseReload();
+      reloadSocket?.destroy();
+      shutdownSocket?.destroy();
+      if ((await readAgenCDaemonPid(pidPath)) !== null) {
+        signalProcess.emit("SIGTERM");
+        await running;
+      }
+      await rm(agencHome, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps concurrent shutdowns blocked when one acknowledgement send fails", async () => {
+    const completed = vi.fn();
+    const coordinator = new AgenCDaemonRpcShutdownCoordinator(completed);
+    const firstResult = coordinator.accept("instance-concurrent");
+    const secondResult = coordinator.accept("instance-concurrent");
+    const firstMessage = {
+      jsonrpc: "2.0",
+      id: "shutdown-failed",
+      method: "daemon.shutdown",
+      params: { instanceId: "instance-concurrent" },
+    } as const;
+    const secondMessage = {
+      ...firstMessage,
+      id: "shutdown-deferred",
+    } as const;
+    const firstResponse = {
+      jsonrpc: "2.0",
+      id: firstMessage.id,
+      result: firstResult,
+    } as const;
+    const secondResponse = {
+      jsonrpc: "2.0",
+      id: secondMessage.id,
+      result: secondResult,
+    } as const;
+    let resolveDeferredSend!: () => void;
+    const deferredSend = new Promise<void>((resolve) => {
+      resolveDeferredSend = resolve;
+    });
+
+    const failed = coordinator.send(firstMessage, firstResponse, async () => {
+      throw new Error("socket closed before acknowledgement flush");
+    });
+    const deferred = coordinator.send(
+      secondMessage,
+      secondResponse,
+      () => deferredSend,
+    );
+
+    await expect(failed).rejects.toThrow(/socket closed/u);
+    // The failed send releases only its own acceptance. The still-pending
+    // Unix/WS-agnostic send barrier continues to reject interleaved work.
+    expect(coordinator.blocksRequests).toBe(true);
+    expect(completed).not.toHaveBeenCalled();
+
+    resolveDeferredSend();
+    await deferred;
+    expect(coordinator.blocksRequests).toBe(true);
+    expect(completed).toHaveBeenCalledTimes(1);
   });
 
   it("foreground daemon instantiates AuthBackend for auth requests", async () => {
@@ -2544,7 +4277,7 @@ snapshot_max_bytes = 64
     const signalProcess = createSignalProcess();
     const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
     const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
-    seedRecoverableDaemonState(agencHome, {
+    const restartRolloutPath = seedRecoverableDaemonState(agencHome, {
       cwd: process.cwd(),
       runId: "run-restart",
       sessionId: "session-restart",
@@ -2564,7 +4297,7 @@ snapshot_max_bytes = 64
       status: "failed",
       lastActiveAt: "2026-01-01T00:00:00.000Z",
     });
-    seedRecoverableDaemonState(agencHome, {
+    const otherRolloutPath = seedRecoverableDaemonState(agencHome, {
       cwd: otherCwd,
       runId: "run-other",
       sessionId: "session-other",
@@ -2572,35 +4305,40 @@ snapshot_max_bytes = 64
       status: "blocked",
     });
     const restoredConversationIds: string[] = [];
+    const restoreOptions = new Map<
+      string,
+      Parameters<AgenCBootstrapFunction>[0]
+    >();
     const sendInput = vi.fn(async () => {});
     const permissionModeRegistry = {
       current: () => createEmptyToolPermissionContext(),
       update: async () => {},
     };
-    const runner: AgenCBackgroundAgentRunner =
-      new AgenCDelegateBackgroundAgentRunner({
-        bootstrap: (async (options) => {
-          const conversationId = options.conversationId ?? "daemon-recovery";
-          restoredConversationIds.push(conversationId);
-          const session = createRecoveredSession(
-            conversationId,
-            permissionModeRegistry,
-          );
-          return {
-            session,
-            rolloutStore: session.rolloutStore,
-            shutdown: async () => {},
-          };
-        }) as AgenCBootstrapFunction,
-        ensureAgentControl: (() => ({
-          control: {
-            sendInput,
-            shutdown: async () => {},
-          },
-          registry: {},
-        })) as AgenCEnsureAgentControlFunction,
-        now: () => "2026-05-01T12:00:00.000Z",
-      });
+    const runner = new AgenCDelegateBackgroundAgentRunner({
+      bootstrap: (async (options) => {
+        const conversationId = options.conversationId ?? "daemon-recovery";
+        restoredConversationIds.push(conversationId);
+        restoreOptions.set(conversationId, options);
+        const session = createRecoveredSession(
+          conversationId,
+          permissionModeRegistry,
+        );
+        return {
+          session,
+          rolloutStore: session.rolloutStore,
+          shutdown: async () => {},
+        };
+      }) as AgenCBootstrapFunction,
+      ensureAgentControl: (() => ({
+        control: {
+          sendInput,
+          shutdown: async () => {},
+        },
+        registry: {},
+      })) as AgenCEnsureAgentControlFunction,
+      now: () => "2026-05-01T12:00:00.000Z",
+    });
+    const restoreAgentSpy = vi.spyOn(runner, "restoreAgent");
 
     const running = runAgenCDaemonCli(
       { kind: "command", action: "run" },
@@ -2632,6 +4370,50 @@ snapshot_max_bytes = 64
       "run-other",
       "run-restart",
     ]);
+    expect(
+      restoreAgentSpy.mock.calls
+        .map(([params]) => ({
+          agentId: params.agentId,
+          explicitColdResume: params.explicitColdResume,
+        }))
+        .sort((left, right) => left.agentId.localeCompare(right.agentId)),
+    ).toEqual([
+      { agentId: "run-other", explicitColdResume: true },
+      { agentId: "run-restart", explicitColdResume: true },
+    ]);
+    expect(restoreOptions.get("run-restart")).toMatchObject({
+      conversationId: "run-restart",
+      resumeConversation: true,
+      cwd: process.cwd(),
+      resumeRolloutPath: restartRolloutPath,
+      resumeRolloutLease: expect.objectContaining({
+        rolloutPath: restartRolloutPath,
+        claim: expect.any(Function),
+        closeUnclaimed: expect.any(Function),
+      }),
+      resumeCwdIdentity: {
+        dev: expect.any(String),
+        ino: expect.any(String),
+      },
+      resumeCwdFd: expect.any(Number),
+    });
+    expect(restoreOptions.get("run-restart")?.cwd).not.toBe(
+      dirname(dirname(dirname(restartRolloutPath))),
+    );
+    expect(restoreOptions.get("run-other")).toMatchObject({
+      conversationId: "run-other",
+      resumeConversation: true,
+      cwd: otherCwd,
+      resumeRolloutPath: otherRolloutPath,
+      resumeCwdIdentity: {
+        dev: expect.any(String),
+        ino: expect.any(String),
+      },
+      resumeCwdFd: expect.any(Number),
+    });
+    expect(restoreOptions.get("run-other")?.cwd).not.toBe(
+      dirname(dirname(dirname(otherRolloutPath))),
+    );
     const authCookie = (await readFile(cookiePath, "utf8")).trim();
     const client = createAgenCJsonLineDaemonRequestClient({
       socketPath: resolveAgenCDaemonSocketPath(host.env, host.userHome),
@@ -2644,7 +4426,9 @@ snapshot_max_bytes = 64
       "run-restart",
     ]);
     const stats = await client.request("health.stats", {});
-    expect(stats.sessions.active).toBe(2);
+    // Each retained canonical root plus its daemon attachment session is
+    // visible after exact-source startup restoration.
+    expect(stats.sessions.active).toBe(4);
     expect(stats.state?.agentRuns).toBe(2);
     expect(agentList.agents[1]).toMatchObject({
       agentId: "run-restart",
@@ -2748,6 +4532,355 @@ snapshot_max_bytes = 64
 
     await rm(otherCwd, { recursive: true, force: true });
     await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("rolls back an exact startup runtime and session when recovered-agent publication fails", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const runId = "run-startup-publication-failure";
+    const sessionId = "session-startup-publication-failure";
+    seedRecoverableDaemonState(agencHome, {
+      cwd: process.cwd(),
+      runId,
+      sessionId,
+    });
+    const primaryFailure = new Error(
+      "injected recovered-agent publication failure",
+    );
+    const cleanupFailure = new Error(
+      "injected restored-runtime rollback failure",
+    );
+    const restoreAgent = vi.fn(async () => true);
+    const rollbackRestoredAgent = vi.fn(async () => {
+      throw cleanupFailure;
+    });
+    const terminateSession = vi.spyOn(
+      AgenCDaemonSessionManager.prototype,
+      "terminateSession",
+    );
+    const runner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => {
+        throw new Error("not used");
+      },
+      restoreAgent,
+      rollbackRestoredAgent,
+      attachAgentSessionEvents: async () => {
+        throw primaryFailure;
+      },
+    };
+
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io: createIo(), runner },
+    );
+    const failure = await running.catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors[0]).toBe(primaryFailure);
+    expect((failure as AggregateError).errors).toContain(cleanupFailure);
+    const restoreAttemptId = restoreAgent.mock.calls[0]?.[0].restoreAttemptId;
+    expect(restoreAttemptId).toEqual(expect.any(String));
+    expect(rollbackRestoredAgent).toHaveBeenCalledWith(runId, restoreAttemptId);
+    expect(terminateSession).toHaveBeenCalledWith({
+      sessionId,
+      reason: "startup_restore_publication_failed",
+    });
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("never restores runner authority after a canonical cancellation request tail", async () => {
+    const agencHome = await tempAgencHome();
+    const host = createHost(agencHome);
+    const signalProcess = createSignalProcess();
+    const runId = "run-cancel-request-no-restore";
+    const sessionId = "session-cancel-request-no-restore";
+    const rolloutPath = seedRecoverableDaemonState(agencHome, {
+      cwd: process.cwd(),
+      runId,
+      sessionId,
+    });
+    writeFileSync(
+      rolloutPath,
+      `${JSON.stringify({
+        type: "event_msg",
+        payload: {
+          eventId: `run-cancel-request:${runId}:1`,
+          id: `run-cancel-request:${runId}:1`,
+          seq: 1,
+          msg: {
+            type: "run_cancel_requested",
+            payload: {
+              runId,
+              epoch: 1,
+              reason: "operator",
+              requestedAt: "2026-05-01T00:07:00.000Z",
+            },
+          },
+        },
+      })}\n`,
+      { flag: "a" },
+    );
+    const restoreAgent = vi.fn(async () => true);
+    const runner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => {
+        throw new Error("not used");
+      },
+      restoreAgent,
+    };
+
+    const running = runAgenCDaemonCli(
+      { kind: "command", action: "run" },
+      { host, io: createIo(), signalProcess, runner },
+    );
+    await expect(
+      waitForPid(resolveAgenCDaemonPidPath(host.env, host.userHome)),
+    ).resolves.toBe(4100);
+    expect(restoreAgent).not.toHaveBeenCalled();
+    expect(readAgentRunStatus(agencHome, process.cwd(), runId)).toBe(
+      "cancelled",
+    );
+    signalProcess.emit("SIGTERM");
+    await expect(running).resolves.toBe(0);
+    await rm(agencHome, { recursive: true, force: true });
+  });
+
+  it("suspends an idle run, restores it on daemon restart, and accepts new input", async () => {
+    const agencHome = await tempAgencHome();
+    const originalAgencHome = process.env.AGENC_HOME;
+    process.env.AGENC_HOME = agencHome;
+    const host = createHost(agencHome);
+    const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
+    const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
+    const runId = "run-idle-daemon-restart";
+    const sessionId = "session-idle-daemon-restart";
+    const rolloutPath = seedRecoverableDaemonState(agencHome, {
+      cwd: process.cwd(),
+      runId,
+      sessionId,
+    });
+    const rolloutIdentity = await stat(rolloutPath, { bigint: true });
+    const sendInput = vi.fn(async () => {});
+    const restoredOptions: Array<Parameters<AgenCBootstrapFunction>[0]> = [];
+    const permissionModeRegistry = {
+      current: () => createEmptyToolPermissionContext(),
+      update: async () => {},
+    };
+    const makeRunner = (): AgenCBackgroundAgentRunner =>
+      new AgenCDelegateBackgroundAgentRunner({
+        bootstrap: (async (options) => {
+          restoredOptions.push(options);
+          if (
+            options.conversationId === undefined ||
+            options.cwd === undefined ||
+            options.resumeRolloutPath === undefined ||
+            options.resumeRolloutLease === undefined ||
+            options.resumeCwdIdentity === undefined ||
+            options.resumeCwdFd === undefined
+          ) {
+            throw new Error(
+              "startup restore omitted exact canonical authority",
+            );
+          }
+          const pinnedCwd = fstatSync(options.resumeCwdFd, { bigint: true });
+          if (
+            pinnedCwd.dev.toString(10) !== options.resumeCwdIdentity.dev ||
+            pinnedCwd.ino.toString(10) !== options.resumeCwdIdentity.ino
+          ) {
+            throw new Error("startup restore cwd descriptor identity changed");
+          }
+          const rolloutStore = new RolloutStore({
+            cwd: options.cwd,
+            sessionId: options.conversationId,
+            agencVersion: "0.16.1",
+            resume: true,
+            resumeRolloutPath: options.resumeRolloutPath,
+            resumeRolloutLease: options.resumeRolloutLease,
+            autoStartScheduler: false,
+            ...(options.resumeSuspendedConversation === true
+              ? {
+                  resumeSuspendedRun: true,
+                  suspendedResumeReason:
+                    options.suspendedResumeReason ?? "explicit_continue",
+                }
+              : {}),
+          });
+          rolloutStore.open({
+            sessionId: options.conversationId,
+            timestamp: "2026-05-01T12:00:00.000Z",
+            cwd: options.cwd,
+            originator: "daemon-restart-test",
+            source: "interactive-root",
+            agencVersion: "0.16.1",
+            model: "test-model",
+            modelProvider: "test-provider",
+          });
+          const session = createRecoveredSession(
+            options.conversationId,
+            permissionModeRegistry,
+            {
+              rolloutStore,
+              threadStatus: "idle",
+              enableDurableClose: true,
+            },
+          );
+          let closed = false;
+          return {
+            session,
+            rolloutStore,
+            shutdown: async () => {
+              if (closed) return;
+              closed = true;
+              try {
+                await session.runBeforeDurableClose();
+              } finally {
+                rolloutStore.close();
+              }
+            },
+          };
+        }) as AgenCBootstrapFunction,
+        ensureAgentControl: (() => ({
+          control: {
+            sendInput,
+            shutdown: async () => {},
+            liveThreadSpawnChildren: () => new Map(),
+            openThreadSpawnChildren: () => new Map(),
+          },
+          registry: {},
+        })) as AgenCEnsureAgentControlFunction,
+        now: () => "2026-05-01T12:00:00.000Z",
+      });
+
+    const firstSignal = createSignalProcess();
+    let first: Promise<number> | undefined;
+    let second: Promise<number> | undefined;
+    let secondSignal: ReturnType<typeof createSignalProcess> | undefined;
+    let firstStopped = false;
+    let secondStopped = false;
+    try {
+      first = runAgenCDaemonCli(
+        { kind: "command", action: "run" },
+        {
+          host,
+          io: createIo(),
+          signalProcess: firstSignal,
+          runner: makeRunner(),
+        },
+      );
+      await expect(waitForPid(pidPath)).resolves.toBe(4100);
+      expect(restoredOptions[0]).toMatchObject({
+        conversationId: runId,
+        resumeConversation: true,
+        cwd: process.cwd(),
+        resumeRolloutPath: rolloutPath,
+      });
+      expect(restoredOptions[0]?.resumeSuspendedConversation).toBeUndefined();
+      expect(restoredOptions[0]?.deferSessionStartHooks).toBeUndefined();
+      expect(restoredOptions[0]?.deferAgentStartupSideEffects).toBeUndefined();
+
+      firstSignal.emit("SIGTERM");
+      firstStopped = true;
+      await expect(first).resolves.toBe(0);
+      expect(readAgentRunStatus(agencHome, process.cwd(), runId)).toBe(
+        "suspended",
+      );
+      const suspended = readCanonicalRunLifecycle(rolloutPath);
+      expect(suspended.map(({ type }) => type)).toEqual(["run_suspended"]);
+      expect(suspended[0]?.payload).toMatchObject({
+        runId,
+        epoch: 1,
+        reason: "daemon_shutdown_idle",
+      });
+
+      secondSignal = createSignalProcess();
+      second = runAgenCDaemonCli(
+        { kind: "command", action: "run" },
+        {
+          host,
+          io: createIo(),
+          signalProcess: secondSignal,
+          runner: makeRunner(),
+        },
+      );
+      await expect(waitForPid(pidPath)).resolves.toBe(4100);
+      expect(restoredOptions[1]).toMatchObject({
+        conversationId: runId,
+        resumeConversation: true,
+        resumeSuspendedConversation: true,
+        suspendedResumeReason: "daemon_startup_restore",
+        deferSessionStartHooks: true,
+        deferAgentStartupSideEffects: true,
+        cwd: process.cwd(),
+        resumeRolloutPath: rolloutPath,
+      });
+      const resumed = readCanonicalRunLifecycle(rolloutPath);
+      expect(resumed.map(({ type }) => type)).toEqual([
+        "run_suspended",
+        "run_resumed",
+      ]);
+      expect(resumed[1]?.payload).toMatchObject({
+        runId,
+        epoch: 1,
+        suspensionEventId: suspended[0]?.eventId,
+        reason: "daemon_startup_restore",
+      });
+
+      const authCookie = (await readFile(cookiePath, "utf8")).trim();
+      const client = createAgenCJsonLineDaemonRequestClient({
+        socketPath: resolveAgenCDaemonSocketPath(host.env, host.userHome),
+        authCookie,
+        timeoutMs: 1000,
+      });
+      const restoredAgents = await client.request("agent.list", {});
+      expect(
+        restoredAgents.agents.find((agent) => agent.agentId === runId),
+      ).toMatchObject({
+        agentId: runId,
+        agentPath: "/root",
+        cwd: process.cwd(),
+        metadata: {
+          agentPath: "/root",
+          canonicalRolloutPath: rolloutPath,
+          canonicalRolloutDev: rolloutIdentity.dev.toString(),
+          canonicalRolloutIno: rolloutIdentity.ino.toString(),
+          recovery: {
+            runnable: true,
+            runtimeRestore: "available",
+          },
+        },
+      });
+      await expect(
+        client.request("message.stream", {
+          sessionId,
+          content: "continue after daemon restart",
+        }),
+      ).resolves.toMatchObject({
+        messageId: expect.any(String),
+        streamId: expect.any(String),
+      });
+      expect(sendInput).toHaveBeenCalledWith(
+        runId,
+        "continue after daemon restart",
+      );
+
+      secondSignal.emit("SIGTERM");
+      secondStopped = true;
+      await expect(second).resolves.toBe(0);
+      expect(
+        readCanonicalRunLifecycle(rolloutPath).map(({ type }) => type),
+      ).toEqual(["run_suspended", "run_resumed", "run_suspended"]);
+    } finally {
+      if (!firstStopped && first !== undefined) {
+        firstSignal.emit("SIGTERM");
+        await first.catch(() => {});
+      }
+      if (!secondStopped && second !== undefined) {
+        secondSignal?.emit("SIGTERM");
+        await second.catch(() => {});
+      }
+      if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
+      else process.env.AGENC_HOME = originalAgencHome;
+      await rm(agencHome, { recursive: true, force: true });
+    }
   });
 
   it("foreground daemon replays idempotent recovered tool calls and persists completion", async () => {
@@ -3305,6 +5438,11 @@ snapshot_max_bytes = 64
     // The harness can only stop gracefully; reset the row to simulate a crash
     // after proving agent.create produced the running row and session snapshot.
     markAgentRunRunning(agencHome, process.cwd(), createdAgentId, sessionId);
+    seedCanonicalDaemonRollout(agencHome, {
+      cwd: process.cwd(),
+      runId: createdAgentId,
+      objective: "survive daemon restart",
+    });
 
     const sendInput = vi.fn(async () => {});
     let restoreBootstrapOptions:
@@ -3508,13 +5646,13 @@ function seedRecoverableDaemonState(
     readonly cwd: string;
     readonly runId: string;
     readonly sessionId: string;
-    readonly toolCallId: string;
+    readonly toolCallId?: string;
     readonly toolName?: string;
     readonly toolArgs?: unknown;
     readonly recoveryCategory?: string;
     readonly status?: string;
   },
-): void {
+): string {
   const driver = openStateDatabases({
     cwd: params.cwd,
     agencHome,
@@ -3561,35 +5699,44 @@ function seedRecoverableDaemonState(
         params.sessionId,
         "2026-05-01T00:06:00.000Z",
         JSON.stringify([{ role: "assistant", content: "state" }]),
-        JSON.stringify({ pending: [params.toolCallId] }),
+        JSON.stringify({
+          pending: params.toolCallId === undefined ? [] : [params.toolCallId],
+        }),
         JSON.stringify({ connected: true }),
       );
-    driver
-      .prepareState(
-        `INSERT INTO in_flight_tool_calls (
-          session_id,
-          tool_call_id,
-          tool_name,
-          args_json,
-          status,
-          recovery_category,
-          output_partial,
-          started_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        params.sessionId,
-        params.toolCallId,
-        params.toolName ?? "FileWrite",
-        JSON.stringify(params.toolArgs ?? { path: "a.txt" }),
-        "running",
-        params.recoveryCategory ?? "side-effecting",
-        null,
-        "2026-05-01T00:05:00.000Z",
-      );
+    if (params.toolCallId !== undefined) {
+      driver
+        .prepareState(
+          `INSERT INTO in_flight_tool_calls (
+            session_id,
+            tool_call_id,
+            tool_name,
+            args_json,
+            status,
+            recovery_category,
+            output_partial,
+            started_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          params.sessionId,
+          params.toolCallId,
+          params.toolName ?? "FileWrite",
+          JSON.stringify(params.toolArgs ?? { path: "a.txt" }),
+          "running",
+          params.recoveryCategory ?? "side-effecting",
+          null,
+          "2026-05-01T00:05:00.000Z",
+        );
+    }
   } finally {
     driver.close();
   }
+  return seedCanonicalDaemonRollout(agencHome, {
+    cwd: params.cwd,
+    runId: params.runId,
+    objective: "recover daemon state",
+  });
 }
 
 function seedTerminalDaemonRun(
@@ -3803,6 +5950,105 @@ function seedRecoverableCompletedToolState(
   } finally {
     driver.close();
   }
+  seedCanonicalDaemonRollout(agencHome, {
+    cwd: params.cwd,
+    runId: params.runId,
+    objective: "recover this completed tool run",
+  });
+}
+
+function seedCanonicalDaemonRollout(
+  agencHome: string,
+  params: {
+    readonly cwd: string;
+    readonly runId: string;
+    readonly objective: string;
+  },
+): string {
+  const driver = openStateDatabases({ cwd: params.cwd, agencHome });
+  try {
+    const sessionDir = join(driver.projectDir, "sessions", params.runId);
+    mkdirSync(sessionDir, { recursive: true });
+    const rolloutPath = join(
+      sessionDir,
+      `rollout-2026-05-01T00-00-00-000Z-${params.runId}.jsonl`,
+    );
+    const timestamp = "2026-05-01T00:00:00.000Z";
+    writeFileSync(
+      rolloutPath,
+      [
+        {
+          type: "session_meta",
+          payload: {
+            sessionId: params.runId,
+            timestamp,
+            cwd: params.cwd,
+            originator: "agenc-cli",
+            source: "interactive-root",
+            agencVersion: "0.16.1",
+            rolloutSchemaVersion: ROLLOUT_SCHEMA_VERSION,
+            model: "grok-4",
+            modelProvider: "xai",
+          },
+          eventVersion: 1,
+        },
+        {
+          type: "response_item",
+          payload: { role: "user", content: params.objective },
+          eventVersion: 1,
+        },
+      ]
+        .map((item) => JSON.stringify(item))
+        .join("\n") + "\n",
+      { mode: 0o600 },
+    );
+    const runs = new StateRunDurabilityRepository(driver);
+    runs.ensureInitialEpoch({ runId: params.runId, openedAt: timestamp });
+    runs.bindJournalSource({
+      runId: params.runId,
+      epoch: 1,
+      childRunId: params.runId,
+      sessionId: params.runId,
+      sourcePath: rolloutPath,
+      boundAt: timestamp,
+    });
+    return rolloutPath;
+  } finally {
+    driver.close();
+  }
+}
+
+function readCanonicalRunLifecycle(rolloutPath: string): Array<{
+  readonly type: "run_suspended" | "run_resumed";
+  readonly eventId?: string;
+  readonly payload: Record<string, unknown>;
+}> {
+  return readFileSync(rolloutPath, "utf8")
+    .split(/\r?\n/u)
+    .filter((line) => line.length > 0)
+    .flatMap((line) => {
+      const item = JSON.parse(line) as {
+        readonly type?: unknown;
+        readonly payload?: {
+          readonly eventId?: string;
+          readonly msg?: {
+            readonly type?: unknown;
+            readonly payload?: Record<string, unknown>;
+          };
+        };
+      };
+      const type = item.payload?.msg?.type;
+      if (type !== "run_suspended" && type !== "run_resumed") return [];
+      return [
+        {
+          type,
+          ...(item.payload?.eventId !== undefined
+            ? { eventId: item.payload.eventId }
+            : {}),
+          payload: item.payload?.msg?.payload ?? {},
+        },
+      ];
+    });
 }
 
 function readRecoveredToolStatus(

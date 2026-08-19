@@ -14,6 +14,8 @@
  * @module
  */
 
+import { createHash } from "node:crypto";
+
 import type { LLMChatOptions, LLMMessage, LLMProvider } from "../llm/types.js";
 import {
   createProvider,
@@ -746,6 +748,23 @@ function reviewTerminalReason(reason: unknown, fallback: string): string {
   return fallback;
 }
 
+/**
+ * Derive the durable review-child identity without embedding either caller
+ * value in a filesystem path segment. The domain separator and structured
+ * tuple encoding keep the mapping stable and unambiguous, while the full
+ * SHA-256 digest remains well below the cross-platform 255-code-unit limit.
+ */
+export function deriveReviewChildSessionId(
+  parentSessionId: string,
+  reviewSubId: string,
+): string {
+  const digest = createHash("sha256")
+    .update("agenc-review-child-session-v1\0", "utf8")
+    .update(JSON.stringify([parentSessionId, reviewSubId]), "utf8")
+    .digest("hex");
+  return `review-${digest}`;
+}
+
 export async function spawnAgenCDelegateThread(
   parent: Session,
   req: AgenCReviewOneShotRequest,
@@ -753,7 +772,10 @@ export async function spawnAgenCDelegateThread(
   reviewerModelInfo: ModelInfo,
   childController: AbortController,
 ): Promise<InternalDelegateThread> {
-  const childSessionId = `${parent.conversationId}:review:${req.subId}`;
+  const childSessionId = deriveReviewChildSessionId(
+    parent.conversationId,
+    req.subId,
+  );
   const admission = parent.services.executionAdmission;
   if (admission === undefined && parent.services.admissionRequired !== false) {
     throw new AdmissionDeniedError("admission_kernel_unavailable");

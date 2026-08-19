@@ -1,21 +1,48 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join, sep } from "node:path";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 import type {
   EffectBoundary,
   EffectNoEffectProof,
   EffectReviewResolution,
+  RunResumeReason,
+  RunRuntimeSettingsSnapshot,
+  RunRuntimeSettingsChangeReason,
+  RunSuspensionReason,
   RunTerminalResult,
   RunTerminalStatus,
   RunUsageTotals,
 } from "../contracts/run-contracts.js";
+import {
+  RUN_RUNTIME_MODEL_VERBOSITIES,
+  RUN_RUNTIME_PERMISSION_MODES,
+  RUN_RUNTIME_REASONING_EFFORTS,
+  RUN_RUNTIME_SERVICE_TIERS,
+  RUN_RUNTIME_SETTINGS_CHANGE_REASONS,
+} from "../contracts/run-contracts.js";
 import type { JsonObject } from "../app-server/protocol/index.js";
 import type { ToolRecoveryCategory } from "../tools/types.js";
 import { asRecord } from "../utils/record.js";
+import {
+  createResumeRolloutDescriptorLease,
+  hasSupportedFileIdentity,
+  type ResumeRolloutDescriptorLease,
+} from "../session/session-store.js";
 import { updateAgentRunStatus } from "./agent-runs.js";
 import {
   withPreparedPinnedRolloutRun,
   type BackfillPinnedRolloutSource,
+  type PreparedPinnedRolloutRun,
 } from "./backfill.js";
 import { RecoveryOperationalError } from "./recovery-contract.js";
 import { RecoveryDescriptorBudget } from "./recovery-file.js";
@@ -44,6 +71,14 @@ import { cancelAgentRunTree } from "./run-cancellation.js";
 
 const DEFAULT_MAX_STARTUP_RUNS = 4_096;
 const DEFAULT_MAX_ROLLOUT_FILES_PER_RUN = 32;
+/**
+ * Each retained startup source owns two handles until the restore loop adopts
+ * or closes it: one append-capable rollout fd and one pinned cwd directory fd.
+ * Keep the aggregate staging cost well below ordinary per-process fd limits,
+ * including the descriptors temporarily needed by the strict scanner.
+ */
+export const DEFAULT_MAX_RETAINED_STARTUP_RESUME_SOURCES = 32;
+const MAX_ROLLOUT_DIRECTORY_ENTRIES = 4_096;
 
 const JOURNAL_EVENT_TYPES = [
   "effect_intent",
@@ -52,6 +87,10 @@ const JOURNAL_EVENT_TYPES = [
   "effect_review_resolved",
   "run_cancel_requested",
   "run_reopened",
+  "run_suspended",
+  "run_resumed",
+  "run_startup_activated",
+  "run_runtime_settings_changed",
   "run_terminal",
 ] as const;
 
@@ -109,6 +148,65 @@ export interface CanonicalRunJournalProjectionResult {
   readonly eventsProjected: number;
   readonly terminalSuppressed: boolean;
   readonly exclusion?: RecoveryRunExclusion;
+}
+
+/** One-shot startup authority for the exact canonical root session. */
+export interface StartupRunResumeSource {
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly agentPath: "/root";
+  readonly rolloutPath: string;
+  readonly rolloutIdentity: { readonly dev: string; readonly ino: string };
+  readonly cwd: string;
+  readonly activeEpoch: number;
+  readonly lifecycleState: "open" | "suspended";
+  readonly activeSuspensionEventId?: string;
+  readonly activeStartupActivationResumeEventId?: string;
+  readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+  readonly activeRuntimeSettingsEventId?: string;
+  readonly legacyPermissionMode?: "plan";
+  readonly rolloutLease: ResumeRolloutDescriptorLease;
+  readonly cwdIdentity: { readonly dev: string; readonly ino: string };
+  readonly cwdFd: number;
+  close(): void;
+}
+
+/** Shared lifetime budget for exact startup resume descriptor pairs. */
+export class StartupResumeSourceBudget {
+  #retainedSources = 0;
+
+  constructor(readonly limit = DEFAULT_MAX_RETAINED_STARTUP_RESUME_SOURCES) {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit <= 0 ||
+      limit > DEFAULT_MAX_RETAINED_STARTUP_RESUME_SOURCES
+    ) {
+      throw new TypeError(
+        `startup resume source limit must be an integer in [1, ${DEFAULT_MAX_RETAINED_STARTUP_RESUME_SOURCES}]`,
+      );
+    }
+  }
+
+  get retainedSources(): number {
+    return this.#retainedSources;
+  }
+
+  reserve(): () => void {
+    if (this.#retainedSources >= this.limit) {
+      throw new RecoveryOperationalError(
+        "descriptor_limit",
+        `startup resume source budget is limited to ${this.limit} retained source(s)`,
+        "STARTUP_RESUME_DESCRIPTOR_BUDGET",
+      );
+    }
+    this.#retainedSources += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#retainedSources -= 1;
+    };
+  }
 }
 
 type StrictRecoveryOptions = RecoveryCutoverOptions;
@@ -287,6 +385,12 @@ export function recoverCanonicalRunJournalsOnStartup(
     /** Restrict compatibility recovery to runs with an explicit M4 binding. */
     readonly requireJournalBinding?: boolean;
     readonly strict?: StrictRecoveryOptions;
+    /** Retain an exact descriptor authority for daemon runtime restoration. */
+    readonly onResumeSource?: (source: StartupRunResumeSource) => void;
+    /** Aggregate lifetime budget shared across every startup state database. */
+    readonly resumeSourceBudget?: StartupResumeSourceBudget;
+    /** Test-only race seam after cwd fd open and before pathname reproof. */
+    readonly afterStartupResumeCwdOpenForTestingOnly?: (cwd: string) => void;
   },
 ): StartupRunJournalRecoveryResult {
   if (options.recoverableStatuses.length === 0) {
@@ -365,12 +469,21 @@ export function recoverCanonicalRunJournalsOnStartup(
     }
     const sources = selection.sources;
     if (sources.length === 0) continue;
-    const projected = recoverStrictRun(driver, threads, run, sources, {
-      ...options.strict,
-      descriptorBudget,
-      nowMilliseconds,
-      startupBudget,
-    });
+    const projected = recoverStrictRun(
+      driver,
+      threads,
+      run,
+      sources,
+      {
+        ...options.strict,
+        descriptorBudget,
+        nowMilliseconds,
+        startupBudget,
+      },
+      options.onResumeSource,
+      options.resumeSourceBudget,
+      options.afterStartupResumeCwdOpenForTestingOnly,
+    );
     if (projected.exclusion !== undefined) {
       exclusions.push(projected.exclusion);
       continue;
@@ -395,7 +508,7 @@ function rolloutCandidates(
   maxFiles: number,
 ): readonly BackfillPinnedRolloutSource[] {
   const repository = new StateRunDurabilityRepository(driver);
-  const known = new Set<string>();
+  const known = new Map<string, RunJournalBinding>();
   const bindings = repository.listJournalBindings(run.id);
   for (const binding of bindings) {
     // `active = 0` also means a newer source superseded this still-canonical
@@ -407,30 +520,54 @@ function rolloutCandidates(
       binding.retiredThroughSequence !== undefined &&
       binding.firstAvailableSequence === undefined;
     if (fullyRetired) continue;
-    known.add(binding.sourcePath);
+    const resolvedPath = resolveBoundRolloutPath(binding.sourcePath);
+    const prior = known.get(resolvedPath);
+    if (
+      prior !== undefined &&
+      (prior.runId !== binding.runId ||
+        prior.epoch !== binding.epoch ||
+        prior.childRunId !== binding.childRunId ||
+        prior.sessionId !== binding.sessionId)
+    ) {
+      throw new RolloutCandidateOperationalError(
+        {
+          sessionId: binding.sessionId,
+          rolloutPath: resolvedPath,
+          expectedRunId: run.id,
+        },
+        "concurrency_limit",
+        `multiple journal bindings resolve to the same startup source: ${resolvedPath}`,
+        "RECOVERY_SOURCE_AMBIGUOUS",
+      );
+    }
+    if (prior === undefined || (!prior.active && binding.active)) {
+      known.set(resolvedPath, binding);
+    }
   }
   if (bindings.length > 0) {
     if (known.size > maxFiles) {
-      throw tooManyRollouts(run.id, known, maxFiles);
+      throw tooManyRollouts(run.id, new Set(known.keys()), maxFiles);
     }
-    return sourcesFromBindings(bindings, [...known].sort(), run.id);
+    return sourcesFromBindings(known, run.id);
   }
+  const fallback = new Set<string>();
   for (const threadId of runThreadIds(run)) {
     const indexed = threads.getThread(threadId);
-    if (indexed?.rolloutPath !== undefined && existsSync(indexed.rolloutPath)) {
-      known.add(indexed.rolloutPath);
+    if (indexed?.rolloutPath !== undefined) {
+      const resolved = resolveIndexedRolloutPath(indexed.rolloutPath);
+      if (resolved !== undefined) fallback.add(resolved);
     }
-    if (
-      indexed?.archivedRolloutPath !== undefined &&
-      existsSync(indexed.archivedRolloutPath)
-    ) {
-      known.add(indexed.archivedRolloutPath);
+    if (indexed?.archivedRolloutPath !== undefined) {
+      const resolved = resolveIndexedRolloutPath(indexed.archivedRolloutPath);
+      if (resolved !== undefined) fallback.add(resolved);
     }
   }
-  if (known.size > maxFiles) {
-    throw tooManyRollouts(run.id, known, maxFiles);
+  if (fallback.size > maxFiles) {
+    throw tooManyRollouts(run.id, fallback, maxFiles);
   }
-  if (known.size > 0) return fallbackSources(sortedByMtime(known), run.id);
+  if (fallback.size > 0) {
+    return fallbackSources(sortedByMtime(fallback), run.id);
+  }
 
   const discovered = new Set<string>();
   for (const threadId of runThreadIds(run)) {
@@ -438,10 +575,7 @@ function rolloutCandidates(
     for (const root of ["sessions", "archived_sessions"] as const) {
       const directory = join(driver.projectDir, root, threadId);
       if (!existsSync(directory)) continue;
-      for (const name of readdirSync(directory).sort()) {
-        if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) continue;
-        const path = join(directory, name);
-        if (!statSync(path).isFile()) continue;
+      for (const path of preferredRolloutPaths(directory)) {
         discovered.add(path);
         if (discovered.size > maxFiles) {
           throw tooManyRollouts(run.id, discovered, maxFiles);
@@ -509,22 +643,109 @@ function defaultRecoverySource(
 }
 
 function sourcesFromBindings(
-  bindings: readonly RunJournalBinding[],
-  paths: readonly string[],
+  bindingsByResolvedPath: ReadonlyMap<string, RunJournalBinding>,
   runId: string,
 ): readonly BackfillPinnedRolloutSource[] {
-  return paths.map((rolloutPath) => {
-    const matches = bindings.filter(
-      (binding) => binding.sourcePath === rolloutPath,
+  return [...bindingsByResolvedPath.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([rolloutPath, binding]) =>
+      Object.freeze({
+        sessionId: binding.sessionId,
+        rolloutPath,
+        archived: rolloutPath.includes(`${sep}archived_sessions${sep}`),
+        expectedRunId: runId,
+        activeBinding: binding.active,
+      }),
     );
-    const binding = matches[0]!;
-    return Object.freeze({
-      sessionId: binding.sessionId,
-      rolloutPath,
-      archived: rolloutPath.includes(`${sep}archived_sessions${sep}`),
-      expectedRunId: runId,
-    });
+}
+
+/**
+ * A descriptor-bound rewrite temporarily moves the bound normal pathname to a
+ * recovery name. If the process dies before publishing the replacement, use
+ * that same-directory recovery generation. Once any normal generation exists,
+ * recovery names are stale cleanup artifacts and must not participate.
+ */
+function resolveBoundRolloutPath(sourcePath: string): string {
+  const preferred = preferredRolloutPaths(dirname(sourcePath));
+  if (preferred.length === 0) return sourcePath;
+  if (
+    existsSync(sourcePath) &&
+    preferred.includes(sourcePath) &&
+    !isRecoveryRolloutPath(sourcePath)
+  ) {
+    return sourcePath;
+  }
+  if (preferred.includes(sourcePath) && preferred.length === 1) {
+    return sourcePath;
+  }
+  return sortedByMtime(new Set(preferred)).at(-1)!;
+}
+
+function resolveIndexedRolloutPath(sourcePath: string): string | undefined {
+  const preferred = preferredRolloutPaths(dirname(sourcePath));
+  if (preferred.length === 0) return undefined;
+  if (preferred.includes(sourcePath) && !isRecoveryRolloutPath(sourcePath)) {
+    return sourcePath;
+  }
+  return sortedByMtime(new Set(preferred)).at(-1);
+}
+
+function preferredRolloutPaths(directory: string): readonly string[] {
+  const names: string[] = [];
+  let handle: ReturnType<typeof opendirSync> | undefined;
+  let primaryFailure: unknown;
+  try {
+    handle = opendirSync(directory);
+    while (true) {
+      const entry = handle.readSync();
+      if (entry === null) break;
+      if (names.length >= MAX_ROLLOUT_DIRECTORY_ENTRIES) {
+        throw new RecoveryOperationalError(
+          "recovery_storage_unavailable",
+          `rollout directory exceeds ${MAX_ROLLOUT_DIRECTORY_ENTRIES} entries`,
+          "RECOVERY_DIRECTORY_ENTRY_LIMIT",
+        );
+      }
+      names.push(entry.name);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    primaryFailure = error;
+    throw candidateStorageError(directory, error);
+  } finally {
+    if (handle !== undefined) {
+      try {
+        handle.closeSync();
+      } catch (error) {
+        if (primaryFailure !== undefined) {
+          throw new AggregateError(
+            [primaryFailure, error],
+            "rollout directory scan and close failed",
+            { cause: primaryFailure },
+          );
+        }
+        throw candidateStorageError(directory, error);
+      }
+    }
+  }
+  names.sort();
+  const candidates = names.flatMap((name) => {
+    if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) return [];
+    const sourcePath = join(directory, name);
+    try {
+      return statSync(sourcePath).isFile() ? [sourcePath] : [];
+    } catch (error) {
+      throw candidateStorageError(sourcePath, error);
+    }
   });
+  const normal = candidates.filter(
+    (sourcePath) => !isRecoveryRolloutPath(sourcePath),
+  );
+  return normal.length > 0 ? normal : candidates;
+}
+
+function isRecoveryRolloutPath(sourcePath: string): boolean {
+  return basename(sourcePath).startsWith("rollout-recovery-");
 }
 
 function fallbackSources(
@@ -541,12 +762,357 @@ function fallbackSources(
   );
 }
 
+function authoritativeLifecycleProof(
+  sources: readonly BackfillPinnedRolloutSource[],
+  proofs: readonly {
+    readonly activeEpoch: number;
+    readonly activeLifecycleState: "open" | "suspended" | "terminal";
+    readonly activeTerminalStatus?:
+      "completed" | "failed" | "cancelled" | "unknown_outcome";
+    readonly activeSuspensionEventId?: string;
+    readonly activeCancellationRequestEventId?: string;
+    readonly activeStartupActivationResumeEventId?: string;
+    readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+    readonly activeRuntimeSettingsEventId?: string;
+    readonly legacyPermissionMode?: "plan";
+    readonly eventCount: number;
+    readonly sourceByteLength: number;
+    readonly sourceSha256: string;
+  }[],
+  runId: string,
+): {
+  readonly sourceIndex: number;
+  readonly activeEpoch: number;
+  readonly activeLifecycleState: "open" | "suspended" | "terminal";
+  readonly activeTerminalStatus?:
+    "completed" | "failed" | "cancelled" | "unknown_outcome";
+  readonly activeSuspensionEventId?: string;
+  readonly activeCancellationRequestEventId?: string;
+  readonly activeStartupActivationResumeEventId?: string;
+  readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+  readonly activeRuntimeSettingsEventId?: string;
+  readonly legacyPermissionMode?: "plan";
+} {
+  if (sources.length !== proofs.length || proofs.length === 0) {
+    throw new Error(`run ${runId} has no pinned canonical lifecycle proof`);
+  }
+  const entries = sources.map((source, index) => ({
+    sourceIndex: index,
+    source,
+    proof: proofs[index]!,
+  }));
+  const rootEntries = entries.filter(
+    ({ source }) =>
+      source.sessionId === runId ||
+      basename(dirname(source.rolloutPath)) === runId,
+  );
+  const rootCandidates = rootEntries.length > 0 ? rootEntries : entries;
+  const activeRootCandidates = rootCandidates.filter(
+    ({ source }) => source.activeBinding === true,
+  );
+  if (activeRootCandidates.length > 1) {
+    throw new Error(`run ${runId} has multiple active root journal bindings`);
+  }
+  const candidates =
+    activeRootCandidates.length === 1 ? activeRootCandidates : rootCandidates;
+  candidates.sort(
+    (left, right) =>
+      right.proof.activeEpoch - left.proof.activeEpoch ||
+      right.proof.eventCount - left.proof.eventCount ||
+      right.proof.sourceByteLength - left.proof.sourceByteLength ||
+      right.source.rolloutPath.localeCompare(left.source.rolloutPath),
+  );
+  const selected = candidates[0]!;
+  const equallyAuthoritative = candidates.filter(
+    ({ proof }) =>
+      proof.activeEpoch === selected.proof.activeEpoch &&
+      proof.eventCount === selected.proof.eventCount &&
+      proof.sourceByteLength === selected.proof.sourceByteLength,
+  );
+  if (
+    equallyAuthoritative.some(
+      ({ proof }) =>
+        proof.activeLifecycleState !== selected.proof.activeLifecycleState ||
+        proof.activeTerminalStatus !== selected.proof.activeTerminalStatus ||
+        proof.activeSuspensionEventId !==
+          selected.proof.activeSuspensionEventId ||
+        proof.activeCancellationRequestEventId !==
+          selected.proof.activeCancellationRequestEventId ||
+        proof.activeStartupActivationResumeEventId !==
+          selected.proof.activeStartupActivationResumeEventId ||
+        proof.activeRuntimeSettingsEventId !==
+          selected.proof.activeRuntimeSettingsEventId ||
+        proof.legacyPermissionMode !== selected.proof.legacyPermissionMode ||
+        JSON.stringify(proof.activeRuntimeSettings) !==
+          JSON.stringify(selected.proof.activeRuntimeSettings) ||
+        proof.sourceSha256 !== selected.proof.sourceSha256,
+    )
+  ) {
+    throw new Error(`run ${runId} has conflicting canonical lifecycle proofs`);
+  }
+  return {
+    sourceIndex: selected.sourceIndex,
+    activeEpoch: selected.proof.activeEpoch,
+    activeLifecycleState: selected.proof.activeLifecycleState,
+    ...(selected.proof.activeTerminalStatus !== undefined
+      ? { activeTerminalStatus: selected.proof.activeTerminalStatus }
+      : {}),
+    ...(selected.proof.activeSuspensionEventId !== undefined
+      ? { activeSuspensionEventId: selected.proof.activeSuspensionEventId }
+      : {}),
+    ...(selected.proof.activeCancellationRequestEventId !== undefined
+      ? {
+          activeCancellationRequestEventId:
+            selected.proof.activeCancellationRequestEventId,
+        }
+      : {}),
+    ...(selected.proof.activeStartupActivationResumeEventId !== undefined
+      ? {
+          activeStartupActivationResumeEventId:
+            selected.proof.activeStartupActivationResumeEventId,
+        }
+      : {}),
+    ...(selected.proof.activeRuntimeSettings !== undefined
+      ? {
+          activeRuntimeSettings: selected.proof.activeRuntimeSettings,
+          activeRuntimeSettingsEventId:
+            selected.proof.activeRuntimeSettingsEventId!,
+        }
+      : {}),
+    ...(selected.proof.legacyPermissionMode !== undefined
+      ? { legacyPermissionMode: selected.proof.legacyPermissionMode }
+      : {}),
+  };
+}
+
+function createStartupRunResumeSource(
+  prepared: PreparedPinnedRolloutRun,
+  lifecycle: {
+    readonly sourceIndex: number;
+    readonly activeEpoch: number;
+    readonly activeLifecycleState: "open" | "suspended" | "terminal";
+    readonly activeTerminalStatus?:
+      "completed" | "failed" | "cancelled" | "unknown_outcome";
+    readonly activeSuspensionEventId?: string;
+    readonly activeCancellationRequestEventId?: string;
+    readonly activeStartupActivationResumeEventId?: string;
+    readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+    readonly activeRuntimeSettingsEventId?: string;
+    readonly legacyPermissionMode?: "plan";
+  },
+  runId: string,
+  budget?: StartupResumeSourceBudget,
+  afterCwdOpenForTestingOnly?: (cwd: string) => void,
+): StartupRunResumeSource {
+  if (lifecycle.activeLifecycleState === "terminal") {
+    throw new Error(`terminal run ${runId} cannot retain resume authority`);
+  }
+  const source = prepared.sources[lifecycle.sourceIndex];
+  const metadata = prepared.initialSessionMetadata[lifecycle.sourceIndex];
+  if (
+    source === undefined ||
+    metadata === undefined ||
+    source.sessionId !== runId ||
+    metadata.sessionId !== runId
+  ) {
+    throw new Error(
+      `run ${runId} has no exact canonical root source for startup restore`,
+    );
+  }
+  const releaseBudget = budget?.reserve() ?? (() => {});
+  let budgetReleased = false;
+  const releaseBudgetOnce = () => {
+    if (budgetReleased) return;
+    budgetReleased = true;
+    releaseBudget();
+  };
+  let cwdProof:
+    | {
+        readonly fd: number;
+        readonly identity: { readonly dev: string; readonly ino: string };
+      }
+    | undefined;
+  let rolloutFd: number | undefined;
+  try {
+    cwdProof = openStartupResumeCwd(metadata.cwd, afterCwdOpenForTestingOnly);
+    rolloutFd = prepared.openAppendDescriptor(lifecycle.sourceIndex);
+    const rolloutStats = fstatSync(rolloutFd, { bigint: true });
+    if (
+      !rolloutStats.isFile() ||
+      rolloutStats.nlink !== 1n ||
+      !hasSupportedFileIdentity(rolloutStats)
+    ) {
+      throw new Error(
+        `run ${runId} canonical rollout has no stable regular-file identity`,
+      );
+    }
+    const rolloutIdentity = Object.freeze({
+      dev: rolloutStats.dev.toString(),
+      ino: rolloutStats.ino.toString(),
+    });
+    const rolloutLease = createResumeRolloutDescriptorLease(
+      source.rolloutPath,
+      rolloutFd,
+    );
+    rolloutFd = undefined;
+    let openCwdFd: number | undefined = cwdProof.fd;
+    return Object.freeze({
+      runId,
+      sessionId: source.sessionId,
+      agentPath: "/root" as const,
+      rolloutPath: source.rolloutPath,
+      rolloutIdentity,
+      cwd: metadata.cwd,
+      activeEpoch: lifecycle.activeEpoch,
+      lifecycleState: lifecycle.activeLifecycleState,
+      ...(lifecycle.activeSuspensionEventId !== undefined
+        ? { activeSuspensionEventId: lifecycle.activeSuspensionEventId }
+        : {}),
+      ...(lifecycle.activeStartupActivationResumeEventId !== undefined
+        ? {
+            activeStartupActivationResumeEventId:
+              lifecycle.activeStartupActivationResumeEventId,
+          }
+        : {}),
+      ...(lifecycle.activeRuntimeSettings !== undefined
+        ? {
+            activeRuntimeSettings: lifecycle.activeRuntimeSettings,
+            activeRuntimeSettingsEventId:
+              lifecycle.activeRuntimeSettingsEventId!,
+          }
+        : {}),
+      ...(lifecycle.legacyPermissionMode !== undefined
+        ? { legacyPermissionMode: lifecycle.legacyPermissionMode }
+        : {}),
+      rolloutLease,
+      cwdIdentity: cwdProof.identity,
+      cwdFd: cwdProof.fd,
+      close: () => {
+        const closeErrors: unknown[] = [];
+        try {
+          try {
+            rolloutLease.closeUnclaimed();
+          } catch (error) {
+            closeErrors.push(error);
+          }
+          if (openCwdFd !== undefined) {
+            const closing = openCwdFd;
+            openCwdFd = undefined;
+            try {
+              closeSync(closing);
+            } catch (error) {
+              closeErrors.push(error);
+            }
+          }
+        } finally {
+          releaseBudgetOnce();
+        }
+        if (closeErrors.length > 0) {
+          throw new AggregateError(
+            closeErrors,
+            "startup resume source cleanup failed",
+          );
+        }
+      },
+    });
+  } catch (error) {
+    const closeErrors: unknown[] = [];
+    if (rolloutFd !== undefined) {
+      try {
+        closeSync(rolloutFd);
+      } catch (closeError) {
+        closeErrors.push(closeError);
+      }
+    }
+    if (cwdProof !== undefined) {
+      try {
+        closeSync(cwdProof.fd);
+      } catch (closeError) {
+        closeErrors.push(closeError);
+      }
+    }
+    releaseBudgetOnce();
+    if (closeErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...closeErrors],
+        "startup resume source creation and cleanup failed",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
+function openStartupResumeCwd(
+  cwd: string,
+  afterOpenForTestingOnly?: (cwd: string) => void,
+): {
+  readonly fd: number;
+  readonly identity: { readonly dev: string; readonly ino: string };
+} {
+  if (!isAbsolute(cwd) || resolve(cwd) !== cwd) {
+    throw new Error(
+      "canonical startup resume cwd is not absolute and normalized",
+    );
+  }
+  const before = lstatSync(cwd, { bigint: true });
+  if (
+    !before.isDirectory() ||
+    before.isSymbolicLink() ||
+    !hasSupportedFileIdentity(before) ||
+    realpathSync(cwd) !== cwd
+  ) {
+    throw new Error(
+      "canonical startup resume cwd is not a supported non-symlink directory",
+    );
+  }
+  const noFollow =
+    (fsConstants as typeof fsConstants & { readonly O_NOFOLLOW?: number })
+      .O_NOFOLLOW ?? 0;
+  const directoryOnly =
+    (fsConstants as typeof fsConstants & { readonly O_DIRECTORY?: number })
+      .O_DIRECTORY ?? 0;
+  const fd = openSync(cwd, fsConstants.O_RDONLY | noFollow | directoryOnly);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    afterOpenForTestingOnly?.(cwd);
+    const after = lstatSync(cwd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      !after.isDirectory() ||
+      after.isSymbolicLink() ||
+      !hasSupportedFileIdentity(opened) ||
+      !hasSupportedFileIdentity(after) ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino ||
+      realpathSync(cwd) !== cwd
+    ) {
+      throw new Error("canonical startup resume cwd changed while pinned");
+    }
+    return {
+      fd,
+      identity: {
+        dev: opened.dev.toString(10),
+        ino: opened.ino.toString(10),
+      },
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
 function recoverStrictRun(
   driver: StateSqliteDriver,
   threads: StateThreadRepository,
   run: RecoverableRunRow,
   sources: readonly BackfillPinnedRolloutSource[],
   strict: StrictRecoveryOptions = {},
+  onResumeSource?: (source: StartupRunResumeSource) => void,
+  resumeSourceBudget?: StartupResumeSourceBudget,
+  afterStartupResumeCwdOpenForTestingOnly?: (cwd: string) => void,
 ): CanonicalRunJournalProjectionResult & { readonly readBytes: number } {
   if (sources.length === 0) {
     return { ...emptyProjectionResult(), readBytes: 0 };
@@ -585,6 +1151,7 @@ function recoverStrictRun(
             remaining.maxMilliseconds,
           ),
         };
+  let retainedResumeSource: StartupRunResumeSource | undefined;
   try {
     const result = withPreparedPinnedRolloutRun(
       {
@@ -599,28 +1166,71 @@ function recoverStrictRun(
           ? { nowMilliseconds: strict.nowMilliseconds }
           : {}),
       },
-      (prepared) =>
-        driver.transactionImmediate(() => {
+      (prepared) => {
+        const projected = driver.transactionImmediate(() => {
           const projectedSources = prepared.projectAll();
-          const projected = projectRunEvents(
+          const canonicalLifecycle = authoritativeLifecycleProof(
+            prepared.sources,
+            prepared.proofs,
+            run.id,
+          );
+          const eventProjection = projectRunEvents(
             driver,
             run,
             prepared.sources.map(({ rolloutPath }) => rolloutPath),
+            canonicalLifecycle,
           );
           prepared.assertPinned();
           return {
             filesScanned: prepared.sources.length,
-            ...projected,
+            ...eventProjection,
             readBytes: projectedSources.reduce(
               (total, source) => total + source.proof.sourceByteLength * 2,
               0,
             ),
           };
-        }),
+        });
+        const canonicalLifecycle = authoritativeLifecycleProof(
+          prepared.sources,
+          prepared.proofs,
+          run.id,
+        );
+        if (
+          onResumeSource !== undefined &&
+          canonicalLifecycle.activeLifecycleState !== "terminal" &&
+          canonicalLifecycle.activeCancellationRequestEventId === undefined
+        ) {
+          try {
+            retainedResumeSource = createStartupRunResumeSource(
+              prepared,
+              canonicalLifecycle,
+              run.id,
+              resumeSourceBudget,
+              afterStartupResumeCwdOpenForTestingOnly,
+            );
+          } catch (error) {
+            // Canonical projection already committed under the pinned source
+            // proof. Failure to retain optional live-runtime descriptors (for
+            // example an unavailable cwd) leaves the run listable and cold;
+            // it must not launder that successful projection into a permanent
+            // canonical exclusion. Cleanup failures remain fatal because they
+            // can represent leaked authority.
+            if (error instanceof AggregateError) throw error;
+            retainedResumeSource = undefined;
+          }
+        }
+        prepared.assertPinned();
+        return projected;
+      },
     );
     strict.startupBudget?.consume(result.readBytes);
+    if (retainedResumeSource !== undefined) {
+      onResumeSource?.(retainedResumeSource);
+      retainedResumeSource = undefined;
+    }
     return result;
   } catch (error) {
+    retainedResumeSource?.close();
     return {
       ...emptyProjectionResult(
         persistRecoveryFailure(driver, run.id, sources, strict, error),
@@ -645,6 +1255,18 @@ function projectRunEvents(
   driver: StateSqliteDriver,
   run: RecoverableRunRow,
   sourcePaths: readonly string[],
+  canonicalLifecycle: {
+    readonly activeEpoch: number;
+    readonly activeLifecycleState: "open" | "suspended" | "terminal";
+    readonly activeTerminalStatus?:
+      "completed" | "failed" | "cancelled" | "unknown_outcome";
+    readonly activeSuspensionEventId?: string;
+    readonly activeCancellationRequestEventId?: string;
+    readonly activeStartupActivationResumeEventId?: string;
+    readonly activeRuntimeSettings?: RunRuntimeSettingsSnapshot;
+    readonly activeRuntimeSettingsEventId?: string;
+    readonly legacyPermissionMode?: "plan";
+  },
 ): { readonly eventsProjected: number; readonly terminalSuppressed: boolean } {
   if (sourcePaths.length === 0) {
     return { eventsProjected: 0, terminalSuppressed: false };
@@ -667,10 +1289,6 @@ function projectRunEvents(
       isJournalProjectionType(row.payload_json),
   );
   const relevant = deduplicateRowsForRun(rows, run.id);
-  if (relevant.length === 0) {
-    return { eventsProjected: 0, terminalSuppressed: false };
-  }
-
   const repository = new StateRunDurabilityRepository(driver);
   if (repository.currentEpoch(run.id) === undefined) {
     repository.ensureInitialEpoch({
@@ -684,7 +1302,16 @@ function projectRunEvents(
   let projectionEpoch = 1;
   let projectionOpenedAt = run.started_at;
   let pendingCancellation:
-    { readonly reason: string; readonly requestedAt: string } | undefined;
+    | {
+        readonly eventId: string;
+        readonly reason: string;
+        readonly requestedAt: string;
+      }
+    | undefined;
+  let lifecycleBoundaryAt: string | undefined;
+  let pendingStartupActivationResumeEventId: string | undefined;
+  let projectedRuntimeSettings: RunRuntimeSettingsSnapshot | undefined;
+  let projectedRuntimeSettingsEventId: string | undefined;
   for (const row of relevant) {
     const message = journalMessage(row, run.id);
     if (message === undefined) {
@@ -734,12 +1361,20 @@ function projectRunEvents(
         projectionOpenedAt,
       );
       pendingCancellation = {
+        eventId: row.event_id,
         reason: requireString(payload.reason, "reason"),
         requestedAt: requireString(payload.requestedAt, "requestedAt"),
       };
       continue;
     }
     if (type === "run_reopened") {
+      if (pendingCancellation !== undefined) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_reopened follows a cancellation request",
+        );
+      }
       const previousEpoch = requirePositiveInteger(
         payload.previousEpoch,
         "previousEpoch",
@@ -761,9 +1396,180 @@ function projectRunEvents(
       pendingCancellation = undefined;
       continue;
     }
+    if (type === "run_suspended") {
+      if (pendingCancellation !== undefined) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_suspended follows a cancellation request",
+        );
+      }
+      const epoch = requirePositiveInteger(payload.epoch, "epoch");
+      if (epoch !== projectionEpoch) {
+        throw invalidEvent(row, run.id, "run_suspended epoch is out of order");
+      }
+      bindSource(
+        driver,
+        repository,
+        run.id,
+        projectionEpoch,
+        row,
+        projectionOpenedAt,
+      );
+      const suspendedAt = requireString(payload.suspendedAt, "suspendedAt");
+      repository.recordRunSuspended({
+        runId: run.id,
+        epoch,
+        eventId: row.event_id,
+        eventSequence: row.event_seq,
+        reason: requireSuspensionReason(payload.reason),
+        suspendedAt,
+      });
+      pendingStartupActivationResumeEventId = undefined;
+      lifecycleBoundaryAt = suspendedAt;
+      continue;
+    }
+    if (type === "run_resumed") {
+      if (pendingCancellation !== undefined) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_resumed follows a cancellation request",
+        );
+      }
+      const epoch = requirePositiveInteger(payload.epoch, "epoch");
+      if (epoch !== projectionEpoch) {
+        throw invalidEvent(row, run.id, "run_resumed epoch is out of order");
+      }
+      bindSource(
+        driver,
+        repository,
+        run.id,
+        projectionEpoch,
+        row,
+        projectionOpenedAt,
+      );
+      const resumedAt = requireString(payload.resumedAt, "resumedAt");
+      repository.recordRunResumed({
+        runId: run.id,
+        epoch,
+        suspensionEventId: requireString(
+          payload.suspensionEventId,
+          "suspensionEventId",
+        ),
+        eventId: row.event_id,
+        eventSequence: row.event_seq,
+        reason: requireResumeReason(payload.reason),
+        resumedAt,
+      });
+      pendingStartupActivationResumeEventId = row.event_id;
+      lifecycleBoundaryAt = resumedAt;
+      continue;
+    }
+    if (type === "run_startup_activated") {
+      if (pendingCancellation !== undefined) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_startup_activated follows a cancellation request",
+        );
+      }
+      const epoch = requirePositiveInteger(payload.epoch, "epoch");
+      if (epoch !== projectionEpoch) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_startup_activated epoch is out of order",
+        );
+      }
+      const resumeEventId = requireString(
+        payload.resumeEventId,
+        "resumeEventId",
+      );
+      if (resumeEventId !== pendingStartupActivationResumeEventId) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_startup_activated does not match the pending resume",
+        );
+      }
+      bindSource(
+        driver,
+        repository,
+        run.id,
+        projectionEpoch,
+        row,
+        projectionOpenedAt,
+      );
+      repository.recordRunStartupActivated({
+        runId: run.id,
+        epoch,
+        resumeEventId,
+        eventId: row.event_id,
+        eventSequence: row.event_seq,
+        activatedAt: requireString(payload.activatedAt, "activatedAt"),
+      });
+      pendingStartupActivationResumeEventId = undefined;
+      continue;
+    }
+    if (type === "run_runtime_settings_changed") {
+      if (pendingCancellation !== undefined) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_runtime_settings_changed follows a cancellation request",
+        );
+      }
+      const epoch = requirePositiveInteger(payload.epoch, "epoch");
+      if (epoch !== projectionEpoch) {
+        throw invalidEvent(
+          row,
+          run.id,
+          "run_runtime_settings_changed epoch is out of order",
+        );
+      }
+      bindSource(
+        driver,
+        repository,
+        run.id,
+        projectionEpoch,
+        row,
+        projectionOpenedAt,
+      );
+      const settings = runtimeSettingsProjectionPayload(payload);
+      const previousSettingsEventId =
+        optionalString(payload.previousSettingsEventId) ?? null;
+      const rollbackOfSettingsEventId =
+        optionalString(payload.rollbackOfSettingsEventId) ?? null;
+      repository.recordRuntimeSettingsChanged({
+        runId: run.id,
+        epoch,
+        eventId: row.event_id,
+        eventSequence: row.event_seq,
+        previousSettingsEventId,
+        rollbackOfSettingsEventId,
+        reason: requireRuntimeSettingsReason(payload.reason),
+        changedAt: requireString(payload.changedAt, "changedAt"),
+        settings,
+      });
+      projectedRuntimeSettings = settings;
+      projectedRuntimeSettingsEventId = row.event_id;
+      continue;
+    }
     const epoch = requirePositiveInteger(payload.epoch, "epoch");
     if (epoch !== projectionEpoch) {
       throw invalidEvent(row, run.id, "run_terminal epoch is out of order");
+    }
+    if (
+      pendingCancellation !== undefined &&
+      payload.status !== "cancelled" &&
+      payload.status !== "unknown_outcome"
+    ) {
+      throw invalidEvent(
+        row,
+        run.id,
+        "run terminal conflicts with its cancellation request",
+      );
     }
     bindSource(driver, repository, run.id, epoch, row, projectionOpenedAt);
     repository.recordTerminalResult({
@@ -771,9 +1577,58 @@ function projectRunEvents(
       result: terminalResult(row, run.id, payload),
       eventId: row.event_id,
     });
+    pendingStartupActivationResumeEventId = undefined;
   }
 
+  const durableEpoch = repository.currentEpoch(run.id);
+  if (
+    durableEpoch === undefined ||
+    durableEpoch.epoch !== projectionEpoch ||
+    projectionEpoch !== canonicalLifecycle.activeEpoch
+  ) {
+    throw new Error(
+      `run ${run.id} canonical lifecycle ends at epoch ${canonicalLifecycle.activeEpoch}, ordered replay reaches ${projectionEpoch}, and SQLite reaches ${durableEpoch?.epoch ?? "missing"}`,
+    );
+  }
+  const activeSuspension = repository.getActiveSuspension(run.id);
+  const pendingStartupActivation = repository.getPendingStartupActivation(
+    run.id,
+  );
+  const durableRuntimeSettings = repository.getCurrentRuntimeSettings(run.id);
   const terminal = repository.getCurrentTerminalResult(run.id);
+  const projectedLifecycleState =
+    terminal !== undefined
+      ? "terminal"
+      : activeSuspension !== undefined
+        ? "suspended"
+        : "open";
+  if (
+    projectedLifecycleState !== canonicalLifecycle.activeLifecycleState ||
+    terminal?.status !== canonicalLifecycle.activeTerminalStatus ||
+    activeSuspension?.eventId !== canonicalLifecycle.activeSuspensionEventId ||
+    pendingCancellation?.eventId !==
+      canonicalLifecycle.activeCancellationRequestEventId ||
+    pendingStartupActivation?.resumeEventId !==
+      canonicalLifecycle.activeStartupActivationResumeEventId ||
+    pendingStartupActivationResumeEventId !==
+      canonicalLifecycle.activeStartupActivationResumeEventId ||
+    projectedRuntimeSettingsEventId !==
+      canonicalLifecycle.activeRuntimeSettingsEventId ||
+    durableRuntimeSettings?.eventId !==
+      canonicalLifecycle.activeRuntimeSettingsEventId ||
+    JSON.stringify(projectedRuntimeSettings) !==
+      JSON.stringify(canonicalLifecycle.activeRuntimeSettings) ||
+    JSON.stringify(
+      durableRuntimeSettings === undefined
+        ? undefined
+        : runtimeSettingsSnapshot(durableRuntimeSettings),
+    ) !== JSON.stringify(canonicalLifecycle.activeRuntimeSettings)
+  ) {
+    throw new Error(
+      `run ${run.id} lifecycle projection does not match its pinned canonical proof`,
+    );
+  }
+
   if (terminal === undefined) {
     if (pendingCancellation !== undefined) {
       // The daemon crossed the durable cancellation-intent boundary but died
@@ -783,6 +1638,29 @@ function projectRunEvents(
         runId: run.id,
         reason: pendingCancellation.reason,
         cancelledAt: pendingCancellation.requestedAt,
+      });
+      return { eventsProjected: relevant.length, terminalSuppressed: false };
+    }
+    const suspension = repository.getActiveSuspension(run.id);
+    if (suspension !== undefined) {
+      updateAgentRunStatus(driver, {
+        id: run.id,
+        status: "suspended",
+        lastActiveAt: suspension.suspendedAt,
+        ...(run.current_session_id !== null
+          ? { currentSessionId: run.current_session_id }
+          : {}),
+      });
+    } else if (lifecycleBoundaryAt !== undefined) {
+      // Covers the crash window after run_resumed fsync but before its SQLite
+      // projection/status write. The epoch remains unchanged and executable.
+      updateAgentRunStatus(driver, {
+        id: run.id,
+        status: "running",
+        lastActiveAt: lifecycleBoundaryAt,
+        ...(run.current_session_id !== null
+          ? { currentSessionId: run.current_session_id }
+          : {}),
       });
     }
     return { eventsProjected: relevant.length, terminalSuppressed: false };
@@ -1422,6 +2300,92 @@ function requireRecoveryCategory(value: unknown): ToolRecoveryCategory {
     throw new TypeError("recoveryCategory is invalid");
   }
   return value;
+}
+
+function requireSuspensionReason(value: unknown): RunSuspensionReason {
+  if (value !== "daemon_shutdown_idle") {
+    throw new TypeError("run suspension reason is invalid");
+  }
+  return value;
+}
+
+function requireResumeReason(value: unknown): RunResumeReason {
+  if (value !== "daemon_startup_restore" && value !== "explicit_continue") {
+    throw new TypeError("run resume reason is invalid");
+  }
+  return value;
+}
+
+function requireRuntimeSettingsReason(
+  value: unknown,
+): RunRuntimeSettingsChangeReason {
+  if (!RUN_RUNTIME_SETTINGS_CHANGE_REASONS.includes(value as never)) {
+    throw new TypeError("run runtime settings reason is invalid");
+  }
+  return value as RunRuntimeSettingsChangeReason;
+}
+
+function runtimeSettingsProjectionPayload(
+  payload: JsonObject,
+): RunRuntimeSettingsSnapshot {
+  const permissionMode = payload.permissionMode;
+  const prePlanMode = payload.prePlanMode;
+  const reasoningEffort = payload.reasoningEffort;
+  const modelVerbosity = payload.modelVerbosity;
+  const serviceTier = payload.serviceTier;
+  if (
+    !RUN_RUNTIME_PERMISSION_MODES.includes(permissionMode as never) ||
+    (prePlanMode !== null &&
+      !RUN_RUNTIME_PERMISSION_MODES.includes(prePlanMode as never)) ||
+    typeof payload.autoModeActive !== "boolean" ||
+    (payload.bypassPermissionsWorkspace !== null &&
+      typeof payload.bypassPermissionsWorkspace !== "string") ||
+    (payload.profile !== null && typeof payload.profile !== "string") ||
+    (reasoningEffort !== null &&
+      !RUN_RUNTIME_REASONING_EFFORTS.includes(reasoningEffort as never)) ||
+    (modelVerbosity !== null &&
+      !RUN_RUNTIME_MODEL_VERBOSITIES.includes(modelVerbosity as never)) ||
+    (serviceTier !== null &&
+      !RUN_RUNTIME_SERVICE_TIERS.includes(serviceTier as never)) ||
+    typeof payload.hooksDisabled !== "boolean"
+  ) {
+    throw new TypeError("run runtime settings snapshot is invalid");
+  }
+  return {
+    permissionMode:
+      permissionMode as RunRuntimeSettingsSnapshot["permissionMode"],
+    prePlanMode: prePlanMode as RunRuntimeSettingsSnapshot["prePlanMode"],
+    autoModeActive: payload.autoModeActive,
+    bypassPermissionsWorkspace: payload.bypassPermissionsWorkspace as
+      string | null,
+    model: requireString(payload.model, "model"),
+    provider: requireString(payload.provider, "provider"),
+    profile: payload.profile as string | null,
+    reasoningEffort:
+      reasoningEffort as RunRuntimeSettingsSnapshot["reasoningEffort"],
+    modelVerbosity:
+      modelVerbosity as RunRuntimeSettingsSnapshot["modelVerbosity"],
+    serviceTier: serviceTier as RunRuntimeSettingsSnapshot["serviceTier"],
+    hooksDisabled: payload.hooksDisabled,
+  };
+}
+
+function runtimeSettingsSnapshot(
+  settings: RunRuntimeSettingsSnapshot,
+): RunRuntimeSettingsSnapshot {
+  return {
+    permissionMode: settings.permissionMode,
+    prePlanMode: settings.prePlanMode,
+    autoModeActive: settings.autoModeActive,
+    bypassPermissionsWorkspace: settings.bypassPermissionsWorkspace,
+    model: settings.model,
+    provider: settings.provider,
+    profile: settings.profile,
+    reasoningEffort: settings.reasoningEffort,
+    modelVerbosity: settings.modelVerbosity,
+    serviceTier: settings.serviceTier,
+    hooksDisabled: settings.hooksDisabled,
+  };
 }
 
 function requireEffectResultOutcome(

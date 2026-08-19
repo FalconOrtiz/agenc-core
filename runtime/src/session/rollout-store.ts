@@ -14,9 +14,16 @@
  * @module
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  opendirSync,
+  readFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   AtomicArtifactOperationUnsupportedError,
   type AtomicArtifactObservation,
@@ -66,6 +73,9 @@ import {
   EFFECT_EVIDENCE_FORMAT_VERSION,
   EFFECT_EVIDENCE_MINIMUM_READER_RUNTIME,
   type EffectNoEffectProof,
+  type RunResumeReason,
+  type RunRuntimeSettingsSnapshot,
+  type RunTerminalResult,
 } from "../contracts/run-contracts.js";
 import {
   planLegacyDurableCheckpointUpgrade,
@@ -165,7 +175,23 @@ export interface RolloutStoreOpts extends SessionStoreOpts {
   readonly afterCompactionRollbackAppendForTestingOnly?: () => void;
   /** Injectable store-owned wall clock. Production always uses Date.now. */
   readonly nowMilliseconds?: () => number;
+  /**
+   * Explicit user continuation of a previously-terminal root run.
+   *
+   * Ordinary crash recovery must leave this unset: it may reopen only a
+   * non-terminal epoch. The explicit path appends a durable `run_reopened`
+   * boundary before the writer is allowed to accept new work.
+   */
+  readonly reopenTerminalRun?: boolean;
+  /** Resume a canonical nonterminal suspension in the existing epoch. */
+  readonly resumeSuspendedRun?: boolean;
+  /** Internal disposition; never derived from a caller-supplied reason. */
+  readonly suspendedResumeReason?: RunResumeReason;
 }
+
+const MAX_BOUND_ROLLOUT_DIRECTORY_ENTRIES = 4_096;
+const MAX_BOUND_ROLLOUT_CANDIDATES = 256;
+const MAX_BOUND_ROLLOUT_DISCOVERY_MILLISECONDS = 30_000;
 
 export interface CompactionTransactionLease {
   release(): void;
@@ -177,8 +203,14 @@ interface ReviewedRollbackTargetReservation {
 }
 
 type PersistedCompactionRolloutItem =
-  | { readonly type: "compaction_intent"; readonly payload: CompactionPersistedIntentV1 }
-  | { readonly type: "compaction_committed"; readonly payload: CompactionPersistedCommittedV1 }
+  | {
+      readonly type: "compaction_intent";
+      readonly payload: CompactionPersistedIntentV1;
+    }
+  | {
+      readonly type: "compaction_committed";
+      readonly payload: CompactionPersistedCommittedV1;
+    }
   | {
       readonly type: "compaction_rollback_committed";
       readonly payload: CompactionPersistedRollbackCommittedV1;
@@ -238,6 +270,18 @@ export class TerminalRunEpochOpenError extends Error {
   }
 }
 
+export class SuspendedRunEpochOpenError extends Error {
+  constructor(
+    readonly runId: string,
+    readonly epoch: number,
+  ) {
+    super(
+      `refusing to open suspended run ${runId} epoch ${epoch}; explicit suspended resume is required`,
+    );
+    this.name = "SuspendedRunEpochOpenError";
+  }
+}
+
 export type ThreadSpawnEdgeStatus = "open" | "closed";
 
 export interface ThreadSpawnEdgeRecord {
@@ -263,6 +307,90 @@ function rolloutItemsContainTerminal(
       item.payload.msg.payload.runId === runId &&
       item.payload.msg.payload.epoch === epoch,
   );
+}
+
+/**
+ * Resolve a binding across SessionStore's two-rename crash window. Normal
+ * generations always outrank recovery names. A recovery generation is eligible
+ * only while its session directory has no normal rollout at all.
+ */
+function resolveCurrentBoundRolloutPath(boundPath: string): string {
+  if (existsSync(boundPath) && !isRecoveryRolloutPath(boundPath)) {
+    return boundPath;
+  }
+  const directoryPath = dirname(boundPath);
+  const deadline = Date.now() + MAX_BOUND_ROLLOUT_DISCOVERY_MILLISECONDS;
+  let directory: ReturnType<typeof opendirSync>;
+  try {
+    directory = opendirSync(directoryPath);
+  } catch (error) {
+    throw new Error(
+      `bound rollout directory is unavailable: ${directoryPath}`,
+      { cause: error },
+    );
+  }
+  const candidates: Array<{
+    readonly sourcePath: string;
+    readonly mtimeNs: bigint;
+  }> = [];
+  let entryCount = 0;
+  try {
+    for (;;) {
+      if (Date.now() >= deadline) {
+        throw new Error("bound rollout discovery exceeded its time budget");
+      }
+      const entry = directory.readSync();
+      if (entry === null) break;
+      entryCount += 1;
+      if (entryCount > MAX_BOUND_ROLLOUT_DIRECTORY_ENTRIES) {
+        throw new Error("bound rollout discovery exceeded its entry budget");
+      }
+      if (
+        !entry.isFile() ||
+        !entry.name.startsWith("rollout-") ||
+        !entry.name.endsWith(".jsonl")
+      ) {
+        continue;
+      }
+      if (candidates.length >= MAX_BOUND_ROLLOUT_CANDIDATES) {
+        throw new Error("bound rollout discovery exceeded its file budget");
+      }
+      const sourcePath = join(directoryPath, entry.name);
+      const stats = lstatSync(sourcePath, { bigint: true });
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n) {
+        continue;
+      }
+      candidates.push({ sourcePath, mtimeNs: stats.mtimeNs });
+    }
+  } finally {
+    directory.closeSync();
+  }
+  const normal = candidates.filter(
+    ({ sourcePath }) => !isRecoveryRolloutPath(sourcePath),
+  );
+  const eligible = normal.length > 0 ? normal : candidates;
+  eligible.sort((left, right) =>
+    left.mtimeNs === right.mtimeNs
+      ? right.sourcePath.localeCompare(left.sourcePath)
+      : left.mtimeNs > right.mtimeNs
+        ? -1
+        : 1,
+  );
+  const authoritative = eligible[0];
+  if (authoritative === undefined) {
+    throw new Error(`bound rollout source is unavailable: ${boundPath}`);
+  }
+  if (
+    eligible[1] !== undefined &&
+    eligible[1].mtimeNs === authoritative.mtimeNs
+  ) {
+    throw new Error(`bound rollout source is ambiguous in ${directoryPath}`);
+  }
+  return authoritative.sourcePath;
+}
+
+function isRecoveryRolloutPath(sourcePath: string): boolean {
+  return basename(sourcePath).startsWith("rollout-recovery-");
 }
 
 function rolloutContentContainsTerminal(
@@ -360,7 +488,10 @@ function persistedCompactionIntent(
     minimum_reader_runtime: intent.minimum_reader_runtime,
     attempt_id: intent.attempt_id,
     recorded_at_ms: intent.recorded_at_ms,
-    source: persistedCompactionSource(intent.source, bundles.active_history_refs),
+    source: persistedCompactionSource(
+      intent.source,
+      bundles.active_history_refs,
+    ),
     source_history_manifest: bundles.source_history.manifest,
     policy_digest: intent.policy_digest,
     configuration_digest: intent.configuration_digest,
@@ -378,7 +509,8 @@ function persistedCompactionCommit(
   bundles: NonNullable<CompactionCommitInputV1["payload_bundles"]>,
   activeHistoryRefsManifest: CompactionPayloadBundleV1["manifest"],
 ): CompactionPersistedCommittedV1 {
-  const { active_history_refs: _activeHistoryRefs, ...authority } = committed.source;
+  const { active_history_refs: _activeHistoryRefs, ...authority } =
+    committed.source;
   return readCompactionPersistedCommittedV1({
     format_version: committed.format_version,
     minimum_reader_runtime: committed.minimum_reader_runtime,
@@ -479,36 +611,42 @@ function compactionSourceAuthorityMatchesScan(
       record === undefined ||
       record.encodedByteLength !== ref.encoded_bytes ||
       record.compactionSourceSha256 !== ref.sha256
-    ) return false;
+    )
+      return false;
     if (!seenRecords.has(record.lineNumber)) {
       seenRecords.add(record.lineNumber);
       sourceBytes += record.encodedByteLength;
     }
   }
-  return sourceBytes === source.source_bytes &&
+  return (
+    sourceBytes === source.source_bytes &&
     digestWithDomain(
       COMPACTION_SOURCE_DIGEST_DOMAIN,
       source.active_history_refs,
-    ) === source.source_sha256;
+    ) === source.source_sha256
+  );
 }
 
 function compactionPinSourceMatchesScan(
   pin: CompactionPinRecord,
   scan: CanonicalRolloutScan,
 ): boolean {
-  return compactionSourceAuthorityMatchesScan({
-    format_version: COMPACTION_EVENT_FORMAT_VERSION,
-    attempt_id: pin.attemptId,
-    session_id: pin.sessionId,
-    epoch: pin.epoch,
-    source_binding: pin.sourceBinding,
-    first_sequence: pin.firstSequence,
-    last_sequence: pin.lastSequence,
-    source_sha256: pin.sourceSha256,
-    source_bytes: pin.sourceBytes,
-    history_digest: pin.historyDigest,
-    active_history_refs: pin.activeHistoryRefs,
-  }, scan);
+  return compactionSourceAuthorityMatchesScan(
+    {
+      format_version: COMPACTION_EVENT_FORMAT_VERSION,
+      attempt_id: pin.attemptId,
+      session_id: pin.sessionId,
+      epoch: pin.epoch,
+      source_binding: pin.sourceBinding,
+      first_sequence: pin.firstSequence,
+      last_sequence: pin.lastSequence,
+      source_sha256: pin.sourceSha256,
+      source_bytes: pin.sourceBytes,
+      history_digest: pin.historyDigest,
+      active_history_refs: pin.activeHistoryRefs,
+    },
+    scan,
+  );
 }
 
 function compactionSourceRowsPrunedInScan(
@@ -517,10 +655,12 @@ function compactionSourceRowsPrunedInScan(
 ): boolean {
   return pin.activeHistoryRefs.every((ref) => {
     const retained = scan.sourceRecords.get(ref.first_sequence);
-    return retained === undefined ||
+    return (
+      retained === undefined ||
       retained.compactionSourceSha256 !== ref.sha256 ||
       (retained.itemType !== "response_item" &&
-        retained.itemType !== "compacted");
+        retained.itemType !== "compacted")
+    );
   });
 }
 
@@ -572,7 +712,8 @@ function reviewedRollbackTargetOriginator(
 }
 
 function assertCompactionItemFitsCanonicalLine(item: RolloutItem): void {
-  const encodedBytes = Buffer.byteLength(serializeRolloutItem(item), "utf8") - 1;
+  const encodedBytes =
+    Buffer.byteLength(serializeRolloutItem(item), "utf8") - 1;
   if (encodedBytes > HARD_MAX_RECOVERY_LINE_BYTES) {
     throw new CompactionTransactionError(
       "source_limit_exceeded",
@@ -594,6 +735,10 @@ export class RolloutStore {
   private readonly scheduler: SessionStoreFlushScheduler;
   private readonly startScheduler: boolean;
   private readonly resumed: boolean;
+  private readonly reopenTerminalRun: boolean;
+  private readonly resumeSuspendedRun: boolean;
+  private readonly suspendedResumeReason: RunResumeReason;
+  private readonly existingRolloutAtConstruction: boolean;
   readonly projectRootMarkers?: readonly string[];
   private readonly threadSpawnEdgePath: string;
   private readonly stateDriver: StateSqliteDriver;
@@ -608,8 +753,10 @@ export class RolloutStore {
   private readonly nowMilliseconds: () => number;
   private readonly durablyCommittedCompactionsAwaitingReconstruction =
     new Set<string>();
-  private readonly compactionSourcePayloadBundles =
-    new Map<string, CompactionSourcePayloadBundlesV1>();
+  private readonly compactionSourcePayloadBundles = new Map<
+    string,
+    CompactionSourcePayloadBundlesV1
+  >();
   private liveToolPairProjection: ToolPairProjection | undefined;
   private liveToolPairValidator: StreamingToolPairValidator | undefined;
   private openedAt: string | undefined;
@@ -617,12 +764,22 @@ export class RolloutStore {
 
   constructor(opts: RolloutStoreOpts) {
     this.store = new SessionStore(opts);
+    this.existingRolloutAtConstruction = existsSync(this.store.rolloutPath);
     this.scheduler = new SessionStoreFlushScheduler(
       this.store,
       opts.flushIntervalMs ?? 100,
     );
     this.startScheduler = opts.autoStartScheduler !== false;
     this.resumed = opts.resume === true;
+    this.reopenTerminalRun = opts.reopenTerminalRun === true;
+    this.resumeSuspendedRun = opts.resumeSuspendedRun === true;
+    this.suspendedResumeReason =
+      opts.suspendedResumeReason ?? "explicit_continue";
+    if (this.reopenTerminalRun && this.resumeSuspendedRun) {
+      throw new TypeError(
+        "terminal reopen and suspended resume are mutually exclusive",
+      );
+    }
     this.projectRootMarkers = opts.projectRootMarkers;
     this.threadSpawnEdgePath = join(
       this.store.sessionDir,
@@ -651,11 +808,26 @@ export class RolloutStore {
 
   open(meta: Parameters<SessionStore["open"]>[0]): void {
     try {
+      if (this.reopenTerminalRun && !this.existingRolloutAtConstruction) {
+        throw new Error(
+          `cannot resume session ${meta.sessionId}: canonical rollout not found`,
+        );
+      }
       this.assertJournalSourceWritable();
       const existingEpoch = this.runDurabilityRepo.currentEpoch(meta.sessionId);
+      const existingSuspension = this.runDurabilityRepo.getActiveSuspension(
+        meta.sessionId,
+      );
+      if (existingSuspension !== undefined && !this.resumeSuspendedRun) {
+        throw new SuspendedRunEpochOpenError(
+          meta.sessionId,
+          existingSuspension.epoch,
+        );
+      }
       if (
         existingEpoch !== undefined &&
-        this.currentEpochIsTerminal(meta.sessionId, existingEpoch.epoch)
+        this.currentEpochIsTerminal(meta.sessionId, existingEpoch.epoch) &&
+        !this.reopenTerminalRun
       ) {
         throw new TerminalRunEpochOpenError(
           meta.sessionId,
@@ -680,7 +852,11 @@ export class RolloutStore {
         }).value;
       this.openedAt = epoch.openedAt;
       this.openedEpoch = epoch.epoch;
-      if (this.currentEpochIsTerminal(meta.sessionId, epoch.epoch)) {
+      const terminalEpoch = this.currentEpochIsTerminal(
+        meta.sessionId,
+        epoch.epoch,
+      );
+      if (terminalEpoch && !this.reopenTerminalRun) {
         throw new TerminalRunEpochOpenError(meta.sessionId, epoch.epoch);
       }
       if (
@@ -698,9 +874,66 @@ export class RolloutStore {
       // C2 reconciliation precedes every other executable recovery family and
       // all pruning. Unresolved pins therefore fail closed before a resumed
       // turn can run or retention can remove source bytes.
-      this.reconcileCompactionsOnOpen();
+      const canonicalScan = this.reconcileCompactionsOnOpen();
+      if (
+        canonicalScan.proof.activeLifecycleState === "suspended" &&
+        !this.resumeSuspendedRun
+      ) {
+        throw new SuspendedRunEpochOpenError(
+          meta.sessionId,
+          canonicalScan.proof.activeEpoch,
+        );
+      }
+      if (
+        this.resumeSuspendedRun &&
+        canonicalScan.proof.activeLifecycleState === "terminal"
+      ) {
+        throw new TerminalRunEpochOpenError(
+          meta.sessionId,
+          canonicalScan.proof.activeEpoch,
+        );
+      }
+      if (this.reopenTerminalRun) {
+        const sqliteEpoch = this.runDurabilityRepo.currentEpoch(meta.sessionId);
+        if (
+          sqliteEpoch !== undefined &&
+          sqliteEpoch.epoch > canonicalScan.proof.activeEpoch
+        ) {
+          throw new Error(
+            `cannot resume run ${meta.sessionId}: SQLite lifecycle epoch ${sqliteEpoch.epoch} is ahead of canonical epoch ${canonicalScan.proof.activeEpoch}`,
+          );
+        }
+      }
+      if (this.resumed) {
+        const canonicalMeta = this.store
+          .readAll()
+          .find((item) => item.type === "session_meta");
+        if (
+          canonicalMeta === undefined ||
+          canonicalMeta.type !== "session_meta" ||
+          canonicalMeta.payload.sessionId !== meta.sessionId
+        ) {
+          throw new Error(
+            `cannot resume run ${meta.sessionId}: canonical session metadata is missing`,
+          );
+        }
+        this.recoverEffectProjectionOnOpen(
+          canonicalScan.proof.activeEpoch,
+          canonicalMeta.payload.timestamp,
+        );
+      }
+      if (this.resumeSuspendedRun) {
+        this.resumeSuspendedEpoch(
+          meta.sessionId,
+          canonicalScan.proof.activeLifecycleState,
+          canonicalScan.proof.activeSuspensionEventId,
+          meta.timestamp,
+        );
+      }
+      if (this.reopenTerminalRun) {
+        this.reopenTerminalEpoch(meta.sessionId, meta.timestamp);
+      }
       this.runCompactionRetentionMaintenance(Date.now());
-      if (this.resumed) this.recoverEffectProjectionOnOpen();
       if (this.startScheduler) this.scheduler.start();
     } catch (error) {
       this.scheduler.stop();
@@ -781,8 +1014,10 @@ export class RolloutStore {
       );
     }
     const activeHistory = scan.activeHistory;
-    if (activeHistory === undefined ||
-        activeHistory.positions.length !== activeHistory.messages.length) {
+    if (
+      activeHistory === undefined ||
+      activeHistory.positions.length !== activeHistory.messages.length
+    ) {
       throw new CompactionTransactionError(
         "pin_failed",
         "active history cannot be mapped exactly to canonical rollout records",
@@ -938,9 +1173,10 @@ export class RolloutStore {
       source_history: sourceHistory,
     });
     const persistedIntent = persistedCompactionIntent(intent, payloadBundles);
-    assertCompactionItemFitsCanonicalLine(
-      { type: "compaction_intent", payload: persistedIntent } as unknown as RolloutItem,
-    );
+    assertCompactionItemFitsCanonicalLine({
+      type: "compaction_intent",
+      payload: persistedIntent,
+    } as unknown as RolloutItem);
     try {
       this.compactionRetentionRepo.createPreparingPin(
         intent,
@@ -964,10 +1200,10 @@ export class RolloutStore {
       { type: "compaction_intent", payload: persistedIntent },
       { durable: true },
     );
-    this.appendCompactionPayloadBundles([
-      payloadBundles.active_history_refs,
-      payloadBundles.source_history,
-    ], true);
+    this.appendCompactionPayloadBundles(
+      [payloadBundles.active_history_refs, payloadBundles.source_history],
+      true,
+    );
     this.compactionRetentionRepo.bindIntent(
       intent.attempt_id,
       intent.recorded_at_ms,
@@ -979,18 +1215,19 @@ export class RolloutStore {
     source: CompactionSourceAuthorityV1,
   ): readonly string[] {
     this.store.syncCanonicalTail();
-    const candidates = this.compactionRetentionRepo
-      .listActiveForSourceBinding(source.source_binding);
+    const candidates = this.compactionRetentionRepo.listActiveForSourceBinding(
+      source.source_binding,
+    );
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: source.session_id,
-      expectedEpoch: source.epoch,
+      expectedEpoch: this.runEpoch,
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
       additionalSourceLines: [
         ...source.active_history_refs.map((ref) => ref.first_sequence),
         ...candidates.flatMap((pin) =>
-          pin.activeHistoryRefs.map((ref) => ref.first_sequence)
+          pin.activeHistoryRefs.map((ref) => ref.first_sequence),
         ),
       ],
     });
@@ -1002,29 +1239,35 @@ export class RolloutStore {
     }
     const attempts = new Set<string>();
     for (const ref of source.active_history_refs) {
-      const committedAttemptId = scan.sourceRecords.get(ref.first_sequence)
-        ?.committedAttemptId;
+      const committedAttemptId = scan.sourceRecords.get(
+        ref.first_sequence,
+      )?.committedAttemptId;
       if (committedAttemptId !== undefined) attempts.add(committedAttemptId);
     }
     for (const candidate of candidates) {
       const earliestDeletableLine = candidate.activeHistoryRefs
         .filter((ref) => {
           const record = scan.sourceRecords.get(ref.first_sequence);
-          return record !== undefined &&
+          return (
+            record !== undefined &&
             (record.itemType === "response_item" ||
               record.itemType === "compacted") &&
-            record.compactionSourceSha256 === ref.sha256;
+            record.compactionSourceSha256 === ref.sha256
+          );
         })
         .reduce<number | undefined>(
-          (earliest, ref) => earliest === undefined
-            ? ref.first_sequence
-            : Math.min(earliest, ref.first_sequence),
+          (earliest, ref) =>
+            earliest === undefined
+              ? ref.first_sequence
+              : Math.min(earliest, ref.first_sequence),
           undefined,
         );
-      if (earliestDeletableLine !== undefined &&
-          source.active_history_refs.some(
-            (ref) => ref.last_sequence >= earliestDeletableLine,
-          )) {
+      if (
+        earliestDeletableLine !== undefined &&
+        source.active_history_refs.some(
+          (ref) => ref.last_sequence >= earliestDeletableLine,
+        )
+      ) {
         attempts.add(candidate.attemptId);
       }
     }
@@ -1141,7 +1384,10 @@ export class RolloutStore {
     );
     // This fsync is the sole commit point. SQLite projection follows and is
     // rebuildable from this event if the process dies between the two writes.
-    const commitItem = { type: "compaction_committed", payload: committed } as const;
+    const commitItem = {
+      type: "compaction_committed",
+      payload: committed,
+    } as const;
     const persistedCommitItem = {
       type: "compaction_committed",
       payload: persistedCommit,
@@ -1155,15 +1401,17 @@ export class RolloutStore {
       "transactional compaction commit",
     );
     try {
-      this.appendCompactionPayloadBundles([
-        commitBundles.final_summary,
-        commitBundles.summary_dag,
-        commitBundles.replacement_history,
-      ], false);
-      this.appendPersistedCompactionRollout(
-        persistedCommitItem,
-        { durable: true },
+      this.appendCompactionPayloadBundles(
+        [
+          commitBundles.final_summary,
+          commitBundles.summary_dag,
+          commitBundles.replacement_history,
+        ],
+        false,
       );
+      this.appendPersistedCompactionRollout(persistedCommitItem, {
+        durable: true,
+      });
     } catch (appendError) {
       this.resolveAmbiguousCompactionCommitAppend(commitItem, appendError);
       throw appendError;
@@ -1213,12 +1461,14 @@ export class RolloutStore {
         syncError,
       ]);
     }
-    const terminalItems = this.store.readAll().filter(
-      (item) =>
-        (item.type === "compaction_committed" ||
-          item.type === "compaction_failed") &&
-        item.payload.attempt_id === expected.payload.attempt_id,
-    );
+    const terminalItems = this.store
+      .readAll()
+      .filter(
+        (item) =>
+          (item.type === "compaction_committed" ||
+            item.type === "compaction_failed") &&
+          item.payload.attempt_id === expected.payload.attempt_id,
+      );
     if (terminalItems.length === 0) {
       // The canonical tail was repaired and fsynced without this commit. The
       // transaction layer may now append the single failure terminal.
@@ -1232,7 +1482,9 @@ export class RolloutStore {
     if (!exactCommit) {
       this.poisonCompactionProjection(expected.payload.attempt_id, [
         appendError,
-        new Error("ambiguous compaction append produced conflicting terminal evidence"),
+        new Error(
+          "ambiguous compaction append produced conflicting terminal evidence",
+        ),
       ]);
     }
     this.poisonCompactionProjection(expected.payload.attempt_id, [appendError]);
@@ -1262,7 +1514,7 @@ export class RolloutStore {
     this.store.syncCanonicalTail();
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: intent.source.session_id,
-      expectedEpoch: intent.source.epoch,
+      expectedEpoch: this.runEpoch,
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -1277,13 +1529,16 @@ export class RolloutStore {
       );
     }
     const attempt = scan.attempts.get(intent.attempt_id);
-    const persistedIntents = attempt?.records.filter(
-      (record) => record.item.type === "compaction_intent",
-    ) ?? [];
-    const hasTerminal = attempt?.records.some(
-      (record) => record.item.type === "compaction_committed" ||
-        record.item.type === "compaction_failed",
-    ) ?? false;
+    const persistedIntents =
+      attempt?.records.filter(
+        (record) => record.item.type === "compaction_intent",
+      ) ?? [];
+    const hasTerminal =
+      attempt?.records.some(
+        (record) =>
+          record.item.type === "compaction_committed" ||
+          record.item.type === "compaction_failed",
+      ) ?? false;
     if (
       attempt === undefined ||
       persistedIntents.length !== 1 ||
@@ -1357,8 +1612,11 @@ export class RolloutStore {
     extendedUntilMs: number,
   ): void {
     const pin = this.compactionRetentionRepo.require(attemptId);
-    if (pin.state !== "committed_reference" || pin.commitSha256 === undefined ||
-        pin.retentionDeadlineMs === undefined) {
+    if (
+      pin.state !== "committed_reference" ||
+      pin.commitSha256 === undefined ||
+      pin.retentionDeadlineMs === undefined
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "rollback retention can only extend a committed source",
@@ -1368,9 +1626,11 @@ export class RolloutStore {
       pin.retentionDeadlineMs,
       pin.rollbackExtendedUntilMs ?? 0,
     );
-    if (!Number.isSafeInteger(extendedUntilMs) ||
-        extendedUntilMs <= previousDeadlineMs ||
-        extendedUntilMs <= this.nowMilliseconds()) {
+    if (
+      !Number.isSafeInteger(extendedUntilMs) ||
+      extendedUntilMs <= previousDeadlineMs ||
+      extendedUntilMs <= this.nowMilliseconds()
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "rollback retention extension must strictly increase the effective future deadline",
@@ -1442,7 +1702,7 @@ export class RolloutStore {
     this.store.syncCanonicalTail();
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: pin.sessionId,
-      expectedEpoch: pin.epoch,
+      expectedEpoch: this.runEpoch,
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -1464,16 +1724,21 @@ export class RolloutStore {
     const commitRecord = attempt?.records.find(
       (record) => record.item.type === "compaction_committed",
     );
-    if (attempt?.records.some(
-      (record) => record.item.type === "compaction_rollback_committed",
-    )) {
+    if (
+      attempt?.records.some(
+        (record) => record.item.type === "compaction_rollback_committed",
+      )
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "compaction attempt already has a durable rollback",
       );
     }
-    if (intentRecord === undefined || commitRecord === undefined ||
-        intentRecord.lineNumber >= commitRecord.lineNumber) {
+    if (
+      intentRecord === undefined ||
+      commitRecord === undefined ||
+      intentRecord.lineNumber >= commitRecord.lineNumber
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "compaction rollback lifecycle is out of order",
@@ -1504,8 +1769,9 @@ export class RolloutStore {
         "a reviewed rollback branch must have a distinct target session",
       );
     }
-    const sourceHistory = (scan.historyAtAttempts.get(pin.attemptId) ?? [])
-      .map(cloneProjectionMessage);
+    const sourceHistory = (scan.historyAtAttempts.get(pin.attemptId) ?? []).map(
+      cloneProjectionMessage,
+    );
     if (
       digestWithDomain(
         COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -1536,9 +1802,10 @@ export class RolloutStore {
       source_history: sourceHistory,
     };
     readCompactionRolloutPayload("compaction_rollback_committed", event);
-    const sourceHistoryManifest = attempt?.sourceHistoryManifest ??
-      this.compactionSourcePayloadBundles.get(pin.attemptId)
-        ?.source_history.manifest;
+    const sourceHistoryManifest =
+      attempt?.sourceHistoryManifest ??
+      this.compactionSourcePayloadBundles.get(pin.attemptId)?.source_history
+        .manifest;
     if (sourceHistoryManifest === undefined) {
       throw new CompactionTransactionError(
         "commit_failed",
@@ -1553,9 +1820,10 @@ export class RolloutStore {
       type: "compaction_rollback_committed",
       payload: persistedRollback,
     } as unknown as RolloutItem);
-    const targetReservation = event.rollback_mode === "reviewed_branch"
-      ? this.reserveReviewedRollbackTarget(event)
-      : undefined;
+    const targetReservation =
+      event.rollback_mode === "reviewed_branch"
+        ? this.reserveReviewedRollbackTarget(event)
+        : undefined;
     try {
       this.assertValidToolPairHistory(
         event.source_history as readonly ToolPairMessage[],
@@ -1618,9 +1886,7 @@ export class RolloutStore {
       );
     }
     if (
-      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(
-        rollback.target_session_id,
-      )
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(rollback.target_session_id)
     ) {
       throw new CompactionTransactionError(
         "commit_failed",
@@ -1636,10 +1902,7 @@ export class RolloutStore {
     });
     const sessionsRoot = resolve(dirname(this.store.sessionDir));
     const confined = relative(sessionsRoot, resolve(target.sessionDir));
-    if (
-      confined !== rollback.target_session_id ||
-      confined.startsWith("..")
-    ) {
+    if (confined !== rollback.target_session_id || confined.startsWith("..")) {
       throw new CompactionTransactionError(
         "commit_failed",
         "reviewed rollback target resolves outside the project session root",
@@ -1700,7 +1963,7 @@ export class RolloutStore {
       );
     }
     const projected = existing.flatMap((item) =>
-      item.type === "response_item" ? [item.payload] : []
+      item.type === "response_item" ? [item.payload] : [],
     );
     if (
       projected.length > rollback.source_history.length ||
@@ -1723,9 +1986,9 @@ export class RolloutStore {
   ): void {
     this.openAndValidateReviewedRollbackTarget(rollback, reservation);
     const target = reservation.target;
-    const projected = target.readAll().flatMap((item) =>
-      item.type === "response_item" ? [item.payload] : []
-    );
+    const projected = target
+      .readAll()
+      .flatMap((item) => (item.type === "response_item" ? [item.payload] : []));
     for (
       let index = projected.length;
       index < rollback.source_history.length;
@@ -1739,9 +2002,9 @@ export class RolloutStore {
         { durable: true },
       );
     }
-    const materialized = target.readAll().flatMap((item) =>
-      item.type === "response_item" ? [item.payload] : []
-    );
+    const materialized = target
+      .readAll()
+      .flatMap((item) => (item.type === "response_item" ? [item.payload] : []));
     if (
       canonicalizeJson(materialized) !==
       canonicalizeJson(rollback.source_history)
@@ -1766,10 +2029,7 @@ export class RolloutStore {
     readonly nowMs: number;
   }): CompactionSourceReleaseV1 {
     const nowMs = this.nowMilliseconds();
-    const scan = this.scanCompactionSourceRelease(
-      params.attemptId,
-      nowMs,
-    );
+    const scan = this.scanCompactionSourceRelease(params.attemptId, nowMs);
     const pin = scan.pin;
     const event: CompactionSourceReleaseV1 = {
       format_version: COMPACTION_EVENT_FORMAT_VERSION,
@@ -1826,7 +2086,10 @@ export class RolloutStore {
         "compaction source release is missing its authoritative scan generation",
       );
     }
-    if (this.compactionRetentionRepo.listActiveReferences(pin.attemptId).length !== 0) {
+    if (
+      this.compactionRetentionRepo.listActiveReferences(pin.attemptId)
+        .length !== 0
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "compaction source acquired a reference during release",
@@ -1835,7 +2098,7 @@ export class RolloutStore {
     this.store.syncCanonicalTail();
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: pin.sessionId,
-      expectedEpoch: pin.epoch,
+      expectedEpoch: this.runEpoch,
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -1857,7 +2120,8 @@ export class RolloutStore {
         "release-pending source changed before bounded pruning completed",
       );
     }
-    const requestedLimit = params.maxRecords ?? COMPACTION_PRUNE_RECORDS_PER_PAGE;
+    const requestedLimit =
+      params.maxRecords ?? COMPACTION_PRUNE_RECORDS_PER_PAGE;
     const limit = Math.min(
       COMPACTION_PRUNE_RECORDS_PER_PAGE,
       Math.max(1, Math.floor(requestedLimit)),
@@ -1892,27 +2156,36 @@ export class RolloutStore {
   ): boolean {
     const exclusions = pin.activeHistoryRefs.flatMap((ref) => {
       const record = scan.sourceRecords.get(ref.first_sequence);
-      if (record === undefined ||
-          (record.itemType !== "response_item" && record.itemType !== "compacted") ||
-          record.compactionSourceSha256 !== ref.sha256) return [];
-      return [{
-        lineNumber: ref.first_sequence,
-        encodedBytes: ref.encoded_bytes,
-        sha256: ref.sha256,
-        itemType: record.itemType,
-      }];
+      if (
+        record === undefined ||
+        (record.itemType !== "response_item" &&
+          record.itemType !== "compacted") ||
+        record.compactionSourceSha256 !== ref.sha256
+      )
+        return [];
+      return [
+        {
+          lineNumber: ref.first_sequence,
+          encodedBytes: ref.encoded_bytes,
+          sha256: ref.sha256,
+          itemType: record.itemType,
+        },
+      ];
     });
     const attempt = scan.attempts.get(pin.attemptId);
-    const sourceHistoryExclusions = attempt?.sourceHistoryManifest === undefined
-      ? []
-      : (scan.payloadRecordsAtAttempts.get(pin.attemptId) ?? []).map((record) => ({
-          lineNumber: record.lineNumber,
-          encodedBytes: record.encodedByteLength,
-          sha256: record.compactionSourceSha256,
-          itemType: "compaction_payload_chunk" as const,
-          attemptId: pin.attemptId,
-          payloadKind: record.payloadKind,
-        }));
+    const sourceHistoryExclusions =
+      attempt?.sourceHistoryManifest === undefined
+        ? []
+        : (scan.payloadRecordsAtAttempts.get(pin.attemptId) ?? []).map(
+            (record) => ({
+              lineNumber: record.lineNumber,
+              encodedBytes: record.encodedByteLength,
+              sha256: record.compactionSourceSha256,
+              itemType: "compaction_payload_chunk" as const,
+              attemptId: pin.attemptId,
+              payloadKind: record.payloadKind,
+            }),
+          );
     const physicalExclusions = [...exclusions, ...sourceHistoryExclusions];
     if (physicalExclusions.length === 0) return false;
     this.store.rewriteRolloutExcludingPhysicalLinesAtomically(
@@ -1980,22 +2253,22 @@ export class RolloutStore {
         let complete: boolean;
         if (candidate.state === "release_pending") {
           complete = this.resumeCompactionSourceRelease({
-              attemptId: candidate.attemptId,
-              nowMs,
-            });
+            attemptId: candidate.attemptId,
+            nowMs,
+          });
         } else {
           this.beginCompactionSourceRelease({
-              attemptId: candidate.attemptId,
-              nowMs,
-            });
-          complete = this.compactionRetentionRepo.require(candidate.attemptId)
-            .state === "released";
+            attemptId: candidate.attemptId,
+            nowMs,
+          });
+          complete =
+            this.compactionRetentionRepo.require(candidate.attemptId).state ===
+            "released";
         }
         if (complete) released += 1;
       }
-      const deletedPage = this.compactionRetentionRepo.deleteReleasedHistory(
-        boundedLimit,
-      );
+      const deletedPage =
+        this.compactionRetentionRepo.deleteReleasedHistory(boundedLimit);
       deletedPins += deletedPage;
       if (candidates.length < boundedLimit && deletedPage < boundedLimit) break;
     }
@@ -2007,7 +2280,8 @@ export class RolloutStore {
     nowMs: number,
   ): { readonly pin: CompactionPinRecord; readonly generation: number } {
     const pin = this.compactionRetentionRepo.require(attemptId);
-    const references = this.compactionRetentionRepo.listActiveReferences(attemptId);
+    const references =
+      this.compactionRetentionRepo.listActiveReferences(attemptId);
     if (references.length > 0) {
       throw new CompactionTransactionError(
         "commit_failed",
@@ -2017,7 +2291,7 @@ export class RolloutStore {
     this.store.syncCanonicalTail();
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: pin.sessionId,
-      expectedEpoch: pin.epoch,
+      expectedEpoch: this.runEpoch,
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -2038,8 +2312,11 @@ export class RolloutStore {
     const commitRecord = attempt?.records.find(
       (record) => record.item.type === "compaction_committed",
     );
-    if (intentRecord === undefined || commitRecord === undefined ||
-        intentRecord.lineNumber >= commitRecord.lineNumber) {
+    if (
+      intentRecord === undefined ||
+      commitRecord === undefined ||
+      intentRecord.lineNumber >= commitRecord.lineNumber
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "release scan found an out-of-order compaction lifecycle",
@@ -2057,27 +2334,31 @@ export class RolloutStore {
         "release scan cannot bind the canonical compaction commit",
       );
     }
-    const sourceLines = new Set(pin.activeHistoryRefs
-      .filter((ref) => {
-        const record = scan.sourceRecords.get(ref.first_sequence);
-        return record !== undefined &&
-          (record.itemType === "response_item" ||
-            record.itemType === "compacted") &&
-          record.compactionSourceSha256 === ref.sha256;
-      })
-      .map((ref) => ref.first_sequence));
-    const earliestRemovedLine = sourceLines.size === 0
-      ? undefined
-      : Math.min(...sourceLines);
+    const sourceLines = new Set(
+      pin.activeHistoryRefs
+        .filter((ref) => {
+          const record = scan.sourceRecords.get(ref.first_sequence);
+          return (
+            record !== undefined &&
+            (record.itemType === "response_item" ||
+              record.itemType === "compacted") &&
+            record.compactionSourceSha256 === ref.sha256
+          );
+        })
+        .map((ref) => ref.first_sequence),
+    );
+    const earliestRemovedLine =
+      sourceLines.size === 0 ? undefined : Math.min(...sourceLines);
     const endangeredPin = this.compactionRetentionRepo
       .listActiveForSourceBinding(pin.sourceBinding)
       .find(
         (candidate) =>
           candidate.attemptId !== pin.attemptId &&
           earliestRemovedLine !== undefined &&
-          candidate.activeHistoryRefs.some((ref) =>
-            sourceLines.has(ref.first_sequence) ||
-            ref.last_sequence >= earliestRemovedLine
+          candidate.activeHistoryRefs.some(
+            (ref) =>
+              sourceLines.has(ref.first_sequence) ||
+              ref.last_sequence >= earliestRemovedLine,
           ),
       );
     if (endangeredPin !== undefined) {
@@ -2095,15 +2376,17 @@ export class RolloutStore {
 
   /** Whether this session must be reconstructed before it can accept a turn. */
   get compactionReconstructionRequired(): boolean {
-    return this.durablyCommittedCompactionsAwaitingReconstruction.size > 0 ||
+    return (
+      this.durablyCommittedCompactionsAwaitingReconstruction.size > 0 ||
       this.compactionRetentionRepo
-      .listSession(this.sessionId)
-      .some(
-        (pin) =>
-          pin.state === "committed_reference" &&
-          (pin.projectionState !== "complete" ||
-            pin.cleanupState !== "complete"),
-      );
+        .listSession(this.sessionId)
+        .some(
+          (pin) =>
+            pin.state === "committed_reference" &&
+            (pin.projectionState !== "complete" ||
+              pin.cleanupState !== "complete"),
+        )
+    );
   }
 
   assertCompactionProjectionReady(): void {
@@ -2130,7 +2413,10 @@ export class RolloutStore {
     for (const attemptId of new Set(attemptIds)) {
       const pin = this.compactionRetentionRepo.get(attemptId);
       if (pin?.sessionId !== this.sessionId) continue;
-      this.compactionRetentionRepo.markProjectionComplete(attemptId, Date.now());
+      this.compactionRetentionRepo.markProjectionComplete(
+        attemptId,
+        Date.now(),
+      );
       this.durablyCommittedCompactionsAwaitingReconstruction.delete(attemptId);
     }
   }
@@ -2140,7 +2426,7 @@ export class RolloutStore {
       this.store.syncCanonicalTail();
       const scan = scanCanonicalRollout(this.rolloutPath, {
         expectedRunId: pin.sessionId,
-        expectedEpoch: pin.epoch,
+        expectedEpoch: this.runEpoch,
         maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
         nowMilliseconds: this.nowMilliseconds,
         compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
@@ -2154,26 +2440,30 @@ export class RolloutStore {
     }
   }
 
-  private reconcileCompactionsOnOpen(): void {
+  private reconcileCompactionsOnOpen(): CanonicalRolloutScan {
     const startedAtMs = this.nowMilliseconds();
     this.store.syncCanonicalTail();
-    const existingPins = this.compactionRetentionRepo.listSession(this.sessionId);
+    const existingPins = this.compactionRetentionRepo.listSession(
+      this.sessionId,
+    );
     const scan = scanCanonicalRollout(this.rolloutPath, {
       expectedRunId: this.sessionId,
-      expectedEpoch: this.runEpoch,
+      ...(this.reopenTerminalRun ? {} : { expectedEpoch: this.runEpoch }),
       maximumScanMilliseconds: MAX_COMPACTION_RECONCILIATION_MS_PER_START,
       nowMilliseconds: this.nowMilliseconds,
       compactionSourceDigestDomain: COMPACTION_SOURCE_DIGEST_DOMAIN,
       additionalSourceLines: existingPins.flatMap((pin) =>
-        pin.activeHistoryRefs.map((ref) => ref.first_sequence)
+        pin.activeHistoryRefs.map((ref) => ref.first_sequence),
       ),
     });
     this.rebuildCompactionPinsFromCanonical(scan);
     let pages = 0;
     let exhausted = false;
     while (pages < MAX_COMPACTION_RECONCILIATION_PAGES_PER_START) {
-      if (this.nowMilliseconds() - startedAtMs >=
-          MAX_COMPACTION_RECONCILIATION_MS_PER_START) {
+      if (
+        this.nowMilliseconds() - startedAtMs >=
+        MAX_COMPACTION_RECONCILIATION_MS_PER_START
+      ) {
         exhausted = true;
         break;
       }
@@ -2185,12 +2475,14 @@ export class RolloutStore {
           this.sessionId,
           this.nowMilliseconds(),
         );
-        return;
+        return scan;
       }
       pages += 1;
       for (const listedPin of page) {
-        if (this.nowMilliseconds() - startedAtMs >=
-            MAX_COMPACTION_RECONCILIATION_MS_PER_START) {
+        if (
+          this.nowMilliseconds() - startedAtMs >=
+          MAX_COMPACTION_RECONCILIATION_MS_PER_START
+        ) {
           exhausted = true;
           break;
         }
@@ -2211,12 +2503,10 @@ export class RolloutStore {
           this.sessionId,
           this.nowMilliseconds(),
         );
-        return;
+        return scan;
       }
     }
-    const reason = exhausted
-      ? "startup_time_budget"
-      : "startup_page_budget";
+    const reason = exhausted ? "startup_time_budget" : "startup_page_budget";
     this.compactionRetentionRepo.createDeferral({
       sessionId: this.sessionId,
       reason,
@@ -2230,47 +2520,54 @@ export class RolloutStore {
 
   private rebuildCompactionPinsFromCanonical(scan: CanonicalRolloutScan): void {
     const orderedAttempts = [...scan.attempts.values()].sort(
-      (left, right) => left.records[0]!.lineNumber - right.records[0]!.lineNumber,
+      (left, right) =>
+        left.records[0]!.lineNumber - right.records[0]!.lineNumber,
     );
     for (const attempt of orderedAttempts) {
       const intent = attempt.intent;
       if (this.compactionRetentionRepo.get(intent.attempt_id) !== undefined) {
         continue;
       }
-      const provenanceAttemptIds = new Set(intent.source.active_history_refs.flatMap(
-        (ref) => {
-          const ancestor = scan.sourceRecords.get(ref.first_sequence)
-            ?.committedAttemptId;
+      const provenanceAttemptIds = new Set(
+        intent.source.active_history_refs.flatMap((ref) => {
+          const ancestor = scan.sourceRecords.get(
+            ref.first_sequence,
+          )?.committedAttemptId;
           return ancestor === undefined ? [] : [ancestor];
-        },
-      ));
-      for (const candidate of this.compactionRetentionRepo
-        .listActiveForSourceBinding(intent.source.source_binding)) {
+        }),
+      );
+      for (const candidate of this.compactionRetentionRepo.listActiveForSourceBinding(
+        intent.source.source_binding,
+      )) {
         const earliestDeletableLine = candidate.activeHistoryRefs
           .filter((ref) => {
             const record = scan.sourceRecords.get(ref.first_sequence);
-            return record !== undefined &&
+            return (
+              record !== undefined &&
               (record.itemType === "response_item" ||
                 record.itemType === "compacted") &&
-              record.compactionSourceSha256 === ref.sha256;
+              record.compactionSourceSha256 === ref.sha256
+            );
           })
           .reduce<number | undefined>(
-            (earliest, ref) => earliest === undefined
-              ? ref.first_sequence
-              : Math.min(earliest, ref.first_sequence),
+            (earliest, ref) =>
+              earliest === undefined
+                ? ref.first_sequence
+                : Math.min(earliest, ref.first_sequence),
             undefined,
           );
-        if (earliestDeletableLine !== undefined &&
-            intent.source.active_history_refs.some(
-              (ref) => ref.last_sequence >= earliestDeletableLine,
-            )) {
+        if (
+          earliestDeletableLine !== undefined &&
+          intent.source.active_history_refs.some(
+            (ref) => ref.last_sequence >= earliestDeletableLine,
+          )
+        ) {
           provenanceAttemptIds.add(candidate.attemptId);
         }
       }
-      let pin = this.compactionRetentionRepo.createPreparingPin(
-        intent,
-        [...provenanceAttemptIds],
-      );
+      let pin = this.compactionRetentionRepo.createPreparingPin(intent, [
+        ...provenanceAttemptIds,
+      ]);
       pin = this.compactionRetentionRepo.bindIntent(
         intent.attempt_id,
         intent.recorded_at_ms,
@@ -2293,12 +2590,16 @@ export class RolloutStore {
         continue;
       }
       const commit = items.find(
-        (item): item is Extract<RolloutItem, { type: "compaction_committed" }> =>
+        (
+          item,
+        ): item is Extract<RolloutItem, { type: "compaction_committed" }> =>
           item.type === "compaction_committed",
       );
       if (commit === undefined) continue;
-      if (!attempt.admissionValid ||
-          !compactionCommitMatchesIntentAndPin(commit.payload, intent, pin)) {
+      if (
+        !attempt.admissionValid ||
+        !compactionCommitMatchesIntentAndPin(commit.payload, intent, pin)
+      ) {
         throw new CompactionTransactionError(
           "commit_failed",
           "canonical compaction cannot rebuild an invalid admission or commit binding",
@@ -2316,12 +2617,20 @@ export class RolloutStore {
       this.reconcileCompactionRetentionExtensions(pin, items);
       pin = this.compactionRetentionRepo.require(pin.attemptId);
       const rollback = items.find(
-        (item): item is Extract<RolloutItem, { type: "compaction_rollback_committed" }> =>
-          item.type === "compaction_rollback_committed",
+        (
+          item,
+        ): item is Extract<
+          RolloutItem,
+          { type: "compaction_rollback_committed" }
+        > => item.type === "compaction_rollback_committed",
       );
       const release = items.find(
-        (item): item is Extract<RolloutItem, { type: "compaction_source_release" }> =>
-          item.type === "compaction_source_release",
+        (
+          item,
+        ): item is Extract<
+          RolloutItem,
+          { type: "compaction_source_release" }
+        > => item.type === "compaction_source_release",
       );
       if (rollback !== undefined && release === undefined) {
         if (rollback.payload.rollback_mode === "reviewed_branch") {
@@ -2361,24 +2670,40 @@ export class RolloutStore {
     let pin = this.compactionRetentionRepo.require(listedPin.attemptId);
     const items = attemptScan?.records.map((record) => record.item) ?? [];
     const intents = items.filter(
-      (item): item is Extract<RolloutItem, { readonly type: "compaction_intent" }> =>
+      (
+        item,
+      ): item is Extract<RolloutItem, { readonly type: "compaction_intent" }> =>
         item.type === "compaction_intent",
     );
     const failures = items.filter(
-      (item): item is Extract<RolloutItem, { readonly type: "compaction_failed" }> =>
+      (
+        item,
+      ): item is Extract<RolloutItem, { readonly type: "compaction_failed" }> =>
         item.type === "compaction_failed",
     );
     const commits = items.filter(
-      (item): item is Extract<RolloutItem, { readonly type: "compaction_committed" }> =>
-        item.type === "compaction_committed",
+      (
+        item,
+      ): item is Extract<
+        RolloutItem,
+        { readonly type: "compaction_committed" }
+      > => item.type === "compaction_committed",
     );
     const rollbacks = items.filter(
-      (item): item is Extract<RolloutItem, { readonly type: "compaction_rollback_committed" }> =>
-        item.type === "compaction_rollback_committed",
+      (
+        item,
+      ): item is Extract<
+        RolloutItem,
+        { readonly type: "compaction_rollback_committed" }
+      > => item.type === "compaction_rollback_committed",
     );
     const releases = items.filter(
-      (item): item is Extract<RolloutItem, { readonly type: "compaction_source_release" }> =>
-        item.type === "compaction_source_release",
+      (
+        item,
+      ): item is Extract<
+        RolloutItem,
+        { readonly type: "compaction_source_release" }
+      > => item.type === "compaction_source_release",
     );
     if (
       intents.length > 1 ||
@@ -2397,7 +2722,10 @@ export class RolloutStore {
     const commit = commits[0];
     const rollback = rollbacks[0];
     const release = releases[0];
-    if (intent !== undefined && !compactionIntentMatchesPin(intent.payload, pin)) {
+    if (
+      intent !== undefined &&
+      !compactionIntentMatchesPin(intent.payload, pin)
+    ) {
       throw new CompactionTransactionError(
         "commit_failed",
         "canonical compaction intent does not match its immutable retention pin",
@@ -2414,10 +2742,7 @@ export class RolloutStore {
         });
         return;
       }
-      const sourceMatches = compactionPinSourceMatchesScan(
-        pin,
-        scan,
-      );
+      const sourceMatches = compactionPinSourceMatchesScan(pin, scan);
       if (!sourceMatches) {
         this.compactionRetentionRepo.createDeferral({
           sessionId: pin.sessionId,
@@ -2444,17 +2769,18 @@ export class RolloutStore {
     if (commit !== undefined) {
       if (
         intent === undefined ||
-        !compactionCommitMatchesIntentAndPin(commit.payload, intent.payload, pin)
+        !compactionCommitMatchesIntentAndPin(
+          commit.payload,
+          intent.payload,
+          pin,
+        )
       ) {
         throw new CompactionTransactionError(
           "commit_failed",
           "canonical compaction commit does not match its durable intent and pin",
         );
       }
-      if (
-        attemptScan === undefined ||
-        !attemptScan.admissionValid
-      ) {
+      if (attemptScan === undefined || !attemptScan.admissionValid) {
         throw new CompactionTransactionError(
           "commit_failed",
           "canonical compaction admission lifecycle is incomplete or contaminated",
@@ -2464,10 +2790,7 @@ export class RolloutStore {
         COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
         commit.payload,
       );
-      if (
-        pin.state !== "intent_bound" &&
-        pin.commitSha256 !== commitSha256
-      ) {
+      if (pin.state !== "intent_bound" && pin.commitSha256 !== commitSha256) {
         throw new CompactionTransactionError(
           "commit_failed",
           "canonical compaction commit digest does not match its durable pin",
@@ -2532,7 +2855,9 @@ export class RolloutStore {
         source_sha256: pin.sourceSha256,
         history_digest: pin.historyDigest,
         reason: "recovery_interrupted",
-        detail_digest: sha256Hex("startup reconciliation closed incomplete intent"),
+        detail_digest: sha256Hex(
+          "startup reconciliation closed incomplete intent",
+        ),
       };
       try {
         this.appendRollout(
@@ -2568,10 +2893,12 @@ export class RolloutStore {
     for (const item of items) {
       if (item.type !== "compaction_retention_extended") continue;
       const extension = item.payload;
-      if (pin.commitSha256 !== extension.commit_sha256 ||
-          pin.sourceSha256 !== extension.source_sha256 ||
-          pin.sessionId !== extension.source_session_id ||
-          pin.epoch !== extension.source_epoch) {
+      if (
+        pin.commitSha256 !== extension.commit_sha256 ||
+        pin.sourceSha256 !== extension.source_sha256 ||
+        pin.sessionId !== extension.source_session_id ||
+        pin.epoch !== extension.source_epoch
+      ) {
         throw new CompactionTransactionError(
           "commit_failed",
           "canonical retention extension does not bind the durable compaction pin",
@@ -2598,7 +2925,13 @@ export class RolloutStore {
   }
 
   /** Project a fsync-committed effect event into rebuildable M4 state. */
-  recordEffectEvent(event: Event): void {
+  recordEffectEvent(
+    event: Event,
+    projection?: {
+      readonly epoch: number;
+      readonly canonicalReplay: true;
+    },
+  ): void {
     const sequence = event.seq;
     if (!Number.isSafeInteger(sequence) || (sequence ?? 0) <= 0) {
       throw new Error("effect projection requires a positive event sequence");
@@ -2607,7 +2940,10 @@ export class RolloutStore {
     const message = event.msg;
     if (message.type === "effect_intent") {
       const payload = message.payload;
-      const epoch = this.requireRunEpoch(payload.runId);
+      const epoch =
+        projection === undefined
+          ? this.requireRunEpoch(payload.runId)
+          : { epoch: projection.epoch };
       this.runDurabilityRepo.beginEffect({
         runId: payload.runId,
         epoch: epoch.epoch,
@@ -2629,6 +2965,9 @@ export class RolloutStore {
         effectFormatVersion: payload.formatVersion ?? 1,
         ...(payload.minimumReaderRuntime !== undefined
           ? { minimumReaderRuntime: payload.minimumReaderRuntime }
+          : {}),
+        ...(projection?.canonicalReplay === true
+          ? { projection: "canonical_replay" as const }
           : {}),
       });
       return;
@@ -2753,6 +3092,102 @@ export class RolloutStore {
     }
   }
 
+  /** Fail closed unless this writer can relinquish a clean, effect-free epoch. */
+  assertRunSuspendable(): void {
+    const epoch = this.runEpoch;
+    if (this.currentEpochIsTerminal(this.sessionId, epoch)) {
+      throw new Error(
+        `run ${this.sessionId} epoch ${epoch} is terminal and cannot suspend`,
+      );
+    }
+    if (
+      this.runDurabilityRepo.getActiveSuspension(this.sessionId) !== undefined
+    ) {
+      throw new Error(`run ${this.sessionId} is already suspended`);
+    }
+    const unsettled = this.runDurabilityRepo
+      .listEffects(this.sessionId)
+      .filter(
+        (effect) =>
+          effect.outcome === undefined || effect.reviewStatus === "pending",
+      );
+    if (unsettled.length > 0) {
+      throw new Error(
+        `run ${this.sessionId} cannot suspend with unsettled effect(s): ${unsettled
+          .map((effect) => effect.stepId)
+          .join(", ")}`,
+      );
+    }
+  }
+
+  /** Project an already-fsync-committed canonical suspension boundary. */
+  recordRunSuspensionEvent(event: Event): void {
+    if (
+      !isSequencedEvent(event) ||
+      event.msg.type !== "run_suspended" ||
+      event.msg.payload.runId !== this.sessionId ||
+      event.msg.payload.epoch !== this.runEpoch
+    ) {
+      throw new Error("run suspension projection requires a canonical event");
+    }
+    this.runDurabilityRepo.recordRunSuspended({
+      runId: this.sessionId,
+      epoch: this.runEpoch,
+      eventId: canonicalRolloutEventId(event),
+      eventSequence: event.seq,
+      reason: event.msg.payload.reason,
+      suspendedAt: event.msg.payload.suspendedAt,
+    });
+  }
+
+  /** Project an already-fsync-committed first-input startup activation. */
+  recordRunStartupActivationEvent(event: Event): void {
+    if (
+      !isSequencedEvent(event) ||
+      event.msg.type !== "run_startup_activated" ||
+      event.msg.payload.runId !== this.sessionId ||
+      event.msg.payload.epoch !== this.runEpoch
+    ) {
+      throw new Error(
+        "run startup activation projection requires a canonical event",
+      );
+    }
+    this.runDurabilityRepo.recordRunStartupActivated({
+      runId: this.sessionId,
+      epoch: this.runEpoch,
+      resumeEventId: event.msg.payload.resumeEventId,
+      eventId: canonicalRolloutEventId(event),
+      eventSequence: event.seq,
+      activatedAt: event.msg.payload.activatedAt,
+    });
+  }
+
+  /** Project an already-fsync-committed complete runtime overlay. */
+  recordRunRuntimeSettingsEvent(event: Event): void {
+    if (
+      !isSequencedEvent(event) ||
+      event.msg.type !== "run_runtime_settings_changed" ||
+      event.msg.payload.runId !== this.sessionId ||
+      event.msg.payload.epoch !== this.runEpoch
+    ) {
+      throw new Error(
+        "run runtime settings projection requires a canonical event",
+      );
+    }
+    const payload = event.msg.payload;
+    this.runDurabilityRepo.recordRuntimeSettingsChanged({
+      runId: this.sessionId,
+      epoch: this.runEpoch,
+      eventId: canonicalRolloutEventId(event),
+      eventSequence: event.seq,
+      previousSettingsEventId: payload.previousSettingsEventId,
+      rollbackOfSettingsEventId: payload.rollbackOfSettingsEventId,
+      reason: payload.reason,
+      changedAt: payload.changedAt,
+      settings: runtimeSettingsSnapshotFromEvent(payload),
+    });
+  }
+
   appendRollout(item: RolloutItem, opts: AppendOptions = {}): void {
     if (item.type === "response_item") {
       this.validateLiveResponseItem(item.payload);
@@ -2821,7 +3256,9 @@ export class RolloutStore {
   }
 
   /** Fresh exact projection namespace for raw-prefix validation. */
-  checkpointProjectionContext(purpose: string): DurableCheckpointProjectionContext {
+  checkpointProjectionContext(
+    purpose: string,
+  ): DurableCheckpointProjectionContext {
     return this.toolPairProjectionContext(purpose, true);
   }
 
@@ -2848,12 +3285,16 @@ export class RolloutStore {
     const projectionContext = this.checkpointProjectionContext(
       `history:${purpose}`,
     );
-    const outcome = validateToolPairSequence(messages, projectionContext.projection, {
-      projectionId: projectionContext.projectionId,
-      sourceKey: projectionContext.sourceKey,
-      requireResultIntegrity: true,
-      expectedRunId: this.sessionId,
-    });
+    const outcome = validateToolPairSequence(
+      messages,
+      projectionContext.projection,
+      {
+        projectionId: projectionContext.projectionId,
+        sourceKey: projectionContext.sourceKey,
+        requireResultIntegrity: true,
+        expectedRunId: this.sessionId,
+      },
+    );
     if (outcome.status !== "valid") {
       throw new ToolPairHistoryBlockedError(purpose, outcome);
     }
@@ -2890,7 +3331,11 @@ export class RolloutStore {
       "canonical-response-stream",
       true,
     );
-    for (let itemIndex = 0; itemIndex < plan.upgradedItems.length; itemIndex += 1) {
+    for (
+      let itemIndex = 0;
+      itemIndex < plan.upgradedItems.length;
+      itemIndex += 1
+    ) {
       const item = plan.upgradedItems[itemIndex];
       if (
         item?.type !== "compacted" ||
@@ -2927,7 +3372,9 @@ export class RolloutStore {
     purpose: string,
     allowDanglingAtEnd: boolean,
   ): void {
-    const context = this.checkpointProjectionContext(`upgrade-history:${purpose}`);
+    const context = this.checkpointProjectionContext(
+      `upgrade-history:${purpose}`,
+    );
     const outcome = validateToolPairSequence(messages, context.projection, {
       projectionId: context.projectionId,
       sourceKey: context.sourceKey,
@@ -2954,7 +3401,10 @@ export class RolloutStore {
         if (item.type !== "response_item") continue;
         const outcome = validator.push(item.payload);
         if (outcome !== undefined) {
-          throw new ToolPairHistoryBlockedError("live projection rebuild", outcome);
+          throw new ToolPairHistoryBlockedError(
+            "live projection rebuild",
+            outcome,
+          );
         }
       }
       const outcome = validator.finish({
@@ -2962,7 +3412,10 @@ export class RolloutStore {
         persistSuccess: false,
       });
       if (outcome.status === "invalid" || outcome.status === "deferred") {
-        throw new ToolPairHistoryBlockedError("live projection rebuild", outcome);
+        throw new ToolPairHistoryBlockedError(
+          "live projection rebuild",
+          outcome,
+        );
       }
     });
     if (validator === undefined) {
@@ -3235,12 +3688,13 @@ export class RolloutStore {
       runId,
       epoch,
     )) {
-      if (binding.sourcePath === this.rolloutPath) continue;
+      const sourcePath = resolveCurrentBoundRolloutPath(binding.sourcePath);
+      if (sourcePath === this.rolloutPath) continue;
       const terminal = withPinnedOfflineRolloutLease(
         {
           projectDir,
           sessionId: binding.sessionId,
-          sourcePath: binding.sourcePath,
+          sourcePath,
         },
         (rollout) =>
           rolloutContentContainsTerminal(rollout.readUtf8(), runId, epoch),
@@ -3250,7 +3704,166 @@ export class RolloutStore {
     return false;
   }
 
-  private recoverEffectProjectionOnOpen(): void {
+  /**
+   * Re-enter a cleanly terminal canonical run under a new lifecycle epoch.
+   *
+   * The JSONL boundary is committed before the rebuildable SQLite epoch. If
+   * the process dies between those writes, the next explicit resume replays
+   * the same deterministic boundary into SQLite instead of appending a second
+   * one. Unknown-outcome effects remain a hard gate in `reopenRun`.
+   */
+  private reopenTerminalEpoch(runId: string, reopenedAt: string): void {
+    const current = this.runDurabilityRepo.currentEpoch(runId);
+    if (current === undefined) {
+      throw new Error(`cannot resume run ${runId}: lifecycle epoch is missing`);
+    }
+    const items = this.store.readAll();
+    const pendingReviews =
+      this.runDurabilityRepo.listPendingEffectReviews(runId);
+    if (pendingReviews.length > 0) {
+      throw new Error(
+        `cannot resume run ${runId}: ${pendingReviews.length} unknown-outcome effect(s) require review`,
+      );
+    }
+    const terminalEvent = canonicalTerminalEvent(items, runId, current.epoch);
+    // A retained non-terminal epoch is crash recovery, not a lifecycle retry.
+    // Recovery may continue it in-place after the same unknown-effect gate.
+    if (terminalEvent === undefined) return;
+    const terminal = terminalResultFromCanonicalEvent(terminalEvent);
+    this.runDurabilityRepo.recordTerminalResult({
+      epoch: current.epoch,
+      result: terminal,
+      eventId: canonicalRolloutEventId(terminalEvent),
+    });
+    if (
+      terminal.status === "cancelled" ||
+      terminal.status === "unknown_outcome"
+    ) {
+      throw new Error(
+        `cannot resume run ${runId}: ${terminal.status} terminal epoch ${current.epoch} cannot be reopened`,
+      );
+    }
+
+    const nextEpoch = current.epoch + 1;
+    const eventId = `run-reopened:${runId}:${nextEpoch}`;
+    const nextSequence =
+      items.reduce(
+        (maximum, item) =>
+          item.type === "event_msg" && isSequencedEvent(item.payload)
+            ? Math.max(maximum, item.payload.seq)
+            : maximum,
+        0,
+      ) + 1;
+    const reopenEvent: Event = {
+      eventId,
+      id: eventId,
+      seq: nextSequence,
+      msg: {
+        type: "run_reopened",
+        payload: {
+          runId,
+          previousEpoch: current.epoch,
+          epoch: nextEpoch,
+          reason: "user_session_continue",
+          reopenedAt,
+        },
+      },
+    };
+    if (!this.store.append(reopenEvent, { durable: true })) {
+      throw new Error(`failed to commit run reopen event ${eventId}`);
+    }
+    const reopened = this.runDurabilityRepo.reopenRun({
+      runId,
+      fromEpoch: current.epoch,
+      openedAt: reopenedAt,
+      eventId,
+      reason: "user_session_continue",
+    }).value;
+    this.openedAt = reopened.openedAt;
+    this.openedEpoch = reopened.epoch;
+  }
+
+  private resumeSuspendedEpoch(
+    runId: string,
+    canonicalState: "open" | "suspended" | "terminal",
+    canonicalSuspensionEventId: string | undefined,
+    resumedAt: string,
+  ): void {
+    if (canonicalState === "open") {
+      if (this.runDurabilityRepo.getActiveSuspension(runId) !== undefined) {
+        throw new Error(
+          `cannot resume run ${runId}: SQLite suspension is ahead of canonical lifecycle`,
+        );
+      }
+      return;
+    }
+    if (canonicalState !== "suspended") {
+      throw new Error(`cannot resume run ${runId}: canonical run is terminal`);
+    }
+    const suspension = this.runDurabilityRepo.getActiveSuspension(runId);
+    if (
+      suspension === undefined ||
+      suspension.epoch !== this.runEpoch ||
+      suspension.eventId !== canonicalSuspensionEventId
+    ) {
+      throw new Error(
+        `cannot resume run ${runId}: canonical suspension has no matching durable projection`,
+      );
+    }
+    const pendingEffects = this.runDurabilityRepo
+      .listEffects(runId)
+      .filter(
+        (effect) =>
+          effect.outcome === undefined || effect.reviewStatus === "pending",
+      );
+    if (pendingEffects.length > 0) {
+      throw new Error(
+        `cannot resume run ${runId}: ${pendingEffects.length} effect(s) remain unresolved`,
+      );
+    }
+    const items = this.store.readAll();
+    const nextSequence =
+      items.reduce(
+        (maximum, item) =>
+          item.type === "event_msg" && isSequencedEvent(item.payload)
+            ? Math.max(maximum, item.payload.seq)
+            : maximum,
+        0,
+      ) + 1;
+    const eventId = `run-resumed:${runId}:${this.runEpoch}:${suspension.eventId}`;
+    const event: Event = {
+      eventId,
+      id: eventId,
+      seq: nextSequence,
+      msg: {
+        type: "run_resumed",
+        payload: {
+          runId,
+          epoch: this.runEpoch,
+          suspensionEventId: suspension.eventId,
+          reason: this.suspendedResumeReason,
+          resumedAt,
+        },
+      },
+    };
+    if (!this.store.append(event, { durable: true })) {
+      throw new Error(`failed to commit run resume event ${eventId}`);
+    }
+    this.runDurabilityRepo.recordRunResumed({
+      runId,
+      epoch: this.runEpoch,
+      suspensionEventId: suspension.eventId,
+      eventId,
+      eventSequence: nextSequence,
+      reason: this.suspendedResumeReason,
+      resumedAt,
+    });
+  }
+
+  private recoverEffectProjectionOnOpen(
+    canonicalFinalEpoch: number,
+    initialOpenedAt: string,
+  ): void {
     this.retrySafeDeferredEffectSteps.clear();
     const events = this.store
       .readAll()
@@ -3261,8 +3874,202 @@ export class RolloutStore {
       .map((item) => item.payload)
       .filter(isSequencedEvent)
       .sort((left, right) => left.seq - right.seq);
-    const effectEvents = events.filter(isEffectLifecycleEvent);
-    for (const event of effectEvents) this.recordEffectEvent(event);
+    const effectEvents: EffectLifecycleEvent[] = [];
+    const effectBoundaryState = new Map<
+      string,
+      "retry_safe" | "unresolved" | "review_required"
+    >();
+    let projectionEpoch = 1;
+    let terminalStatus:
+      "completed" | "failed" | "cancelled" | "unknown_outcome" | undefined;
+    this.runDurabilityRepo.ensureInitialEpoch({
+      runId: this.sessionId,
+      openedAt: initialOpenedAt,
+    });
+    for (const event of events) {
+      if (
+        event.msg.type === "run_suspended" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        if (event.msg.payload.epoch !== projectionEpoch) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: suspension epoch is out of order`,
+          );
+        }
+        this.runDurabilityRepo.recordRunSuspended({
+          runId: this.sessionId,
+          epoch: projectionEpoch,
+          eventId: canonicalRolloutEventId(event),
+          eventSequence: event.seq,
+          reason: event.msg.payload.reason,
+          suspendedAt: event.msg.payload.suspendedAt,
+        });
+        continue;
+      }
+      if (
+        event.msg.type === "run_resumed" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        if (event.msg.payload.epoch !== projectionEpoch) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: resumed epoch is out of order`,
+          );
+        }
+        this.runDurabilityRepo.recordRunResumed({
+          runId: this.sessionId,
+          epoch: projectionEpoch,
+          suspensionEventId: event.msg.payload.suspensionEventId,
+          eventId: canonicalRolloutEventId(event),
+          eventSequence: event.seq,
+          reason: event.msg.payload.reason,
+          resumedAt: event.msg.payload.resumedAt,
+        });
+        continue;
+      }
+      if (
+        event.msg.type === "run_startup_activated" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        this.runDurabilityRepo.recordRunStartupActivated({
+          runId: this.sessionId,
+          epoch: event.msg.payload.epoch,
+          resumeEventId: event.msg.payload.resumeEventId,
+          eventId: canonicalRolloutEventId(event),
+          eventSequence: event.seq,
+          activatedAt: event.msg.payload.activatedAt,
+        });
+        continue;
+      }
+      if (
+        event.msg.type === "run_runtime_settings_changed" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        const payload = event.msg.payload;
+        this.runDurabilityRepo.recordRuntimeSettingsChanged({
+          runId: this.sessionId,
+          epoch: payload.epoch,
+          eventId: canonicalRolloutEventId(event),
+          eventSequence: event.seq,
+          previousSettingsEventId: payload.previousSettingsEventId,
+          rollbackOfSettingsEventId: payload.rollbackOfSettingsEventId,
+          reason: payload.reason,
+          changedAt: payload.changedAt,
+          settings: runtimeSettingsSnapshotFromEvent(payload),
+        });
+        continue;
+      }
+      if (
+        event.msg.type === "run_reopened" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        const payload = event.msg.payload;
+        if (
+          payload.previousEpoch !== projectionEpoch ||
+          payload.epoch !== projectionEpoch + 1 ||
+          terminalStatus === undefined
+        ) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: canonical reopen is out of order`,
+          );
+        }
+        if (
+          terminalStatus === "cancelled" ||
+          terminalStatus === "unknown_outcome"
+        ) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: ${terminalStatus} terminal epoch ${projectionEpoch} cannot be reopened`,
+          );
+        }
+        const blockedEffects = [...effectBoundaryState].filter(
+          ([, state]) => state !== "retry_safe",
+        );
+        if (blockedEffects.length > 0) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: canonical reopen at epoch ${projectionEpoch} precedes required effect review`,
+          );
+        }
+        const eventId = canonicalRolloutEventId(event);
+        const projected = this.runDurabilityRepo.getEpoch(
+          this.sessionId,
+          payload.epoch,
+        );
+        if (projected === undefined) {
+          this.runDurabilityRepo.reopenRun({
+            runId: this.sessionId,
+            fromEpoch: projectionEpoch,
+            openedAt: payload.reopenedAt,
+            eventId,
+            reason: payload.reason,
+          });
+        } else if (
+          projected.openedEventId !== eventId ||
+          projected.reopenedFromEpoch !== projectionEpoch ||
+          projected.openedAt !== payload.reopenedAt ||
+          projected.reopenReason !== payload.reason
+        ) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: SQLite epoch ${payload.epoch} conflicts with canonical reopen`,
+          );
+        }
+        projectionEpoch = payload.epoch;
+        terminalStatus = undefined;
+        continue;
+      }
+      if (
+        event.msg.type === "run_terminal" &&
+        event.msg.payload.runId === this.sessionId
+      ) {
+        if (event.msg.payload.epoch !== projectionEpoch) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: terminal epoch is out of order`,
+          );
+        }
+        terminalStatus = event.msg.payload.status;
+        this.runDurabilityRepo.recordTerminalResult({
+          epoch: projectionEpoch,
+          result: terminalResultFromCanonicalEvent(event),
+          eventId: canonicalRolloutEventId(event),
+        });
+        continue;
+      }
+      if (isEffectLifecycleEvent(event)) {
+        effectEvents.push(event);
+        this.recordEffectEvent(event, {
+          epoch: projectionEpoch,
+          canonicalReplay: true,
+        });
+        if (event.msg.type === "effect_intent") {
+          effectBoundaryState.set(
+            event.msg.payload.stepId,
+            event.msg.payload.recoveryCategory === "idempotent"
+              ? "retry_safe"
+              : "unresolved",
+          );
+        } else if (event.msg.type === "effect_result") {
+          effectBoundaryState.delete(event.msg.payload.stepId);
+        } else if (event.msg.type === "effect_unknown_outcome") {
+          effectBoundaryState.set(event.msg.payload.stepId, "review_required");
+        } else if (
+          typeof event.msg.payload.resolution !== "string" &&
+          event.msg.payload.resolution.workflowStatus !== "pending"
+        ) {
+          effectBoundaryState.delete(event.msg.payload.stepId);
+        }
+      }
+    }
+    if (projectionEpoch !== canonicalFinalEpoch) {
+      throw new Error(
+        `cannot resume run ${this.sessionId}: canonical lifecycle ended at epoch ${canonicalFinalEpoch} but ordered projection reached ${projectionEpoch}`,
+      );
+    }
+    const finalEpoch = this.runDurabilityRepo.currentEpoch(this.sessionId);
+    if (finalEpoch === undefined || finalEpoch.epoch !== canonicalFinalEpoch) {
+      throw new Error(
+        `cannot resume run ${this.sessionId}: SQLite lifecycle did not reach canonical epoch ${canonicalFinalEpoch}`,
+      );
+    }
+    this.openedAt = finalEpoch.openedAt;
+    this.openedEpoch = finalEpoch.epoch;
 
     // Artifact and effect recovery share one canonical sequence cursor. Each
     // recovery append must advance from the tail written by the previous
@@ -3639,6 +4446,62 @@ function isSequencedEvent(event: Event): event is SequencedEvent {
   );
 }
 
+function terminalResultFromCanonicalEvent(event: Event): RunTerminalResult {
+  if (!isSequencedEvent(event) || event.msg.type !== "run_terminal") {
+    throw new Error("run reopen requires a sequenced canonical terminal event");
+  }
+  const payload = event.msg.payload;
+  return {
+    runId: payload.runId,
+    status: payload.status,
+    exitCode: payload.exitCode,
+    stopReason: payload.stopReason,
+    finalMessage: payload.finalMessage,
+    usage: payload.usage,
+    lastSequence: event.seq,
+    finishedAt: payload.finishedAt,
+  };
+}
+
+function canonicalTerminalEvent(
+  items: readonly RolloutItem[],
+  runId: string,
+  epoch: number,
+): Event | undefined {
+  return items
+    .flatMap((item) =>
+      item.type === "event_msg" &&
+      item.payload.msg.type === "run_terminal" &&
+      item.payload.msg.payload.runId === runId &&
+      item.payload.msg.payload.epoch === epoch &&
+      isSequencedEvent(item.payload)
+        ? [item.payload]
+        : [],
+    )
+    .at(-1);
+}
+
+function runtimeSettingsSnapshotFromEvent(
+  payload: Extract<
+    EventMsg,
+    { readonly type: "run_runtime_settings_changed" }
+  >["payload"],
+): RunRuntimeSettingsSnapshot {
+  return {
+    permissionMode: payload.permissionMode,
+    prePlanMode: payload.prePlanMode,
+    autoModeActive: payload.autoModeActive,
+    bypassPermissionsWorkspace: payload.bypassPermissionsWorkspace,
+    model: payload.model,
+    provider: payload.provider,
+    profile: payload.profile,
+    reasoningEffort: payload.reasoningEffort,
+    modelVerbosity: payload.modelVerbosity,
+    serviceTier: payload.serviceTier,
+    hooksDisabled: payload.hooksDisabled,
+  };
+}
+
 function canonicalRolloutEventId(event: SequencedEvent | Event): string {
   if (typeof event.eventId === "string" && event.eventId.length > 0) {
     return event.eventId;
@@ -3701,10 +4564,16 @@ function runtimeMessageFromResponseItem(item: ResponseItem): RuntimeMessage {
   const message = responseItemToLlmMessage(item);
   return {
     role: message.role === "developer" ? "user" : message.role,
-    ...(message.role === "developer" ? { originalRole: "developer" as const } : {}),
+    ...(message.role === "developer"
+      ? { originalRole: "developer" as const }
+      : {}),
     content: message.content,
-    ...(message.toolCalls !== undefined ? { toolCalls: message.toolCalls } : {}),
-    ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
+    ...(message.toolCalls !== undefined
+      ? { toolCalls: message.toolCalls }
+      : {}),
+    ...(message.toolCallId !== undefined
+      ? { toolCallId: message.toolCallId }
+      : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
     ...(message.phase !== undefined ? { phase: message.phase } : {}),
     ...(item.id !== undefined ? { uuid: item.id } : {}),

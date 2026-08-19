@@ -91,6 +91,7 @@ export const AGENC_DAEMON_METHODS = [
   "health.ready",
   "health.stats",
   "daemon.reload",
+  "daemon.shutdown",
   "auth.login",
   "auth.whoami",
   "auth.logout",
@@ -588,6 +589,13 @@ export const AGENC_DAEMON_METHOD_SPECS = defineMethodSpecs({
     result: "object",
     description: "Reload daemon configuration in the running process.",
   },
+  "daemon.shutdown": {
+    method: "daemon.shutdown",
+    direction: "client-to-server",
+    params: "required",
+    result: "object",
+    description: "Request shutdown of one authenticated daemon instance.",
+  },
   "auth.login": {
     method: "auth.login",
     direction: "client-to-server",
@@ -1008,6 +1016,16 @@ export function isAgenCDaemonNotificationMethod(
 export interface AgentCreateParams extends JsonObject {
   readonly objective?: string;
   /**
+   * Explicitly continue this canonical rollout instead of creating a fresh
+   * run. The daemon reopens a terminal epoch only after durable recovery and
+   * unknown-outcome review gates pass.
+   */
+  readonly resumeSessionId?: string;
+  /** Exact absolute canonical rollout selected by the trusted CLI resolver. */
+  readonly resumeRolloutPath?: string;
+  /** Frozen resolver proof; the daemon independently revalidates every field. */
+  readonly resumeSourceProof?: AgentResumeSourceProof;
+  /**
    * Absolute workspace directory. Required (DAE-02): the daemon will not
    * invent a project root from its own process.cwd().
    */
@@ -1053,7 +1071,12 @@ export interface AgentCreateParams extends JsonObject {
    * dropped on the wire to the daemon.
    */
   readonly permissionMode?:
-    "default" | "plan" | "acceptEdits" | "bypassPermissions";
+    | "default"
+    | "plan"
+    | "acceptEdits"
+    | "bypassPermissions"
+    | "dontAsk"
+    | "auto";
   /**
    * Per-invocation environment overrides for the spawned agent. Used by
    * the TUI to propagate `OPENAI_BASE_URL` (and similar provider-config
@@ -1067,6 +1090,15 @@ export interface AgentCreateParams extends JsonObject {
    * leaking unrelated env into agent processes.
    */
   readonly envOverrides?: { readonly [key: string]: string };
+}
+
+export interface AgentResumeSourceProof extends JsonObject {
+  readonly dev: string;
+  readonly ino: string;
+  readonly size: string;
+  readonly sha256: string;
+  readonly cwdDev: string;
+  readonly cwdIno: string;
 }
 
 export interface EditorInteractionPositionParams extends JsonObject {
@@ -1100,6 +1132,15 @@ export interface DaemonProtocolInfo extends JsonObject {
   readonly version: string;
 }
 
+export interface DaemonInstanceIdentity extends JsonObject {
+  readonly pid: number;
+  readonly instanceId: string;
+  readonly processStart: string;
+  readonly runtimeVersion: string;
+  readonly commit: string;
+  readonly buildTime: string;
+}
+
 export interface InitializeParams extends JsonObject {
   /**
    * Compatibility flat version field. Accepted when `protocol` is omitted, and must
@@ -1118,6 +1159,10 @@ export interface InitializeParams extends JsonObject {
 export interface RequestCancelParams extends JsonObject {
   readonly requestId: RequestId;
   readonly reason?: string;
+}
+
+export interface DaemonShutdownParams extends JsonObject {
+  readonly instanceId: string;
 }
 
 export interface AgentListParams extends JsonObject {
@@ -2171,6 +2216,7 @@ export type AgenCDaemonRequest =
   | AgenCDaemonRequestWithoutParams<"health.ready">
   | AgenCDaemonRequestWithoutParams<"health.stats">
   | AgenCDaemonRequestWithoutParams<"daemon.reload">
+  | AgenCDaemonRequestWithParams<"daemon.shutdown", DaemonShutdownParams>
   | AgenCDaemonRequestWithoutParams<"auth.login">
   | AgenCDaemonRequestWithoutParams<"auth.whoami">
   | AgenCDaemonRequestWithoutParams<"auth.logout">;
@@ -2748,6 +2794,8 @@ export interface InitializeResult extends JsonObject {
    */
   readonly protocol: DaemonProtocolInfo;
   readonly capabilities: AgenCDaemonServerCapabilities;
+  /** Present on the real daemon and bound to this authenticated connection. */
+  readonly daemonIdentity?: DaemonInstanceIdentity;
 }
 
 export interface RequestCancelResult extends JsonObject {
@@ -3356,6 +3404,11 @@ export interface DaemonReloadResult extends JsonObject {
   readonly mcpServer: DaemonReloadMcpServerResult;
 }
 
+export interface DaemonShutdownResult extends JsonObject {
+  readonly shuttingDown: true;
+  readonly instanceId: string;
+}
+
 export interface AuthIdentity extends JsonObject {
   readonly accountId?: string;
   readonly email?: string;
@@ -3440,6 +3493,7 @@ export interface AgenCDaemonResultByMethod {
   readonly "health.ready": HealthReadyResult;
   readonly "health.stats": HealthStatsResult;
   readonly "daemon.reload": DaemonReloadResult;
+  readonly "daemon.shutdown": DaemonShutdownResult;
   readonly "auth.login": AuthLoginResult;
   readonly "auth.whoami": AuthWhoamiResult;
   readonly "auth.logout": AuthLogoutResult;

@@ -288,6 +288,7 @@ describe("AgenC daemon session lifecycle dispatcher", () => {
       "session.detach": false,
       "session.terminate": false,
       "daemon.reload": false,
+      "daemon.shutdown": false,
       "auth.login": false,
       "auth.whoami": false,
       "auth.logout": false,
@@ -322,6 +323,10 @@ describe("AgenC daemon session lifecycle dispatcher", () => {
           configReloadedAt: "2026-05-01T09:00:00.000Z",
           mcpServer: { status: "disabled" },
         }),
+        shutdown: (instanceId) => ({
+          shuttingDown: true,
+          instanceId,
+        }),
       },
       initializeAuthenticator: () => true,
       sessionManager: new AgenCDaemonSessionManager(),
@@ -342,10 +347,82 @@ describe("AgenC daemon session lifecycle dispatcher", () => {
       "session.detach": true,
       "session.terminate": true,
       "daemon.reload": true,
+      "daemon.shutdown": false,
       "auth.login": true,
       "auth.whoami": true,
       "auth.logout": true,
     });
+  });
+
+  it("binds authenticated shutdown to the initialized daemon instance", async () => {
+    const daemonIdentity = {
+      pid: 4242,
+      instanceId: "instance-4242",
+      processStart: "test-process:4242:start",
+      runtimeVersion: "0.16.1",
+      commit: "abc123",
+      buildTime: "2026-08-19T00:00:00.000Z",
+    } as const;
+    const shutdown = vi.fn((instanceId: string) => ({
+      shuttingDown: true as const,
+      instanceId,
+    }));
+    const dispatcher = new AgenCDaemonJsonRpcDispatcher({
+      agentManager: new AgenCDaemonAgentManager(),
+      daemonIdentity,
+      initializeAuthenticator: ({ authCookie }) => authCookie === "cookie",
+      daemonControl: {
+        reloadConfig: () => ({
+          reloaded: true,
+          configReloadedAt: "2026-08-19T00:00:00.000Z",
+          mcpServer: { status: "disabled" },
+        }),
+        shutdown,
+      },
+    });
+    const connection = dispatcher.createConnection();
+
+    await expect(
+      connection.dispatch(
+        request("init-instance", "initialize", {
+          protocol: { version: "1.2.0" },
+          authCookie: "cookie",
+        }),
+      ),
+    ).resolves.toMatchObject({
+      result: {
+        daemonIdentity,
+        capabilities: {
+          [AGENC_DAEMON_METHOD_CAPABILITIES_KEY]: {
+            "daemon.shutdown": true,
+          },
+        },
+      },
+    });
+    await expect(
+      connection.dispatch(
+        request("wrong-instance", "daemon.shutdown", {
+          instanceId: "different-instance",
+        }),
+      ),
+    ).resolves.toMatchObject({
+      error: { data: { code: "DAEMON_INSTANCE_IDENTITY_MISMATCH" } },
+    });
+    expect(shutdown).not.toHaveBeenCalled();
+
+    await expect(
+      connection.dispatch(
+        request("shutdown-instance", "daemon.shutdown", {
+          instanceId: daemonIdentity.instanceId,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      result: {
+        shuttingDown: true,
+        instanceId: daemonIdentity.instanceId,
+      },
+    });
+    expect(shutdown).toHaveBeenCalledOnce();
   });
 
   it("rejects normal requests over the in-flight limit while allowing request.cancel", async () => {

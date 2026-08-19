@@ -83,6 +83,7 @@ import type { StateSqliteDriver } from "./sqlite-driver.js";
 import { resolveDurableEffectReview } from "./effect-review.js";
 import { StateRunDurabilityRepository } from "./run-durability.js";
 import type { EffectReviewResolution } from "../contracts/run-contracts.js";
+import { readTrustedWindowsProcessCreationTime } from "../utils/windows-process-identity.js";
 
 export type {
   CsvAgentJobItemStatus,
@@ -1840,9 +1841,12 @@ const CSV_TERMINAL_OUTPUT_EVIDENCE_SET_MAX_BYTES = Math.floor(
   CSV_MAX_JOB_TOMBSTONE_BYTES / 4,
 );
 const MACOS_PROCESS_QUERY_EXECUTABLE = "/bin/ps";
-const WINDOWS_PROCESS_QUERY_EXECUTABLE = "powershell.exe";
 const MACOS_PROCESS_START_PREFIX = "darwin-lstart-seconds:";
-const WINDOWS_PROCESS_START_PREFIX = "win32-creation-time:";
+// Preserve the historical ISO-8601 representation as a distinct encoding.
+// Numeric .NET ticks are intentionally versioned so records written by old
+// runtimes can never be mistaken for a definitively different generation.
+const WINDOWS_PROCESS_START_LEGACY_PREFIX = "win32-creation-time:";
+const WINDOWS_PROCESS_START_TICKS_PREFIX = "win32-creation-time-ticks:";
 
 type CsvProcessStartInspector = (
   platform: NodeJS.Platform,
@@ -1951,19 +1955,10 @@ async function defaultProcessStartInspector(
       return output.length > 0 ? output : null;
     }
     if (platform === "win32") {
-      const script = [
-        `$process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pidText}' -ErrorAction Stop`,
-        "if ($null -eq $process) { exit 3 }",
-        "[Console]::Out.Write($process.CreationDate.ToUniversalTime().ToString('O'))",
-      ].join("; ");
-      const output = (
-        await execProcessIdentityQuery(
-          WINDOWS_PROCESS_QUERY_EXECUTABLE,
-          ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-          { signal, windowsHide: true },
-        )
-      ).trim();
-      return output.length > 0 ? output : null;
+      return await readTrustedWindowsProcessCreationTime(pid, {
+        signal,
+        timeoutMs: CSV_PROCESS_START_QUERY_TIMEOUT_MS,
+      });
     }
   } catch {
     if (signal?.aborted === true) throw signal.reason;
@@ -1991,7 +1986,7 @@ async function portableProcessObservation(
         platform === "darwin"
           ? `${MACOS_PROCESS_START_PREFIX}${processStart}`
           : platform === "win32"
-            ? `${WINDOWS_PROCESS_START_PREFIX}${processStart}`
+            ? `${WINDOWS_PROCESS_START_TICKS_PREFIX}${processStart}`
             : processStart,
     };
   }
@@ -2111,21 +2106,54 @@ function reserveRecoveryProcessProbe(budget: CsvRecoveryProbeBudget): boolean {
   return true;
 }
 
-function processStartTokensMatch(recorded: string, observed: string): boolean {
-  if (recorded === observed) return true;
+type CsvProcessStartComparison = "same" | "different" | "incomparable";
+
+function processStartTokensCompare(
+  recorded: string,
+  observed: string,
+): CsvProcessStartComparison {
+  if (recorded === observed) return "same";
   if (observed.startsWith(MACOS_PROCESS_START_PREFIX)) {
-    return recorded === observed.slice(MACOS_PROCESS_START_PREFIX.length);
+    return recorded === observed.slice(MACOS_PROCESS_START_PREFIX.length)
+      ? "same"
+      : "different";
   }
   if (recorded.startsWith(MACOS_PROCESS_START_PREFIX)) {
-    return observed === recorded.slice(MACOS_PROCESS_START_PREFIX.length);
+    return observed === recorded.slice(MACOS_PROCESS_START_PREFIX.length)
+      ? "same"
+      : "different";
   }
-  if (observed.startsWith(WINDOWS_PROCESS_START_PREFIX)) {
-    return recorded === observed.slice(WINDOWS_PROCESS_START_PREFIX.length);
+  const recordedWindowsLegacy = recorded.startsWith(
+    WINDOWS_PROCESS_START_LEGACY_PREFIX,
+  );
+  const observedWindowsLegacy = observed.startsWith(
+    WINDOWS_PROCESS_START_LEGACY_PREFIX,
+  );
+  const recordedWindowsTicks = recorded.startsWith(
+    WINDOWS_PROCESS_START_TICKS_PREFIX,
+  );
+  const observedWindowsTicks = observed.startsWith(
+    WINDOWS_PROCESS_START_TICKS_PREFIX,
+  );
+  if (
+    (recordedWindowsLegacy && observedWindowsTicks) ||
+    (recordedWindowsTicks && observedWindowsLegacy) ||
+    ((recordedWindowsLegacy || recordedWindowsTicks) &&
+      !observedWindowsLegacy &&
+      !observedWindowsTicks) ||
+    ((observedWindowsLegacy || observedWindowsTicks) &&
+      !recordedWindowsLegacy &&
+      !recordedWindowsTicks)
+  ) {
+    return "incomparable";
   }
-  if (recorded.startsWith(WINDOWS_PROCESS_START_PREFIX)) {
-    return observed === recorded.slice(WINDOWS_PROCESS_START_PREFIX.length);
+  if (
+    (recordedWindowsLegacy && observedWindowsLegacy) ||
+    (recordedWindowsTicks && observedWindowsTicks)
+  ) {
+    return "different";
   }
-  return false;
+  return "different";
 }
 
 function isCoarseProcessStartToken(token: string): boolean {
@@ -5260,10 +5288,7 @@ export class CsvAgentJobsRepository {
       throw new Error("CSV output orphan limit is outside its bounded page");
     }
     return this.driver
-      .prepareState<
-        [string, number],
-        CsvOutputOrphanReservationRow
-      >(
+      .prepareState<[string, number], CsvOutputOrphanReservationRow>(
         `SELECT intent_id
          FROM csv_output_orphans
          WHERE root_path = ? AND state = 'retained' AND cleanup_eligible = 1
@@ -5402,7 +5427,17 @@ export class CsvAgentJobsRepository {
         code: CSV_RECOVERY_DEFERRED_PROCESS_IDENTITY_UNPROVEN,
       };
     }
-    if (!processStartTokensMatch(owner.processStart, observed.processStart)) {
+    const processStartComparison = processStartTokensCompare(
+      owner.processStart,
+      observed.processStart,
+    );
+    if (processStartComparison === "incomparable") {
+      return {
+        kind: "deferred",
+        code: CSV_RECOVERY_DEFERRED_PROCESS_IDENTITY_UNPROVEN,
+      };
+    }
+    if (processStartComparison === "different") {
       return { kind: "proven_dead" };
     }
     if (

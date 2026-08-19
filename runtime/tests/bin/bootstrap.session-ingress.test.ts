@@ -223,6 +223,107 @@ describe("bootstrapLocalRuntimeSession session-ingress startup wiring", () => {
     }
   });
 
+  it("activates restored-session startup effects once, in order, before the first ordinary submit", async () => {
+    const providerMod = await import("../llm/provider.js");
+    vi.spyOn(providerMod, "createProvider").mockImplementation(
+      () =>
+        ({
+          name: "stub",
+          chat: async () => ({
+            content: "ok",
+            toolCalls: [],
+            usage: {
+              promptTokens: 1,
+              completionTokens: 1,
+              totalTokens: 2,
+            },
+          }),
+        }) as never,
+    );
+    const sequence: string[] = [];
+    const mcpStart = vi
+      .spyOn(Session.prototype, "startMcpManager")
+      .mockImplementation(async () => {
+        sequence.push("mcp");
+      });
+    const cronTasks = await import("../utils/cronTasks.js");
+    const modelFacingTools = await import("./model-facing-tools.js");
+    const readCronTasks = vi
+      .spyOn(cronTasks, "readCronTasks")
+      .mockImplementation(async () => {
+        sequence.push("cron-read");
+        return [{}] as never;
+      });
+    const startCron = vi
+      .spyOn(modelFacingTools, "startCronSchedulerRunner")
+      .mockImplementation(async () => {
+        sequence.push("cron-start");
+      });
+    const resumeJobs = vi
+      .spyOn(modelFacingTools, "resumeInterruptedAgentJobs")
+      .mockImplementation(async () => {
+        sequence.push("jobs-resume");
+        return 0;
+      });
+    const prewarm = vi
+      .spyOn(ConversationThreadManager.prototype, "runStartupPrewarm")
+      .mockImplementation(async () => {
+        sequence.push("prewarm");
+        return "ready";
+      });
+
+    let shutdown: (() => Promise<void>) | null = null;
+    try {
+      const boot = await bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        conversationId: "restored_deferred_startup_once",
+        deferSessionStartHooks: true,
+        deferAgentStartupSideEffects: true,
+        env: {
+          ...process.env,
+          AGENC_HOME: home,
+          AGENC_WORKSPACE: workspace,
+          HOME: home,
+        },
+      });
+      shutdown = boot.shutdown;
+      boot.session.installTurnDriverHooks({
+        submit: (async (message: string) => {
+          sequence.push(`turn:${message}`);
+        }) as never,
+      });
+
+      expect(sequence).toEqual([]);
+      await boot.session.submit("first");
+      expect(sequence).toEqual([
+        "mcp",
+        "cron-read",
+        "cron-start",
+        "jobs-resume",
+        "turn:first",
+      ]);
+
+      await boot.session.submit("second");
+      expect(sequence).toEqual([
+        "mcp",
+        "cron-read",
+        "cron-start",
+        "jobs-resume",
+        "turn:first",
+        "turn:second",
+      ]);
+      expect(mcpStart).toHaveBeenCalledOnce();
+      expect(readCronTasks).toHaveBeenCalledOnce();
+      expect(startCron).toHaveBeenCalledOnce();
+      expect(resumeJobs).toHaveBeenCalledOnce();
+      expect(prewarm).not.toHaveBeenCalled();
+    } finally {
+      await shutdown?.().catch(() => {
+        /* best effort */
+      });
+    }
+  });
+
   it("closes deferred startup admission synchronously through the bootstrap handle", async () => {
     const providerMod = await import("../llm/provider.js");
     vi.spyOn(providerMod, "createProvider").mockImplementation(

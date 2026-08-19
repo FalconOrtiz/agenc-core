@@ -33,8 +33,7 @@ const AGENC_DAEMON_SOCKET_MODE = 0o600;
 const AGENC_DAEMON_SOCKET_ACCEPT_AUTH_TIMEOUT_MS = 5000;
 
 const AGENC_WINDOWS_NAMED_PIPE_ROOT = "\\\\.\\pipe\\";
-const AGENC_DAEMON_WINDOWS_PIPE_PREFIX =
-  `${AGENC_WINDOWS_NAMED_PIPE_ROOT}agenc-daemon-`;
+const AGENC_DAEMON_WINDOWS_PIPE_PREFIX = `${AGENC_WINDOWS_NAMED_PIPE_ROOT}agenc-daemon-`;
 
 export function isAgenCWindowsNamedPipePath(endpoint: string): boolean {
   return endpoint.toLowerCase().startsWith(AGENC_WINDOWS_NAMED_PIPE_ROOT);
@@ -48,9 +47,7 @@ export function agenCDaemonLocalEndpoint(
     return join(daemonHome, "daemon.sock");
   }
   const canonicalHome = win32.resolve(daemonHome).toLowerCase();
-  const identity = createHash("sha256")
-    .update(canonicalHome)
-    .digest("hex");
+  const identity = createHash("sha256").update(canonicalHome).digest("hex");
   return `${AGENC_DAEMON_WINDOWS_PIPE_PREFIX}${identity}`;
 }
 
@@ -103,11 +100,23 @@ export interface AgenCUnixSocketServerOptions {
   ) => void | Promise<void>;
   readonly onError?: (error: Error, connectionId: number | null) => void;
   readonly onConnectionClosed?: (connectionId: number) => void;
+  /** @internal Deterministic close/unlink interposition contract-test seam. */
+  readonly beforeSocketPathRemoval?: () => Promise<void> | void;
 }
 
 interface ActiveConnection {
   readonly socket: Socket;
   readonly transport: AgenCStdioTransport;
+}
+
+interface AgenCUnixSocketPathIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly ctimeNs: bigint;
+}
+
+interface AgenCUnixSocketPathStat extends AgenCUnixSocketPathIdentity {
+  isSocket(): boolean;
 }
 
 export class AgenCUnixSocketServer {
@@ -116,6 +125,7 @@ export class AgenCUnixSocketServer {
   #server: Server | null = null;
   #privateSocketOwnerUid: number | null = null;
   #nativePeerCredentialBinding: AgenCNativePeerCredentialBinding | null = null;
+  #boundSocketIdentity: AgenCUnixSocketPathIdentity | null = null;
   #nextConnectionId = 1;
 
   constructor(options: AgenCUnixSocketServerOptions) {
@@ -222,14 +232,25 @@ export class AgenCUnixSocketServer {
     this.#privateSocketOwnerUid = namedPipe
       ? null
       : await resolveAgenCPrivateUnixSocketOwnerUid(socketPath);
+    if (!namedPipe) {
+      const socketInfo = await lstat(socketPath, { bigint: true });
+      if (!socketInfo.isSocket()) {
+        throw new Error(
+          `AgenC daemon socket path changed type after bind: ${socketPath}`,
+        );
+      }
+      this.#boundSocketIdentity = socketPathIdentity(socketInfo);
+    }
     return socketPath;
   }
 
   async close(): Promise<void> {
     const server = this.#server;
+    const boundSocketIdentity = this.#boundSocketIdentity;
     this.#server = null;
     this.#privateSocketOwnerUid = null;
     this.#nativePeerCredentialBinding = null;
+    this.#boundSocketIdentity = null;
 
     for (const { socket, transport } of this.#connections.values()) {
       socket.destroy();
@@ -249,8 +270,9 @@ export class AgenCUnixSocketServer {
       });
     }
 
-    if (process.platform !== "win32") {
-      await removeSocketPathIfPresent(this.socketPath);
+    if (process.platform !== "win32" && boundSocketIdentity !== null) {
+      await this.#options.beforeSocketPathRemoval?.();
+      await removeSocketPathIfIdentity(this.socketPath, boundSocketIdentity);
     }
   }
 
@@ -516,6 +538,42 @@ async function removeSocketPathIfPresent(socketPath: string): Promise<void> {
       throw error;
     }
   }
+}
+
+async function removeSocketPathIfIdentity(
+  socketPath: string,
+  expected: AgenCUnixSocketPathIdentity,
+): Promise<void> {
+  let current: AgenCUnixSocketPathStat;
+  try {
+    current = await lstat(socketPath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (
+    !current.isSocket() ||
+    current.dev !== expected.dev ||
+    current.ino !== expected.ino ||
+    current.ctimeNs !== expected.ctimeNs
+  ) {
+    return;
+  }
+  try {
+    await unlink(socketPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function socketPathIdentity(
+  value: AgenCUnixSocketPathStat,
+): AgenCUnixSocketPathIdentity {
+  return {
+    dev: value.dev,
+    ino: value.ino,
+    ctimeNs: value.ctimeNs,
+  };
 }
 
 function asNodeError(error: unknown): NodeJS.ErrnoException {

@@ -121,6 +121,219 @@ function beginSideEffect(stepId = "step-write", sequence = 1) {
 }
 
 describe("StateRunDurabilityRepository", () => {
+  it("records a single exact suspension and resumes it in the same epoch", () => {
+    runs.ensureInitialEpoch({ runId: "run-1", openedAt: T0 });
+    const suspended = runs.recordRunSuspended({
+      runId: "run-1",
+      epoch: 1,
+      eventId: "event-suspend-1",
+      eventSequence: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: T1,
+    });
+    expect(suspended).toMatchObject({
+      applied: true,
+      value: { epoch: 1, suspensionSequence: 1 },
+    });
+    expect(
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-1",
+        eventSequence: 1,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T1,
+      }).applied,
+    ).toBe(false);
+    expect(() =>
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-copy",
+        eventSequence: 2,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T1,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_SUSPENSION_CONFLICT" }),
+    );
+
+    const resumed = runs.recordRunResumed({
+      runId: "run-1",
+      epoch: 1,
+      suspensionEventId: "event-suspend-1",
+      eventId: "event-resume-1",
+      eventSequence: 2,
+      reason: "explicit_continue",
+      resumedAt: T2,
+    });
+    expect(resumed).toMatchObject({
+      applied: true,
+      value: {
+        epoch: 1,
+        resumeEventId: "event-resume-1",
+        resumeSequence: 2,
+      },
+    });
+    expect(runs.currentEpoch("run-1")?.epoch).toBe(1);
+    expect(runs.getActiveSuspension("run-1")).toBeUndefined();
+    expect(runs.listSuspensions("run-1")).toHaveLength(1);
+
+    expect(() =>
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-sequence-reuse",
+        eventSequence: 2,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T3,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_EVENT_SEQUENCE_CONFLICT" }),
+    );
+    expect(
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-2",
+        eventSequence: 3,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T3,
+      }).applied,
+    ).toBe(true);
+    expect(
+      runs.recordRunResumed({
+        runId: "run-1",
+        epoch: 1,
+        suspensionEventId: "event-suspend-2",
+        eventId: "event-resume-2",
+        eventSequence: 4,
+        reason: "daemon_startup_restore",
+        resumedAt: "2026-07-18T00:00:04.000Z",
+      }).applied,
+    ).toBe(true);
+    expect(runs.currentEpoch("run-1")?.epoch).toBe(1);
+    expect(runs.listSuspensions("run-1")).toHaveLength(2);
+  });
+
+  it("refuses suspension while an effect intent or review remains pending", () => {
+    runs.ensureInitialEpoch({ runId: "run-1", openedAt: T0 });
+    beginSideEffect("step-write", 1);
+    expect(() =>
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-blocked",
+        eventSequence: 2,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T1,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_SUSPENSION_EFFECT_PENDING" }),
+    );
+    runs.markEffectUnknown({
+      runId: "run-1",
+      stepId: "step-write",
+      eventId: "event-effect-unknown",
+      eventSequence: 2,
+      reason: "acknowledgement_lost",
+      observedAt: T1,
+    });
+    expect(() =>
+      runs.recordRunSuspended({
+        runId: "run-1",
+        epoch: 1,
+        eventId: "event-suspend-review",
+        eventSequence: 3,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T2,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_SUSPENSION_EFFECT_PENDING" }),
+    );
+  });
+
+  it("refuses executable lifecycle boundaries after durable cancellation locks", () => {
+    runs.ensureInitialEpoch({ runId: "run-admission-cancelled", openedAt: T0 });
+    driver
+      .prepareState(
+        `INSERT INTO execution_admission_cancellations (
+           run_id, reason, cancelled_at
+         ) VALUES (?, ?, ?)`,
+      )
+      .run("run-admission-cancelled", "operator", T1);
+    expect(() =>
+      runs.recordRunSuspended({
+        runId: "run-admission-cancelled",
+        epoch: 1,
+        eventId: "event-suspend-after-cancel",
+        eventSequence: 1,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T2,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_CANCELLATION_CONFLICT" }),
+    );
+
+    runs.ensureInitialEpoch({ runId: "run-status-cancelled", openedAt: T0 });
+    runs.recordRunSuspended({
+      runId: "run-status-cancelled",
+      epoch: 1,
+      eventId: "event-suspend-before-cancel",
+      eventSequence: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: T1,
+    });
+    driver
+      .prepareState(
+        `INSERT INTO agent_runs (
+           id, objective, status, started_at, last_active_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("run-status-cancelled", "cancelled", "cancelled", T0, T1);
+    expect(() =>
+      runs.recordRunResumed({
+        runId: "run-status-cancelled",
+        epoch: 1,
+        suspensionEventId: "event-suspend-before-cancel",
+        eventId: "event-resume-after-cancel",
+        eventSequence: 2,
+        reason: "explicit_continue",
+        resumedAt: T2,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_CANCELLATION_CONFLICT" }),
+    );
+
+    runs.ensureInitialEpoch({ runId: "run-reopen-cancelled", openedAt: T0 });
+    runs.recordTerminalResult({
+      epoch: 1,
+      result: terminal({
+        runId: "run-reopen-cancelled",
+        finishedAt: T1,
+      }),
+      eventId: "event-terminal-before-cancel-lock",
+    });
+    driver
+      .prepareState(
+        `INSERT INTO execution_admission_cancellations (
+           run_id, reason, cancelled_at
+         ) VALUES (?, ?, ?)`,
+      )
+      .run("run-reopen-cancelled", "operator", T2);
+    expect(() =>
+      runs.reopenRun({
+        runId: "run-reopen-cancelled",
+        fromEpoch: 1,
+        openedAt: T3,
+        eventId: "event-reopen-after-cancel",
+        reason: "retry",
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "RUN_CANCELLATION_CONFLICT" }),
+    );
+  });
+
   it("keeps terminal results sticky and retains them across explicit reopen epochs", () => {
     const initial = runs.ensureInitialEpoch({
       runId: "run-1",
