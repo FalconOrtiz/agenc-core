@@ -18,7 +18,8 @@
  * - **Read-only carve-outs inside writable roots** (`readOnlySubpaths`) and
  *   **protected metadata** monitoring: deny-inside-allow again; refused.
  * - **Managed proxy networking**: needs a network namespace; refused.
- * - **Inherited read-only cwd**: bound by descriptor under bwrap; refused.
+ * - **Inherited read-only cwd with writes**: the descriptor-bound read runner
+ *   is supported only after its effective profile has no writable roots.
  *
  * `mountProc` is deliberately NOT a refusal: under bubblewrap it mounts a
  * PRIVATE procfs as an environment convenience, and without namespaces the
@@ -119,13 +120,6 @@ export function planLandlockConfinement(input: LandlockPlanInput): LandlockPlan 
       reason: "managed proxy networking requires a network namespace",
     };
   }
-  if (input.inheritedCwd) {
-    return {
-      kind: "refused",
-      reason: "inherited read-only cwd requires descriptor binds",
-    };
-  }
-
   const policy = input.fileSystem;
   const cwd = input.sandboxPolicyCwd;
 
@@ -146,6 +140,12 @@ export function planLandlockConfinement(input: LandlockPlanInput): LandlockPlan 
   }
 
   const writableRoots = getWritableRootsWithCwd(policy, cwd);
+  if (input.inheritedCwd && writableRoots.length > 0) {
+    return {
+      kind: "refused",
+      reason: "inherited read-only cwd cannot retain writable filesystem roots",
+    };
+  }
   const protectedCreateTargets: string[] = [];
   for (const root of writableRoots) {
     // Landlock rulesets compose by union along the path hierarchy: a grant

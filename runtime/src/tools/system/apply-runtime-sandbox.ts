@@ -5,7 +5,15 @@
  */
 
 import { basename } from "node:path";
-import type { SandboxManager } from "../../sandbox/engine/index.js";
+import {
+  permissionProfileFromRuntimePermissions,
+  restrictedFileSystemPolicy,
+  type FileSystemSandboxEntry,
+  type FileSystemSandboxPolicy,
+  type PermissionProfile,
+  type SandboxManager,
+} from "../../sandbox/engine/index.js";
+import { effectivePermissionProfile } from "../../sandbox/engine/policy-transforms.js";
 import {
   readSandboxExecutionBroker,
   readSandboxExecutionSurface,
@@ -25,12 +33,7 @@ export interface SandboxSpawnCommand {
   readonly argv0?: string;
 }
 
-/**
- * If the tool runtime context requires platform isolation, transform
- * program/args through SandboxManager (landlock/bwrap/etc.). When isolation
- * is required but unavailable, throw — fail closed (TOOL-03 honesty).
- */
-export function applyRuntimeSandboxToSpawn(params: {
+interface ApplyRuntimeSandboxToSpawnParams {
   readonly toolArgs: Record<string, unknown>;
   readonly fallbackCwd: string;
   readonly program: string;
@@ -40,7 +43,35 @@ export function applyRuntimeSandboxToSpawn(params: {
   readonly cwdBinding?: "inherited_readonly";
   readonly sandboxManager?: SandboxManager;
   readonly surface?: SandboxExecutionSurface;
-}): SandboxSpawnCommand {
+}
+
+/**
+ * If the tool runtime context requires platform isolation, transform
+ * program/args through SandboxManager (landlock/bwrap/etc.). When isolation
+ * is required but unavailable, throw — fail closed (TOOL-03 honesty).
+ */
+export function applyRuntimeSandboxToSpawn(
+  params: ApplyRuntimeSandboxToSpawnParams,
+): SandboxSpawnCommand {
+  return applyRuntimeSandboxToSpawnWithCapabilities(params, "inherit");
+}
+
+/**
+ * Apply the authenticated session boundary to a subprocess that is itself
+ * strictly read-only. This is a narrowing transform: it never constructs a
+ * runtime identity, never expands the session's read scope, and never carries
+ * filesystem-write or network grants into the child.
+ */
+export function applyReadOnlyRuntimeSandboxToSpawn(
+  params: ApplyRuntimeSandboxToSpawnParams,
+): SandboxSpawnCommand {
+  return applyRuntimeSandboxToSpawnWithCapabilities(params, "read_only");
+}
+
+function applyRuntimeSandboxToSpawnWithCapabilities(
+  params: ApplyRuntimeSandboxToSpawnParams,
+  capabilities: "inherit" | "read_only",
+): SandboxSpawnCommand {
   const runtimeContext = readToolRuntimeContext(params.toolArgs);
   const surface = params.surface ??
     readSandboxExecutionSurface(params.toolArgs) ??
@@ -88,11 +119,89 @@ export function applyRuntimeSandboxToSpawn(params: {
     ...(params.cwdBinding !== undefined
       ? { cwdBinding: params.cwdBinding }
       : {}),
-    runtimeSandbox,
+    runtimeSandbox:
+      capabilities === "read_only"
+        ? narrowRuntimeSandboxToReadOnly(runtimeSandbox)
+        : runtimeSandbox,
     ...(params.sandboxManager !== undefined
       ? { sandboxManager: params.sandboxManager }
       : {}),
   });
+}
+
+function narrowRuntimeSandboxToReadOnly(
+  runtimeSandbox: UnifiedExecRuntimeSandbox,
+): UnifiedExecRuntimeSandbox {
+  const effectiveProfile = effectivePermissionProfile(
+    runtimeSandbox.permissionProfile,
+    runtimeSandbox.additionalPermissions,
+  );
+  // `external_sandbox` is already an out-of-process authority boundary. AgenC
+  // cannot replace or narrow that host-owned policy without silently changing
+  // who enforces it. Glob/Grep execute the pinned ripgrep binary with
+  // data-only arguments, so preserve the external boundary exactly; the
+  // managed profiles below are the ones whose write/network grants AgenC can
+  // and must remove.
+  if (effectiveProfile.fileSystem.kind === "external_sandbox") {
+    return runtimeSandbox;
+  }
+  const permissionProfile = narrowPermissionProfileToReadOnly(effectiveProfile);
+  const {
+    additionalPermissions: _additionalPermissions,
+    enforceManagedNetwork: _enforceManagedNetwork,
+    network: _network,
+    ...boundary
+  } = runtimeSandbox;
+  return {
+    ...boundary,
+    permissionProfile,
+  };
+}
+
+function narrowPermissionProfileToReadOnly(
+  profile: PermissionProfile,
+): PermissionProfile {
+  return permissionProfileFromRuntimePermissions(
+    narrowFileSystemPolicyToReadOnly(profile.fileSystem),
+    "disabled",
+    profile.enforcement,
+  );
+}
+
+function narrowFileSystemPolicyToReadOnly(
+  policy: FileSystemSandboxPolicy,
+): FileSystemSandboxPolicy {
+  switch (policy.kind) {
+    case "restricted":
+      return restrictedFileSystemPolicy(
+        policy.entries.map(readOnlyEntry),
+        {
+          ...(policy.globScanMaxDepth !== undefined
+            ? { globScanMaxDepth: policy.globScanMaxDepth }
+            : {}),
+          ...(policy.includePlatformDefaults !== undefined
+            ? { includePlatformDefaults: policy.includePlatformDefaults }
+            : {}),
+        },
+      );
+    case "unrestricted":
+      return restrictedFileSystemPolicy(
+        [
+          {
+            path: { kind: "special", value: { kind: "root" } },
+            access: "read",
+          },
+        ],
+        { includePlatformDefaults: true },
+      );
+    case "external_sandbox":
+      // Handled before this transform so the external authority remains exact.
+      return policy;
+  }
+}
+
+function readOnlyEntry(entry: FileSystemSandboxEntry): FileSystemSandboxEntry {
+  return entry.access === "write" ? { ...entry, access: "read" } : entry;
 }
 
 export function transformWithRuntimeSandbox(params: {
