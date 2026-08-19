@@ -76,23 +76,30 @@ type SessionSelection = {
 };
 
 export function readSessionSelection(session: Session): SessionSelection {
-  const peekStateForApply = (session as unknown as {
-    state?: { unsafePeek?: () => unknown };
-  }).state?.unsafePeek;
-  const rawState = (typeof peekStateForApply === "function"
-    ? (peekStateForApply.call((session as unknown as { state?: unknown }).state) as {
-        sessionConfiguration?: {
-          provider?: { slug?: string };
-          collaborationMode?: { model?: string };
-        };
-      })
-    : null);
-  const directConfig = (session as unknown as {
-    sessionConfiguration?: {
-      provider?: { slug?: string };
-      collaborationMode?: { model?: string };
-    };
-  }).sessionConfiguration;
+  const peekStateForApply = (
+    session as unknown as {
+      state?: { unsafePeek?: () => unknown };
+    }
+  ).state?.unsafePeek;
+  const rawState =
+    typeof peekStateForApply === "function"
+      ? (peekStateForApply.call(
+          (session as unknown as { state?: unknown }).state,
+        ) as {
+          sessionConfiguration?: {
+            provider?: { slug?: string };
+            collaborationMode?: { model?: string };
+          };
+        })
+      : null;
+  const directConfig = (
+    session as unknown as {
+      sessionConfiguration?: {
+        provider?: { slug?: string };
+        collaborationMode?: { model?: string };
+      };
+    }
+  ).sessionConfiguration;
   const sc = rawState?.sessionConfiguration ?? directConfig;
   return {
     provider: sc?.provider?.slug ?? "unknown",
@@ -110,18 +117,21 @@ export function checkModelHistoryCompat(
   // switch path doesn't crash with `Cannot read properties of undefined
   // (reading 'unsafePeek')`. The daemon-side turn loop performs its own
   // capability check before consuming the pending switch.
-  const peekState = (session as unknown as {
-    state?: { unsafePeek?: () => unknown };
-  }).state?.unsafePeek;
-  const snapshot = (typeof peekState === "function"
-    ? (peekState.call((session as unknown as { state?: unknown }).state) as {
-        history?: unknown[];
-        sessionConfiguration?: {
-          provider?: { slug?: string };
-          collaborationMode?: { reasoningEffort?: string };
-        };
-      })
-    : null);
+  const peekState = (
+    session as unknown as {
+      state?: { unsafePeek?: () => unknown };
+    }
+  ).state?.unsafePeek;
+  const snapshot =
+    typeof peekState === "function"
+      ? (peekState.call((session as unknown as { state?: unknown }).state) as {
+          history?: unknown[];
+          sessionConfiguration?: {
+            provider?: { slug?: string };
+            collaborationMode?: { reasoningEffort?: string };
+          };
+        })
+      : null;
   if (snapshot === null) {
     return { compatible: true };
   }
@@ -153,10 +163,18 @@ export async function applyModelSwitch(
   session: Session,
   targetModel: string,
   targetProvider?: string,
+  options: {
+    readonly beforeStage?: (selection: {
+      readonly provider: string;
+      readonly model: string;
+    }) => Promise<void> | void;
+  } = {},
 ): Promise<string> {
   const current = readSessionSelection(session);
   const normalizedTargetProvider =
-    targetProvider === undefined ? undefined : normalizeProviderName(targetProvider);
+    targetProvider === undefined
+      ? undefined
+      : normalizeProviderName(targetProvider);
   if (targetProvider !== undefined && normalizedTargetProvider === null) {
     return `Model switch to "${targetModel}" blocked: unknown provider "${targetProvider}"`;
   }
@@ -188,6 +206,10 @@ export async function applyModelSwitch(
       "`agenc config set model <name>`."
     );
   }
+  await options.beforeStage?.({
+    provider: switchProvider,
+    model: targetModel,
+  });
   // Use the typed mutator so the I-13 + I-57 staging site has a single
   // well-typed entry point.
   sessionShim.setPendingProviderSwitch({
@@ -198,9 +220,11 @@ export async function applyModelSwitch(
   // Peek the active-turn lock without taking it — safe for an immediate
   // command because we only branch on "is there a turn" and the session
   // mutex on `activeTurn` serializes actual clearing elsewhere.
-  const activeTurnPeek = (session as unknown as {
-    activeTurn?: { unsafePeek?: () => unknown };
-  }).activeTurn?.unsafePeek;
+  const activeTurnPeek = (
+    session as unknown as {
+      activeTurn?: { unsafePeek?: () => unknown };
+    }
+  ).activeTurn?.unsafePeek;
   const activeTurn =
     typeof activeTurnPeek === "function"
       ? activeTurnPeek.call(
@@ -237,7 +261,11 @@ function modelSwitchApplied(summary: string): boolean {
 function resolveCommandSelection(
   ctx: SlashCommandContext,
   target: string,
-): { readonly provider?: ProviderSlug; readonly model: string; readonly error?: string } {
+): {
+  readonly provider?: ProviderSlug;
+  readonly model: string;
+  readonly error?: string;
+} {
   const config = readCommandConfig(ctx);
   const currentProvider =
     normalizeProviderSlug(readSessionSelection(ctx.session).provider) ??
@@ -248,7 +276,11 @@ function resolveCommandSelection(
     const provider = normalizeProviderSlug(target.slice(0, explicitSeparator));
     if (provider !== undefined) {
       try {
-        const resolved = resolveDisambiguatedModelSelection({ slug: target, config, catalog });
+        const resolved = resolveDisambiguatedModelSelection({
+          slug: target,
+          config,
+          catalog,
+        });
         return {
           provider,
           model: resolved.model,
@@ -271,7 +303,11 @@ function resolveCommandSelection(
   }
 
   try {
-    const resolved = resolveDisambiguatedModelSelection({ slug: target, config, catalog });
+    const resolved = resolveDisambiguatedModelSelection({
+      slug: target,
+      config,
+      catalog,
+    });
     const provider = normalizeProviderSlug(resolved.provider);
     if (provider === undefined) return { model: resolved.model };
     if (currentProvider !== undefined && provider === currentProvider) {
@@ -395,7 +431,11 @@ export const modelCommand: SlashCommand = {
                 shouldClose: false,
               };
             }
-            const modelError = subscriptionManagedModelError(ctx, provider, model);
+            const modelError = subscriptionManagedModelError(
+              ctx,
+              provider,
+              model,
+            );
             if (modelError !== undefined) {
               return {
                 message: modelError,
@@ -424,7 +464,11 @@ export const modelCommand: SlashCommand = {
       if (selection.error !== undefined) {
         return { kind: "text", text: selection.error };
       }
-      const authError = modelSwitchAuthError(ctx, selection.provider, selection.model);
+      const authError = modelSwitchAuthError(
+        ctx,
+        selection.provider,
+        selection.model,
+      );
       if (authError !== undefined) {
         return { kind: "text", text: authError };
       }
@@ -447,7 +491,11 @@ export const modelCommand: SlashCommand = {
       // Cosmetic-only; the authoritative state still converges through the
       // turn loop.
       if (modelSwitchApplied(summary)) {
-        updateModelChrome(ctx, selection.model, selection.provider !== undefined);
+        updateModelChrome(
+          ctx,
+          selection.model,
+          selection.provider !== undefined,
+        );
       }
       return { kind: "text", text: summary };
     }),

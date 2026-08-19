@@ -152,6 +152,296 @@ describe("strict canonical journal contract", () => {
     );
   });
 
+  it("validates an exact same-epoch suspend/resume lifecycle", () => {
+    const suspended = validEvent(1, "run_suspended", {
+      runId: "run-1",
+      epoch: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: "2026-08-19T00:00:00.000Z",
+    });
+    expect(validateCanonicalJournalText(suspended)).toMatchObject({
+      activeEpoch: 1,
+      activeLifecycleState: "suspended",
+      activeSuspensionEventId: "event:1",
+    });
+
+    const resumed = validEvent(2, "run_resumed", {
+      runId: "run-1",
+      epoch: 1,
+      suspensionEventId: "event:1",
+      reason: "explicit_continue",
+      resumedAt: "2026-08-19T00:01:00.000Z",
+    });
+    expect(
+      validateCanonicalJournalText(`${suspended}${resumed}`),
+    ).toMatchObject({
+      activeEpoch: 1,
+      activeLifecycleState: "open",
+    });
+
+    const suspendedAgain = validEvent(3, "run_suspended", {
+      runId: "run-1",
+      epoch: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: "2026-08-19T00:02:00.000Z",
+    });
+    const resumedAgain = validEvent(4, "run_resumed", {
+      runId: "run-1",
+      epoch: 1,
+      suspensionEventId: "event:3",
+      reason: "daemon_startup_restore",
+      resumedAt: "2026-08-19T00:03:00.000Z",
+    });
+    expect(
+      validateCanonicalJournalText(
+        `${suspended}${resumed}${suspendedAgain}${resumedAgain}`,
+      ),
+    ).toMatchObject({
+      activeEpoch: 1,
+      activeLifecycleState: "open",
+    });
+  });
+
+  it("rejects mismatched, non-adjacent, and terminal suspension tails", () => {
+    const suspended = validEvent(1, "run_suspended", {
+      runId: "run-1",
+      epoch: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: "2026-08-19T00:00:00.000Z",
+    });
+    expect(() =>
+      validateCanonicalJournalText(
+        `${suspended}${validEvent(2, "run_resumed", {
+          runId: "run-1",
+          epoch: 1,
+          suspensionEventId: "another-event",
+          reason: "daemon_startup_restore",
+          resumedAt: "2026-08-19T00:01:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+    expect(() =>
+      validateCanonicalJournalText(
+        `${suspended}${validEvent(2, "turn_started", { turnId: "late" })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+    expect(() =>
+      validateCanonicalJournalText(
+        `${suspended}${validEvent(2, "run_terminal", {
+          runId: "run-1",
+          epoch: 1,
+          status: "cancelled",
+          exitCode: null,
+          stopReason: "late",
+          finalMessage: null,
+          usage: null,
+          lastSequenceBeforeTerminal: 1,
+          finishedAt: "2026-08-19T00:01:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+  });
+
+  it("rejects missing or malformed suspension lifecycle timestamps", () => {
+    for (const suspendedAt of [undefined, "", "not-a-timestamp"]) {
+      expect(() =>
+        validateCanonicalJournalText(
+          validEvent(1, "run_suspended", {
+            runId: "run-1",
+            epoch: 1,
+            reason: "daemon_shutdown_idle",
+            ...(suspendedAt !== undefined ? { suspendedAt } : {}),
+          }),
+        ),
+      ).toThrow(expect.objectContaining({ reasonCode: "schema_invalid" }));
+    }
+    const suspended = validEvent(1, "run_suspended", {
+      runId: "run-1",
+      epoch: 1,
+      reason: "daemon_shutdown_idle",
+      suspendedAt: "2026-08-19T00:00:00.000Z",
+    });
+    for (const resumedAt of [undefined, "", "not-a-timestamp"]) {
+      expect(() =>
+        validateCanonicalJournalText(
+          `${suspended}${validEvent(2, "run_resumed", {
+            runId: "run-1",
+            epoch: 1,
+            suspensionEventId: "event:1",
+            reason: "daemon_startup_restore",
+            ...(resumedAt !== undefined ? { resumedAt } : {}),
+          })}`,
+        ),
+      ).toThrow(expect.objectContaining({ reasonCode: "schema_invalid" }));
+    }
+  });
+
+  it("keeps a cancellation request sticky across every executable lifecycle boundary", () => {
+    const cancelled = validEvent(1, "run_cancel_requested", {
+      runId: "run-1",
+      epoch: 1,
+      reason: "operator",
+      requestedAt: "2026-08-19T00:00:00.000Z",
+    });
+    expect(validateCanonicalJournalText(cancelled)).toMatchObject({
+      activeEpoch: 1,
+      activeLifecycleState: "open",
+      activeCancellationRequestEventId: "event:1",
+    });
+
+    expect(() =>
+      validateCanonicalJournalText(
+        `${cancelled}${validEvent(2, "run_suspended", {
+          runId: "run-1",
+          epoch: 1,
+          reason: "daemon_shutdown_idle",
+          suspendedAt: "2026-08-19T00:01:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+    expect(() =>
+      validateCanonicalJournalText(
+        `${cancelled}${validEvent(2, "run_resumed", {
+          runId: "run-1",
+          epoch: 1,
+          suspensionEventId: "event:0",
+          reason: "explicit_continue",
+          resumedAt: "2026-08-19T00:01:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+    expect(() =>
+      validateCanonicalJournalText(
+        `${cancelled}${validEvent(2, "run_terminal", {
+          runId: "run-1",
+          epoch: 1,
+          status: "completed",
+          exitCode: 0,
+          stopReason: "end_turn",
+          finalMessage: "late success",
+          usage: null,
+          lastSequenceBeforeTerminal: 1,
+          finishedAt: "2026-08-19T00:01:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+
+    const terminal = validEvent(2, "run_terminal", {
+      runId: "run-1",
+      epoch: 1,
+      status: "cancelled",
+      exitCode: null,
+      stopReason: "operator",
+      finalMessage: null,
+      usage: null,
+      lastSequenceBeforeTerminal: 1,
+      finishedAt: "2026-08-19T00:01:00.000Z",
+    });
+    expect(
+      validateCanonicalJournalText(`${cancelled}${terminal}`),
+    ).toMatchObject({
+      activeLifecycleState: "terminal",
+      activeTerminalStatus: "cancelled",
+      activeCancellationRequestEventId: "event:1",
+    });
+    expect(() =>
+      validateCanonicalJournalText(
+        `${cancelled}${terminal}${validEvent(3, "run_reopened", {
+          runId: "run-1",
+          previousEpoch: 1,
+          epoch: 2,
+          reason: "retry",
+          reopenedAt: "2026-08-19T00:02:00.000Z",
+        })}`,
+      ),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+  });
+
+  it("rejects suspension until canonical effect uncertainty is reviewed", () => {
+    const intent = validEvent(1, "effect_intent", {
+      formatVersion: 2,
+      minimumReaderRuntime: "0.14.0",
+      runId: "run-1",
+      stepId: "step-1",
+      callId: "call-1",
+      toolName: "side-effecting-test",
+      recoveryCategory: "side-effecting",
+      intentDigest: "intent-digest",
+      attempt: 1,
+      recordedAt: "2026-08-19T00:00:00.000Z",
+    });
+    const suspend = (sequence: number) =>
+      validEvent(sequence, "run_suspended", {
+        runId: "run-1",
+        epoch: 1,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: "2026-08-19T00:03:00.000Z",
+      });
+    expect(() =>
+      validateCanonicalJournalText(`${intent}${suspend(2)}`),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+
+    const unknown = validEvent(2, "effect_unknown_outcome", {
+      formatVersion: 2,
+      minimumReaderRuntime: "0.14.0",
+      runId: "run-1",
+      stepId: "step-1",
+      callId: "call-1",
+      toolName: "side-effecting-test",
+      recoveryCategory: "side-effecting",
+      intentEventSeq: 1,
+      outcome: "unknown_outcome",
+      reason: "daemon_restart",
+      requiresReview: true,
+      recordedAt: "2026-08-19T00:01:00.000Z",
+    });
+    expect(() =>
+      validateCanonicalJournalText(`${intent}${unknown}${suspend(3)}`),
+    ).toThrow(
+      expect.objectContaining({ reasonCode: "terminal_binding_mismatch" }),
+    );
+
+    const reviewed = validEvent(3, "effect_review_resolved", {
+      runId: "run-1",
+      stepId: "step-1",
+      callId: "call-1",
+      resolution: {
+        version: 1,
+        kind: "effect_review_resolution",
+        disposition: "confirmed_no_effect",
+        actorKind: "operator",
+        actorId: "operator-1",
+        evidenceKind: "operator_evidence",
+        evidenceRef: "incident:effect-1",
+        evidenceSha256: "a".repeat(64),
+        reviewedAt: "2026-08-19T00:02:00.000Z",
+        workflowStatus: "resolved",
+        domainAction: "retry_new_attempt",
+      },
+    });
+    expect(
+      validateCanonicalJournalText(
+        `${intent}${unknown}${reviewed}${suspend(4)}`,
+      ),
+    ).toMatchObject({ activeLifecycleState: "suspended" });
+  });
+
   it("rejects invalid UTF-8 without replacement decoding", () => {
     const bytes = Buffer.concat([
       Buffer.from(
@@ -504,7 +794,11 @@ describe("strict canonical journal contract", () => {
   });
 
   it("keeps an exhaustive fail-closed schema for every known event discriminant", () => {
+    expect(KNOWN_EVENT_TYPES.size).toBe(82);
     expect(CANONICAL_EVENT_SCHEMA_TYPES).toEqual([...KNOWN_EVENT_TYPES].sort());
+    expect(CANONICAL_EVENT_SCHEMA_TYPES).toEqual(
+      expect.arrayContaining(["run_suspended", "run_resumed"]),
+    );
     const eventsWithoutRequiredFields = new Set([
       "context_compacted",
       "protocol_stake",

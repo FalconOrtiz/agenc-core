@@ -24,6 +24,7 @@ import {
 import { effectivePermissionProfile } from "./engine/policy-transforms.js";
 import {
   findSystemBubblewrapInPath,
+  probeSystemBubblewrapNamespaces,
   systemBubblewrapSupportsBindFd,
 } from "./linux-launcher/launcher.js";
 import { resolveRuntimePackageRootFromUrl } from "../app-server/daemon-runtime-info.js";
@@ -81,9 +82,8 @@ export interface SandboxExecutionStatus {
   readonly isolationProgram?: string;
   /**
    * Functional Landlock enforcement on this host (Linux only), from the
-   * vendored launcher's `--probe`. Report-only today: it names the
-   * confinement rung available when bubblewrap's user namespace is
-   * restricted, ahead of the execution path learning to use it.
+   * vendored launcher's `--probe`. The execution helper applies the same
+   * bubblewrap namespace probe and selects this fallback rung when needed.
    */
   readonly landlock?: "full" | "partial" | "unusable";
 }
@@ -575,32 +575,13 @@ function probeLinuxSandbox(options: {
       bwrap,
     );
   }
-  const probeEnvironment = sanitizeSandboxLauncherEnvironment(options.env);
-  const result = spawnSync(
+  const result = probeSystemBubblewrapNamespaces(
     bwrap,
-    [
-      "--die-with-parent",
-      "--unshare-user",
-      "--unshare-pid",
-      "--unshare-net",
-      "--ro-bind",
-      "/",
-      "/",
-      "--",
-      "/bin/true",
-    ],
-    {
-      cwd: options.cwd,
-      env: probeEnvironment,
-      encoding: "utf8",
-      timeout: 3_000,
-      stdio: ["ignore", "ignore", "pipe"],
-    },
+    options.env,
+    options.cwd,
   );
-  if (result.error !== undefined || result.status !== 0) {
-    const detail = boundedDiagnostic(
-      result.error?.message ?? result.stderr ?? `exit status ${String(result.status)}`,
-    );
+  if (!result.ok) {
+    const detail = boundedDiagnostic(result.diagnostic);
     return landlockFallback(
       `probe: bubblewrap could not create the required namespaces${detail ? ` (${detail})` : ""}`,
       linuxSandboxProbeRemediation(detail),

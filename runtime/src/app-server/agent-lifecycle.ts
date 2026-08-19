@@ -7,6 +7,27 @@
  * available for follow-up inspection.
  */
 
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
+import { randomUUID } from "node:crypto";
+import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
+
 import { AsyncLock } from "../utils/async-lock.js";
 import { openStateDatabases } from "../state/sqlite-driver.js";
 import {
@@ -24,9 +45,11 @@ import {
 } from "./workspace-cwd.js";
 import {
   AgenCBackgroundAgentMessageError,
+  AgenCBackgroundAgentSuspensionShutdownError,
   sessionTranscriptV2FromRollout,
   type AgenCBackgroundAgentMessageResult,
   type AgenCBackgroundAgentSnapshot,
+  type AgenCBackgroundAgentStartResult,
   type AgenCBackgroundAgentTerminalSnapshot,
   type AgenCBackgroundAgentRunner,
 } from "./background-agent-runner.js";
@@ -101,6 +124,26 @@ import type {
 } from "./protocol/index.js";
 import type { SessionEditorInteraction } from "../session/autonomous-mode.js";
 import {
+  getAgencHomeDir,
+  createResumeRolloutDescriptorLease,
+  hasSupportedFileIdentity,
+  isSafeSessionIdSegment,
+  resolveCanonicalSessionCwd,
+  type ResumeRolloutDescriptorLease,
+} from "../session/session-store.js";
+import {
+  ROLLOUT_SCHEMA_VERSION,
+  type SessionMetaLine,
+} from "../session/event-log.js";
+import { parseRolloutLine, type RolloutItem } from "../session/rollout-item.js";
+import { StrictCanonicalJournalValidator } from "../state/recovery-journal-contract.js";
+import {
+  DEFAULT_MAX_STARTUP_RECOVERY_MS,
+  MAX_RECOVERY_CANONICAL_EVENTS,
+  MAX_RECOVERY_CANONICAL_LINE_BYTES,
+  MAX_RECOVERY_CANONICAL_SOURCE_BYTES,
+} from "../state/recovery-contract.js";
+import {
   ABORT,
   APPROVED,
   APPROVED_FOR_SESSION,
@@ -135,7 +178,7 @@ import {
   threadSourceStringField,
 } from "../thread-store/thread-source.js";
 import type { Event } from "../session/event-log.js";
-import type { ResponseItem, RolloutItem } from "../session/rollout-item.js";
+import type { ResponseItem } from "../session/rollout-item.js";
 import type { AgenCStateAgentRunRecord } from "../state/agent-runs.js";
 import type { CancelAgentRunTreeReport } from "../state/run-cancellation.js";
 import type { CodePredictionSource } from "../services/code-prediction/types.js";
@@ -159,6 +202,25 @@ export class AgenCDaemonAgentLifecycleError extends Error {
     this.name = "AgenCDaemonAgentLifecycleError";
     this.code = code;
   }
+}
+
+export interface AgentLifecycleResumeSourceTestHooks {
+  readonly beforeSessionDirectoryClose?: (
+    sessionDir: string,
+    closeEarly: () => void,
+  ) => void;
+  /** Test-only closeSync failure seams after the real descriptors are closed. */
+  readonly afterResumeRolloutLeaseClose?: () => void;
+  readonly afterResumeCwdClose?: () => void;
+}
+
+let resumeSourceTestHooks: AgentLifecycleResumeSourceTestHooks = {};
+
+/** Install deterministic resume-source filesystem seams for contract tests. */
+export function __setAgentLifecycleResumeSourceTestHooksForTest(
+  hooks: AgentLifecycleResumeSourceTestHooks = {},
+): void {
+  resumeSourceTestHooks = hooks;
 }
 
 export interface AgenCDaemonAgentManagerOptions {
@@ -299,6 +361,8 @@ export interface AgenCDaemonAgentRestoreRecord {
   readonly metadata?: JsonObject;
   readonly sessionIds?: readonly string[];
   readonly runtimeAvailable?: boolean;
+  /** Internal generation token for startup publication rollback only. */
+  readonly restoreAttemptId?: string;
 }
 
 interface MutableAgent {
@@ -312,6 +376,7 @@ interface MutableAgent {
   cwd?: string;
   stateProjectDir?: string;
   metadata?: JsonObject;
+  restoreAttemptId?: string;
   sessionIds: string[];
   logSessionIds: string[];
   recovered?: boolean;
@@ -404,8 +469,10 @@ export class AgenCDaemonAgentManager {
   readonly #voidBudgetHoldsForAgents:
     ((agentIds: readonly string[]) => number | Promise<number>) | undefined;
   #shuttingDown = false;
+  #shutdownDisposition: "cancel" | "suspend_idle" = "cancel";
   #activeCreates = 0;
   readonly #createWaiters = new Set<() => void>();
+  readonly #pendingResumeCreates = new Set<string>();
   readonly #pendingRunnerTerminations = new Map<
     string,
     PendingRunnerTermination
@@ -443,6 +510,10 @@ export class AgenCDaemonAgentManager {
 
   async createAgent(params: AgentCreateParams): Promise<AgentCreateResult> {
     const finishCreate = this.#beginCreate();
+    let reservedResumeSessionId: string | undefined;
+    let resumeProof: ResumeSourceProof | undefined;
+    let primaryFailure: unknown;
+    let createFailed = false;
     if (this.#runner === undefined) {
       finishCreate();
       throw new AgenCDaemonAgentLifecycleError(
@@ -451,8 +522,102 @@ export class AgenCDaemonAgentManager {
       );
     }
     try {
-      const objective = normalizeObjective(params);
-      const createdAt = this.#now();
+      const resumeSessionId = normalizeNonEmpty(params.resumeSessionId);
+      const resumeRolloutPath = normalizeNonEmpty(params.resumeRolloutPath);
+      const resumeSourceProof = params.resumeSourceProof;
+      let retainedAgent: MutableAgent | undefined;
+      let retainedAgentPath: string | undefined;
+      if (
+        params.resumeSessionId !== undefined &&
+        resumeSessionId === undefined
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          "agent.create resumeSessionId must be non-empty",
+        );
+      }
+      if (
+        resumeSessionId !== undefined &&
+        !isSafeSessionIdSegment(resumeSessionId)
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          "agent.create resumeSessionId must be a safe single path segment",
+        );
+      }
+      if (
+        (resumeSessionId === undefined) !==
+        (resumeRolloutPath === undefined)
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          "agent.create resumeSessionId and resumeRolloutPath must be provided together",
+        );
+      }
+      if (
+        (resumeSessionId === undefined) !==
+        (resumeSourceProof === undefined)
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          "agent.create resumeSessionId and resumeSourceProof must be provided together",
+        );
+      }
+      if (
+        resumeSessionId !== undefined &&
+        (params.objective !== undefined ||
+          params.instructions !== undefined ||
+          params.initialContent !== undefined ||
+          params.deferInitialTurn !== undefined ||
+          params.initialDisplayUserMessage !== undefined ||
+          params.initialEditorInteraction !== undefined ||
+          params.metadata !== undefined ||
+          params.unattendedAllow !== undefined ||
+          params.unattendedDeny !== undefined)
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          "agent.create resumeSessionId cannot override objective, initial turn content, metadata, or unattended policy",
+        );
+      }
+      if (resumeSessionId !== undefined) {
+        if (this.#pendingResumeCreates.has(resumeSessionId)) {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} is already being resumed`,
+          );
+        }
+        this.#pendingResumeCreates.add(resumeSessionId);
+        reservedResumeSessionId = resumeSessionId;
+        const existing = await this.#state.with(
+          (state) =>
+            state.agents.get(resumeSessionId) ??
+            this.#listPersistedAgents(state).find(
+              (agent) => agent.agentId === resumeSessionId,
+            ),
+        );
+        retainedAgent = existing;
+        retainedAgentPath =
+          existing?.agentPath ??
+          metadataString(existing?.metadata, "agentPath");
+        if (retainedAgentPath !== undefined && retainedAgentPath !== "/root") {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} is a child agent and cannot be resumed as an interactive root`,
+          );
+        }
+        if (
+          existing !== undefined &&
+          isActiveAgent(existing) &&
+          !isRecoveredRuntimeUnavailable(existing) &&
+          !isStaleAgent(existing)
+        ) {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} already has a live daemon agent`,
+          );
+        }
+      }
       let cwd: string;
       try {
         cwd = requireAbsoluteWorkspaceCwd(params.cwd, "agent.create");
@@ -465,76 +630,269 @@ export class AgenCDaemonAgentManager {
         }
         throw error;
       }
+      if (resumeRolloutPath !== undefined && resumeSessionId !== undefined) {
+        resumeProof = assertAuthoritativeResumeSource({
+          sessionId: resumeSessionId,
+          rolloutPath: resumeRolloutPath,
+          cwd,
+          sourceProof: resumeSourceProof!,
+          allowLegacyRetainedRoot: retainedAgentPath === "/root",
+        });
+        if (
+          resumeProof.terminalStatus === "cancelled" ||
+          resumeProof.terminalStatus === "unknown_outcome"
+        ) {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} ended with ${resumeProof.terminalStatus} and cannot be resumed`,
+          );
+        }
+        assertCanonicalRuntimeSettingsProjection(
+          cwd,
+          resumeSessionId,
+          resumeProof,
+        );
+        if (
+          retainedAgent?.objective !== undefined &&
+          retainedAgent.objective !== resumeProof.objective
+        ) {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} retained objective disagrees with the rollout`,
+          );
+        }
+        if (
+          retainedAgent?.createdAt !== undefined &&
+          retainedAgent.createdAt !== resumeProof.createdAt
+        ) {
+          throw new AgenCDaemonAgentLifecycleError(
+            "INVALID_ARGUMENT",
+            `canonical session ${resumeSessionId} retained creation time disagrees with the rollout`,
+          );
+        }
+      }
+      const objective =
+        resumeSessionId === undefined
+          ? normalizeObjective(params)
+          : (resumeProof?.objective ??
+            (() => {
+              throw new AgenCDaemonAgentLifecycleError(
+                "INVALID_ARGUMENT",
+                `canonical session ${resumeSessionId} has no retained objective`,
+              );
+            })());
+      const createdAt =
+        resumeSessionId === undefined
+          ? (retainedAgent?.createdAt ?? this.#now())
+          : resumeProof!.createdAt;
+      const retainedMetadata = retainedAgent?.metadata;
+      const retainedModel = metadataString(retainedMetadata, "model");
+      const retainedProvider =
+        metadataString(retainedMetadata, "provider") ??
+        metadataString(retainedMetadata, "modelProvider");
+      const canonicalRuntimeSettings = resumeProof?.runtimeSettings;
+      if (
+        canonicalRuntimeSettings === undefined &&
+        resumeProof?.model !== undefined &&
+        retainedModel !== undefined &&
+        resumeProof.model !== retainedModel
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          `canonical session ${resumeSessionId} retained model disagrees with the rollout`,
+        );
+      }
+      if (
+        canonicalRuntimeSettings === undefined &&
+        resumeProof?.provider !== undefined &&
+        retainedProvider !== undefined &&
+        resumeProof.provider !== retainedProvider
+      ) {
+        throw new AgenCDaemonAgentLifecycleError(
+          "INVALID_ARGUMENT",
+          `canonical session ${resumeSessionId} retained provider disagrees with the rollout`,
+        );
+      }
+      const canonicalPermissionMode =
+        canonicalRuntimeSettings === undefined
+          ? resumeProof?.legacyPermissionMode
+          : interactivePermissionModeFromRuntimeSettings(
+              canonicalRuntimeSettings,
+              cwd,
+              resumeSessionId!,
+            );
+      const model =
+        params.model ??
+        canonicalRuntimeSettings?.model ??
+        resumeProof?.model ??
+        retainedModel;
+      const provider =
+        params.provider ??
+        canonicalRuntimeSettings?.provider ??
+        resumeProof?.provider ??
+        retainedProvider;
+      const profile =
+        params.profile ??
+        (canonicalRuntimeSettings === undefined
+          ? metadataString(retainedMetadata, "profile")
+          : (canonicalRuntimeSettings.profile ?? undefined));
+      const permissionMode =
+        params.permissionMode ??
+        canonicalPermissionMode ??
+        metadataUserPermissionMode(retainedMetadata);
       const unattendedAllow = normalizeStringList(
         params.unattendedAllow,
-        DEFAULT_UNATTENDED_ALLOWLIST,
+        metadataStringList(retainedMetadata, "unattendedAllow") ??
+          DEFAULT_UNATTENDED_ALLOWLIST,
       );
-      const unattendedDeny = normalizeStringList(params.unattendedDeny, []);
+      const unattendedDeny = normalizeStringList(
+        params.unattendedDeny,
+        metadataStringList(retainedMetadata, "unattendedDeny") ?? [],
+      );
       const metadata: JsonObject = {
-        ...(params.metadata ?? {}),
-        ...(params.model !== undefined ? { model: params.model } : {}),
-        ...(params.provider !== undefined ? { provider: params.provider } : {}),
-        ...(params.profile !== undefined ? { profile: params.profile } : {}),
+        ...(retainedMetadata ?? {}),
+        ...(resumeSessionId === undefined ? (params.metadata ?? {}) : {}),
+        ...(resumeSessionId !== undefined
+          ? {
+              resumedFromSessionId: resumeSessionId,
+              agentPath: resumeProof!.agentPath,
+            }
+          : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(provider !== undefined ? { provider } : {}),
+        ...(canonicalRuntimeSettings !== undefined
+          ? { profile: profile ?? null }
+          : profile !== undefined
+            ? { profile }
+            : {}),
+        ...(permissionMode !== undefined ? { permissionMode } : {}),
         unattendedAllow,
         unattendedDeny,
       };
-      const started = await this.#runner.startAgent({
-        objective,
-        cwd,
-        ...(params.model !== undefined ? { model: params.model } : {}),
-        ...(params.provider !== undefined ? { provider: params.provider } : {}),
-        ...(params.profile !== undefined ? { profile: params.profile } : {}),
-        ...(params.initialContent !== undefined
-          ? { initialContent: params.initialContent }
-          : {}),
-        ...(params.deferInitialTurn !== undefined
-          ? { deferInitialTurn: params.deferInitialTurn }
-          : {}),
-        ...(params.initialDisplayUserMessage !== undefined
-          ? {
-              initialDisplayUserMessage: params.initialDisplayUserMessage,
-            }
-          : {}),
-        ...(params.initialEditorInteraction !== undefined
-          ? {
-              initialEditorInteraction: params.initialEditorInteraction,
-            }
-          : {}),
-        metadata,
-        unattendedAllow,
-        unattendedDeny,
-        ...(params.permissionMode !== undefined
-          ? { permissionMode: params.permissionMode }
-          : {}),
-        ...(params.envOverrides !== undefined
-          ? { envOverrides: params.envOverrides }
-          : {}),
-      });
+      const resumeRestoreAttemptId =
+        resumeSessionId === undefined ? undefined : randomUUID();
+      const started =
+        resumeSessionId === undefined
+          ? await this.#runner.startAgent({
+              objective,
+              cwd,
+              ...(model !== undefined ? { model } : {}),
+              ...(provider !== undefined ? { provider } : {}),
+              ...(profile !== undefined ? { profile } : {}),
+              ...(params.initialContent !== undefined
+                ? { initialContent: params.initialContent }
+                : {}),
+              ...(params.deferInitialTurn !== undefined
+                ? { deferInitialTurn: params.deferInitialTurn }
+                : {}),
+              ...(params.initialDisplayUserMessage !== undefined
+                ? {
+                    initialDisplayUserMessage: params.initialDisplayUserMessage,
+                  }
+                : {}),
+              ...(params.initialEditorInteraction !== undefined
+                ? {
+                    initialEditorInteraction: params.initialEditorInteraction,
+                  }
+                : {}),
+              metadata,
+              unattendedAllow,
+              unattendedDeny,
+              ...(permissionMode !== undefined ? { permissionMode } : {}),
+              ...(params.envOverrides !== undefined
+                ? { envOverrides: params.envOverrides }
+                : {}),
+            })
+          : await this.#resumeTerminalAgent({
+              agentId: resumeSessionId,
+              resumeRolloutPath: resumeRolloutPath!,
+              resumeCwdIdentity: resumeProof!.cwdIdentity,
+              resumeRolloutLease: resumeProof!.rolloutLease,
+              resumeCwdFd: resumeProof!.cwdFd,
+              rolloutDev: resumeProof!.rolloutDev,
+              rolloutIno: resumeProof!.rolloutIno,
+              agentPath: resumeProof!.agentPath,
+              lifecycleState: resumeProof!.lifecycleState,
+              startupActivationPending: resumeProof!.startupActivationPending,
+              restoreAttemptId: resumeRestoreAttemptId!,
+              objective,
+              cwd,
+              createdAt,
+              metadata,
+              ...(model !== undefined ? { model } : {}),
+              ...(provider !== undefined ? { provider } : {}),
+              ...(profile !== undefined ? { profile } : {}),
+              ...(permissionMode !== undefined ? { permissionMode } : {}),
+              ...(canonicalRuntimeSettings !== undefined
+                ? { runtimeSettings: canonicalRuntimeSettings }
+                : {}),
+              ...(params.envOverrides !== undefined
+                ? { envOverrides: params.envOverrides }
+                : {}),
+            });
 
       if (this.#shuttingDown) {
-        await this.#runner.stopAgent?.(started.agentId, "daemon_shutdown");
+        if (
+          resumeSessionId !== undefined &&
+          this.#shutdownDisposition === "suspend_idle" &&
+          this.#runner.suspendIdleAgentForDaemonShutdown !== undefined
+        ) {
+          const disposition =
+            await this.#runner.suspendIdleAgentForDaemonShutdown(
+              started.agentId,
+            );
+          if (disposition.disposition !== "suspended") {
+            throw new AgenCDaemonAgentLifecycleError(
+              "INVALID_ARGUMENT",
+              "resumed canonical session could not be suspended during daemon shutdown",
+            );
+          }
+        } else {
+          await this.#runner.stopAgent?.(started.agentId, "daemon_shutdown");
+        }
         throw new AgenCDaemonAgentLifecycleError(
           "INVALID_ARGUMENT",
           "agent.start cancelled because the daemon is shutting down",
         );
       }
 
+      const agentMetadata: JsonObject = {
+        ...metadata,
+        ...(started.rolloutPath !== undefined
+          ? { canonicalRolloutPath: started.rolloutPath }
+          : {}),
+        ...(started.rolloutDev !== undefined
+          ? { canonicalRolloutDev: started.rolloutDev }
+          : {}),
+        ...(started.rolloutIno !== undefined
+          ? { canonicalRolloutIno: started.rolloutIno }
+          : {}),
+      };
+
       const agent: MutableAgent = {
         agentId: started.agentId,
         ...(started.agentPath !== undefined
           ? { agentPath: started.agentPath }
-          : {}),
+          : retainedAgent?.agentPath !== undefined
+            ? { agentPath: retainedAgent.agentPath }
+            : resumeProof?.agentPath !== undefined
+              ? { agentPath: resumeProof.agentPath }
+              : {}),
         objective,
         status: started.status,
         createdAt,
         startedAt: started.startedAt,
         lastActiveAt: started.startedAt,
-        sessionIds: [],
-        logSessionIds: [],
+        sessionIds: retainedAgent?.sessionIds.slice() ?? [],
+        logSessionIds: retainedAgent?.logSessionIds.slice() ?? [],
         cwd,
-        metadata,
+        metadata: agentMetadata,
+        ...(retainedAgent?.stateProjectDir !== undefined
+          ? { stateProjectDir: retainedAgent.stateProjectDir }
+          : {}),
       };
 
+      let createdLifecycleSessionId: string | undefined;
       try {
         if (this.#sessionManager !== undefined) {
           const session = await this.#sessionManager.createSession({
@@ -542,13 +900,15 @@ export class AgenCDaemonAgentManager {
             cwd,
             initialPrompt: objective,
             metadata: {
-              ...(params.metadata ?? {}),
+              ...agentMetadata,
               objective,
-              source: "agent.start",
+              source:
+                resumeSessionId === undefined ? "agent.start" : "agent.resume",
               unattendedAllow,
               unattendedDeny,
             },
           });
+          createdLifecycleSessionId = session.sessionId;
           agent.sessionIds.push(session.sessionId);
           agent.logSessionIds.push(session.sessionId);
           await this.#registerSnapshotSessionRoute(session.sessionId, agent);
@@ -600,23 +960,212 @@ export class AgenCDaemonAgentManager {
         return result;
       } catch (error) {
         this.#pendingRunnerTerminations.delete(agent.agentId);
-        await this.#runner.stopAgent?.(
-          agent.agentId,
-          "agent.create rollback after lifecycle failure",
-        );
+        const cleanupErrors: unknown[] = [];
+        if (resumeSessionId !== undefined) {
+          if (
+            resumeRestoreAttemptId === undefined ||
+            this.#runner.rollbackRestoredAgent === undefined
+          ) {
+            cleanupErrors.push(
+              new Error(
+                "background runner cannot safely roll back the unpublished restored generation",
+              ),
+            );
+          } else {
+            try {
+              await this.#runner.rollbackRestoredAgent(
+                agent.agentId,
+                resumeRestoreAttemptId,
+              );
+            } catch (cleanupError) {
+              cleanupErrors.push(cleanupError);
+            }
+          }
+        } else {
+          try {
+            await this.#runner.stopAgent?.(
+              agent.agentId,
+              "agent.create rollback after lifecycle failure",
+            );
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+        if (
+          createdLifecycleSessionId !== undefined &&
+          this.#sessionManager !== undefined
+        ) {
+          try {
+            await this.#sessionManager.terminateSession({
+              sessionId: createdLifecycleSessionId,
+              reason: "agent.create rollback after lifecycle failure",
+            });
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+        const rollbackStatus =
+          resumeSessionId === undefined
+            ? ("error" as const)
+            : ("stopped" as const);
         await this.#recordAgentStatusSnapshots(
-          agent.sessionIds,
+          createdLifecycleSessionId === undefined
+            ? []
+            : [createdLifecycleSessionId],
           agent.agentId,
-          "error",
+          rollbackStatus,
           this.#now(),
           "agent.create rollback after lifecycle failure",
           snapshotRouteForAgent(agent),
+          undefined,
+          resumeSessionId === undefined ? undefined : "stopped",
         );
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(
+            [error, ...cleanupErrors],
+            error instanceof Error
+              ? `${error.message}; restored agent cleanup also failed`
+              : "agent.create failed; restored agent cleanup also failed",
+          );
+        }
         throw error;
       }
+    } catch (error) {
+      createFailed = true;
+      primaryFailure = error;
+      throw error;
     } finally {
-      finishCreate();
+      const cleanupErrors: unknown[] = [];
+      try {
+        if (resumeProof !== undefined) {
+          try {
+            resumeProof.rolloutLease.closeUnclaimed();
+            resumeSourceTestHooks.afterResumeRolloutLeaseClose?.();
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+          try {
+            resumeProof.closeCwd();
+            resumeSourceTestHooks.afterResumeCwdClose?.();
+          } catch (error) {
+            cleanupErrors.push(error);
+          }
+        }
+      } finally {
+        try {
+          if (reservedResumeSessionId !== undefined) {
+            this.#pendingResumeCreates.delete(reservedResumeSessionId);
+          }
+        } finally {
+          finishCreate();
+        }
+      }
+      if (cleanupErrors.length > 0) {
+        if (createFailed) {
+          throw new AggregateError(
+            [primaryFailure, ...cleanupErrors],
+            primaryFailure instanceof Error
+              ? `${primaryFailure.message}; resume source cleanup also failed`
+              : "agent.create failed; resume source cleanup also failed",
+            { cause: primaryFailure },
+          );
+        }
+        throw new AggregateError(
+          cleanupErrors,
+          "agent.create resume source cleanup failed",
+        );
+      }
     }
+  }
+
+  async #resumeTerminalAgent(params: {
+    readonly agentId: string;
+    readonly resumeRolloutPath: string;
+    readonly resumeCwdIdentity: { readonly dev: string; readonly ino: string };
+    readonly resumeRolloutLease: ResumeRolloutDescriptorLease;
+    readonly resumeCwdFd: number;
+    readonly rolloutDev: string;
+    readonly rolloutIno: string;
+    readonly agentPath: "/root";
+    readonly lifecycleState: "open" | "suspended" | "terminal";
+    readonly startupActivationPending: boolean;
+    readonly restoreAttemptId: string;
+    readonly objective: string;
+    readonly cwd: string;
+    readonly createdAt: string;
+    readonly model?: string;
+    readonly provider?: string;
+    readonly profile?: string;
+    readonly permissionMode?:
+      | "default"
+      | "plan"
+      | "acceptEdits"
+      | "bypassPermissions"
+      | "dontAsk"
+      | "auto";
+    readonly runtimeSettings?: RunRuntimeSettingsSnapshot;
+    readonly envOverrides?: { readonly [key: string]: string };
+    readonly metadata: JsonObject;
+  }): Promise<AgenCBackgroundAgentStartResult> {
+    if (this.#runner?.restoreAgent === undefined) {
+      throw new AgenCDaemonAgentLifecycleError(
+        "BACKGROUND_RUNNER_UNAVAILABLE",
+        "agent resume requires a background runner with restore support",
+      );
+    }
+    const restored = await this.#runner.restoreAgent({
+      agentId: params.agentId,
+      objective: params.objective,
+      cwd: params.cwd,
+      startedAt: params.createdAt,
+      metadata: params.metadata,
+      explicitColdResume: true,
+      restoreAttemptId: params.restoreAttemptId,
+      ...(params.lifecycleState === "terminal"
+        ? { reopenTerminalRun: true }
+        : {}),
+      ...(params.lifecycleState === "suspended"
+        ? {
+            resumeSuspendedRun: true,
+            suspendedResumeReason: "explicit_continue" as const,
+          }
+        : {}),
+      ...(params.startupActivationPending
+        ? { resumeStartupActivationPending: true }
+        : {}),
+      resumeRolloutPath: params.resumeRolloutPath,
+      resumeRolloutLease: params.resumeRolloutLease,
+      resumeCwdIdentity: params.resumeCwdIdentity,
+      resumeCwdFd: params.resumeCwdFd,
+      ...(params.model !== undefined ? { model: params.model } : {}),
+      ...(params.provider !== undefined ? { provider: params.provider } : {}),
+      ...(params.profile !== undefined ? { profile: params.profile } : {}),
+      ...(params.permissionMode !== undefined
+        ? { permissionMode: params.permissionMode }
+        : {}),
+      ...(params.runtimeSettings !== undefined
+        ? { runtimeSettings: params.runtimeSettings }
+        : {}),
+      ...(params.envOverrides !== undefined
+        ? { envOverrides: params.envOverrides }
+        : {}),
+    });
+    if (!restored) {
+      throw new AgenCDaemonAgentLifecycleError(
+        "BACKGROUND_RUNNER_UNAVAILABLE",
+        `daemon could not resume canonical session ${params.agentId}`,
+      );
+    }
+    return {
+      agentId: params.agentId,
+      agentPath: params.agentPath,
+      startedAt: params.createdAt,
+      status: "running",
+      rolloutPath: params.resumeRolloutPath,
+      rolloutDev: params.rolloutDev,
+      rolloutIno: params.rolloutIno,
+      restoreAttemptId: params.restoreAttemptId,
+    };
   }
 
   async restoreAgent(
@@ -644,12 +1193,17 @@ export class AgenCDaemonAgentManager {
       logSessionIds: normalizeStringList(record.sessionIds, []),
       recovered: true,
       runtimeAvailable: record.runtimeAvailable === true,
+      ...(record.restoreAttemptId !== undefined
+        ? { restoreAttemptId: record.restoreAttemptId }
+        : {}),
     };
     if (record.cwd !== undefined) agent.cwd = record.cwd;
     if (record.stateProjectDir !== undefined) {
       agent.stateProjectDir = record.stateProjectDir;
     }
     if (record.metadata !== undefined) agent.metadata = record.metadata;
+    const restoredAgentPath = metadataString(record.metadata, "agentPath");
+    if (restoredAgentPath !== undefined) agent.agentPath = restoredAgentPath;
 
     let inserted: MutableAgent | undefined;
     const summary = await this.#state.with((state) => {
@@ -660,14 +1214,48 @@ export class AgenCDaemonAgentManager {
       return toAgentSummary(agent);
     });
     if (inserted?.runtimeAvailable === true) {
-      for (const sessionId of inserted.sessionIds) {
-        await this.#runner?.attachAgentSessionEvents?.(inserted.agentId, {
-          sessionId,
-          emit: (event) => this.#broadcastSessionEvent?.(sessionId, event),
-        });
+      try {
+        for (const sessionId of inserted.sessionIds) {
+          await this.#runner?.attachAgentSessionEvents?.(inserted.agentId, {
+            sessionId,
+            emit: (event) => this.#broadcastSessionEvent?.(sessionId, event),
+          });
+        }
+      } catch (error) {
+        // Preserve the token so the startup coordinator can remove only this
+        // unpublished generation after it rolls the runner back.
+        throw error;
       }
+      delete inserted.restoreAttemptId;
     }
     return summary;
+  }
+
+  /** Remove only the unpublished startup record bound to one restore attempt. */
+  async rollbackRestoredAgentRecord(
+    agentId: string,
+    expectedRestoreAttemptId: string,
+  ): Promise<void> {
+    if (expectedRestoreAttemptId.length === 0) {
+      throw new TypeError(
+        "restored agent record rollback requires an attempt id",
+      );
+    }
+    await this.#state.with((state) => {
+      const existing = state.agents.get(agentId);
+      if (existing === undefined) return;
+      if (
+        existing.recovered !== true ||
+        existing.runtimeAvailable !== true ||
+        existing.restoreAttemptId !== expectedRestoreAttemptId
+      ) {
+        throw new Error(
+          `restored agent record generation no longer owns ${agentId}`,
+        );
+      }
+      state.agents.delete(agentId);
+      this.#pendingRunnerTerminations.delete(agentId);
+    });
   }
 
   #beginCreate(): () => void {
@@ -1348,8 +1936,12 @@ export class AgenCDaemonAgentManager {
     await this.#terminateAgentSessions(target.sessionIds, "runner_terminated");
   }
 
-  async stopAll(reason = "daemon_shutdown"): Promise<number> {
+  async stopAll(
+    reason = "daemon_shutdown",
+    options: { readonly disposition?: "cancel" | "suspend_idle" } = {},
+  ): Promise<number> {
     this.#shuttingDown = true;
+    this.#shutdownDisposition = options.disposition ?? "cancel";
     await this.#waitForActiveCreates();
     const targets = await this.#state.with(async (state) => {
       await this.#refreshAgentsFromRunner(state);
@@ -1366,8 +1958,25 @@ export class AgenCDaemonAgentManager {
     let stopped = 0;
     for (const target of targets) {
       const stopRunner = this.#runner?.stopAgent?.bind(this.#runner);
+      const suspendRunner =
+        this.#runner?.suspendIdleAgentForDaemonShutdown?.bind(this.#runner);
       let stopFailed = false;
-      if (stopRunner !== undefined) {
+      let runStatus: "suspended" | undefined;
+      if (
+        options.disposition === "suspend_idle" &&
+        suspendRunner !== undefined
+      ) {
+        try {
+          const result = await suspendRunner(target.agentId);
+          if (result.disposition === "suspended") runStatus = "suspended";
+        } catch (error) {
+          if (error instanceof AgenCBackgroundAgentSuspensionShutdownError) {
+            runStatus = "suspended";
+          }
+          stopFailed = true;
+          failures.push({ agentId: target.agentId, error });
+        }
+      } else if (stopRunner !== undefined) {
         try {
           await stopRunner(target.agentId, reason);
         } catch (error) {
@@ -1395,6 +2004,8 @@ export class AgenCDaemonAgentManager {
         stoppedAt,
         reason,
         target.route,
+        undefined,
+        runStatus,
       );
       try {
         await this.#terminateAgentSessions(target.sessionIds, reason);
@@ -2698,6 +3309,7 @@ export class AgenCDaemonAgentManager {
     reason?: string,
     route: AgenCDaemonSnapshotRoute = {},
     metadataPatch?: JsonObject,
+    runStatus?: string,
   ): Promise<void> {
     if (this.#recordAgentStatusTransition === undefined) return;
     for (const sessionId of sessionIds) {
@@ -2707,6 +3319,7 @@ export class AgenCDaemonAgentManager {
           agentId,
           ...route,
           status,
+          ...(runStatus !== undefined ? { runStatus } : {}),
           transitionAt,
           ...(reason !== undefined ? { reason } : {}),
           ...(metadataPatch !== undefined ? { metadataPatch } : {}),
@@ -3144,6 +3757,790 @@ function normalizeNonEmpty(value: string | undefined): string | undefined {
   return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
 }
 
+function metadataString(
+  metadata: JsonObject | undefined,
+  key: string,
+): string | undefined {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.trim().length > 0
+    ? value
+    : undefined;
+}
+
+function metadataStringList(
+  metadata: JsonObject | undefined,
+  key: string,
+): readonly string[] | undefined {
+  const value = metadata?.[key];
+  return Array.isArray(value) && value.every((item) => typeof item === "string")
+    ? value
+    : undefined;
+}
+
+function metadataUserPermissionMode(
+  metadata: JsonObject | undefined,
+): AgentCreateParams["permissionMode"] {
+  const value = metadata?.permissionMode;
+  return value === "default" ||
+    value === "plan" ||
+    value === "acceptEdits" ||
+    value === "bypassPermissions" ||
+    value === "dontAsk" ||
+    value === "auto"
+    ? value
+    : undefined;
+}
+
+interface ResumeFileIdentity {
+  readonly dev: string;
+  readonly ino: string;
+}
+
+interface ResumeSourceProof {
+  readonly cwdIdentity: ResumeFileIdentity;
+  readonly cwdFd: number;
+  readonly closeCwd: () => void;
+  readonly rolloutLease: ResumeRolloutDescriptorLease;
+  readonly rolloutPath: string;
+  readonly rolloutDev: string;
+  readonly rolloutIno: string;
+  readonly createdAt: string;
+  readonly objective: string;
+  readonly agentPath: "/root";
+  readonly activeEpoch: number;
+  readonly lifecycleState: "open" | "suspended" | "terminal";
+  readonly startupActivationPending: boolean;
+  readonly terminalStatus?:
+    "completed" | "failed" | "cancelled" | "unknown_outcome";
+  readonly model?: string;
+  readonly provider?: string;
+  readonly runtimeSettings?: RunRuntimeSettingsSnapshot;
+  readonly runtimeSettingsEventId?: string;
+  readonly legacyPermissionMode?: "plan";
+}
+
+function interactivePermissionModeFromRuntimeSettings(
+  settings: RunRuntimeSettingsSnapshot,
+  cwd: string,
+  sessionId: string,
+): NonNullable<AgentCreateParams["permissionMode"]> {
+  const mode = settings.permissionMode;
+  if (mode === "unattended") {
+    throw new AgenCDaemonAgentLifecycleError(
+      "INVALID_ARGUMENT",
+      `canonical session ${sessionId} is unattended and cannot be resumed as an interactive root`,
+    );
+  }
+  const bypassTransitionCritical =
+    mode === "bypassPermissions" ||
+    (mode === "plan" && settings.prePlanMode === "bypassPermissions");
+  if (
+    (bypassTransitionCritical && settings.bypassPermissionsWorkspace !== cwd) ||
+    (!bypassTransitionCritical && settings.bypassPermissionsWorkspace !== null)
+  ) {
+    throw new AgenCDaemonAgentLifecycleError(
+      "INVALID_ARGUMENT",
+      `canonical session ${sessionId} has invalid bypass permission authority`,
+    );
+  }
+  return mode;
+}
+
+function assertCanonicalRuntimeSettingsProjection(
+  cwd: string,
+  runId: string,
+  proof: ResumeSourceProof,
+): void {
+  let driver: ReturnType<typeof openStateDatabases>;
+  try {
+    driver = openStateDatabases({ cwd });
+  } catch {
+    throw new AgenCDaemonAgentLifecycleError(
+      "INVALID_ARGUMENT",
+      `canonical session ${runId} runtime settings projection is unavailable`,
+    );
+  }
+  let projected: ReturnType<
+    StateRunDurabilityRepository["getCurrentRuntimeSettings"]
+  >;
+  let primaryError: unknown;
+  try {
+    projected = new StateRunDurabilityRepository(
+      driver,
+    ).getCurrentRuntimeSettings(runId);
+  } catch (error) {
+    primaryError = error;
+    projected = undefined;
+  }
+  try {
+    driver.close();
+  } catch (error) {
+    primaryError ??= error;
+  }
+  if (primaryError !== undefined) {
+    throw new AgenCDaemonAgentLifecycleError(
+      "INVALID_ARGUMENT",
+      `canonical session ${runId} runtime settings projection could not be verified`,
+    );
+  }
+  if (projected === undefined) {
+    // SQLite is rebuildable. A missing row may lag canonical journal evidence;
+    // RolloutStore's ordered replay will reconstruct it under the writer lease.
+    return;
+  }
+  if (
+    proof.runtimeSettings === undefined ||
+    proof.runtimeSettingsEventId === undefined ||
+    projected.eventId !== proof.runtimeSettingsEventId ||
+    !runtimeSettingsSnapshotsEqual(projected, proof.runtimeSettings)
+  ) {
+    throw new AgenCDaemonAgentLifecycleError(
+      "INVALID_ARGUMENT",
+      `canonical session ${runId} runtime settings projection is ahead of or disagrees with the rollout`,
+    );
+  }
+}
+
+function runtimeSettingsSnapshotsEqual(
+  left: RunRuntimeSettingsSnapshot,
+  right: RunRuntimeSettingsSnapshot,
+): boolean {
+  return (
+    left.permissionMode === right.permissionMode &&
+    left.prePlanMode === right.prePlanMode &&
+    left.autoModeActive === right.autoModeActive &&
+    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
+    left.model === right.model &&
+    left.provider === right.provider &&
+    left.profile === right.profile &&
+    left.reasoningEffort === right.reasoningEffort &&
+    left.modelVerbosity === right.modelVerbosity &&
+    left.serviceTier === right.serviceTier &&
+    left.hooksDisabled === right.hooksDisabled
+  );
+}
+
+const MAX_RESUME_ROLLOUT_FILES_PER_SESSION = 256;
+const MAX_RESUME_DIRECTORY_ENTRIES = 4_096;
+const MAX_RESUME_SOURCE_DISCOVERY_MS = DEFAULT_MAX_STARTUP_RECOVERY_MS;
+const MAX_RESUME_CANONICAL_SCAN_BYTES =
+  MAX_RECOVERY_CANONICAL_LINE_BYTES + 64 * 1024;
+const MAX_RESUME_CANONICAL_LINE_BYTES = MAX_RECOVERY_CANONICAL_LINE_BYTES;
+const MAX_RESUME_CANONICAL_LINES = 2_048;
+const MAX_RESUME_CANONICAL_VALIDATION_MS = DEFAULT_MAX_STARTUP_RECOVERY_MS;
+
+function assertAuthoritativeResumeSource(params: {
+  readonly sessionId: string;
+  readonly rolloutPath: string;
+  readonly cwd: string;
+  readonly sourceProof: NonNullable<AgentCreateParams["resumeSourceProof"]>;
+  readonly allowLegacyRetainedRoot: boolean;
+}): ResumeSourceProof {
+  const fail = (message: string): never => {
+    throw new AgenCDaemonAgentLifecycleError("INVALID_ARGUMENT", message);
+  };
+  if (
+    !isAbsolute(params.rolloutPath) ||
+    resolve(params.rolloutPath) !== params.rolloutPath
+  ) {
+    fail("agent.create resume rollout path must be absolute and normalized");
+  }
+  const projectsRoot = (() => {
+    try {
+      return realpathSync(resolve(getAgencHomeDir(), "projects"));
+    } catch {
+      return fail("agent.create daemon projects directory is unavailable");
+    }
+  })();
+  const contained = relative(projectsRoot, params.rolloutPath);
+  if (
+    contained.length === 0 ||
+    contained === ".." ||
+    contained.startsWith("../") ||
+    contained.startsWith("..\\") ||
+    isAbsolute(contained)
+  ) {
+    fail(
+      "agent.create resume rollout must be under daemon AGENC_HOME/projects",
+    );
+  }
+  const sessionDir = dirname(params.rolloutPath);
+  const projectDir = dirname(dirname(sessionDir));
+  if (
+    basename(sessionDir) !== params.sessionId ||
+    basename(dirname(sessionDir)) !== "sessions" ||
+    dirname(projectDir) !== projectsRoot ||
+    basename(projectDir).length === 0 ||
+    !basename(params.rolloutPath).startsWith("rollout-") ||
+    !basename(params.rolloutPath).endsWith(`-${params.sessionId}.jsonl`)
+  ) {
+    fail("agent.create resume rollout is not bound to its session id");
+  }
+  const discoveryDeadline = Date.now() + MAX_RESUME_SOURCE_DISCOVERY_MS;
+  const candidates = (() => {
+    let directory;
+    try {
+      directory = opendirSync(sessionDir);
+    } catch {
+      return fail("agent.create resume session directory is unavailable");
+    }
+    const discovered: Array<{
+      readonly path: string;
+      readonly mtimeNs: bigint;
+    }> = [];
+    let entryCount = 0;
+    let discoveryError: unknown;
+    try {
+      for (;;) {
+        if (Date.now() >= discoveryDeadline) {
+          return fail(
+            "agent.create resume source discovery exceeded its time budget",
+          );
+        }
+        const entry = directory.readSync();
+        if (entry === null) break;
+        entryCount += 1;
+        if (entryCount > MAX_RESUME_DIRECTORY_ENTRIES) {
+          return fail(
+            "agent.create resume source discovery exceeded its entry budget",
+          );
+        }
+        if (
+          entry.isFile() &&
+          entry.name.startsWith("rollout-") &&
+          entry.name.endsWith(".jsonl")
+        ) {
+          if (discovered.length >= MAX_RESUME_ROLLOUT_FILES_PER_SESSION) {
+            return fail(
+              "agent.create resume source discovery exceeded its file budget",
+            );
+          }
+          const candidatePath = join(sessionDir, entry.name);
+          let stats;
+          try {
+            stats = lstatSync(candidatePath, { bigint: true });
+          } catch {
+            return fail("agent.create resume source changed during discovery");
+          }
+          if (
+            stats.isFile() &&
+            !stats.isSymbolicLink() &&
+            stats.nlink === 1n &&
+            !hasSupportedFileIdentity(stats)
+          ) {
+            return fail(
+              "agent.create resume source filesystem identity is unsupported",
+            );
+          }
+          if (stats.isFile() && !stats.isSymbolicLink() && stats.nlink === 1n) {
+            discovered.push({ path: candidatePath, mtimeNs: stats.mtimeNs });
+          }
+        }
+      }
+    } catch (error) {
+      discoveryError = error;
+    }
+    let closeError: unknown;
+    try {
+      resumeSourceTestHooks.beforeSessionDirectoryClose?.(sessionDir, () =>
+        directory.closeSync(),
+      );
+    } catch (error) {
+      closeError = error;
+    }
+    try {
+      directory.closeSync();
+    } catch (error) {
+      closeError ??= error;
+    }
+    if (discoveryError !== undefined) {
+      throw discoveryError;
+    }
+    if (closeError !== undefined) {
+      return fail(
+        "agent.create resume session directory could not be closed safely",
+      );
+    }
+    return discovered;
+  })();
+  const normalCandidates = candidates.filter(
+    (candidate) => !basename(candidate.path).startsWith("rollout-recovery-"),
+  );
+  const eligibleCandidates =
+    normalCandidates.length > 0 ? normalCandidates : candidates;
+  const authoritative = eligibleCandidates.sort((left, right) =>
+    left.mtimeNs === right.mtimeNs
+      ? right.path.localeCompare(left.path)
+      : left.mtimeNs > right.mtimeNs
+        ? -1
+        : 1,
+  )[0]?.path;
+  if (authoritative !== params.rolloutPath) {
+    fail("agent.create resume rollout is not the authoritative session source");
+  }
+  const sourcePathStats = (() => {
+    try {
+      const stats = lstatSync(params.rolloutPath, { bigint: true });
+      if (!hasSupportedFileIdentity(stats)) {
+        fail("agent.create resume source filesystem identity is unsupported");
+      }
+      if (
+        !stats.isFile() ||
+        stats.isSymbolicLink() ||
+        stats.nlink !== 1n ||
+        realpathSync(params.rolloutPath) !== params.rolloutPath
+      ) {
+        fail("agent.create resume rollout must be a regular non-symlink file");
+      }
+      return stats;
+    } catch (error) {
+      if (error instanceof AgenCDaemonAgentLifecycleError) throw error;
+      return fail("agent.create resume rollout is unavailable");
+    }
+  })();
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  const sourceFd = (() => {
+    try {
+      return openSync(
+        params.rolloutPath,
+        fsConstants.O_RDWR | fsConstants.O_APPEND | noFollow,
+      );
+    } catch {
+      return fail("agent.create resume rollout could not be opened safely");
+    }
+  })();
+  let cwdProof: ReturnType<typeof proveCanonicalResumeCwd> | undefined;
+  try {
+    const opened = fstatSync(sourceFd, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== sourcePathStats.dev ||
+      opened.ino !== sourcePathStats.ino ||
+      opened.size !== sourcePathStats.size
+    ) {
+      fail("agent.create resume rollout changed while being opened");
+    }
+    const canonical = readCanonicalResumeSource(
+      sourceFd,
+      params.sessionId,
+      fail,
+    );
+    const reopened = fstatSync(sourceFd, { bigint: true });
+    const observed = lstatSync(params.rolloutPath, { bigint: true });
+    if (
+      reopened.dev !== opened.dev ||
+      reopened.ino !== opened.ino ||
+      reopened.size !== opened.size ||
+      observed.dev !== opened.dev ||
+      observed.ino !== opened.ino ||
+      observed.size !== opened.size ||
+      observed.nlink !== 1n ||
+      !observed.isFile() ||
+      observed.isSymbolicLink()
+    ) {
+      fail("agent.create resume rollout changed during validation");
+    }
+    if (
+      sourcePathStats.dev.toString(10) !== params.sourceProof.dev ||
+      sourcePathStats.ino.toString(10) !== params.sourceProof.ino ||
+      sourcePathStats.size.toString(10) !== params.sourceProof.size ||
+      canonical.sourceSha256 !== params.sourceProof.sha256
+    ) {
+      fail(
+        "agent.create resume rollout no longer matches the trusted source proof",
+      );
+    }
+    const meta = canonical.meta;
+    if (canonical.cancellationRequestEventId !== undefined) {
+      fail(
+        "agent.create resume canonical run has a pending cancellation request",
+      );
+    }
+    const metadataCwd = resolveCanonicalSessionCwd(meta.cwd);
+    if (metadataCwd.kind === "identity_unsupported") {
+      fail("agent.create resume cwd filesystem identity is unsupported");
+    }
+    if (
+      meta.sessionId !== params.sessionId ||
+      metadataCwd.kind !== "ok" ||
+      metadataCwd.cwd !== params.cwd ||
+      metadataCwd.dev.toString(10) !== params.sourceProof.cwdDev ||
+      metadataCwd.ino.toString(10) !== params.sourceProof.cwdIno
+    ) {
+      fail(
+        "agent.create resume rollout metadata does not match session id and cwd",
+      );
+    }
+    const explicitlyTopLevel =
+      meta.originator === "agenc-cli" && meta.source === "interactive-root";
+    const retainedLegacyTopLevel =
+      meta.originator === "agenc-cli" &&
+      meta.source === undefined &&
+      params.allowLegacyRetainedRoot;
+    if (!explicitlyTopLevel && !retainedLegacyTopLevel) {
+      fail(
+        "agent.create resume rollout is not a top-level interactive session",
+      );
+    }
+    cwdProof = proveCanonicalResumeCwd(params.cwd, fail);
+    if (
+      cwdProof.identity.dev !== params.sourceProof.cwdDev ||
+      cwdProof.identity.ino !== params.sourceProof.cwdIno
+    ) {
+      fail(
+        "agent.create resume cwd no longer matches the trusted source proof",
+      );
+    }
+    const rolloutLease = createResumeRolloutDescriptorLease(
+      params.rolloutPath,
+      sourceFd,
+    );
+    return {
+      cwdIdentity: cwdProof.identity,
+      cwdFd: cwdProof.fd,
+      closeCwd: cwdProof.close,
+      rolloutLease,
+      rolloutPath: params.rolloutPath,
+      rolloutDev: params.sourceProof.dev,
+      rolloutIno: params.sourceProof.ino,
+      createdAt: meta.timestamp,
+      objective: canonical.objective,
+      agentPath: "/root",
+      activeEpoch: canonical.activeEpoch,
+      lifecycleState: canonical.lifecycleState,
+      startupActivationPending:
+        canonical.startupActivationResumeEventId !== undefined,
+      ...(canonical.terminalStatus !== undefined
+        ? { terminalStatus: canonical.terminalStatus }
+        : {}),
+      ...(meta.model !== undefined ? { model: meta.model } : {}),
+      ...(meta.modelProvider !== undefined
+        ? { provider: meta.modelProvider }
+        : {}),
+      ...(canonical.runtimeSettings !== undefined
+        ? {
+            runtimeSettings: canonical.runtimeSettings,
+            runtimeSettingsEventId: canonical.runtimeSettingsEventId!,
+          }
+        : {}),
+      ...(canonical.legacyPermissionMode !== undefined
+        ? { legacyPermissionMode: canonical.legacyPermissionMode }
+        : {}),
+    };
+  } catch (error) {
+    // Cleanup is unconditional, but a cleanup report must never replace the
+    // authoritative validation failure that caused this path.
+    try {
+      cwdProof?.close();
+    } catch {
+      /* preserve primary validation error */
+    }
+    try {
+      closeSync(sourceFd);
+    } catch {
+      /* preserve primary validation error */
+    }
+    throw error;
+  }
+}
+
+interface CanonicalResumeSource {
+  readonly meta: SessionMetaLine;
+  readonly objective: string;
+  readonly activeEpoch: number;
+  readonly lifecycleState: "open" | "suspended" | "terminal";
+  readonly sourceSha256: string;
+  readonly cancellationRequestEventId?: string;
+  readonly startupActivationResumeEventId?: string;
+  readonly runtimeSettings?: RunRuntimeSettingsSnapshot;
+  readonly runtimeSettingsEventId?: string;
+  readonly legacyPermissionMode?: "plan";
+  readonly terminalStatus?:
+    "completed" | "failed" | "cancelled" | "unknown_outcome";
+}
+
+function readCanonicalResumeSource(
+  fd: number,
+  expectedSessionId: string,
+  fail: (message: string) => never,
+): CanonicalResumeSource {
+  const chunk = Buffer.allocUnsafe(16 * 1024);
+  let pending = Buffer.alloc(0);
+  let position = 0;
+  let objectiveScanBytes = 0;
+  let lineCount = 0;
+  let meta: SessionMetaLine | undefined;
+  let objective: string | undefined;
+  const validationDeadline = Date.now() + MAX_RESUME_CANONICAL_VALIDATION_MS;
+  const validator = new StrictCanonicalJournalValidator({
+    expectedRunId: expectedSessionId,
+    retainRecords: false,
+    maxLineBytes: MAX_RECOVERY_CANONICAL_LINE_BYTES,
+    maxSourceBytes: MAX_RECOVERY_CANONICAL_SOURCE_BYTES,
+    maxEvents: MAX_RECOVERY_CANONICAL_EVENTS,
+    checkOperationalBudget: () => {
+      if (Date.now() >= validationDeadline) {
+        fail(
+          "agent.create resume canonical validation exceeded its time budget",
+        );
+      }
+    },
+  });
+  const inspectLine = (lineBytes: Buffer): string | undefined => {
+    lineCount += 1;
+    if (lineCount > MAX_RESUME_CANONICAL_LINES) {
+      return fail(
+        "agent.create resume canonical scan exceeded its line budget",
+      );
+    }
+    if (lineBytes.byteLength > MAX_RESUME_CANONICAL_LINE_BYTES) {
+      return fail("agent.create resume canonical row exceeded its byte budget");
+    }
+    const line = lineBytes.toString("utf8").trim();
+    if (line.length === 0) return undefined;
+    let item: RolloutItem | null;
+    try {
+      item = parseRolloutLine(line);
+    } catch {
+      return fail(
+        "agent.create resume canonical source contains malformed JSON",
+      );
+    }
+    if (item === null) return undefined;
+    if (meta === undefined) {
+      if (item.type !== "session_meta") {
+        return fail(
+          "agent.create resume canonical source has no initial metadata",
+        );
+      }
+      if (
+        !isValidResumeMeta(item.payload) ||
+        item.payload.rolloutSchemaVersion > ROLLOUT_SCHEMA_VERSION
+      ) {
+        return fail("agent.create resume canonical metadata is unsupported");
+      }
+      meta = item.payload;
+      return undefined;
+    }
+    return canonicalObjectiveFromItem(item);
+  };
+  for (;;) {
+    if (Date.now() >= validationDeadline) {
+      return fail(
+        "agent.create resume canonical validation exceeded its time budget",
+      );
+    }
+    const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, position);
+    if (bytesRead === 0) {
+      if (objective === undefined && pending.byteLength > 0) {
+        objective = inspectLine(pending);
+      }
+      if (objective === undefined || meta === undefined) {
+        return fail(
+          "agent.create resume rollout has no bounded canonical user objective",
+        );
+      }
+      let journal;
+      try {
+        journal = validator.finish();
+      } catch {
+        return fail(
+          "agent.create resume rollout failed strict canonical validation",
+        );
+      }
+      return {
+        meta,
+        objective,
+        activeEpoch: journal.activeEpoch,
+        lifecycleState: journal.activeLifecycleState,
+        sourceSha256: journal.sourceSha256,
+        ...(journal.activeCancellationRequestEventId !== undefined
+          ? {
+              cancellationRequestEventId:
+                journal.activeCancellationRequestEventId,
+            }
+          : {}),
+        ...(journal.activeTerminalStatus !== undefined
+          ? { terminalStatus: journal.activeTerminalStatus }
+          : {}),
+        ...(journal.activeStartupActivationResumeEventId !== undefined
+          ? {
+              startupActivationResumeEventId:
+                journal.activeStartupActivationResumeEventId,
+            }
+          : {}),
+        ...(journal.activeRuntimeSettings !== undefined
+          ? {
+              runtimeSettings: journal.activeRuntimeSettings,
+              runtimeSettingsEventId: journal.activeRuntimeSettingsEventId!,
+            }
+          : {}),
+        ...(journal.legacyPermissionMode !== undefined
+          ? { legacyPermissionMode: journal.legacyPermissionMode }
+          : {}),
+      };
+    }
+    position += bytesRead;
+    try {
+      validator.push(chunk.subarray(0, bytesRead));
+    } catch {
+      return fail(
+        "agent.create resume rollout failed strict canonical validation",
+      );
+    }
+    if (objective !== undefined) continue;
+    objectiveScanBytes += bytesRead;
+    if (objectiveScanBytes > MAX_RESUME_CANONICAL_SCAN_BYTES) {
+      return fail(
+        "agent.create resume canonical objective exceeded its scan budget",
+      );
+    }
+    pending = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+    for (;;) {
+      const newline = pending.indexOf(0x0a);
+      if (newline < 0) {
+        if (pending.byteLength > MAX_RESUME_CANONICAL_LINE_BYTES) {
+          return fail(
+            "agent.create resume canonical row exceeded its byte budget",
+          );
+        }
+        break;
+      }
+      const candidate = inspectLine(pending.subarray(0, newline));
+      pending = pending.subarray(newline + 1);
+      if (candidate !== undefined && meta !== undefined) {
+        objective = candidate;
+        pending = Buffer.alloc(0);
+        break;
+      }
+    }
+  }
+}
+
+function isValidResumeMeta(value: SessionMetaLine): boolean {
+  return (
+    typeof value.sessionId === "string" &&
+    value.sessionId.length > 0 &&
+    typeof value.timestamp === "string" &&
+    Number.isFinite(Date.parse(value.timestamp)) &&
+    typeof value.cwd === "string" &&
+    isAbsolute(value.cwd) &&
+    typeof value.originator === "string" &&
+    typeof value.agencVersion === "string" &&
+    Number.isSafeInteger(value.rolloutSchemaVersion) &&
+    value.rolloutSchemaVersion >= 0
+  );
+}
+
+function canonicalObjectiveFromItem(item: RolloutItem): string | undefined {
+  if (item.type === "response_item" && item.payload.role === "user") {
+    return canonicalUserText(item.payload.content);
+  }
+  if (item.type === "event_msg" && item.payload.msg.type === "user_message") {
+    return canonicalUserText(item.payload.msg.payload.message);
+  }
+  return undefined;
+}
+
+function canonicalUserText(
+  content: string | readonly unknown[],
+): string | undefined {
+  const text =
+    typeof content === "string"
+      ? content
+      : content
+          .flatMap((part) =>
+            typeof part === "object" &&
+            part !== null &&
+            "text" in part &&
+            typeof part.text === "string"
+              ? [part.text]
+              : [],
+          )
+          .join("\n");
+  const normalized = text.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function proveCanonicalResumeCwd(
+  cwd: string,
+  fail: (message: string) => never,
+): {
+  readonly identity: ResumeFileIdentity;
+  readonly fd: number;
+  readonly close: () => void;
+} {
+  const before = (() => {
+    try {
+      const stats = lstatSync(cwd, { bigint: true });
+      if (
+        !stats.isDirectory() ||
+        stats.isSymbolicLink() ||
+        !hasSupportedFileIdentity(stats) ||
+        realpathSync(cwd) !== cwd
+      ) {
+        fail(
+          "agent.create resume cwd must be a canonical non-symlink directory",
+        );
+      }
+      return stats;
+    } catch (error) {
+      if (error instanceof AgenCDaemonAgentLifecycleError) throw error;
+      return fail("agent.create resume cwd is unavailable");
+    }
+  })();
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  const directoryOnly =
+    "O_DIRECTORY" in fsConstants ? (fsConstants.O_DIRECTORY as number) : 0;
+  let fd: number;
+  try {
+    fd = openSync(cwd, fsConstants.O_RDONLY | noFollow | directoryOnly);
+  } catch {
+    return fail("agent.create resume cwd could not be opened safely");
+  }
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const after = lstatSync(cwd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      !after.isDirectory() ||
+      after.isSymbolicLink()
+    ) {
+      return fail("agent.create resume cwd changed during validation");
+    }
+    let openFd: number | undefined = fd;
+    return {
+      identity: {
+        dev: opened.dev.toString(10),
+        ino: opened.ino.toString(10),
+      },
+      fd,
+      close: () => {
+        if (openFd === undefined) return;
+        const closing = openFd;
+        openFd = undefined;
+        closeSync(closing);
+      },
+    };
+  } catch (error) {
+    try {
+      closeSync(fd);
+    } catch {
+      /* preserve primary cwd validation error */
+    }
+    throw error;
+  }
+}
+
 function normalizeRequiredAgentId(value: string, methodName: string): string {
   const normalized = normalizeNonEmpty(value);
   if (normalized === undefined) {
@@ -3312,6 +4709,7 @@ function compareNewestSessionFirst(
 function storedThreadToAgent(thread: StoredThread): MutableAgent | undefined {
   if (!isAgentThreadSource(thread.source)) return undefined;
   const agentId = agentIdForThread(thread);
+  const agentPath = threadSourceStringField(thread.source, "agentPath");
   const metadata: JsonObject = {
     source:
       thread.source === undefined
@@ -3324,6 +4722,7 @@ function storedThreadToAgent(thread: StoredThread): MutableAgent | undefined {
   };
   return {
     agentId,
+    ...(agentPath !== undefined ? { agentPath } : {}),
     objective:
       thread.name ??
       threadSourceStringField(thread.source, "objective") ??

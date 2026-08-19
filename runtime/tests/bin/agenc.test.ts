@@ -16,7 +16,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../../src/version.js";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { lstat, mkdtemp, rm, writeFile, mkdir, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -66,7 +66,12 @@ import {
 import type { Session } from "../session/session.js";
 import { PermissionModeRegistry } from "../permissions/permission-mode.js";
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
-import { trustProjectSync } from "../permissions/trust/project-trust.js";
+import {
+  isProjectTrustedSync,
+  trustProjectSync,
+} from "../permissions/trust/project-trust.js";
+import { getProjectDir } from "../session/session-store.js";
+import { classifyCLI } from "./route.js";
 
 function stubSession() {
   return {
@@ -119,6 +124,38 @@ function trustWorkspaceForTest(agencHome: string, workspace: string): void {
   });
 }
 
+async function writeResumeRolloutForTest(
+  cwd: string,
+  conversationId: string,
+): Promise<string> {
+  const sessionDir = join(getProjectDir(cwd), "sessions", conversationId);
+  const rolloutPath = join(
+    sessionDir,
+    `rollout-2026-08-19T00-00-00-000Z-${conversationId}.jsonl`,
+  );
+  await mkdir(sessionDir, { recursive: true });
+  await writeFile(
+    rolloutPath,
+    `${JSON.stringify({
+      type: "session_meta",
+      payload: {
+        sessionId: conversationId,
+        timestamp: "2026-08-19T00:00:00.000Z",
+        cwd,
+        originator: "agenc-cli",
+        source: "interactive-root",
+        agencVersion: VERSION,
+        rolloutSchemaVersion: 3,
+      },
+    })}\n${JSON.stringify({
+      type: "response_item",
+      payload: { role: "user", content: "retained prompt" },
+    })}\n`,
+    "utf8",
+  );
+  return rolloutPath;
+}
+
 async function waitForValue<T>(
   label: string,
   read: () => T | null | undefined,
@@ -154,6 +191,10 @@ function installDaemonCliDepsForTest(
       readonly emit: (event: unknown) => void;
     }) => void;
     readonly createConnectedTuiClientError?: Error;
+    readonly liveAgent?: boolean;
+    readonly liveAgentMetadata?: Readonly<Record<string, unknown>>;
+    readonly liveAgentPath?: string;
+    readonly resumePromptAgentError?: Error;
     readonly requestErrors?: Partial<Record<string, Error | readonly Error[]>>;
     readonly mcpManager?: unknown;
   } = {},
@@ -170,6 +211,7 @@ function installDaemonCliDepsForTest(
     close: ReturnType<typeof vi.fn>;
   };
   readonly startPromptAgent: ReturnType<typeof vi.fn>;
+  readonly resumePromptAgent: ReturnType<typeof vi.fn>;
   readonly stopPromptAgent: ReturnType<typeof vi.fn>;
   readonly createConnectedTuiClient: ReturnType<typeof vi.fn>;
   readonly findAgentBySessionId: ReturnType<typeof vi.fn>;
@@ -214,6 +256,9 @@ function installDaemonCliDepsForTest(
     ] satisfies readonly unknown[]);
   const agent = {
     agentId,
+    ...(options.liveAgentPath !== undefined
+      ? { agentPath: options.liveAgentPath }
+      : {}),
     objective: "test objective",
     status: "running",
     createdAt: "2026-05-06T00:00:00.000Z",
@@ -221,7 +266,7 @@ function installDaemonCliDepsForTest(
     lastActiveAt: "2026-05-06T00:00:00.100Z",
     cwd,
     activeSessionIds: [sessionId],
-    metadata: {},
+    metadata: options.liveAgentMetadata ?? {},
   };
   const client = {
     request: vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -268,7 +313,10 @@ function installDaemonCliDepsForTest(
       }
       if (method === "session.snapshot") {
         return {
-          sessionId: typeof params?.sessionId === "string" ? params.sessionId : sessionId,
+          sessionId:
+            typeof params?.sessionId === "string"
+              ? params.sessionId
+              : sessionId,
           turnCount: 1,
           tokenUsage: {
             inputTokens: 10,
@@ -343,6 +391,29 @@ function installDaemonCliDepsForTest(
       };
     },
   );
+  const resumePromptAgent = vi.fn(
+    async (params: {
+      rolloutPath: string;
+      sourceProof: { readonly dev: string; readonly ino: string };
+    }) => {
+      if (options.resumePromptAgentError !== undefined) {
+        throw options.resumePromptAgentError;
+      }
+      return {
+        ...agent,
+        agentPath: "/root",
+        objective: `resume ${agentId}`,
+        sessionId,
+        metadata: {
+          ...agent.metadata,
+          agentPath: "/root",
+          canonicalRolloutPath: params.rolloutPath,
+          canonicalRolloutDev: params.sourceProof.dev,
+          canonicalRolloutIno: params.sourceProof.ino,
+        },
+      };
+    },
+  );
   const stopPromptAgent = vi.fn(async () => undefined);
   const createConnectedTuiClient = vi.fn(async () => {
     if (options.createConnectedTuiClientError !== undefined) {
@@ -350,60 +421,66 @@ function installDaemonCliDepsForTest(
     }
     return client;
   });
-  const findAgentBySessionId = vi.fn(async (_client, targetSessionId: string) =>
-    targetSessionId === sessionId ? agent : null,
+  const findAgentBySessionId = vi.fn(
+    async (_client, targetSessionId: string) =>
+      options.liveAgent !== false && targetSessionId === sessionId
+        ? agent
+        : null,
   );
-  const createTuiContext = vi.fn(async (params: {
-    env?: NodeJS.ProcessEnv;
-    cwd: string;
-    roleWorkspace?: { readonly id: string; readonly cwd: string };
-    conversationId: string;
-  }) => {
-    const abortController = new AbortController();
-    return {
-      configStore: {
-        agencHome: params.env?.AGENC_HOME ?? "/tmp/agenc-test-home",
-        current: () => ({
-          ...defaultConfig(),
-          model: "grok-4.3",
-          model_provider: "xai",
-        }),
-        subscribe: () => () => undefined,
-        warnings: () => [],
-      },
-      baseSession: {
-        conversationId: params.conversationId,
-        roleWorkspace: params.roleWorkspace,
-        cwd: params.cwd,
-        home: params.env?.HOME ?? "/tmp/agenc-test-user",
-        sessionConfiguration: {
+  const createTuiContext = vi.fn(
+    async (params: {
+      env?: NodeJS.ProcessEnv;
+      cwd: string;
+      roleWorkspace?: { readonly id: string; readonly cwd: string };
+      conversationId: string;
+    }) => {
+      const abortController = new AbortController();
+      return {
+        configStore: {
+          agencHome: params.env?.AGENC_HOME ?? "/tmp/agenc-test-home",
+          current: () => ({
+            ...defaultConfig(),
+            model: "grok-4.3",
+            model_provider: "xai",
+          }),
+          subscribe: () => () => undefined,
+          warnings: () => [],
+        },
+        baseSession: {
+          conversationId: params.conversationId,
+          roleWorkspace: params.roleWorkspace,
           cwd: params.cwd,
-          provider: { slug: "xai" },
+          home: params.env?.HOME ?? "/tmp/agenc-test-user",
+          sessionConfiguration: {
+            cwd: params.cwd,
+            provider: { slug: "xai" },
+          },
+          services: {
+            permissionModeRegistry: new PermissionModeRegistry(
+              createEmptyToolPermissionContext(),
+            ),
+            ...(options.mcpManager !== undefined
+              ? { mcpManager: options.mcpManager }
+              : {}),
+          },
+          abortController,
+          abortTerminal: (reason?: unknown) => {
+            if (!abortController.signal.aborted) abortController.abort(reason);
+          },
+          flushEventLog: () => {},
+          emit: () => {},
+          nextInternalSubId: () => "daemon-test-sub",
+          listMcpClients: () => [],
         },
-        services: {
-          permissionModeRegistry: new PermissionModeRegistry(
-            createEmptyToolPermissionContext(),
-          ),
-          ...(options.mcpManager !== undefined
-            ? { mcpManager: options.mcpManager }
-            : {}),
-        },
-        abortController,
-        abortTerminal: (reason?: unknown) => {
-          if (!abortController.signal.aborted) abortController.abort(reason);
-        },
-        flushEventLog: () => {},
-        emit: () => {},
-        nextInternalSubId: () => "daemon-test-sub",
-        listMcpClients: () => [],
-      },
-      model: "grok-4.3",
-      workspaceRoot: params.cwd,
-    };
-  });
+        model: "grok-4.3",
+        workspaceRoot: params.cwd,
+      };
+    },
+  );
   const ensureDaemonReady = vi.fn(() => vi.fn().mockResolvedValue(undefined));
   __setDaemonCliDepsForTest({
     startPromptAgent: startPromptAgent as never,
+    resumePromptAgent: resumePromptAgent as never,
     stopPromptAgent: stopPromptAgent as never,
     createConnectedTuiClient: createConnectedTuiClient as never,
     findAgentBySessionId: findAgentBySessionId as never,
@@ -417,6 +494,7 @@ function installDaemonCliDepsForTest(
     requests,
     client,
     startPromptAgent,
+    resumePromptAgent,
     stopPromptAgent,
     createConnectedTuiClient,
     findAgentBySessionId,
@@ -845,7 +923,9 @@ describe("I-47: maybeReloadConfigBetweenTurns", () => {
     const sessionStub = {
       emit,
       nextInternalSubId: () => "sub-x",
-    } as unknown as Parameters<typeof maybeReloadConfigBetweenTurns>[0]["session"];
+    } as unknown as Parameters<
+      typeof maybeReloadConfigBetweenTurns
+    >[0]["session"];
     await maybeReloadConfigBetweenTurns({
       latch,
       store,
@@ -882,7 +962,9 @@ describe("I-47: maybeReloadConfigBetweenTurns", () => {
       emit,
       nextInternalSubId: () => "sub-x",
       services: { mcpManager: { refreshFromConfig } },
-    } as unknown as Parameters<typeof maybeReloadConfigBetweenTurns>[0]["session"];
+    } as unknown as Parameters<
+      typeof maybeReloadConfigBetweenTurns
+    >[0]["session"];
 
     await maybeReloadConfigBetweenTurns({
       latch,
@@ -921,7 +1003,9 @@ describe("I-47: maybeReloadConfigBetweenTurns", () => {
       emit,
       nextInternalSubId: () => "sub-x",
       services: { mcpManager: { refreshFromConfig } },
-    } as unknown as Parameters<typeof maybeReloadConfigBetweenTurns>[0]["session"];
+    } as unknown as Parameters<
+      typeof maybeReloadConfigBetweenTurns
+    >[0]["session"];
 
     await expect(
       maybeReloadConfigBetweenTurns({
@@ -1000,9 +1084,9 @@ describe("validateAgencHome", () => {
     const homeRoot = await mkdtemp(join(tmpdir(), "agenc-home-fallback-"));
     const expectedHome = join(homeRoot, ".agenc");
     try {
-      expect(
-        validateAgencHome({ HOME: homeRoot } as NodeJS.ProcessEnv),
-      ).toBe(expectedHome);
+      expect(validateAgencHome({ HOME: homeRoot } as NodeJS.ProcessEnv)).toBe(
+        expectedHome,
+      );
       expect(
         validateAgencHome({
           AGENC_HOME: "",
@@ -1043,9 +1127,12 @@ describe("resolveCliCwdForStartup", () => {
       { AGENC_WORKSPACE: "/tmp/agenc-workspace" },
       {
         cwdFn: () => {
-          throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), {
-            syscall: "uv_cwd",
-          });
+          throw Object.assign(
+            new Error("ENOENT: no such file or directory, uv_cwd"),
+            {
+              syscall: "uv_cwd",
+            },
+          );
         },
       },
     );
@@ -1070,9 +1157,12 @@ describe("resolveCliCwdForStartup", () => {
       { AGENC_WORKSPACE: "nested/workspace" },
       {
         cwdFn: () => {
-          throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), {
-            syscall: "uv_cwd",
-          });
+          throw Object.assign(
+            new Error("ENOENT: no such file or directory, uv_cwd"),
+            {
+              syscall: "uv_cwd",
+            },
+          );
         },
       },
     );
@@ -1089,9 +1179,12 @@ describe("resolveCliCwdForStartup", () => {
       {},
       {
         cwdFn: () => {
-          throw Object.assign(new Error("ENOENT: no such file or directory, uv_cwd"), {
-            syscall: "uv_cwd",
-          });
+          throw Object.assign(
+            new Error("ENOENT: no such file or directory, uv_cwd"),
+            {
+              syscall: "uv_cwd",
+            },
+          );
         },
       },
     );
@@ -1301,13 +1394,14 @@ describe("prepareTurnRuntimeInputs", () => {
     const session = {
       services: {
         mcpManager: {
-          effectiveServers: vi.fn(async () =>
-            new Map([
-              [
-                "alpha",
-                { enabled: true, instructions: instructionText } as unknown,
-              ],
-            ]),
+          effectiveServers: vi.fn(
+            async () =>
+              new Map([
+                [
+                  "alpha",
+                  { enabled: true, instructions: instructionText } as unknown,
+                ],
+              ]),
           ),
         },
       },
@@ -1353,12 +1447,8 @@ describe("prepareTurnRuntimeInputs", () => {
 
 describe("runSingleTurn seam (R1 multi-turn future-proofing)", () => {
   it("invokes maybeReloadConfigBetweenTurns exactly once per call", async () => {
-    const reloadConfigFn = vi
-      .fn()
-      .mockResolvedValue({ reloaded: false });
-    const assembleSystemPromptFn = vi
-      .fn()
-      .mockResolvedValue({ text: "SYS" });
+    const reloadConfigFn = vi.fn().mockResolvedValue({ reloaded: false });
+    const assembleSystemPromptFn = vi.fn().mockResolvedValue({ text: "SYS" });
     async function* fakeRunTurn(): AsyncGenerator<unknown, unknown> {
       // empty — terminate immediately
       return { reason: "completed" };
@@ -1401,12 +1491,8 @@ describe("runSingleTurn seam (R1 multi-turn future-proofing)", () => {
   });
 
   it("calls reload again when invoked a second time (multi-turn loop compat)", async () => {
-    const reloadConfigFn = vi
-      .fn()
-      .mockResolvedValue({ reloaded: false });
-    const assembleSystemPromptFn = vi
-      .fn()
-      .mockResolvedValue({ text: "SYS" });
+    const reloadConfigFn = vi.fn().mockResolvedValue({ reloaded: false });
+    const assembleSystemPromptFn = vi.fn().mockResolvedValue({ text: "SYS" });
     async function* fakeRunTurn(): AsyncGenerator<unknown, unknown> {
       return { reason: "completed" };
     }
@@ -1799,9 +1885,9 @@ describe("main() smoke", () => {
         }),
       );
       // Must DENY, never grant.
-      expect(
-        daemon.requests.some((r) => r.method === "tool.approve"),
-      ).toBe(false);
+      expect(daemon.requests.some((r) => r.method === "tool.approve")).toBe(
+        false,
+      );
     } finally {
       stdoutSpy.mockRestore();
       for (const key of Object.keys(process.env)) {
@@ -1966,9 +2052,7 @@ describe("main() smoke", () => {
       ]);
       expect(result).toBe(0);
       // No deny was ever sent.
-      expect(
-        daemon.requests.some((r) => r.method === "tool.deny"),
-      ).toBe(false);
+      expect(daemon.requests.some((r) => r.method === "tool.deny")).toBe(false);
       expect(daemon.requests).toContainEqual({
         method: "agent.stop",
         params: {
@@ -2318,10 +2402,7 @@ describe("main() smoke", () => {
       const timeout = new Promise<"timeout">((resolve) =>
         setTimeout(() => resolve("timeout"), 4000),
       );
-      const result = await Promise.race([
-        oneShotCLI("do a thing"),
-        timeout,
-      ]);
+      const result = await Promise.race([oneShotCLI("do a thing"), timeout]);
       expect(result).toBe(0);
       const createCall = daemon.requests.find(
         (r) => r.method === "agent.create",
@@ -2383,10 +2464,7 @@ describe("main() smoke", () => {
       const timeout = new Promise<"timeout">((resolve) =>
         setTimeout(() => resolve("timeout"), 4000),
       );
-      const result = await Promise.race([
-        oneShotCLI("do a thing"),
-        timeout,
-      ]);
+      const result = await Promise.race([oneShotCLI("do a thing"), timeout]);
       expect(result).toBe(0);
       const createCall = daemon.requests.find(
         (r) => r.method === "agent.create",
@@ -2515,6 +2593,356 @@ describe("main() smoke", () => {
       ]);
     } finally {
       vi.doUnmock("../tui/main.js");
+      for (const key of Object.keys(process.env)) {
+        if (!(key in prevEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, prevEnv);
+      await rm(tmpHome, { recursive: true, force: true });
+      await rm(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resumeTUIEntry cold-restores a retained rollout with no live daemon agent", async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-cold-resume-home-"));
+    const tmpCwd = await mkdtemp(join(tmpdir(), "agenc-cold-resume-cwd-"));
+    const prevArgv = process.argv;
+    const prevEnv = { ...process.env };
+    const conversationId = "conv-coldresume1";
+
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+      "--permission-mode",
+      "plan",
+    ];
+    process.env.AGENC_HOME = tmpHome;
+    process.env.AGENC_WORKSPACE = tmpCwd;
+    process.env.XAI_API_KEY = "stub-key-for-test";
+    process.env.AGENC_CLI_ENTRY_DISABLE = "1";
+    const sessionDir = join(getProjectDir(tmpCwd), "sessions", conversationId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(
+      join(
+        sessionDir,
+        `rollout-2026-08-19T00-00-00-000Z-${conversationId}.jsonl`,
+      ),
+      `${JSON.stringify({
+        type: "session_meta",
+        payload: {
+          sessionId: conversationId,
+          timestamp: "2026-08-19T00:00:00.000Z",
+          cwd: tmpCwd,
+          originator: "agenc-test",
+          agencVersion: VERSION,
+          rolloutSchemaVersion: 3,
+        },
+      })}\n` +
+        `${JSON.stringify({ role: "user", content: "retained prompt" })}\n`,
+      "utf8",
+    );
+
+    const daemon = installDaemonCliDepsForTest({
+      agentId: conversationId,
+      sessionId: "session_cold_resume",
+      cwd: tmpCwd,
+      liveAgent: false,
+    });
+    daemon.ensureDaemonReady.mockImplementation(() => async () => {
+      await mkdir(join(tmpCwd, "concurrent-build-output"));
+    });
+    const waitUntilExit = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("../tui/main.js", () => ({
+      bootTUI: vi.fn(async () => ({
+        unmount: vi.fn(),
+        waitUntilExit,
+      })),
+    }));
+
+    try {
+      trustWorkspaceForTest(tmpHome, tmpCwd);
+      await expect(resumeTUIEntry({ resumeId: conversationId })).resolves.toBe(
+        0,
+      );
+      expect(daemon.findAgentBySessionId).toHaveBeenCalledWith(
+        daemon.client,
+        conversationId,
+      );
+      expect(daemon.resumePromptAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionId: conversationId,
+          rolloutPath: join(
+            sessionDir,
+            `rollout-2026-08-19T00-00-00-000Z-${conversationId}.jsonl`,
+          ),
+          cwd: tmpCwd,
+          provider: "grok",
+          model: "grok-4.3",
+          permissionMode: "plan",
+        }),
+      );
+      expect(daemon.requests).toContainEqual({
+        method: "agent.attach",
+        params: expect.objectContaining({ agentId: conversationId }),
+      });
+      expect(waitUntilExit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock("../tui/main.js");
+      process.argv = prevArgv;
+      for (const key of Object.keys(process.env)) {
+        if (!(key in prevEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, prevEnv);
+      await rm(tmpHome, { recursive: true, force: true });
+      await rm(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resumeTUIEntry attaches an exactly-bound live recovered runtime", async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-live-resume-home-"));
+    const tmpCwd = await mkdtemp(join(tmpdir(), "agenc-live-resume-cwd-"));
+    const prevEnv = { ...process.env };
+    const conversationId = "conv-liverecovered1";
+    process.env.AGENC_HOME = tmpHome;
+    process.env.AGENC_WORKSPACE = tmpCwd;
+    process.env.AGENC_CLI_ENTRY_DISABLE = "1";
+    const rolloutPath = await writeResumeRolloutForTest(tmpCwd, conversationId);
+    const rolloutIdentity = await lstat(rolloutPath, { bigint: true });
+    const daemon = installDaemonCliDepsForTest({
+      agentId: conversationId,
+      sessionId: conversationId,
+      cwd: tmpCwd,
+      liveAgent: true,
+      liveAgentPath: "/root",
+      liveAgentMetadata: {
+        agentPath: "/root",
+        canonicalRolloutPath: rolloutPath,
+        canonicalRolloutDev: rolloutIdentity.dev.toString(10),
+        canonicalRolloutIno: rolloutIdentity.ino.toString(10),
+      },
+    });
+    const waitUntilExit = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("../tui/main.js", () => ({
+      bootTUI: vi.fn(async () => ({
+        unmount: vi.fn(),
+        waitUntilExit,
+      })),
+    }));
+    try {
+      trustWorkspaceForTest(tmpHome, tmpCwd);
+      await expect(resumeTUIEntry({ resumeId: conversationId })).resolves.toBe(
+        0,
+      );
+      expect(daemon.resumePromptAgent).not.toHaveBeenCalled();
+      expect(daemon.requests).toContainEqual({
+        method: "agent.attach",
+        params: expect.objectContaining({ agentId: conversationId }),
+      });
+      expect(waitUntilExit).toHaveBeenCalledOnce();
+    } finally {
+      vi.doUnmock("../tui/main.js");
+      for (const key of Object.keys(process.env)) {
+        if (!(key in prevEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, prevEnv);
+      await rm(tmpHome, { recursive: true, force: true });
+      await rm(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("main --resume trusts only the resolved target workspace", async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-resume-trust-home-"));
+    const currentCwd = await mkdtemp(join(tmpdir(), "agenc-resume-current-"));
+    const targetCwd = await mkdtemp(join(tmpdir(), "agenc-resume-target-"));
+    const prevArgv = process.argv;
+    const prevEnv = { ...process.env };
+    const prevStdinIsTTY = Object.getOwnPropertyDescriptor(
+      process.stdin,
+      "isTTY",
+    );
+    const conversationId = "conv-targettrust1";
+    process.argv = [
+      process.argv[0] ?? "node",
+      "agenc-test-entry",
+      `--resume=${conversationId}`,
+    ];
+    process.env.AGENC_HOME = tmpHome;
+    process.env.AGENC_WORKSPACE = currentCwd;
+    process.env.AGENC_CLI_ENTRY_DISABLE = "1";
+    process.env.AGENC_DAEMON_AUTOSTART = "0";
+    Object.defineProperty(process.stdin, "isTTY", {
+      configurable: true,
+      value: true,
+    });
+    const rolloutPath = await writeResumeRolloutForTest(
+      targetCwd,
+      conversationId,
+    );
+    const rolloutIdentity = await lstat(rolloutPath, { bigint: true });
+    trustWorkspaceForTest(tmpHome, targetCwd);
+    const daemon = installDaemonCliDepsForTest({
+      agentId: conversationId,
+      sessionId: conversationId,
+      cwd: targetCwd,
+      liveAgent: true,
+      liveAgentPath: "/root",
+      liveAgentMetadata: {
+        agentPath: "/root",
+        canonicalRolloutPath: rolloutPath,
+        canonicalRolloutDev: rolloutIdentity.dev.toString(10),
+        canonicalRolloutIno: rolloutIdentity.ino.toString(10),
+      },
+    });
+    const waitUntilExit = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("../tui/main.js", () => ({
+      bootTUI: vi.fn(async () => ({
+        unmount: vi.fn(),
+        waitUntilExit,
+      })),
+    }));
+    try {
+      expect(
+        classifyCLI({
+          argv: process.argv,
+          isTTY: Boolean(process.stdin.isTTY),
+          isStdoutTTY: Boolean(process.stdout.isTTY),
+        }),
+      ).toEqual({ kind: "resumeTUI", args: { resumeId: conversationId } });
+      expect(
+        isProjectTrustedSync({
+          agencHome: tmpHome,
+          cwd: currentCwd,
+          env: process.env,
+        }),
+      ).toBe(false);
+      await expect(main()).resolves.toBe(0);
+      expect(
+        isProjectTrustedSync({
+          agencHome: tmpHome,
+          cwd: currentCwd,
+          env: process.env,
+        }),
+      ).toBe(false);
+      expect(
+        isProjectTrustedSync({
+          agencHome: tmpHome,
+          cwd: targetCwd,
+          env: process.env,
+        }),
+      ).toBe(true);
+      expect(daemon.resumePromptAgent).not.toHaveBeenCalled();
+      expect(daemon.requests).toContainEqual({
+        method: "agent.attach",
+        params: expect.objectContaining({ agentId: conversationId }),
+      });
+      expect(waitUntilExit).toHaveBeenCalledOnce();
+    } finally {
+      vi.doUnmock("../tui/main.js");
+      process.argv = prevArgv;
+      if (prevStdinIsTTY === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        Object.defineProperty(process.stdin, "isTTY", prevStdinIsTTY);
+      }
+      for (const key of Object.keys(process.env)) {
+        if (!(key in prevEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, prevEnv);
+      await rm(tmpHome, { recursive: true, force: true });
+      await rm(currentCwd, { recursive: true, force: true });
+      await rm(targetCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resumeTUIEntry refuses a same-id live agent bound to another rollout", async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-live-mismatch-home-"));
+    const tmpCwd = await mkdtemp(join(tmpdir(), "agenc-live-mismatch-cwd-"));
+    const prevEnv = { ...process.env };
+    const conversationId = "conv-livemismatch1";
+    process.env.AGENC_HOME = tmpHome;
+    process.env.AGENC_WORKSPACE = tmpCwd;
+    process.env.AGENC_CLI_ENTRY_DISABLE = "1";
+    const rolloutPath = await writeResumeRolloutForTest(tmpCwd, conversationId);
+    const daemon = installDaemonCliDepsForTest({
+      agentId: conversationId,
+      sessionId: conversationId,
+      cwd: tmpCwd,
+      liveAgent: true,
+      liveAgentPath: "/root",
+      liveAgentMetadata: {
+        agentPath: "/root",
+        canonicalRolloutPath: `${rolloutPath}.different-generation`,
+        canonicalRolloutDev: "1",
+        canonicalRolloutIno: "1",
+      },
+    });
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      trustWorkspaceForTest(tmpHome, tmpCwd);
+      await expect(resumeTUIEntry({ resumeId: conversationId })).resolves.toBe(
+        1,
+      );
+      expect(daemon.findAgentBySessionId).toHaveBeenCalledOnce();
+      expect(daemon.resumePromptAgent).not.toHaveBeenCalled();
+      expect(daemon.requests).not.toContainEqual(
+        expect.objectContaining({ method: "agent.attach" }),
+      );
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining("does not match the trusted resume workspace"),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+      for (const key of Object.keys(process.env)) {
+        if (!(key in prevEnv)) delete process.env[key];
+      }
+      Object.assign(process.env, prevEnv);
+      await rm(tmpHome, { recursive: true, force: true });
+      await rm(tmpCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resumeTUIEntry detects a workspace swap after trust before daemon create", async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-cwd-swap-home-"));
+    const tmpCwd = await mkdtemp(join(tmpdir(), "agenc-cwd-swap-cwd-"));
+    const parkedCwd = `${tmpCwd}.parked`;
+    const prevEnv = { ...process.env };
+    const conversationId = "conv-cwdswap1";
+    process.env.AGENC_HOME = tmpHome;
+    process.env.AGENC_WORKSPACE = tmpCwd;
+    process.env.AGENC_CLI_ENTRY_DISABLE = "1";
+    await writeResumeRolloutForTest(tmpCwd, conversationId);
+    const daemon = installDaemonCliDepsForTest({
+      agentId: conversationId,
+      sessionId: conversationId,
+      cwd: tmpCwd,
+      liveAgent: false,
+    });
+    daemon.ensureDaemonReady.mockImplementation(() => async () => {
+      await rename(tmpCwd, parkedCwd);
+      await mkdir(tmpCwd);
+    });
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      trustWorkspaceForTest(tmpHome, tmpCwd);
+      await expect(resumeTUIEntry({ resumeId: conversationId })).resolves.toBe(
+        1,
+      );
+      expect(daemon.createConnectedTuiClient).not.toHaveBeenCalled();
+      expect(daemon.resumePromptAgent).not.toHaveBeenCalled();
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining("workspace changed during authorization"),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+      await rm(tmpCwd, { recursive: true, force: true });
+      await rename(parkedCwd, tmpCwd).catch(() => {});
       for (const key of Object.keys(process.env)) {
         if (!(key in prevEnv)) delete process.env[key];
       }
@@ -2669,7 +3097,9 @@ describe("main() smoke", () => {
 
   it("attaches a worktree child with separate execution and role workspaces", async () => {
     const tmpHome = await mkdtemp(join(tmpdir(), "agenc-tui-role-home-"));
-    const authority = await mkdtemp(join(tmpdir(), "agenc-tui-role-authority-"));
+    const authority = await mkdtemp(
+      join(tmpdir(), "agenc-tui-role-authority-"),
+    );
     const worktree = await mkdtemp(join(tmpdir(), "agenc-tui-role-worktree-"));
     const prevEnv = { ...process.env };
 
@@ -2718,7 +3148,14 @@ describe("main() smoke", () => {
     const prevArgv = process.argv;
     const prevEnv = { ...process.env };
 
-    process.argv = ["node", "agenc", "--provider", "grok", "--model", "grok-4.3"];
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+    ];
     process.env.AGENC_HOME = tmpHome;
     process.env.AGENC_WORKSPACE = tmpCwd;
     process.env.XAI_API_KEY = "stub-key-for-test";
@@ -2791,7 +3228,14 @@ describe("main() smoke", () => {
     const prevArgv = process.argv;
     const prevEnv = { ...process.env };
 
-    process.argv = ["node", "agenc", "--provider", "grok", "--model", "grok-4.3"];
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+    ];
     process.env.AGENC_HOME = tmpHome;
     process.env.AGENC_WORKSPACE = tmpCwd;
     process.env.XAI_API_KEY = "stub-key-for-test";
@@ -2861,7 +3305,14 @@ describe("main() smoke", () => {
     const prevArgv = process.argv;
     const prevEnv = { ...process.env };
 
-    process.argv = ["node", "agenc", "--provider", "grok", "--model", "grok-4.3"];
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+    ];
     process.env.AGENC_HOME = tmpHome;
     process.env.AGENC_WORKSPACE = tmpCwd;
     process.env.XAI_API_KEY = "stub-key-for-test";
@@ -2949,7 +3400,14 @@ describe("main() smoke", () => {
     const prevArgv = process.argv;
     const prevEnv = { ...process.env };
 
-    process.argv = ["node", "agenc", "--provider", "grok", "--model", "grok-4.3"];
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+    ];
     process.env.AGENC_HOME = tmpHome;
     process.env.AGENC_WORKSPACE = tmpCwd;
     process.env.XAI_API_KEY = "stub-key-for-test";
@@ -3002,8 +3460,7 @@ describe("main() smoke", () => {
       const code = await pending;
       expect(code).toBe(0);
       const env = daemon.startPromptAgent.mock.calls[0]?.[0].env as
-        | NodeJS.ProcessEnv
-        | undefined;
+        NodeJS.ProcessEnv | undefined;
       expect(env?.AGENC_MCP_SERVERS).toBe(JSON.stringify([mcpConfig]));
     } finally {
       vi.doUnmock("../tui/main.js");
@@ -3023,7 +3480,14 @@ describe("main() smoke", () => {
     const prevArgv = process.argv;
     const prevEnv = { ...process.env };
 
-    process.argv = ["node", "agenc", "--provider", "grok", "--model", "grok-4.3"];
+    process.argv = [
+      "node",
+      "agenc",
+      "--provider",
+      "grok",
+      "--model",
+      "grok-4.3",
+    ];
     process.env.AGENC_HOME = tmpHome;
     process.env.AGENC_WORKSPACE = tmpCwd;
     process.env.XAI_API_KEY = "stub-key-for-test";
@@ -3098,84 +3562,86 @@ describe("main() smoke", () => {
   it.each(["/help", "/permissions"])(
     "bootTUIEntry does not send first %s input as a daemon prompt",
     async (slashInput) => {
-    const tmpHome = await mkdtemp(join(tmpdir(), "agenc-tui-permissions-"));
-    const tmpCwd = await mkdtemp(join(tmpdir(), "agenc-tui-permissions-cwd-"));
-    const prevArgv = process.argv;
-    const prevEnv = { ...process.env };
-    process.argv = ["node", "agenc", "--provider", "xai"];
-    process.env.HOME = tmpHome;
-    process.env.USERPROFILE = tmpHome;
-    process.env.AGENC_HOME = tmpHome;
-    process.env.AGENC_WORKSPACE = tmpCwd;
-    process.env.XAI_API_KEY = "test-key";
-    const daemon = installDaemonCliDepsForTest({
-      agentId: "agent_permissions",
-      sessionId: "session_permissions",
-      cwd: tmpCwd,
-    });
-
-    let resolveExit: (() => void) | null = null;
-    const waitUntilExit = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveExit = resolve;
-        }),
-    );
-    const unmount = vi.fn();
-    let capturedSession: {
-      submit?: (message: string) => Promise<void>;
-      subscribeToEvents?: (
-        cb: (event: { type: string; [key: string]: unknown }) => void,
-      ) => () => void;
-    } | null = null;
-    vi.doMock("../tui/main.js", () => ({
-      bootTUI: vi.fn(async (opts: { session: typeof capturedSession }) => {
-        capturedSession = opts.session as typeof capturedSession;
-        return { unmount, waitUntilExit };
-      }),
-    }));
-
-    try {
-      trustWorkspaceForTest(tmpHome, tmpCwd);
-      const pending = bootTUIEntry({});
-      const session = await waitForValue(
-        "deferred TUI session",
-        () => capturedSession,
+      const tmpHome = await mkdtemp(join(tmpdir(), "agenc-tui-permissions-"));
+      const tmpCwd = await mkdtemp(
+        join(tmpdir(), "agenc-tui-permissions-cwd-"),
       );
-      const localEvents: Array<{
-        readonly type?: string;
-        readonly input?: string;
-        readonly result?: { readonly kind?: string };
-      }> = [];
-      const unsubscribe = session.subscribeToEvents?.((event) => {
-        localEvents.push(event);
+      const prevArgv = process.argv;
+      const prevEnv = { ...process.env };
+      process.argv = ["node", "agenc", "--provider", "xai"];
+      process.env.HOME = tmpHome;
+      process.env.USERPROFILE = tmpHome;
+      process.env.AGENC_HOME = tmpHome;
+      process.env.AGENC_WORKSPACE = tmpCwd;
+      process.env.XAI_API_KEY = "test-key";
+      const daemon = installDaemonCliDepsForTest({
+        agentId: "agent_permissions",
+        sessionId: "session_permissions",
+        cwd: tmpCwd,
       });
 
-      await session.submit?.(slashInput);
-      unsubscribe?.();
-
-      resolveExit?.();
-      const code = await pending;
-      expect(code).toBe(0);
-      expect(daemon.startPromptAgent).not.toHaveBeenCalled();
-      expect(daemon.requests).toEqual([]);
-      expect(localEvents).toEqual([
-        expect.objectContaining({
-          type: "slash_result",
-          input: slashInput,
-          result: expect.objectContaining({ kind: "text" }),
+      let resolveExit: (() => void) | null = null;
+      const waitUntilExit = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveExit = resolve;
+          }),
+      );
+      const unmount = vi.fn();
+      let capturedSession: {
+        submit?: (message: string) => Promise<void>;
+        subscribeToEvents?: (
+          cb: (event: { type: string; [key: string]: unknown }) => void,
+        ) => () => void;
+      } | null = null;
+      vi.doMock("../tui/main.js", () => ({
+        bootTUI: vi.fn(async (opts: { session: typeof capturedSession }) => {
+          capturedSession = opts.session as typeof capturedSession;
+          return { unmount, waitUntilExit };
         }),
-      ]);
-    } finally {
-      process.argv = prevArgv;
-      vi.doUnmock("../tui/main.js");
-      for (const key of Object.keys(process.env)) {
-        if (!(key in prevEnv)) delete process.env[key];
+      }));
+
+      try {
+        trustWorkspaceForTest(tmpHome, tmpCwd);
+        const pending = bootTUIEntry({});
+        const session = await waitForValue(
+          "deferred TUI session",
+          () => capturedSession,
+        );
+        const localEvents: Array<{
+          readonly type?: string;
+          readonly input?: string;
+          readonly result?: { readonly kind?: string };
+        }> = [];
+        const unsubscribe = session.subscribeToEvents?.((event) => {
+          localEvents.push(event);
+        });
+
+        await session.submit?.(slashInput);
+        unsubscribe?.();
+
+        resolveExit?.();
+        const code = await pending;
+        expect(code).toBe(0);
+        expect(daemon.startPromptAgent).not.toHaveBeenCalled();
+        expect(daemon.requests).toEqual([]);
+        expect(localEvents).toEqual([
+          expect.objectContaining({
+            type: "slash_result",
+            input: slashInput,
+            result: expect.objectContaining({ kind: "text" }),
+          }),
+        ]);
+      } finally {
+        process.argv = prevArgv;
+        vi.doUnmock("../tui/main.js");
+        for (const key of Object.keys(process.env)) {
+          if (!(key in prevEnv)) delete process.env[key];
+        }
+        Object.assign(process.env, prevEnv);
+        await rm(tmpHome, { recursive: true, force: true });
+        await rm(tmpCwd, { recursive: true, force: true });
       }
-      Object.assign(process.env, prevEnv);
-      await rm(tmpHome, { recursive: true, force: true });
-      await rm(tmpCwd, { recursive: true, force: true });
-    }
     },
   );
 
@@ -3202,8 +3668,9 @@ describe("main() smoke", () => {
           resolveExit = resolve;
         }),
     );
-    let capturedSession: { submit?: (message: string) => Promise<void> } | null =
-      null;
+    let capturedSession: {
+      submit?: (message: string) => Promise<void>;
+    } | null = null;
     vi.doMock("../tui/main.js", () => ({
       bootTUI: vi.fn(async (opts: { session: typeof capturedSession }) => {
         capturedSession = opts.session as typeof capturedSession;
@@ -3257,9 +3724,9 @@ describe("main() smoke", () => {
 
     try {
       trustWorkspaceForTest(tmpHome, tmpCwd);
-      await expect(bootTUIEntry({ initialPrompt: "queue this" })).rejects.toThrow(
-        "attach failed",
-      );
+      await expect(
+        bootTUIEntry({ initialPrompt: "queue this" }),
+      ).rejects.toThrow("attach failed");
       expect(daemon.stopPromptAgent).toHaveBeenCalledWith({
         agentId: "agent_attach_failure",
         reason: "tui_startup_failed",
@@ -3297,9 +3764,9 @@ describe("main() smoke", () => {
 
     try {
       trustWorkspaceForTest(tmpHome, tmpCwd);
-      await expect(bootTUIEntry({ initialPrompt: "queue this" })).rejects.toThrow(
-        "boot failed",
-      );
+      await expect(
+        bootTUIEntry({ initialPrompt: "queue this" }),
+      ).rejects.toThrow("boot failed");
       expect(daemon.stopPromptAgent).toHaveBeenCalledWith({
         agentId: "agent_boot_failure",
         reason: "tui_startup_failed",
@@ -3448,11 +3915,7 @@ describe("main() smoke", () => {
         "isTTY",
       );
 
-      process.argv = [
-        process.argv[0] ?? "node",
-        "agenc-test-entry",
-        ...argv,
-      ];
+      process.argv = [process.argv[0] ?? "node", "agenc-test-entry", ...argv];
       process.env.AGENC_HOME = tmpHome;
       process.env.AGENC_WORKSPACE = tmpCwd;
       process.env.AGENC_PROVIDER = "grok";

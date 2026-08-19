@@ -45,7 +45,7 @@ import {
 import type { Tool, ToolExecutionInjectedArgs, ToolResult } from "../types.js";
 import { plainTextErrorToolResult as errorResult } from "../results.js";
 import {
-  applyRuntimeSandboxToSpawn,
+  applyReadOnlyRuntimeSandboxToSpawn,
   type SandboxSpawnCommand,
 } from "./apply-runtime-sandbox.js";
 import { resolveToolAllowedPaths, safePath } from "./filesystem.js";
@@ -502,7 +502,7 @@ function prepareBoundRipgrepCommand(params: {
   readonly args: readonly string[];
   readonly env: Record<string, string>;
 }): SandboxSpawnCommand {
-  const command = applyRuntimeSandboxToSpawn({
+  const command = applyReadOnlyRuntimeSandboxToSpawn({
     toolArgs: params.toolArgs,
     fallbackCwd: params.fallbackCwd,
     program: params.program,
@@ -576,7 +576,7 @@ async function isRipgrepAvailable(
   // session skip its own required sandbox boundary.
   let command: SandboxSpawnCommand;
   try {
-    command = applyRuntimeSandboxToSpawn({
+    command = applyReadOnlyRuntimeSandboxToSpawn({
       toolArgs,
       fallbackCwd: cwd,
       program: ripgrepPath,
@@ -2104,7 +2104,7 @@ async function runRipgrepCollectRecords(params: {
     }
   }
   const { cwd, signal } = params;
-  const command = applyRuntimeSandboxToSpawn({
+  const command = applyReadOnlyRuntimeSandboxToSpawn({
     toolArgs: params.toolArgs,
     fallbackCwd: cwd,
     program: ripgrepPath,

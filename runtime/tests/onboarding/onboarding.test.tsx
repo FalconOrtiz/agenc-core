@@ -204,6 +204,34 @@ describe("first-run onboarding wizard", () => {
     expect(result.completed).toBe(true);
   });
 
+  test("keeps the configured model when Enter confirms the current provider", async () => {
+    const context = {
+      config: {
+        ...defaultConfig(),
+        model_provider: "ollama" as const,
+        model: "llama4:latest",
+      },
+      env: {},
+      checkLocalProviders: false,
+    };
+    let state = createInitialFirstRunOnboardingState(context);
+
+    state = (await submitFirstRunOnboardingInput(state, "next", context)).state;
+    state = (await submitFirstRunOnboardingInput(state, "", context)).state;
+    expect(state).toMatchObject({
+      currentStepId: "provider",
+      selectedProvider: "ollama",
+      selectedModel: "llama4:latest",
+    });
+
+    state = (await submitFirstRunOnboardingInput(state, "", context)).state;
+    expect(state).toMatchObject({
+      currentStepId: "api-key",
+      selectedProvider: "ollama",
+      selectedModel: "llama4:latest",
+    });
+  });
+
   test("checks configured provider credentials and local endpoints", async () => {
     const config = defaultConfig();
     const remoteFetch = vi.fn<typeof fetch>().mockResolvedValue(
@@ -267,7 +295,11 @@ describe("first-run onboarding wizard", () => {
         {
           config,
           env: {},
-          fetchImpl: async () => ({ ok: true }) as Response,
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({ models: [{ name: "llama3.3:latest" }] }),
+              { status: 200 },
+            ),
         },
         "ollama",
         "llama3.3",
@@ -290,6 +322,79 @@ describe("first-run onboarding wizard", () => {
     ).resolves.toMatchObject({
       ok: false,
       status: "local-down",
+    });
+  });
+
+  test("rejects reachable local providers that do not list the selected model", async () => {
+    const config = defaultConfig();
+    const ollamaFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({ models: [{ name: "llama3.3:latest" }] }),
+        { status: 200 },
+      ),
+    );
+
+    await expect(
+      checkOnboardingProviderConnection(
+        { config, env: {}, fetchImpl: ollamaFetch },
+        "ollama",
+        "llama4:latest",
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: "local-model-missing",
+      detail: expect.stringContaining("ollama pull llama4:latest"),
+    });
+    expect(String(ollamaFetch.mock.calls[0]?.[0])).toBe(
+      "http://localhost:11434/api/tags",
+    );
+    expect(ollamaFetch).toHaveBeenCalledTimes(1);
+    expect(ollamaFetch.mock.calls[0]?.[1]).toMatchObject({ method: "GET" });
+
+    const lmStudioFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ id: "qwen3-coder" }] }), {
+        status: 200,
+      }),
+    );
+    await expect(
+      checkOnboardingProviderConnection(
+        { config, env: {}, fetchImpl: lmStudioFetch },
+        "lmstudio",
+        "devstral-small-2",
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: "local-model-missing",
+      detail: expect.stringContaining("devstral-small-2"),
+    });
+    expect(String(lmStudioFetch.mock.calls[0]?.[0])).toBe(
+      "http://localhost:1234/v1/models",
+    );
+    expect(lmStudioFetch).toHaveBeenCalledTimes(1);
+    expect(lmStudioFetch.mock.calls[0]?.[1]).toMatchObject({ method: "GET" });
+  });
+
+  test("rejects an oversized local model catalog without parsing it", async () => {
+    const config = defaultConfig();
+    const oversizedCatalog = JSON.stringify({
+      models: [{ name: "llama3.3:latest" }],
+      padding: "x".repeat(1024 * 1024),
+    });
+
+    await expect(
+      checkOnboardingProviderConnection(
+        {
+          config,
+          env: {},
+          fetchImpl: async () => new Response(oversizedCatalog, { status: 200 }),
+        },
+        "ollama",
+        "llama3.3",
+      ),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: "local-down",
+      detail: expect.stringContaining("readable model catalog"),
     });
   });
 
@@ -1132,7 +1237,7 @@ describe("local runtime detection (O-1)", () => {
     return (async (url: unknown) => {
       const target = String(url);
       if (okUrls.some((ok) => target.includes(ok))) {
-        return { ok: true, status: 200, json: async () => ({}) } as Response;
+        return new Response("{}", { status: 200 });
       }
       throw new Error("connection refused");
     }) as typeof fetch;

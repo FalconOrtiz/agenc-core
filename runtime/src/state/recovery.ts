@@ -13,6 +13,8 @@ import { StartupRecoveryBudget } from "./recovery-cutover.js";
 import {
   recoverCanonicalRunJournalsOnStartup,
   recoverPendingEffectReviewsOnStartup,
+  StartupResumeSourceBudget,
+  type StartupRunResumeSource,
 } from "./startup-run-journal-recovery.js";
 import {
   getRecoveryRunExclusion,
@@ -57,6 +59,8 @@ export type ToolRecoveryAction = "replay" | "poison" | "cancel";
 export type AgentRunRecoveryStatus =
   (typeof RECOVERABLE_AGENT_RUN_STATUSES)[number];
 
+export { StartupResumeSourceBudget };
+
 export interface RecoveredSessionStateSnapshot {
   readonly projectDir: string;
   readonly sessionId: string;
@@ -79,6 +83,8 @@ export interface RecoveredAgentRun {
   readonly lastSnapshotAt?: string;
   readonly metadata?: JsonObject;
   readonly latestSnapshot?: RecoveredSessionStateSnapshot;
+  /** Exact pinned canonical authority retained only for daemon restoration. */
+  readonly resumeSource?: StartupRunResumeSource;
 }
 
 export interface RecoveredInFlightToolCall {
@@ -154,89 +160,169 @@ interface InFlightToolCallRow {
 
 export function recoverDaemonStateOnStartup(
   driver: StateSqliteDriver,
-  options: { readonly now?: () => string } = {},
+  options: {
+    readonly now?: () => string;
+    readonly retainRuntimeResumeSources?: boolean;
+    readonly startupResumeSourceBudget?: StartupResumeSourceBudget;
+    /** Test-only race seam after cwd fd open and before pathname reproof. */
+    readonly afterStartupResumeCwdOpenForTestingOnly?: (cwd: string) => void;
+  } = {},
 ): DaemonStartupRecoveryReport {
-  const warnings: DaemonStartupRecoveryWarning[] = [];
-  const recoveredAt = options.now?.() ?? new Date().toISOString();
-  const preexistingExclusions = loadStartupRecoveryExclusions(driver);
-  const startupBudget = new StartupRecoveryBudget();
-  const admissions = new ExecutionAdmissionRepository(driver, {
-    now: () => new Date(recoveredAt),
-  });
-  // The rollout JSONL is the M4 authority. Rebuild its SQLite projection
-  // before stale tool classification or the recoverable-run load so a crash
-  // after fsyncing `run_terminal`/`effect_result` cannot resurrect or replay
-  // work merely because the legacy snapshot write did not happen.
-  const recoverableProjection = recoverCanonicalRunJournalsOnStartup(driver, {
-    recoverableStatuses: RECOVERABLE_AGENT_RUN_STATUSES,
-    strict: { startupBudget },
-  });
-  // Older run.cancel implementations could commit the SQLite cancellation
-  // cascade immediately before the live writer projected its canonical
-  // terminal. Repair only the bounded set of cancelled M4 runs that have an
-  // explicit journal binding and still lack a current terminal result. This
-  // avoids making all historical offline cancellations part of startup work.
-  // If no canonical terminal is present, the row remains cancelled with
-  // deliberately unavailable output; recovery never invents a result.
-  const cancelledProjection = recoverCanonicalRunJournalsOnStartup(driver, {
-    recoverableStatuses: ["cancelled"],
-    onlyMissingTerminalResults: true,
-    requireJournalBinding: true,
-    strict: { startupBudget },
-  });
-  // A stopped terminal run may later receive one explicitly leased operator
-  // review event. Catch up that durable audit evidence independently of run
-  // status so a crash after journal fsync cannot strand the mutation gate.
-  const reviewProjection = recoverPendingEffectReviewsOnStartup(driver, {
-    strict: { startupBudget },
-  });
-  const recoveryExclusions = uniqueRecoveryExclusions([
-    ...preexistingExclusions,
-    ...recoverableProjection.exclusions,
-    ...cancelledProjection.exclusions,
-    ...reviewProjection.exclusions,
-  ]);
-  for (const exclusion of recoveryExclusions) {
-    warnings.push({
-      code: "run_recovery_excluded",
-      runId: exclusion.runId,
-      message: recoveryExclusionMessage(exclusion),
+  const retainedResumeSources = new Map<string, StartupRunResumeSource>();
+  let recoveryFailure: unknown;
+  try {
+    const warnings: DaemonStartupRecoveryWarning[] = [];
+    const recoveredAt = options.now?.() ?? new Date().toISOString();
+    const preexistingExclusions = loadStartupRecoveryExclusions(driver);
+    const startupBudget = new StartupRecoveryBudget();
+    const admissions = new ExecutionAdmissionRepository(driver, {
+      now: () => new Date(recoveredAt),
     });
-  }
-  const excludedRunIds = new Set(recoveryExclusions.map(({ runId }) => runId));
-  const excludedSessionIds = loadExcludedRecoverySessionIds(
-    driver,
-    excludedRunIds,
-  );
-  return driver.transaction(() => {
-    // A live two-phase cancellation settles admissions while the canonical
-    // Session listener is still open, then writes the terminal tail, then
-    // projects agent_runs/spawn edges. A crash between the first two phases
-    // leaves an admission cancel-lock but must never restore runnable work.
-    repairAdmissionCancelledAgentRuns(driver);
-    // Crash-mid-cascade repair MUST precede the recoverable-run load: a
-    // surviving descendant of a cancelled parent is finished off here so
-    // the restore loop never resurrects it.
-    repairCancelledSubtrees(driver, admissions, { now: recoveredAt });
-    const recoveredToolCalls = recoverStaleToolCalls(
-      driver,
-      warnings,
-      excludedSessionIds,
+    // The rollout JSONL is the M4 authority. Rebuild its SQLite projection
+    // before stale tool classification or the recoverable-run load so a crash
+    // after fsyncing `run_terminal`/`effect_result` cannot resurrect or replay
+    // work merely because the legacy snapshot write did not happen.
+    const recoverableProjection = recoverCanonicalRunJournalsOnStartup(driver, {
+      recoverableStatuses: RECOVERABLE_AGENT_RUN_STATUSES,
+      strict: { startupBudget },
+      ...(options.retainRuntimeResumeSources === true
+        ? {
+            onResumeSource: (source: StartupRunResumeSource) => {
+              if (retainedResumeSources.has(source.runId)) {
+                const duplicate = new Error(
+                  `startup recovery produced duplicate resume authority for run ${source.runId}`,
+                );
+                try {
+                  source.close();
+                } catch (cleanupError) {
+                  throw new AggregateError(
+                    [duplicate, cleanupError],
+                    "duplicate startup resume authority cleanup failed",
+                    { cause: duplicate },
+                  );
+                }
+                throw duplicate;
+              }
+              retainedResumeSources.set(source.runId, source);
+            },
+            resumeSourceBudget:
+              options.startupResumeSourceBudget ??
+              new StartupResumeSourceBudget(),
+            ...(options.afterStartupResumeCwdOpenForTestingOnly !== undefined
+              ? {
+                  afterStartupResumeCwdOpenForTestingOnly:
+                    options.afterStartupResumeCwdOpenForTestingOnly,
+                }
+              : {}),
+          }
+        : {}),
+    });
+    // Older run.cancel implementations could commit the SQLite cancellation
+    // cascade immediately before the live writer projected its canonical
+    // terminal. Repair only the bounded set of cancelled M4 runs that have an
+    // explicit journal binding and still lack a current terminal result. This
+    // avoids making all historical offline cancellations part of startup work.
+    // If no canonical terminal is present, the row remains cancelled with
+    // deliberately unavailable output; recovery never invents a result.
+    const cancelledProjection = recoverCanonicalRunJournalsOnStartup(driver, {
+      recoverableStatuses: ["cancelled"],
+      onlyMissingTerminalResults: true,
+      requireJournalBinding: true,
+      strict: { startupBudget },
+    });
+    // A stopped terminal run may later receive one explicitly leased operator
+    // review event. Catch up that durable audit evidence independently of run
+    // status so a crash after journal fsync cannot strand the mutation gate.
+    const reviewProjection = recoverPendingEffectReviewsOnStartup(driver, {
+      strict: { startupBudget },
+    });
+    const recoveryExclusions = uniqueRecoveryExclusions([
+      ...preexistingExclusions,
+      ...recoverableProjection.exclusions,
+      ...cancelledProjection.exclusions,
+      ...reviewProjection.exclusions,
+    ]);
+    for (const exclusion of recoveryExclusions) {
+      warnings.push({
+        code: "run_recovery_excluded",
+        runId: exclusion.runId,
+        message: recoveryExclusionMessage(exclusion),
+      });
+    }
+    const excludedRunIds = new Set(
+      recoveryExclusions.map(({ runId }) => runId),
     );
-    const recoveredRuns = loadRecoverableAgentRuns(
+    const excludedSessionIds = loadExcludedRecoverySessionIds(
       driver,
-      recoveredToolCalls,
-      warnings,
       excludedRunIds,
     );
-    return {
-      recoveredAt,
-      recoveredRuns,
-      recoveredToolCalls,
-      warnings,
-      recoveryExclusions,
-    };
-  });
+    const report = driver.transaction(() => {
+      // A live two-phase cancellation settles admissions while the canonical
+      // Session listener is still open, then writes the terminal tail, then
+      // projects agent_runs/spawn edges. A crash between the first two phases
+      // leaves an admission cancel-lock but must never restore runnable work.
+      repairAdmissionCancelledAgentRuns(driver);
+      // Crash-mid-cascade repair MUST precede the recoverable-run load: a
+      // surviving descendant of a cancelled parent is finished off here so
+      // the restore loop never resurrects it.
+      repairCancelledSubtrees(driver, admissions, { now: recoveredAt });
+      const recoveredToolCalls = recoverStaleToolCalls(
+        driver,
+        warnings,
+        excludedSessionIds,
+      );
+      const recoveredRuns = loadRecoverableAgentRuns(
+        driver,
+        recoveredToolCalls,
+        warnings,
+        excludedRunIds,
+        retainedResumeSources,
+      );
+      return {
+        recoveredAt,
+        recoveredRuns,
+        recoveredToolCalls,
+        warnings,
+        recoveryExclusions,
+      };
+    });
+    for (const run of report.recoveredRuns) {
+      if (run.resumeSource !== undefined) retainedResumeSources.delete(run.id);
+    }
+    return report;
+  } catch (error) {
+    recoveryFailure = error;
+    throw error;
+  } finally {
+    try {
+      closeStartupResumeSources(retainedResumeSources.values());
+    } catch (cleanupError) {
+      if (recoveryFailure !== undefined) {
+        throw new AggregateError(
+          [recoveryFailure, cleanupError],
+          "startup recovery and resume-source cleanup failed",
+          { cause: recoveryFailure },
+        );
+      }
+      throw cleanupError;
+    }
+  }
+}
+
+function closeStartupResumeSources(
+  sources: Iterable<StartupRunResumeSource>,
+): void {
+  const errors: unknown[] = [];
+  for (const source of sources) {
+    try {
+      source.close();
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, "startup resume source cleanup failed");
+  }
 }
 
 function loadStartupRecoveryExclusions(
@@ -313,6 +399,7 @@ function loadRecoverableAgentRuns(
   recoveredToolCalls: readonly RecoveredInFlightToolCall[],
   warnings: DaemonStartupRecoveryWarning[],
   excludedRunIds: ReadonlySet<string>,
+  resumeSources: ReadonlyMap<string, StartupRunResumeSource>,
 ): RecoveredAgentRun[] {
   const runs = driver
     .prepareState<string[], AgentRunRow>(
@@ -335,7 +422,13 @@ function loadRecoverableAgentRuns(
   return runs
     .filter((row) => !excludedRunIds.has(row.id))
     .map((row) =>
-      toRecoveredAgentRun(driver, row, recoveredToolCalls, warnings),
+      toRecoveredAgentRun(
+        driver,
+        row,
+        recoveredToolCalls,
+        warnings,
+        resumeSources.get(row.id),
+      ),
     );
 }
 
@@ -344,6 +437,7 @@ function toRecoveredAgentRun(
   row: AgentRunRow,
   recoveredToolCalls: readonly RecoveredInFlightToolCall[],
   warnings: DaemonStartupRecoveryWarning[],
+  resumeSource: StartupRunResumeSource | undefined,
 ): RecoveredAgentRun {
   const currentSessionId = nullableString(row.current_session_id);
   const createdByClient = nullableString(row.created_by_client);
@@ -371,6 +465,7 @@ function toRecoveredAgentRun(
     ...(lastSnapshotAt !== undefined ? { lastSnapshotAt } : {}),
     ...(metadata !== undefined ? { metadata } : {}),
     ...(latestSnapshot !== undefined ? { latestSnapshot } : {}),
+    ...(resumeSource !== undefined ? { resumeSource } : {}),
   };
 }
 
@@ -523,10 +618,7 @@ function loadPreviouslyRecoveredToolCalls(
     .filter(
       (row) => !excludeKeys.has(toolCallKey(row.session_id, row.tool_call_id)),
     )
-    .filter(
-      (row) =>
-        !excludedSessionIds.has(row.session_id),
-    )
+    .filter((row) => !excludedSessionIds.has(row.session_id))
     .map((row) => toRecoveredToolCall(driver, row, warnings));
 }
 
@@ -616,15 +708,19 @@ function toRecoveredToolCall(
     recoveryCategory,
     recoveryAction: outcome.action,
     startedAt: row.started_at,
-    ...(row.output_partial !== null ? { outputPartial: row.output_partial } : {}),
-    ...(row.output_log_path !== null ? { outputLogPath: row.output_log_path } : {}),
-    ...(row.output_log_bytes > 0 ? { outputLogBytes: row.output_log_bytes } : {}),
+    ...(row.output_partial !== null
+      ? { outputPartial: row.output_partial }
+      : {}),
+    ...(row.output_log_path !== null
+      ? { outputLogPath: row.output_log_path }
+      : {}),
+    ...(row.output_log_bytes > 0
+      ? { outputLogBytes: row.output_log_bytes }
+      : {}),
   };
 }
 
-function toolRecoveryOutcome(
-  recoveryCategory: ToolRecoveryCategory,
-): {
+function toolRecoveryOutcome(recoveryCategory: ToolRecoveryCategory): {
   readonly action: ToolRecoveryAction;
   readonly statusAfter: string;
 } {

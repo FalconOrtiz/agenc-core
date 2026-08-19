@@ -4,10 +4,12 @@
  * On startup the daemon records the build it was launched against
  * (`runtimeVersion`, `commit`, `buildTime` from `dist/VERSION`) into
  * `~/.agenc/daemon-runtime.json`, next to `daemon.pid`. On CLI startup,
- * `ensureAgenCDaemonAutostart` compares the recorded `buildTime`
- * against the current `dist/VERSION.buildTime`. If they differ — i.e.
- * the runtime was rebuilt while the daemon was running — the CLI
- * SIGTERM's the stale process and lets autostart spawn a fresh one.
+ * `ensureAgenCDaemonAutostart` compares the complete recorded build tuple
+ * against the current `dist/VERSION` tuple. If any field
+ * differs — i.e. the runtime was rebuilt while the daemon was running — the
+ * CLI requests authenticated instance-bound self-shutdown and lets autostart
+ * spawn a fresh one. A numeric signal is only a Linux fallback after the
+ * same-home process and stable start token are rebound immediately beforehand.
  *
  * This exists because the ESM bundler emits content-hashed chunk
  * filenames (`run-turn-AVRTIPZE.js`). A `npm run build` deletes the
@@ -19,9 +21,17 @@
  * respawn.
  */
 
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  isAgenCDaemonInstanceIdentity,
+  type AgenCDaemonInstanceIdentity,
+} from "./daemon-instance-identity.js";
+import { writeDurableAtomicFileSync } from "../utils/durable-atomic-file.js";
+import { readBoundedRegularFileSync } from "../utils/bounded-regular-file.js";
 
 /**
  * Locate the `@tetsuo-ai/runtime` package root from `import.meta.url`.
@@ -55,6 +65,10 @@ export function resolveRuntimePackageRootFromUrl(
 
 export interface DaemonRuntimeInfo {
   readonly pid: number;
+  /** Missing only in a sidecar written by a pre-instance-identity daemon. */
+  readonly instanceId?: string;
+  /** Missing only in a sidecar written by a pre-instance-identity daemon. */
+  readonly processStart?: string;
   readonly runtimeVersion: string;
   readonly commit: string;
   readonly buildTime: string;
@@ -70,6 +84,7 @@ export interface DaemonRuntimeInfo {
 }
 
 const AGENC_DAEMON_RUNTIME_INFO_FILENAME = "daemon-runtime.json";
+export const AGENC_DAEMON_RUNTIME_INFO_MAX_BYTES = 64 * 1_024;
 
 export function resolveAgenCDaemonRuntimeInfoPath(daemonHome: string): string {
   return join(daemonHome, AGENC_DAEMON_RUNTIME_INFO_FILENAME);
@@ -111,14 +126,17 @@ export function readDistVersion(runtimeRoot: string): {
   }
 }
 
-export function readDaemonRuntimeInfo(
-  path: string,
-): DaemonRuntimeInfo | null {
+export function readDaemonRuntimeInfo(path: string): DaemonRuntimeInfo | null {
   try {
-    const raw = readFileSync(path, "utf8");
+    const raw = readBoundedRegularFileSync(
+      path,
+      AGENC_DAEMON_RUNTIME_INFO_MAX_BYTES,
+    );
     const parsed = JSON.parse(raw) as Partial<DaemonRuntimeInfo>;
     if (
       typeof parsed.pid !== "number" ||
+      !Number.isSafeInteger(parsed.pid) ||
+      parsed.pid <= 1 ||
       typeof parsed.runtimeVersion !== "string" ||
       typeof parsed.commit !== "string" ||
       typeof parsed.buildTime !== "string" ||
@@ -128,12 +146,19 @@ export function readDaemonRuntimeInfo(
     }
     return {
       pid: parsed.pid,
+      ...(typeof parsed.instanceId === "string" && parsed.instanceId.length > 0
+        ? { instanceId: parsed.instanceId }
+        : {}),
+      ...(typeof parsed.processStart === "string" &&
+      parsed.processStart.length > 0
+        ? { processStart: parsed.processStart }
+        : {}),
       runtimeVersion: parsed.runtimeVersion,
       commit: parsed.commit,
       buildTime: parsed.buildTime,
       startedAt: parsed.startedAt,
       ...(typeof parsed.webSocketUrl === "string" &&
-        parsed.webSocketUrl.length > 0
+      parsed.webSocketUrl.length > 0
         ? { webSocketUrl: parsed.webSocketUrl }
         : {}),
     };
@@ -142,18 +167,43 @@ export function readDaemonRuntimeInfo(
   }
 }
 
-export function writeDaemonRuntimeInfo(
-  path: string,
-  info: DaemonRuntimeInfo,
-): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(info, null, 2)}\n`, {
-    mode: 0o600,
-  });
+export function daemonInstanceIdentityFromRuntimeInfo(
+  info: DaemonRuntimeInfo | null,
+): AgenCDaemonInstanceIdentity | null {
+  if (!isAgenCDaemonInstanceIdentity(info)) return null;
+  return {
+    pid: info.pid,
+    instanceId: info.instanceId,
+    processStart: info.processStart,
+    runtimeVersion: info.runtimeVersion,
+    commit: info.commit,
+    buildTime: info.buildTime,
+  };
 }
 
-export function removeDaemonRuntimeInfo(path: string): void {
+export function writeDaemonRuntimeInfo(
+  path: string,
+  info: DaemonRuntimeInfo & AgenCDaemonInstanceIdentity,
+): void {
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeDurableAtomicFileSync(
+    path,
+    temporaryPath,
+    `${JSON.stringify(info, null, 2)}\n`,
+  );
+}
+
+export function removeDaemonRuntimeInfo(
+  path: string,
+  expectedInstanceId?: string,
+): void {
   try {
+    if (
+      expectedInstanceId !== undefined &&
+      readDaemonRuntimeInfo(path)?.instanceId !== expectedInstanceId
+    ) {
+      return;
+    }
     rmSync(path, { force: true });
   } catch {
     /* best-effort */

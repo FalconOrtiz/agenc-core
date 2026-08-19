@@ -21,13 +21,13 @@ import {
   hasRemoteAuthSessionSync,
   remoteAuthSessionSubscriptionTierSync,
 } from "../auth/session-state.js";
-import { configuredModelForProvider, defaultModelForProvider } from "../config/resolve-model.js";
+import {
+  configuredModelForProvider,
+  defaultModelForProvider,
+} from "../config/resolve-model.js";
 import { normalizeProviderName } from "../llm/provider.js";
 import { resolveBuiltInProviderInfo } from "../llm/registry/provider-info.js";
-import {
-  checkModelHistoryCompat,
-  type HistoryCompatResult,
-} from "./model.js";
+import { checkModelHistoryCompat, type HistoryCompatResult } from "./model.js";
 import { readCommandConfig } from "./config-context.js";
 import {
   safeExecute,
@@ -63,34 +63,43 @@ export async function applyProviderSwitch(
   session: Session,
   targetProvider: string,
   targetModel?: string,
+  options: {
+    readonly beforeStage?: (selection: {
+      readonly provider: string;
+      readonly model: string;
+    }) => Promise<void> | void;
+  } = {},
 ): Promise<string> {
   const normalizedProvider = normalizeProviderName(targetProvider);
   if (normalizedProvider === null) {
     return `Provider switch to "${targetProvider}" blocked: unknown provider`;
   }
 
-  const peekState = (session as unknown as {
-    state?: { unsafePeek?: () => unknown };
-  }).state?.unsafePeek;
-  const rawState = (typeof peekState === "function"
-    ? (peekState.call((session as unknown as { state?: unknown }).state) as {
-        sessionConfiguration?: {
-          provider?: { slug?: string };
-          collaborationMode?: { model?: string };
-        };
-      })
-    : null);
-  const directConfig = (session as unknown as {
-    sessionConfiguration?: {
-      provider?: { slug?: string };
-      collaborationMode?: { model?: string };
-    };
-  }).sessionConfiguration;
+  const peekState = (
+    session as unknown as {
+      state?: { unsafePeek?: () => unknown };
+    }
+  ).state?.unsafePeek;
+  const rawState =
+    typeof peekState === "function"
+      ? (peekState.call((session as unknown as { state?: unknown }).state) as {
+          sessionConfiguration?: {
+            provider?: { slug?: string };
+            collaborationMode?: { model?: string };
+          };
+        })
+      : null;
+  const directConfig = (
+    session as unknown as {
+      sessionConfiguration?: {
+        provider?: { slug?: string };
+        collaborationMode?: { model?: string };
+      };
+    }
+  ).sessionConfiguration;
   const sessionConfig = rawState?.sessionConfiguration ?? directConfig;
-  const currentProvider =
-    sessionConfig?.provider?.slug ?? "unknown";
-  const currentModel =
-    sessionConfig?.collaborationMode?.model ?? "unknown";
+  const currentProvider = sessionConfig?.provider?.slug ?? "unknown";
+  const currentModel = sessionConfig?.collaborationMode?.model ?? "unknown";
   const config = session.services.configStore?.current();
   const resolvedModel =
     targetModel?.trim() ||
@@ -125,6 +134,11 @@ export async function applyProviderSwitch(
     );
   }
 
+  await options.beforeStage?.({
+    provider: normalizedProvider,
+    model: resolvedModel,
+  });
+
   // Use the typed mutator so the I-13 + I-57 staging site has a single
   // well-typed entry point.
   sessionShim.setPendingProviderSwitch({
@@ -132,9 +146,11 @@ export async function applyProviderSwitch(
     model: resolvedModel,
   });
 
-  const activeTurnPeek = (session as unknown as {
-    activeTurn?: { unsafePeek?: () => unknown };
-  }).activeTurn?.unsafePeek;
+  const activeTurnPeek = (
+    session as unknown as {
+      activeTurn?: { unsafePeek?: () => unknown };
+    }
+  ).activeTurn?.unsafePeek;
   const activeTurn =
     typeof activeTurnPeek === "function"
       ? activeTurnPeek.call(
@@ -176,7 +192,9 @@ function resolveCommandModelForProvider(
   const config = session.services.configStore?.current();
   return (
     targetModel?.trim() ||
-    (config ? configuredModelForProvider(config, normalizedProvider) : undefined) ||
+    (config
+      ? configuredModelForProvider(config, normalizedProvider)
+      : undefined) ||
     defaultModelForProvider(normalizedProvider)
   );
 }
@@ -225,7 +243,8 @@ function subscriptionManagedModelError(
     return undefined;
   }
   if (!providerHasLiveSubscriptionRoute(normalizedProvider)) return undefined;
-  if (isSubscriptionManagedModel(normalizedProvider, targetModel)) return undefined;
+  if (isSubscriptionManagedModel(normalizedProvider, targetModel))
+    return undefined;
   const liveModels = visibleSubscriptionManagedModelsForTier(
     normalizedProvider,
     remoteAuthSessionSubscriptionTierSync(process.env),
@@ -269,7 +288,8 @@ function providerSwitchAuthError(
     config,
     process.env,
   );
-  if (isLocalProviderEndpoint(settings?.baseURL ?? info.baseURL)) return undefined;
+  if (isLocalProviderEndpoint(settings?.baseURL ?? info.baseURL))
+    return undefined;
   const apiKey = settings?.apiKey;
   if (apiKey !== undefined && apiKey.trim().length > 0) return undefined;
   if (
@@ -339,14 +359,22 @@ export const providerCommand: SlashCommand = {
                 shouldClose: false,
               };
             }
-            const modelError = subscriptionManagedModelError(ctx, provider, model);
+            const modelError = subscriptionManagedModelError(
+              ctx,
+              provider,
+              model,
+            );
             if (modelError !== undefined) {
               return {
                 message: modelError,
                 shouldClose: false,
               };
             }
-            const summary = await applyProviderSwitch(ctx.session, provider, model);
+            const summary = await applyProviderSwitch(
+              ctx.session,
+              provider,
+              model,
+            );
             if (providerSwitchApplied(summary)) {
               updateProviderChrome(ctx, model);
             }

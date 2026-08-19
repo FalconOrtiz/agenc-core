@@ -71,13 +71,43 @@ export interface AgenCDaemonPromptAgentOptions {
   readonly metadata?: JsonObject;
   /** See `AgentCreateParams.permissionMode`. Forwarded verbatim. */
   readonly permissionMode?:
-    "default" | "plan" | "acceptEdits" | "bypassPermissions";
+    | "default"
+    | "plan"
+    | "acceptEdits"
+    | "bypassPermissions"
+    | "dontAsk"
+    | "auto";
 }
 
 export interface StopAgenCDaemonPromptAgentOptions {
   readonly agentId: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly reason: string;
+}
+
+export interface ResumeAgenCDaemonPromptAgentOptions {
+  readonly sessionId: string;
+  readonly rolloutPath: string;
+  readonly sourceProof: {
+    readonly dev: string;
+    readonly ino: string;
+    readonly size: string;
+    readonly sha256: string;
+    readonly cwdDev: string;
+    readonly cwdIno: string;
+  };
+  readonly env?: NodeJS.ProcessEnv;
+  readonly cwd?: string;
+  readonly model?: string;
+  readonly provider?: string;
+  readonly profile?: string;
+  readonly permissionMode?:
+    | "default"
+    | "plan"
+    | "acceptEdits"
+    | "bypassPermissions"
+    | "dontAsk"
+    | "auto";
 }
 
 export async function startAgenCDaemonPromptAgent(
@@ -122,6 +152,33 @@ export async function startAgenCDaemonPromptAgent(
       source: "agenc.prompt",
       ...(options.metadata ?? {}),
     },
+  });
+}
+
+/** Restore a retained canonical rollout into a new daemon-owned TUI runtime. */
+export async function resumeAgenCDaemonPromptAgent(
+  options: ResumeAgenCDaemonPromptAgentOptions,
+): Promise<AgentCreateResult> {
+  const sessionId = options.sessionId.trim();
+  if (sessionId.length === 0) {
+    throw new Error("daemon prompt resume requires a non-empty session id");
+  }
+  const env = options.env ?? process.env;
+  await defaultEnsureDaemonReady(env)();
+  const client = createAgenCJsonLineDaemonClient({ env });
+  const envOverrides = collectDaemonClientEnvOverrides(env);
+  return client.createAgent({
+    resumeSessionId: sessionId,
+    resumeRolloutPath: options.rolloutPath,
+    resumeSourceProof: options.sourceProof,
+    cwd: options.cwd ?? processCwd(),
+    ...(options.model !== undefined ? { model: options.model } : {}),
+    ...(options.provider !== undefined ? { provider: options.provider } : {}),
+    ...(options.profile !== undefined ? { profile: options.profile } : {}),
+    ...(options.permissionMode !== undefined
+      ? { permissionMode: options.permissionMode }
+      : {}),
+    ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
   });
 }
 
@@ -197,13 +254,31 @@ export async function findAgenCDaemonAgentBySessionId(
   sessionId: string,
 ): Promise<AgentSummary | null> {
   const agents = await listAgenCDaemonAgents(client);
-  const matches = agents.filter((agent) =>
-    agent.activeSessionIds?.includes(sessionId),
+  const matches = agents.filter(
+    (agent) =>
+      (agent.agentId === sessionId ||
+        agent.activeSessionIds?.includes(sessionId) === true) &&
+      (agent.status === "running" || agent.status === "idle") &&
+      !isPersistedAgentWithoutRuntime(agent),
   );
   if (matches.length > 1) {
     throw new Error(`daemon session matches multiple agents: ${sessionId}`);
   }
   return matches[0] ?? null;
+}
+
+function isPersistedAgentWithoutRuntime(agent: AgentSummary): boolean {
+  const recovery = agent.metadata?.recovery;
+  if (
+    typeof recovery === "object" &&
+    recovery !== null &&
+    !Array.isArray(recovery)
+  ) {
+    const runtimeRestore = (recovery as JsonObject).runtimeRestore;
+    if (runtimeRestore === "available") return false;
+    if (runtimeRestore === "unavailable") return true;
+  }
+  return agent.metadata?.recovered === true;
 }
 
 export interface AgenCDaemonOnlyTuiContextOptions {
@@ -222,7 +297,12 @@ export interface AgenCDaemonOnlyTuiContextOptions {
    * runtime authority instead of always claiming `default`.
    */
   readonly permissionMode?:
-    "default" | "plan" | "acceptEdits" | "bypassPermissions";
+    | "default"
+    | "plan"
+    | "acceptEdits"
+    | "bypassPermissions"
+    | "dontAsk"
+    | "auto";
 }
 
 export interface AgenCDaemonOnlyTuiContext {

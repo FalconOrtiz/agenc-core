@@ -72,14 +72,13 @@ afterEach(async () => {
 });
 
 describe("xAI model options", () => {
-  it("uses grok-4.5 as the default and hides legacy Anthropic picker rows", () => {
-    expect(getDefaultMainLoopModelSetting()).toBe("grok-4.5");
+  it("uses grok-4.6 as the default and hides legacy Anthropic picker rows", () => {
+    expect(getDefaultMainLoopModelSetting()).toBe("grok-4.6");
 
     const options = getModelOptions(false);
     // The grok picker is derived from REGISTERED_MODEL_CATALOG, with the
-    // current frontier model leading the older catalog entries. grok-4.6
-    // leads as the newest; the DEFAULT stays grok-4.5 (asserted above) —
-    // listing a model and defaulting to it are separate decisions.
+    // current frontier model leading the older catalog entries. grok-4.6 is
+    // both the newest entry and the current default (asserted above).
     expect(options.map((option) => option.value)).toEqual([
       null,
       "grok-4.6",

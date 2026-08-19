@@ -354,7 +354,7 @@ describe("CsvAgentJobsRepository", () => {
         processStart:
           platform === "darwin"
             ? `darwin-lstart-seconds:${platform}-start-41`
-            : `win32-creation-time:${platform}-start-41`,
+            : `win32-creation-time-ticks:${platform}-start-41`,
       });
       await expect(probe.inspect(42)).resolves.toEqual({ kind: "dead" });
 
@@ -376,7 +376,7 @@ describe("CsvAgentJobsRepository", () => {
         processStart:
           platform === "darwin"
             ? `darwin-lstart-seconds:${platform}-start-42`
-            : `win32-creation-time:${platform}-start-42`,
+            : `win32-creation-time-ticks:${platform}-start-42`,
       });
 
       const unavailable = await createCsvProcessIdentityProbe({
@@ -412,7 +412,7 @@ describe("CsvAgentJobsRepository", () => {
         processStart:
           platform === "darwin"
             ? "darwin-lstart-seconds:reused-generation"
-            : "win32-creation-time:reused-generation",
+            : "win32-creation-time-ticks:reused-generation",
       });
 
       const permissionLimited = await createCsvProcessIdentityProbe({
@@ -1335,7 +1335,7 @@ describe("CsvAgentJobsRepository", () => {
           `SELECT COUNT(*) AS count FROM csv_output_intents
            WHERE intent_id = ?`,
         )
-      .get(blockedIntent)?.count,
+        .get(blockedIntent)?.count,
     ).toBe(1);
     expect(
       driver
@@ -3748,7 +3748,12 @@ describe("CsvAgentJobsRepository", () => {
   it.each(["darwin", "win32"] as const)(
     "reclaims an expired import after exact %s PID-generation mismatch",
     async (platform) => {
-      seedExpiredStagedImport(`${platform}-reused-generation`, "old-start");
+      seedExpiredStagedImport(
+        `${platform}-reused-generation`,
+        platform === "win32"
+          ? "win32-creation-time-ticks:old-start"
+          : "old-start",
+      );
       const exactProbe = await createCsvProcessIdentityProbe({
         platform,
         pid: 41,
@@ -3778,6 +3783,33 @@ describe("CsvAgentJobsRepository", () => {
       ).toBeUndefined();
     },
   );
+
+  it("defers a live legacy Windows ISO token when the runtime observes ticks", async () => {
+    const id = "win32-live-legacy-encoding";
+    seedExpiredStagedImport(id, "win32-creation-time:2026-08-19T19:00:00.000Z");
+    const probe = await createCsvProcessIdentityProbe({
+      platform: "win32",
+      pid: 41,
+      signalProcess() {},
+      inspectProcessStart(_platform, targetPid) {
+        return targetPid === 41 ? "638911234567890100" : "638911234567890123";
+      },
+    });
+
+    await CsvAgentJobsRepository.open(driver, { processIdentityProbe: probe });
+
+    expect(
+      driver
+        .prepareState<
+          [string],
+          { readonly import_state: string; readonly last_error: string | null }
+        >("SELECT import_state, last_error FROM csv_agent_jobs WHERE id = ?")
+        .get(id),
+    ).toEqual({
+      import_state: "staging",
+      last_error: CSV_RECOVERY_DEFERRED_PROCESS_IDENTITY_UNPROVEN,
+    });
+  });
 
   it.each(["darwin", "win32"] as const)(
     "defers %s recovery when permissions hide the exact process generation",

@@ -197,6 +197,8 @@ export interface BackfillPinnedRolloutSource {
   readonly expectedRunId?: string;
   readonly expectedEpoch?: number;
   readonly terminalPolicy?: "allow_missing" | "require_terminal";
+  /** Durable current-writer provenance; omitted for legacy discovery lanes. */
+  readonly activeBinding?: boolean;
   readonly afterValidationPass?: (proof: PinnedCanonicalJournalProof) => void;
 }
 
@@ -204,36 +206,42 @@ export interface PreparedPinnedRolloutRun {
   /** Exact canonical ordering shared by proofs and projectAll results. */
   readonly sources: readonly BackfillPinnedRolloutSource[];
   readonly proofs: readonly PinnedCanonicalJournalProof[];
+  readonly initialSessionMetadata: readonly (
+    | Extract<RolloutItem, { readonly type: "session_meta" }>["payload"]
+    | undefined
+  )[];
   projectAll(): readonly BackfillPinnedRolloutFileResult[];
   assertPinned(): void;
+  openAppendDescriptor(sourceIndex: number): number;
 }
 
 /**
  * Validate a bounded run before mutation, then retain every lease while the
  * caller executes exactly one outer SQLite transaction.
  */
-export function withPreparedPinnedRolloutRun<T>(options: {
-  readonly projectDir: string;
-  readonly sources: readonly BackfillPinnedRolloutSource[];
-  readonly threads: StateThreadRepository;
-  readonly limits?: RecoveryFileLimitOverrides;
-  readonly descriptorBudget?: RecoveryDescriptorBudget;
-  readonly nowMilliseconds?: () => number;
-  readonly onSourceFailure?: (
-    source: BackfillPinnedRolloutSource,
-    error: unknown,
-  ) => void;
-}, operation: (prepared: PreparedPinnedRolloutRun) => T): T {
+export function withPreparedPinnedRolloutRun<T>(
+  options: {
+    readonly projectDir: string;
+    readonly sources: readonly BackfillPinnedRolloutSource[];
+    readonly threads: StateThreadRepository;
+    readonly limits?: RecoveryFileLimitOverrides;
+    readonly descriptorBudget?: RecoveryDescriptorBudget;
+    readonly nowMilliseconds?: () => number;
+    readonly onSourceFailure?: (
+      source: BackfillPinnedRolloutSource,
+      error: unknown,
+    ) => void;
+  },
+  operation: (prepared: PreparedPinnedRolloutRun) => T,
+): T {
   const sources = [...options.sources].sort((left, right) =>
     compareRolloutPaths(left.rolloutPath, right.rolloutPath),
   );
   const metadata = sources.map(() => ({
     first: undefined as
-      | Extract<RolloutItem, { type: "session_meta" }>
-      | undefined,
+      Extract<RolloutItem, { type: "session_meta" }> | undefined,
     latest: undefined as
-      | Extract<RolloutItem, { type: "session_meta" }>
-      | undefined,
+      Extract<RolloutItem, { type: "session_meta" }> | undefined,
   }));
   const byPath = new Map(
     sources.map((source) => [source.rolloutPath, source] as const),
@@ -282,6 +290,9 @@ export function withPreparedPinnedRolloutRun<T>(options: {
       const prepared: PreparedPinnedRolloutRun = Object.freeze({
         sources: Object.freeze(sources.slice()),
         proofs: Object.freeze(journals.map(({ proof }) => proof)),
+        initialSessionMetadata: Object.freeze(
+          metadata.map((state) => state.first?.payload),
+        ),
         projectAll: () => {
           if (projected) {
             throw new Error("canonical recovery run may project only once");
@@ -301,16 +312,20 @@ export function withPreparedPinnedRolloutRun<T>(options: {
         assertPinned: () => {
           for (const journal of journals) journal.assertPinned();
         },
+        openAppendDescriptor: (sourceIndex: number) => {
+          const journal = journals[sourceIndex];
+          if (journal === undefined) {
+            throw new RangeError("canonical recovery source index is invalid");
+          }
+          return journal.openAppendDescriptor();
+        },
       });
       return operation(prepared);
     },
   );
 }
 
-function compareRolloutPaths(
-  leftPath: string,
-  rightPath: string,
-): number {
+function compareRolloutPaths(leftPath: string, rightPath: string): number {
   const left = process.platform === "win32" ? leftPath.toLowerCase() : leftPath;
   const right =
     process.platform === "win32" ? rightPath.toLowerCase() : rightPath;
@@ -339,21 +354,23 @@ export function backfillPinnedRolloutFile(options: {
   return withPreparedPinnedRolloutRun(
     {
       projectDir: options.projectDir,
-      sources: [{
-        sessionId: options.sessionId,
-        rolloutPath: options.rolloutPath,
-        archived: options.archived,
-        terminalPolicy: options.terminalPolicy ?? "allow_missing",
-        ...(options.expectedRunId !== undefined
-          ? { expectedRunId: options.expectedRunId }
-          : {}),
-        ...(options.expectedEpoch !== undefined
-          ? { expectedEpoch: options.expectedEpoch }
-          : {}),
-        ...(options.afterValidationPass !== undefined
-          ? { afterValidationPass: options.afterValidationPass }
-          : {}),
-      }],
+      sources: [
+        {
+          sessionId: options.sessionId,
+          rolloutPath: options.rolloutPath,
+          archived: options.archived,
+          terminalPolicy: options.terminalPolicy ?? "allow_missing",
+          ...(options.expectedRunId !== undefined
+            ? { expectedRunId: options.expectedRunId }
+            : {}),
+          ...(options.expectedEpoch !== undefined
+            ? { expectedEpoch: options.expectedEpoch }
+            : {}),
+          ...(options.afterValidationPass !== undefined
+            ? { afterValidationPass: options.afterValidationPass }
+            : {}),
+        },
+      ],
       threads: options.threads,
       ...(options.limits !== undefined ? { limits: options.limits } : {}),
       ...(options.descriptorBudget !== undefined
@@ -419,7 +436,9 @@ function projectPinnedJournal(
     },
   });
   if (replayProof === undefined) {
-    throw new Error("canonical journal projection completed without replay proof");
+    throw new Error(
+      "canonical journal projection completed without replay proof",
+    );
   }
   return Object.freeze({
     itemsIndexed: journal.proof.recordCount,
@@ -872,6 +891,7 @@ function collectRolloutFiles(
   } catch {
     return;
   }
+  const rolloutCandidates: string[] = [];
   for (const entry of entries) {
     const full = join(dir, entry);
     let stat;
@@ -883,8 +903,16 @@ function collectRolloutFiles(
     if (stat.isDirectory()) {
       collectRolloutFiles(full, archived, result);
     } else if (entry.startsWith("rollout-") && entry.endsWith(".jsonl")) {
-      result.push({ rolloutPath: full, archived });
+      rolloutCandidates.push(full);
     }
+  }
+  const normalCandidates = rolloutCandidates.filter(
+    (rolloutPath) => !basename(rolloutPath).startsWith("rollout-recovery-"),
+  );
+  for (const rolloutPath of normalCandidates.length > 0
+    ? normalCandidates
+    : rolloutCandidates) {
+    result.push({ rolloutPath, archived });
   }
 }
 

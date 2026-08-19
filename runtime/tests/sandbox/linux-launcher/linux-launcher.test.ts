@@ -456,6 +456,36 @@ describe("Linux sandbox launcher", () => {
     });
   });
 
+  it("rejects bubblewrap that advertises required flags but cannot create namespaces", () => {
+    const root = withTempDir("agenc-linux-launcher-namespace-probe-");
+    const cwd = path.join(root, "workspace");
+    const trusted = path.join(root, "trusted-bin");
+    fs.mkdirSync(cwd);
+    fs.mkdirSync(trusted);
+    const trustedBwrap = path.join(trusted, "bwrap");
+    writeExecutable(
+      trustedBwrap,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "--help" ]; then',
+        "  echo '--argv0 --ro-bind-fd'",
+        "  exit 0",
+        "fi",
+        "echo 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2",
+        "exit 1",
+      ].join("\n") + "\n",
+    );
+
+    expect(
+      preferredBubblewrapLauncher({
+        searchPath: trusted,
+        cwd,
+        trustedDirectories: [trusted],
+        requireNamespaces: true,
+      }),
+    ).toBeNull();
+  });
+
   it("probes descriptor-bind support with a scrubbed launcher environment", () => {
     const root = withTempDir("agenc-linux-launcher-bind-fd-probe-");
     const fakeBwrap = path.join(root, "bwrap");

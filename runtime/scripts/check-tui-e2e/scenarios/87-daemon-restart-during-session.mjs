@@ -1,11 +1,10 @@
 /**
  * Daemon restart during an open TUI session.
  *
- * This catches the production failure: user opens agenc, submits a
+ * This guards against a fixed production failure: user opens agenc, submits a
  * turn, the daemon restarts (crashed, upgraded, or another tool ran
- * `daemon restart`), user submits a second turn → TUI rejects with
- * "Daemon connection is closed" because the persistent client's
- * socket pointer is to a dead process and has no reconnect logic.
+ * `daemon restart`), and the TUI's persistent client must reconnect before
+ * the user submits a second turn.
  *
  * The scenario:
  *   1. start TUI, type "hi", wait for reply
@@ -13,9 +12,8 @@
  *   3. type "and again" → assert TUI either reconnects OR surfaces a
  *      clean error (not an unhandled rejection or stack-trace dump)
  *
- * SKIPPED today — the persistent client (agent-cli.ts ~line 792) has
- * no auto-reconnect path. Filed as GAP-DMN-PERSISTENT-RECONNECT.
- * Unskip when reconnect (or graceful-error-with-retry) lands.
+ * Persistent-client reconnect support is implemented, so this scenario stays
+ * enabled as end-to-end regression coverage.
  */
 export const meta = {
   description:

@@ -42,7 +42,7 @@ import {
   type SupervisedProcessStopReason,
 } from "../../utils/supervisedProcess.js";
 import {
-  applyRuntimeSandboxToSpawn,
+  applyReadOnlyRuntimeSandboxToSpawn,
   type SandboxSpawnCommand,
 } from "./apply-runtime-sandbox.js";
 import { selectPinnedRipgrepPath } from "./pinned-ripgrep.js";
@@ -475,7 +475,7 @@ function prepareBoundRipgrepFilesCommand(params: {
   readonly args: readonly string[];
   readonly env: Record<string, string>;
 }): SandboxSpawnCommand {
-  const command = applyRuntimeSandboxToSpawn({
+  const command = applyReadOnlyRuntimeSandboxToSpawn({
     toolArgs: params.toolArgs,
     fallbackCwd: params.fallbackCwd,
     program: params.program,
@@ -606,7 +606,7 @@ async function runRipgrepFilesWithIgnorePaths(
   }
   let command: SandboxSpawnCommand;
   try {
-    command = applyRuntimeSandboxToSpawn({
+    command = applyReadOnlyRuntimeSandboxToSpawn({
       toolArgs: params.toolArgs,
       fallbackCwd: params.cwd,
       program: params.command,

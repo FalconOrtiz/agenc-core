@@ -398,6 +398,18 @@ describe("bootstrapSession happy path", () => {
       "skills-watcher",
       "turn:ordinary agent turn",
     ]);
+
+    await session.submit("second ordinary turn");
+    expect(sequence).toEqual([
+      "auth",
+      "turn:editor question",
+      "session-start",
+      "mcp",
+      "skills-watcher",
+      "turn:ordinary agent turn",
+      "turn:second ordinary turn",
+    ]);
+    expect(processSessionStart).toHaveBeenCalledOnce();
     expect(manager.start).toHaveBeenCalledOnce();
     expect(skillsWatcher.start).toHaveBeenCalledOnce();
   });

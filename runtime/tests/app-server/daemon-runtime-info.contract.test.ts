@@ -1,16 +1,27 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  AGENC_DAEMON_RUNTIME_INFO_MAX_BYTES,
   readDaemonRuntimeInfo,
+  removeDaemonRuntimeInfo,
   resolveAgenCDaemonRuntimeInfoPath,
   writeDaemonRuntimeInfo,
 } from "../../src/app-server/daemon-runtime-info.js";
 
 const BASE_INFO = {
   pid: 4242,
+  instanceId: "instance-4242",
+  processStart: "test-process:4242:start",
   runtimeVersion: "0.14.2",
   commit: "abc123",
   buildTime: "2026-08-07T00:00:00.000Z",
@@ -39,6 +50,21 @@ describe("daemon runtime info sidecar", () => {
       ...BASE_INFO,
       webSocketUrl: "ws://127.0.0.1:40117/",
     });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(home).filter((entry) => entry.endsWith(".tmp"))).toEqual(
+      [],
+    );
+  });
+
+  it("does not remove a sidecar claimed by another daemon instance", () => {
+    const path = resolveAgenCDaemonRuntimeInfoPath(home);
+    writeDaemonRuntimeInfo(path, BASE_INFO);
+
+    removeDaemonRuntimeInfo(path, "different-instance");
+    expect(readDaemonRuntimeInfo(path)).toEqual(BASE_INFO);
+
+    removeDaemonRuntimeInfo(path, BASE_INFO.instanceId);
+    expect(readDaemonRuntimeInfo(path)).toBeNull();
   });
 
   it("reads sidecars written by daemons that recorded no websocket url", () => {
@@ -70,4 +96,30 @@ describe("daemon runtime info sidecar", () => {
 
     expect(readDaemonRuntimeInfo(path)).toBeNull();
   });
+
+  it.each([1, 1.5, -42, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects a non-canonical daemon pid %s",
+    (pid) => {
+      const path = resolveAgenCDaemonRuntimeInfoPath(home);
+      writeFileSync(path, `${JSON.stringify({ ...BASE_INFO, pid })}\n`);
+      expect(readDaemonRuntimeInfo(path)).toBeNull();
+    },
+  );
+
+  it("rejects an oversized identity sidecar without parsing its prefix", () => {
+    const path = resolveAgenCDaemonRuntimeInfoPath(home);
+    writeFileSync(path, "{".repeat(AGENC_DAEMON_RUNTIME_INFO_MAX_BYTES + 1));
+    expect(readDaemonRuntimeInfo(path)).toBeNull();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "rejects a symlinked identity sidecar",
+    () => {
+      const target = join(home, "sidecar-target.json");
+      const path = resolveAgenCDaemonRuntimeInfoPath(home);
+      writeFileSync(target, `${JSON.stringify(BASE_INFO)}\n`);
+      symlinkSync(target, path);
+      expect(readDaemonRuntimeInfo(path)).toBeNull();
+    },
+  );
 });

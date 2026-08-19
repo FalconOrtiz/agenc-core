@@ -1,15 +1,25 @@
 import {
+  closeSync,
+  constants as fsConstants,
   existsSync,
   fsyncSync,
+  lstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  symlinkSync,
   writeSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { AsyncQueue } from "../utils/async-queue.js";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -28,6 +38,8 @@ import {
   SessionLock,
   SessionLockedError,
   SessionStore,
+  createResumeRolloutDescriptorLease,
+  hasSupportedFileIdentity,
   slugifyCwd,
   truncateCorruptTail,
 } from "./session-store.js";
@@ -85,9 +97,80 @@ describe("session-store", () => {
       agencVersion: "0.2.0",
     });
     const content = readFileSync(store.rolloutPath, "utf8");
-    expect(content).toContain(`"rolloutSchemaVersion":${ROLLOUT_SCHEMA_VERSION}`);
+    expect(content).toContain(
+      `"rolloutSchemaVersion":${ROLLOUT_SCHEMA_VERSION}`,
+    );
     expect(content).toContain(`"sessionId":"sess-a"`);
     store.close();
+  });
+
+  test("fresh session metadata canonicalizes a symlink-spelled workspace", () => {
+    const canonicalCwd = mkdtempSync(join(home, "canonical-workspace-"));
+    const lexicalCwd = join(home, "workspace-alias");
+    symlinkSync(canonicalCwd, lexicalCwd, "dir");
+    const store = new SessionStore({
+      cwd: lexicalCwd,
+      sessionId: "sess-canonical-cwd",
+      agencVersion: "0.2.0",
+    });
+    store.open({
+      sessionId: "sess-canonical-cwd",
+      timestamp: new Date().toISOString(),
+      cwd: lexicalCwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    });
+    try {
+      const firstLine = readFileSync(store.rolloutPath, "utf8").split("\n")[0]!;
+      expect(JSON.parse(firstLine)).toMatchObject({
+        type: "session_meta",
+        payload: { cwd: realpathSync(canonicalCwd) },
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("explicit resume opens a canonical rollout through a symlinked AGENC_HOME", () => {
+    const cwd = mkdtempSync(join(home, "resume-workspace-"));
+    const sessionId = "sess-home-alias-resume";
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open({
+      sessionId,
+      timestamp: new Date().toISOString(),
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    });
+    const rolloutPath = seed.rolloutPath;
+    seed.close();
+
+    const lexicalHome = `${home}-alias`;
+    symlinkSync(home, lexicalHome, "dir");
+    process.env.AGENC_HOME = lexicalHome;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: rolloutPath,
+    });
+    try {
+      expect(() =>
+        resumed.open({
+          sessionId,
+          timestamp: new Date().toISOString(),
+          cwd,
+          originator: "agenc-cli",
+          agencVersion: "0.2.0",
+        }),
+      ).not.toThrow();
+      expect(resumed.rolloutPath).toBe(realpathSync(rolloutPath));
+    } finally {
+      resumed.close();
+      rmSync(lexicalHome, { force: true });
+      process.env.AGENC_HOME = home;
+    }
   });
 
   test("open rejects rollout header schema newer than the runtime", () => {
@@ -133,6 +216,683 @@ describe("session-store", () => {
     ).toThrowError(/please use \/fork to migrate or upgrade/i);
   });
 
+  test("explicit resume rejects a hard-linked canonical rollout", () => {
+    const cwd = mkdtempSync(join(home, "resume-hardlink-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-hardlink1";
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    seed.open(meta);
+    seed.close();
+    linkSync(seed.rolloutPath, `${seed.rolloutPath}.alias`);
+
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    expect(() => resumed.open(meta)).toThrow("regular non-symlink file");
+  });
+
+  test("explicit resume refuses to append after the bound source is swapped", () => {
+    const cwd = mkdtempSync(join(home, "resume-swap-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-swap1";
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    seed.open(meta);
+    seed.close();
+    const original = readFileSync(seed.rolloutPath);
+    const parked = `${seed.rolloutPath}.parked`;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    resumed.open(meta);
+    renameSync(seed.rolloutPath, parked);
+    writeFileSync(seed.rolloutPath, original);
+    const replacementBefore = readFileSync(seed.rolloutPath);
+
+    expect(() =>
+      resumed.append(
+        {
+          id: "swap-event",
+          eventId: "swap-event",
+          seq: 1,
+          msg: { type: "warning", payload: { cause: "test", message: "safe" } },
+        },
+        { durable: true },
+      ),
+    ).toThrow("resume rollout source changed during validation");
+    expect(readFileSync(seed.rolloutPath)).toEqual(replacementBefore);
+
+    rmSync(seed.rolloutPath, { force: true });
+    renameSync(parked, seed.rolloutPath);
+    resumed.close();
+  });
+
+  test("descriptor-bound readAll fails closed when its canonical path disappears", () => {
+    const cwd = mkdtempSync(join(home, "resume-read-missing-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-readmissing1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const parked = `${seed.rolloutPath}.parked`;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    resumed.open(meta);
+    renameSync(seed.rolloutPath, parked);
+    try {
+      expect(() => resumed.readAll()).toThrow(
+        "resume rollout source changed during validation",
+      );
+    } finally {
+      renameSync(parked, seed.rolloutPath);
+      resumed.close();
+    }
+  });
+
+  test("descriptor handoff never treats a missing resume path as a fresh rollout", () => {
+    const cwd = mkdtempSync(join(home, "resume-handoff-missing-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-handoffmissing1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const sourceFd = openSync(
+      seed.rolloutPath,
+      fsConstants.O_RDWR | fsConstants.O_APPEND,
+    );
+    const lease = createResumeRolloutDescriptorLease(
+      seed.rolloutPath,
+      sourceFd,
+    );
+    const parked = `${seed.rolloutPath}.parked`;
+    renameSync(seed.rolloutPath, parked);
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      resumeRolloutLease: lease,
+    });
+    try {
+      expect(() => resumed.open(meta)).toThrow(
+        "resume rollout source changed during validation",
+      );
+      expect(existsSync(seed.rolloutPath)).toBe(false);
+    } finally {
+      renameSync(parked, seed.rolloutPath);
+    }
+  });
+
+  test.each(["append", "in-place"] as const)(
+    "descriptor-bound streaming rewrite rejects a mid-read %s mutation",
+    (mutation) => {
+      const cwd = mkdtempSync(join(home, `resume-stream-${mutation}-cwd-`));
+      mkdirSync(join(cwd, ".git"));
+      const sessionId = `conv-stream-${mutation.replaceAll("-", "")}`;
+      const meta = {
+        sessionId,
+        timestamp: "2026-08-19T00:00:00.000Z",
+        cwd,
+        originator: "agenc-cli",
+        agencVersion: "0.2.0",
+      } as const;
+      const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+      seed.open(meta);
+      seed.rewriteRolloutItemsAtomically([
+        ...seed.readAll(),
+        {
+          type: "response_item",
+          payload: { role: "user", content: "authorized removal" },
+        },
+      ]);
+      seed.close();
+      const physicalLines = readFileSync(seed.rolloutPath, "utf8").split("\n");
+      const physical = Buffer.from(`${physicalLines[1]!}\n`, "utf8");
+      const digestDomain = "descriptor-bound-streaming-rewrite-test";
+      const beforeInode = lstatSync(seed.rolloutPath, { bigint: true }).ino;
+      let mutated = false;
+      const resumed = new SessionStore({
+        cwd,
+        sessionId,
+        agencVersion: "0.2.0",
+        resume: true,
+        resumeRolloutPath: seed.rolloutPath,
+        afterBoundResumeStreamingRewriteReadForTestingOnly: () => {
+          if (mutated) return;
+          mutated = true;
+          if (mutation === "append") {
+            writeFileSync(
+              seed.rolloutPath,
+              `${JSON.stringify({
+                type: "response_item",
+                payload: { role: "user", content: "raced append" },
+              })}\n`,
+              { flag: "a" },
+            );
+            return;
+          }
+          const fd = openSync(seed.rolloutPath, fsConstants.O_RDWR);
+          try {
+            writeSync(fd, Buffer.from(" "), 0, 1, 0);
+            fsyncSync(fd);
+          } finally {
+            closeSync(fd);
+          }
+        },
+      });
+      resumed.open(meta);
+      expect(() =>
+        resumed.rewriteRolloutExcludingPhysicalLinesAtomically(
+          [
+            {
+              lineNumber: 2,
+              encodedBytes: physical.byteLength,
+              sha256: createHash("sha256")
+                .update(digestDomain, "utf8")
+                .update(physical)
+                .digest("hex"),
+              itemType: "response_item",
+            },
+          ],
+          digestDomain,
+        ),
+      ).toThrow("resume rollout source changed during streaming rewrite");
+      expect(mutated).toBe(true);
+      expect(lstatSync(seed.rolloutPath, { bigint: true }).ino).toBe(
+        beforeInode,
+      );
+      resumed.close();
+    },
+  );
+
+  test("descriptor handoff rejects a source swap before SessionStore adoption", () => {
+    const cwd = mkdtempSync(join(home, "resume-handoff-swap-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-handoffswap1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const original = readFileSync(seed.rolloutPath);
+    const sourceFd = openSync(
+      seed.rolloutPath,
+      fsConstants.O_RDWR | fsConstants.O_APPEND,
+    );
+    const lease = createResumeRolloutDescriptorLease(
+      seed.rolloutPath,
+      sourceFd,
+    );
+    const parked = `${seed.rolloutPath}.parked`;
+    renameSync(seed.rolloutPath, parked);
+    writeFileSync(seed.rolloutPath, original, { mode: 0o600 });
+    const replacement = readFileSync(seed.rolloutPath);
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      resumeRolloutLease: lease,
+    });
+
+    expect(() => resumed.open(meta)).toThrow(
+      "resume rollout source changed during validation",
+    );
+    expect(readFileSync(seed.rolloutPath)).toEqual(replacement);
+    expect(existsSync(resumed.lockPath)).toBe(false);
+
+    rmSync(seed.rolloutPath, { force: true });
+    renameSync(parked, seed.rolloutPath);
+  });
+
+  test("close releases the resumed descriptor and lock after a flush failure", () => {
+    const cwd = mkdtempSync(join(home, "resume-close-failure-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-closefailure1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    resumed.open(meta);
+    resumed.append({
+      id: "queued-close-failure",
+      eventId: "queued-close-failure",
+      seq: 1,
+      msg: {
+        type: "warning",
+        payload: { cause: "test", message: "queued" },
+      },
+    });
+    resumed.setWriteImplForTest(() => {
+      throw new Error("injected close flush failure");
+    });
+
+    expect(() => resumed.close()).toThrow("injected close flush failure");
+    expect(existsSync(resumed.lockPath)).toBe(false);
+
+    const reopened = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    expect(() => reopened.open(meta)).not.toThrow();
+    reopened.close();
+  });
+
+  test("explicit resume open preserves its failure while releasing a close-failed descriptor and lock", () => {
+    const cwd = mkdtempSync(join(home, "resume-open-cleanup-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-opencleanup1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const primary = new Error("injected resume fsync failure");
+    const cleanup = new Error("injected resume close report failure");
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      resumeSourceCloseForTestingOnly: (fd) => {
+        closeSync(fd);
+        throw cleanup;
+      },
+    });
+    resumed.setFsyncImplForTest(() => {
+      throw primary;
+    });
+
+    let thrown: unknown;
+    try {
+      resumed.open(meta);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AggregateError);
+    expect((thrown as AggregateError).cause).toBe(primary);
+    expect((thrown as AggregateError).errors).toEqual([primary, cleanup]);
+    expect(existsSync(resumed.lockPath)).toBe(false);
+
+    const reopened = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    expect(() => reopened.open(meta)).not.toThrow();
+    reopened.close();
+  });
+
+  test("explicit resume atomically rebinds after a typed rollout rewrite", () => {
+    const cwd = mkdtempSync(join(home, "resume-rewrite-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-rewrite1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      boundResumeRewriteRenameForTestingOnly: (from, to) => {
+        if (existsSync(to)) {
+          throw Object.assign(new Error("injected replace-over-open failure"), {
+            code: "EPERM",
+          });
+        }
+        renameSync(from, to);
+      },
+      boundResumeRewriteDirectorySyncForTestingOnly: () => {
+        throw Object.assign(new Error("injected Windows directory fsync"), {
+          code: "EPERM",
+        });
+      },
+      boundResumeRewritePlatformForTestingOnly: "win32",
+      boundResumeRewriteUnlinkForTestingOnly: () => {
+        throw Object.assign(new Error("injected stale recovery cleanup"), {
+          code: "EPERM",
+        });
+      },
+    });
+    resumed.open(meta);
+    resumed.append(
+      {
+        id: "before-rewrite",
+        eventId: "before-rewrite",
+        seq: 1,
+        msg: {
+          type: "warning",
+          payload: { cause: "test", message: "before" },
+        },
+      },
+      { durable: true },
+    );
+    const before = lstatSync(seed.rolloutPath, { bigint: true });
+
+    resumed.rewriteRolloutItemsAtomically(resumed.readAll());
+
+    const after = lstatSync(seed.rolloutPath, { bigint: true });
+    expect(after.ino).not.toBe(before.ino);
+    expect(resumed.canonicalSourceIdentity()).toMatchObject({
+      rolloutPath: seed.rolloutPath,
+      dev: after.dev.toString(10),
+      ino: after.ino.toString(10),
+    });
+    expect(
+      readdirSync(dirname(seed.rolloutPath)).some(
+        (name) =>
+          name.startsWith("rollout-recovery-") &&
+          name.endsWith(`-${sessionId}.jsonl`),
+      ),
+    ).toBe(true);
+    resumed.append(
+      {
+        id: "after-rewrite",
+        eventId: "after-rewrite",
+        seq: 2,
+        msg: {
+          type: "warning",
+          payload: { cause: "test", message: "after" },
+        },
+      },
+      { durable: true },
+    );
+    resumed.close();
+    expect(readFileSync(seed.rolloutPath, "utf8")).toContain("after-rewrite");
+  });
+
+  test("explicit resume rejects a rewrite path swap and keeps its old descriptor usable", () => {
+    const cwd = mkdtempSync(join(home, "resume-rewrite-swap-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-rewriteswap1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const parked = `${seed.rolloutPath}.parked`;
+    const original = readFileSync(seed.rolloutPath);
+    let injected = false;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      beforeBoundResumeRewritePublishForTestingOnly: () => {
+        if (injected) return;
+        injected = true;
+        renameSync(seed.rolloutPath, parked);
+        writeFileSync(seed.rolloutPath, original, { mode: 0o600 });
+      },
+    });
+    resumed.open(meta);
+
+    expect(() =>
+      resumed.rewriteRolloutItemsAtomically(resumed.readAll()),
+    ).toThrow("resume rollout source changed during validation");
+    expect(readFileSync(seed.rolloutPath)).toEqual(original);
+
+    rmSync(seed.rolloutPath, { force: true });
+    renameSync(parked, seed.rolloutPath);
+    resumed.append(
+      {
+        id: "old-descriptor-still-live",
+        eventId: "old-descriptor-still-live",
+        seq: 1,
+        msg: {
+          type: "warning",
+          payload: { cause: "test", message: "usable" },
+        },
+      },
+      { durable: true },
+    );
+    resumed.close();
+    expect(readFileSync(seed.rolloutPath, "utf8")).toContain(
+      "old-descriptor-still-live",
+    );
+  });
+
+  test("explicit resume rejects an in-place source change after its typed rewrite read", () => {
+    const cwd = mkdtempSync(join(home, "resume-rewrite-read-race-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-rewritereadrace1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+    });
+    resumed.open(meta);
+    const items = resumed.readAll();
+    const beforeInode = lstatSync(seed.rolloutPath, { bigint: true }).ino;
+    writeFileSync(
+      seed.rolloutPath,
+      `${JSON.stringify({
+        type: "response_item",
+        payload: { role: "user", content: "raced typed rewrite" },
+      })}\n`,
+      { flag: "a" },
+    );
+
+    expect(() => resumed.rewriteRolloutItemsAtomically(items)).toThrow(
+      "resume rollout source changed after its exact read",
+    );
+    expect(lstatSync(seed.rolloutPath, { bigint: true }).ino).toBe(beforeInode);
+    expect(readFileSync(seed.rolloutPath, "utf8")).toContain(
+      "raced typed rewrite",
+    );
+    resumed.close();
+  });
+
+  test.each([
+    "old_moved",
+    "new_published",
+    "directory_synced",
+    "new_opened",
+    "metadata_validated",
+    "before_old_close",
+  ] as const)(
+    "explicit resume rolls back a replacement failure after %s",
+    (failStep) => {
+      const cwd = mkdtempSync(join(home, `resume-failpoint-${failStep}-`));
+      mkdirSync(join(cwd, ".git"));
+      const sessionId = `conv-fail-${failStep.replaceAll("_", "-")}`;
+      const meta = {
+        sessionId,
+        timestamp: "2026-08-19T00:00:00.000Z",
+        cwd,
+        originator: "agenc-cli",
+        agencVersion: "0.2.0",
+      } as const;
+      const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+      seed.open(meta);
+      seed.close();
+      const original = readFileSync(seed.rolloutPath);
+      const resumed = new SessionStore({
+        cwd,
+        sessionId,
+        agencVersion: "0.2.0",
+        resume: true,
+        resumeRolloutPath: seed.rolloutPath,
+        afterBoundResumeRewriteStepForTestingOnly: (step) => {
+          if (step === failStep)
+            throw new Error(`injected ${failStep} failure`);
+        },
+      });
+      resumed.open(meta);
+
+      expect(() =>
+        resumed.rewriteRolloutItemsAtomically(resumed.readAll()),
+      ).toThrow(`injected ${failStep} failure`);
+      expect(readFileSync(seed.rolloutPath)).toEqual(original);
+      resumed.append(
+        {
+          id: `append-after-${failStep}`,
+          eventId: `append-after-${failStep}`,
+          seq: 1,
+          msg: {
+            type: "warning",
+            payload: { cause: "test", message: "rollback usable" },
+          },
+        },
+        { durable: true },
+      );
+      resumed.close();
+      expect(readFileSync(seed.rolloutPath, "utf8")).toContain(
+        `append-after-${failStep}`,
+      );
+    },
+  );
+
+  test("explicit resume revokes writer authority when replacement rollback cannot be proven", () => {
+    const cwd = mkdtempSync(join(home, "resume-rollback-failure-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-rollbackfailure1";
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    seed.open(meta);
+    seed.close();
+    let renameCount = 0;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      boundResumeRewriteRenameForTestingOnly: (from, to) => {
+        renameCount += 1;
+        if (renameCount === 4)
+          throw new Error("injected rollback rename failure");
+        renameSync(from, to);
+      },
+      afterBoundResumeRewriteStepForTestingOnly: (step) => {
+        if (step === "new_published") {
+          throw new Error("injected post-publication failure");
+        }
+      },
+    });
+    resumed.open(meta);
+
+    expect(() =>
+      resumed.rewriteRolloutItemsAtomically(resumed.readAll()),
+    ).toThrow(/could not restore its prior generation/);
+    expect(() => resumed.syncCanonicalTail()).toThrow(
+      "writer authority was revoked",
+    );
+    resumed.close();
+  });
+
+  test("file identity rejects unavailable Windows sentinel values", () => {
+    const sentinel = 0xffff_ffff_ffff_ffffn;
+    expect(hasSupportedFileIdentity({ dev: sentinel, ino: 1n })).toBe(false);
+    expect(hasSupportedFileIdentity({ dev: 1n, ino: sentinel })).toBe(false);
+    expect(hasSupportedFileIdentity({ dev: 1n, ino: 1n })).toBe(true);
+  });
+
   test("open accepts an older rollout schema header without rewriting it", () => {
     const store = new SessionStore({
       cwd: "/home/test-schema-older",
@@ -166,7 +926,10 @@ describe("session-store", () => {
     store.append({
       id: "legacy-mixed-row",
       seq: 1,
-      msg: { type: "warning", payload: { cause: "compat", message: "mixed history" } },
+      msg: {
+        type: "warning",
+        payload: { cause: "compat", message: "mixed history" },
+      },
     });
     store.close();
 
@@ -304,7 +1067,11 @@ describe("session-store", () => {
       expect((caught as SessionLockedError).holderPid).toBe(child.pid);
     } finally {
       if (child && child.pid !== undefined) {
-        try { process.kill(child.pid, "SIGTERM"); } catch { /* already dead */ }
+        try {
+          process.kill(child.pid, "SIGTERM");
+        } catch {
+          /* already dead */
+        }
       }
       rmSync(dir, { recursive: true, force: true });
     }
@@ -394,7 +1161,10 @@ describe("session-store", () => {
       {
         id: "s",
         seq: 2,
-        msg: { type: "tool_call_completed", payload: { callId: "c1", result: "ok", isError: false } },
+        msg: {
+          type: "tool_call_completed",
+          payload: { callId: "c1", result: "ok", isError: false },
+        },
       },
       { turnId: "turn-1", toolResultBytes: 5000, tokenEstimate: 1250 },
     );
@@ -402,13 +1172,74 @@ describe("session-store", () => {
       {
         id: "s",
         seq: 3,
-        msg: { type: "tool_call_completed", payload: { callId: "c2", result: "ok", isError: false } },
+        msg: {
+          type: "tool_call_completed",
+          payload: { callId: "c2", result: "ok", isError: false },
+        },
       },
       { turnId: "turn-1", toolResultBytes: 7000, tokenEstimate: 1750 },
     );
     expect(store.getToolResultBytes("turn-1")).toBe(12000);
     expect(store.getTokenEstimate("turn-1")).toBe(3000);
     store.close();
+  });
+
+  test("resumed schema upgrade reads only from its pinned descriptor during a path swap", () => {
+    const cwd = mkdtempSync(join(home, "resume-schema-swap-cwd-"));
+    mkdirSync(join(cwd, ".git"));
+    const sessionId = "conv-schemaswap1";
+    const seed = new SessionStore({ cwd, sessionId, agencVersion: "0.2.0" });
+    const meta = {
+      sessionId,
+      timestamp: "2026-08-19T00:00:00.000Z",
+      cwd,
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    } as const;
+    const header = {
+      type: "session_meta",
+      payload: { ...meta, rolloutSchemaVersion: 0 },
+      eventVersion: 0,
+    } as const;
+    writeFileSync(
+      seed.rolloutPath,
+      `${JSON.stringify(header)}\n${JSON.stringify({
+        type: "response_item",
+        payload: { role: "user", content: "trusted canonical content" },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const parked = `${seed.rolloutPath}.parked`;
+    const foreign = `${JSON.stringify(header)}\n${JSON.stringify({
+      type: "response_item",
+      payload: { role: "user", content: "foreign substituted content" },
+    })}\n`;
+    const resumed = new SessionStore({
+      cwd,
+      sessionId,
+      agencVersion: "0.2.0",
+      resume: true,
+      resumeRolloutPath: seed.rolloutPath,
+      beforeBoundResumeSchemaUpgradeReadForTestingOnly: () => {
+        renameSync(seed.rolloutPath, parked);
+        writeFileSync(seed.rolloutPath, foreign, { mode: 0o600 });
+      },
+      afterBoundResumeSchemaUpgradeReadForTestingOnly: () => {
+        rmSync(seed.rolloutPath, { force: true });
+        renameSync(parked, seed.rolloutPath);
+      },
+    });
+    resumed.open(meta);
+
+    resumed.upgradeCanonicalSchemaHeader(ROLLOUT_SCHEMA_VERSION);
+    resumed.close();
+
+    const published = readFileSync(seed.rolloutPath, "utf8");
+    expect(published).toContain("trusted canonical content");
+    expect(published).not.toContain("foreign substituted content");
+    expect(published).toContain(
+      `\"rolloutSchemaVersion\":${ROLLOUT_SCHEMA_VERSION}`,
+    );
   });
 
   // OOM regression: the four per-session monotonic indices (offsetsBySeq,
@@ -666,22 +1497,24 @@ describe("session-store", () => {
       isRolloutPersistenceSuspended: () => false,
     } as unknown as Session;
 
-    expect(() => Session.prototype.emit.call(session, {
-      id: "effect-result-id",
-      msg: {
-        type: "effect_result",
-        payload: {
-          runId: "run-1",
-          stepId: "tool:turn-1:call-1",
-          callId: "call-1",
-          toolName: "system.write",
-          recoveryCategory: "side-effecting",
-          intentEventSeq: 1,
-          outcome: "committed",
-          recordedAt: "2026-07-18T00:00:00.000Z",
+    expect(() =>
+      Session.prototype.emit.call(session, {
+        id: "effect-result-id",
+        msg: {
+          type: "effect_result",
+          payload: {
+            runId: "run-1",
+            stepId: "tool:turn-1:call-1",
+            callId: "call-1",
+            toolName: "system.write",
+            recoveryCategory: "side-effecting",
+            intentEventSeq: 1,
+            outcome: "committed",
+            recordedAt: "2026-07-18T00:00:00.000Z",
+          },
         },
-      },
-    })).toThrow(/was not fsync-committed/);
+      }),
+    ).toThrow(/was not fsync-committed/);
     expect(published).toEqual([]);
 
     // Let the scheduled retry/close path use the real fsync implementation.
@@ -722,7 +1555,9 @@ describe("session-store", () => {
 
     expect(writes).toBeGreaterThan(1);
     expect(() => {
-      for (const line of readFileSync(store.rolloutPath, "utf8").trimEnd().split("\n")) {
+      for (const line of readFileSync(store.rolloutPath, "utf8")
+        .trimEnd()
+        .split("\n")) {
         JSON.parse(line);
       }
     }).not.toThrow();
@@ -797,7 +1632,10 @@ describe("session-store", () => {
     rollout.store.setFsyncImplForTest(failFsync);
     expect(() =>
       rollout.appendRollout(
-        { type: "response_item", payload: { role: "user", content: "durable" } },
+        {
+          type: "response_item",
+          payload: { role: "user", content: "durable" },
+        },
         { durable: true },
       ),
     ).toThrow(/not fsync-committed/);
@@ -1041,7 +1879,9 @@ describe("session-store", () => {
     );
     expect(snapshot.toolCallTurnIds.get("call-resume")).toBe("turn-resume");
     resumed.close();
-    expect(readIndexSnapshot(resumed.indexPath)?.snapshotSequenceNumber).toBe(2);
+    expect(readIndexSnapshot(resumed.indexPath)?.snapshotSequenceNumber).toBe(
+      2,
+    );
   });
 
   test("reAppendSessionMetadata writes session_meta line again after compact", () => {
@@ -1088,7 +1928,9 @@ describe("session-store", () => {
     store.setFsyncImplForTest((fd: number) => {
       callsSeen += 1;
       if (callsSeen === 1) {
-        const err = new Error("simulated transient fsync failure") as NodeJS.ErrnoException;
+        const err = new Error(
+          "simulated transient fsync failure",
+        ) as NodeJS.ErrnoException;
         err.code = "EIO";
         throw err;
       }
@@ -1112,12 +1954,16 @@ describe("session-store", () => {
       expect(syncElapsed).toBeLessThan(I4_FSYNC_RETRY_MS);
 
       // Wait for the deferred async retry to settle.
-      await (store as unknown as {
-        awaitPendingFsyncRetries(): Promise<void>;
-      }).awaitPendingFsyncRetries();
+      await (
+        store as unknown as {
+          awaitPendingFsyncRetries(): Promise<void>;
+        }
+      ).awaitPendingFsyncRetries();
 
       expect(callsSeen).toBeGreaterThanOrEqual(2);
-      expect(diagnostics.some((d) => d.cause === "fsync_retry_succeeded")).toBe(true);
+      expect(diagnostics.some((d) => d.cause === "fsync_retry_succeeded")).toBe(
+        true,
+      );
       expect(diagnostics.some((d) => d.cause === "fsync_failed")).toBe(false);
       expect(store.isDegraded).toBe(false);
     } finally {
@@ -1154,7 +2000,13 @@ describe("session-store", () => {
     const lines = readFileSync(store.rolloutPath, "utf8")
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { type?: string; payload?: { msg?: { type?: string } } });
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            type?: string;
+            payload?: { msg?: { type?: string } };
+          },
+      );
     expect(
       lines.some(
         (line) =>
@@ -1202,12 +2054,15 @@ describe("session-store", () => {
       const records = raw
         .trim()
         .split("\n")
-        .map((line) => JSON.parse(line) as {
-          schemaVersion: number;
-          sessionId: string;
-          rolloutPath: string;
-          item: { type: string; payload?: unknown };
-        });
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              schemaVersion: number;
+              sessionId: string;
+              rolloutPath: string;
+              item: { type: string; payload?: unknown };
+            },
+        );
       expect(records.map((record) => record.schemaVersion)).toEqual([
         TRAJECTORY_EXPORT_SCHEMA_VERSION,
         TRAJECTORY_EXPORT_SCHEMA_VERSION,
@@ -1216,8 +2071,14 @@ describe("session-store", () => {
         "session_meta",
         "response_item",
       ]);
-      expect(records.every((record) => record.sessionId === "sess-trajectory-export")).toBe(true);
-      expect(records.every((record) => record.rolloutPath === store.rolloutPath)).toBe(true);
+      expect(
+        records.every(
+          (record) => record.sessionId === "sess-trajectory-export",
+        ),
+      ).toBe(true);
+      expect(
+        records.every((record) => record.rolloutPath === store.rolloutPath),
+      ).toBe(true);
     } finally {
       store.close();
       if (previousExportPath === undefined) {
@@ -1250,7 +2111,9 @@ describe("session-store", () => {
     // Fail every fsync on the rollout path — first attempt and
     // deferred retry must both trip the mock.
     store.setFsyncImplForTest(() => {
-      const err = new Error("simulated persistent fsync failure") as NodeJS.ErrnoException;
+      const err = new Error(
+        "simulated persistent fsync failure",
+      ) as NodeJS.ErrnoException;
       err.code = "EIO";
       throw err;
     });
@@ -1266,9 +2129,11 @@ describe("session-store", () => {
       );
 
       // Wait for the deferred async retry to run + fail.
-      await (store as unknown as {
-        awaitPendingFsyncRetries(): Promise<void>;
-      }).awaitPendingFsyncRetries();
+      await (
+        store as unknown as {
+          awaitPendingFsyncRetries(): Promise<void>;
+        }
+      ).awaitPendingFsyncRetries();
 
       const fsyncFailed = diagnostics.find((d) => d.cause === "fsync_failed");
       expect(fsyncFailed).toBeDefined();
@@ -1277,7 +2142,9 @@ describe("session-store", () => {
       // Retry failure must have routed the batch into the degraded
       // ring buffer (I-12 / I-38).
       expect(store.isDegraded).toBe(true);
-      expect(diagnostics.some((d) => d.cause === "rollout_degraded")).toBe(true);
+      expect(diagnostics.some((d) => d.cause === "rollout_degraded")).toBe(
+        true,
+      );
     } finally {
       // Restore so the close() path + index-snapshot fsync run the
       // real impl and don't trip the mock.
@@ -1304,7 +2171,9 @@ describe("session-store", () => {
       // Fail every fsync so the durable append's writeSync lands the row
       // on disk but both the initial fsync and the I-38 retry trip.
       store.setFsyncImplForTest(() => {
-        const err = new Error("simulated persistent fsync failure") as NodeJS.ErrnoException;
+        const err = new Error(
+          "simulated persistent fsync failure",
+        ) as NodeJS.ErrnoException;
         err.code = "EIO";
         throw err;
       });
@@ -1318,9 +2187,11 @@ describe("session-store", () => {
         { durable: true },
       );
 
-      await (store as unknown as {
-        awaitPendingFsyncRetries(): Promise<void>;
-      }).awaitPendingFsyncRetries();
+      await (
+        store as unknown as {
+          awaitPendingFsyncRetries(): Promise<void>;
+        }
+      ).awaitPendingFsyncRetries();
 
       // writeSync persisted the row even though fsync failed; we entered
       // degraded mode.
@@ -1342,9 +2213,11 @@ describe("session-store", () => {
       // double on resume/reduce). With the fix the degraded buffer is
       // empty, so the flush is a no-op and the row stays exactly once.
       store.setFsyncImplForTest(fsyncSync);
-      await (store as unknown as {
-        degraded: { tryFlush(): Promise<boolean> };
-      }).degraded.tryFlush();
+      await (
+        store as unknown as {
+          degraded: { tryFlush(): Promise<boolean> };
+        }
+      ).degraded.tryFlush();
 
       expect(countOccurrences()).toBe(1);
     } finally {
@@ -1375,7 +2248,8 @@ describe("session-store", () => {
     const dir = mkdtempSync(join(tmpdir(), "agenc-corrupt-repair-failure-"));
     try {
       const path = join(dir, "rollout.jsonl");
-      const partial = '{"type":"session_meta","payload":{}}\n{"type":"event_msg"';
+      const partial =
+        '{"type":"session_meta","payload":{}}\n{"type":"event_msg"';
       writeFileSync(path, partial, { mode: 0o600 });
       const truncateFailure = new Error("injected truncate failure");
       expect(() =>

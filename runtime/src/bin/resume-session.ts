@@ -1,139 +1,636 @@
-import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 
-import { listResumableSessions } from "../commands/resume.js";
 import {
   DEFAULT_SESSION_ROOT_MARKERS,
   findProjectRootSync,
   getAgencHomeDir,
-  listResumableSessions as listProjectRollouts,
+  getProjectDir,
+  hasSupportedFileIdentity,
+  isSafeSessionIdSegment,
+  readAndValidateSchemaVersionFd,
+  resolveCanonicalSessionCwd,
 } from "../session/session-store.js";
 import { sanitizePath } from "../utils/sessionStoragePortable.js";
+import {
+  DEFAULT_MAX_STARTUP_RECOVERY_MS,
+  MAX_RECOVERY_CANONICAL_SOURCE_BYTES,
+} from "../state/recovery-contract.js";
+
+export const RESUME_SEARCH_LIMITS = Object.freeze({
+  projects: 512,
+  sessionsPerProject: 2_048,
+  rolloutFilesPerSession: 256,
+  metadataBytes: 4 * 1024 * 1024,
+  milliseconds: DEFAULT_MAX_STARTUP_RECOVERY_MS,
+});
+
+export interface ResolvedResumeSession {
+  readonly sessionId: string;
+  readonly rolloutPath: string;
+  readonly cwd: string;
+  /** Frozen source generation, reproved before trust handoff and RPC. */
+  readonly sourceDev: string;
+  readonly sourceIno: string;
+  readonly sourceSize: string;
+  readonly sourceSha256: string;
+  /** Frozen canonical workspace generation selected from session metadata. */
+  readonly cwdDev: string;
+  readonly cwdIno: string;
+}
 
 export type ResumeSessionResolution =
-  | { readonly kind: "ok"; readonly sessionId: string }
+  | ({ readonly kind: "ok" } & ResolvedResumeSession)
   | { readonly kind: "none" }
   | { readonly kind: "not_found"; readonly input: string }
   | {
       readonly kind: "ambiguous";
       readonly input: string;
       readonly matches: readonly string[];
+    }
+  | {
+      readonly kind: "search_incomplete";
+      readonly input: string;
+      readonly reason:
+        | "project_limit"
+        | "session_limit"
+        | "file_limit"
+        | "metadata_limit"
+        | "source_limit"
+        | "source_unavailable"
+        | "identity_unavailable"
+        | "time_limit";
     };
 
-/**
- * Two project-slug schemes coexist under `~/.agenc/projects/`:
- *
- *  1. Current (canonical): `slugifyCwd(cwd)` from `session-store.ts` -
- *     `home-tetsuo-...-<8charHash>`. New sessions land here.
- *  2. Legacy: `sanitizePath(cwd)` from `sessionStoragePortable.ts` -
- *     `-home-tetsuo-...` (leading dash, no hash unless the slug exceeds
- *     200 chars). Older sessions and tools using the portable sanitizer
- *     write here.
- *
- * `agenc -c` and `agenc --resume <id>` must accept session ids from
- * either layout, since the `/resume` picker surfaces both. Future cleanup
- * can converge on the hashed slug as the single canonical form; this
- * resolver is the migration seam.
- */
-
-function projectSessions(cwd: string): readonly string[] {
-  const seen = new Set<string>();
-  const sessionIds: string[] = [];
-  for (const entry of listResumableSessions(cwd, {
-    maxFiles: 10_000,
-    limit: 10_000,
-  })) {
-    if (seen.has(entry.sessionId)) continue;
-    seen.add(entry.sessionId);
-    sessionIds.push(entry.sessionId);
-  }
-  return sessionIds;
+interface ResumeCandidate extends Omit<ResolvedResumeSession, "sourceSha256"> {
+  readonly mtimeNs: bigint;
+  readonly sourceMtimeNs: bigint;
+  readonly sourceCtimeNs: bigint;
 }
 
-/** Walk `<projectDir>/sessions/<id>/rollout-*.jsonl` directly. */
-function sessionIdsUnderProjectDir(projectDir: string): readonly string[] {
+export interface ResumeSessionTestHooks {
+  readonly beforeOpenDirectory?: (path: string) => void;
+  readonly afterCandidateMetadataRead?: (path: string) => void;
+  readonly afterCandidateHashRead?: (path: string) => void;
+  readonly beforeCandidateClose?: (path: string, fd: number) => void;
+}
+
+let resumeSessionTestHooks: ResumeSessionTestHooks = {};
+
+/** Install deterministic filesystem-race seams for contract tests. */
+export function __setResumeSessionTestHooksForTest(
+  hooks: ResumeSessionTestHooks = {},
+): void {
+  resumeSessionTestHooks = hooks;
+}
+
+interface SearchBudget {
+  readonly deadlineMs: number;
+  /** Canonical authority root; configured AGENC_HOME may itself be an alias. */
+  readonly projectsRoot: string | undefined;
+  metadataBytes: number;
+  incompleteReason?: Extract<
+    ResumeSessionResolution,
+    { kind: "search_incomplete" }
+  >["reason"];
+}
+
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as { readonly code?: unknown } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function boundedEntries(
+  path: string,
+  maximum: number,
+  budget: SearchBudget,
+  limitReason: SearchBudget["incompleteReason"],
+): readonly { readonly name: string; readonly directory: boolean }[] {
+  const entries: { name: string; directory: boolean }[] = [];
+  let directory;
   try {
-    return listProjectRollouts(projectDir).map((entry) => entry.sessionId);
-  } catch {
-    return [];
+    resumeSessionTestHooks.beforeOpenDirectory?.(path);
+    directory = opendirSync(path);
+  } catch (error) {
+    if (!isMissingPathError(error)) {
+      budget.incompleteReason ??= "source_unavailable";
+    }
+    return entries;
   }
+  try {
+    while (entries.length <= maximum) {
+      if (Date.now() >= budget.deadlineMs) {
+        budget.incompleteReason = "time_limit";
+        break;
+      }
+      const entry = directory.readSync();
+      if (entry === null) break;
+      entries.push({ name: entry.name, directory: entry.isDirectory() });
+    }
+  } catch {
+    budget.incompleteReason ??= "source_unavailable";
+  } finally {
+    try {
+      directory.closeSync();
+    } catch {
+      budget.incompleteReason ??= "source_unavailable";
+    }
+  }
+  if (entries.length > maximum) {
+    budget.incompleteReason ??= limitReason;
+    return entries.slice(0, maximum);
+  }
+  return entries;
 }
 
-/**
- * Produce the legacy slug path for `cwd` (sanitizePath form).
- *
- * Resolves the project root the same way the canonical path does
- * (ancestor walk to a root marker) so two checkouts under the same git
- * root agree on the legacy slug too.
- */
+function candidateFromPath(
+  sessionId: string,
+  rolloutPath: string,
+  mtimeNs: bigint,
+  budget: SearchBudget,
+): ResumeCandidate | null {
+  if (!isSafeSessionIdSegment(sessionId)) return null;
+  if (Date.now() >= budget.deadlineMs) {
+    budget.incompleteReason ??= "time_limit";
+    return null;
+  }
+  let canonicalPath: string;
+  let sourceDev: string;
+  let sourceIno: string;
+  let sourceSize: string;
+  let sourceMtimeNs: bigint;
+  let sourceCtimeNs: bigint;
+  let meta: ReturnType<typeof readAndValidateSchemaVersionFd>;
+  try {
+    const stats = lstatSync(rolloutPath, { bigint: true });
+    if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1n) {
+      budget.incompleteReason ??= "source_unavailable";
+      return null;
+    }
+    if (!hasSupportedFileIdentity(stats)) {
+      budget.incompleteReason ??= "identity_unavailable";
+      return null;
+    }
+    const metadataBytes = stats.size > 65_536n ? 65_536 : Number(stats.size);
+    budget.metadataBytes += metadataBytes;
+    if (budget.metadataBytes > RESUME_SEARCH_LIMITS.metadataBytes) {
+      budget.incompleteReason ??= "metadata_limit";
+      return null;
+    }
+    canonicalPath = realpathSync(rolloutPath);
+    const noFollow =
+      "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+    const fd = openSync(rolloutPath, fsConstants.O_RDONLY | noFollow);
+    try {
+      const opened = fstatSync(fd, { bigint: true });
+      if (
+        !opened.isFile() ||
+        opened.nlink !== 1n ||
+        !hasSupportedFileIdentity(opened) ||
+        opened.dev !== stats.dev ||
+        opened.ino !== stats.ino ||
+        opened.size !== stats.size
+      ) {
+        budget.incompleteReason ??= "source_unavailable";
+        return null;
+      }
+      meta = readAndValidateSchemaVersionFd(fd);
+      resumeSessionTestHooks.afterCandidateMetadataRead?.(rolloutPath);
+      const observed = lstatSync(rolloutPath, { bigint: true });
+      if (
+        !observed.isFile() ||
+        observed.isSymbolicLink() ||
+        !hasSupportedFileIdentity(observed) ||
+        observed.dev !== opened.dev ||
+        observed.ino !== opened.ino ||
+        observed.size !== opened.size ||
+        observed.mtimeNs !== opened.mtimeNs ||
+        observed.ctimeNs !== opened.ctimeNs ||
+        opened.mtimeNs !== stats.mtimeNs ||
+        opened.ctimeNs !== stats.ctimeNs ||
+        mtimeNs !== stats.mtimeNs ||
+        observed.nlink !== 1n ||
+        realpathSync(rolloutPath) !== canonicalPath
+      ) {
+        budget.incompleteReason ??= "source_unavailable";
+        return null;
+      }
+      sourceDev = opened.dev.toString(10);
+      sourceIno = opened.ino.toString(10);
+      sourceSize = opened.size.toString(10);
+      sourceMtimeNs = opened.mtimeNs;
+      sourceCtimeNs = opened.ctimeNs;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    budget.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  if (budget.projectsRoot === undefined) {
+    budget.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  const fromProjectsRoot = relative(budget.projectsRoot, canonicalPath);
+  if (
+    fromProjectsRoot === "" ||
+    fromProjectsRoot === ".." ||
+    fromProjectsRoot.startsWith("../") ||
+    fromProjectsRoot.startsWith("..\\") ||
+    isAbsolute(fromProjectsRoot) ||
+    basename(dirname(canonicalPath)) !== sessionId ||
+    !basename(canonicalPath).startsWith("rollout-") ||
+    !basename(canonicalPath).endsWith(`-${sessionId}.jsonl`)
+  ) {
+    budget.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  if (Date.now() >= budget.deadlineMs) {
+    budget.incompleteReason ??= "time_limit";
+    return null;
+  }
+  const canonicalCwd =
+    meta === null
+      ? { kind: "unavailable" as const }
+      : resolveCanonicalSessionCwd(meta.cwd);
+  if (canonicalCwd.kind === "identity_unsupported") {
+    budget.incompleteReason ??= "identity_unavailable";
+  }
+  if (
+    meta === null ||
+    meta.sessionId !== sessionId ||
+    canonicalCwd.kind !== "ok"
+  ) {
+    budget.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  return {
+    sessionId,
+    rolloutPath: canonicalPath,
+    cwd: canonicalCwd.cwd,
+    sourceDev,
+    sourceIno,
+    sourceSize,
+    cwdDev: canonicalCwd.dev.toString(10),
+    cwdIno: canonicalCwd.ino.toString(10),
+    mtimeNs,
+    sourceMtimeNs,
+    sourceCtimeNs,
+  };
+}
+
+function sealCandidate(
+  candidate: ResumeCandidate,
+  search: SearchBudget,
+): ResolvedResumeSession | null {
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  let fd: number;
+  try {
+    fd = openSync(candidate.rolloutPath, fsConstants.O_RDONLY | noFollow);
+  } catch {
+    search.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  let result: ResolvedResumeSession | null;
+  try {
+    result = (() => {
+      const opened = fstatSync(fd, { bigint: true });
+      if (!hasSupportedFileIdentity(opened)) {
+        search.incompleteReason ??= "identity_unavailable";
+        return null;
+      }
+      if (
+        !opened.isFile() ||
+        opened.nlink !== 1n ||
+        opened.dev.toString(10) !== candidate.sourceDev ||
+        opened.ino.toString(10) !== candidate.sourceIno ||
+        opened.size.toString(10) !== candidate.sourceSize ||
+        opened.mtimeNs !== candidate.sourceMtimeNs ||
+        opened.ctimeNs !== candidate.sourceCtimeNs ||
+        opened.size > BigInt(MAX_RECOVERY_CANONICAL_SOURCE_BYTES)
+      ) {
+        search.incompleteReason ??=
+          opened.size > BigInt(MAX_RECOVERY_CANONICAL_SOURCE_BYTES)
+            ? "source_limit"
+            : "source_unavailable";
+        return null;
+      }
+      const hash = createHash("sha256");
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position < Number(opened.size)) {
+        if (Date.now() >= search.deadlineMs) {
+          search.incompleteReason ??= "time_limit";
+          return null;
+        }
+        const bytesRead = readSync(
+          fd,
+          chunk,
+          0,
+          Math.min(chunk.byteLength, Number(opened.size) - position),
+          position,
+        );
+        if (bytesRead === 0) {
+          search.incompleteReason ??= "source_unavailable";
+          return null;
+        }
+        hash.update(chunk.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      resumeSessionTestHooks.afterCandidateHashRead?.(candidate.rolloutPath);
+      const observed = lstatSync(candidate.rolloutPath, { bigint: true });
+      const reopened = fstatSync(fd, { bigint: true });
+      if (
+        !reopened.isFile() ||
+        reopened.nlink !== 1n ||
+        !hasSupportedFileIdentity(reopened) ||
+        reopened.dev !== opened.dev ||
+        reopened.ino !== opened.ino ||
+        reopened.size !== opened.size ||
+        reopened.mtimeNs !== opened.mtimeNs ||
+        reopened.ctimeNs !== opened.ctimeNs ||
+        !observed.isFile() ||
+        observed.isSymbolicLink() ||
+        !hasSupportedFileIdentity(observed) ||
+        observed.dev !== opened.dev ||
+        observed.ino !== opened.ino ||
+        observed.size !== opened.size ||
+        observed.mtimeNs !== opened.mtimeNs ||
+        observed.ctimeNs !== opened.ctimeNs ||
+        observed.nlink !== 1n ||
+        realpathSync(candidate.rolloutPath) !== candidate.rolloutPath
+      ) {
+        search.incompleteReason ??= "source_unavailable";
+        return null;
+      }
+      const {
+        mtimeNs: _mtimeNs,
+        sourceMtimeNs: _sourceMtimeNs,
+        sourceCtimeNs: _sourceCtimeNs,
+        ...descriptor
+      } = candidate;
+      return { ...descriptor, sourceSha256: hash.digest("hex") };
+    })();
+  } catch {
+    search.incompleteReason ??= "source_unavailable";
+    result = null;
+  }
+  let closeFailed = false;
+  try {
+    resumeSessionTestHooks.beforeCandidateClose?.(candidate.rolloutPath, fd);
+  } catch {
+    closeFailed = true;
+  }
+  try {
+    closeSync(fd);
+  } catch {
+    closeFailed = true;
+  }
+  if (closeFailed) {
+    search.incompleteReason ??= "source_unavailable";
+    return null;
+  }
+  return result;
+}
+
+function candidateUnderProjectDir(
+  projectDir: string,
+  sessionId: string,
+  budget: SearchBudget,
+): ResumeCandidate | null {
+  const sessionDir = join(projectDir, "sessions", sessionId);
+  const discoveredFiles = boundedEntries(
+    sessionDir,
+    RESUME_SEARCH_LIMITS.rolloutFilesPerSession,
+    budget,
+    "file_limit",
+  ).filter(
+    (entry) =>
+      !entry.directory &&
+      entry.name.startsWith("rollout-") &&
+      entry.name.endsWith(`-${sessionId}.jsonl`),
+  );
+  if (budget.incompleteReason !== undefined) return null;
+  // A recovery rollout is the crash-safe old generation from a two-entry
+  // Windows replacement. It is authoritative only while no normally named
+  // generation exists; otherwise a failed backup cleanup must not roll back a
+  // successfully published compaction on the next --continue.
+  const normalFiles = discoveredFiles.filter(
+    (entry) => !entry.name.startsWith("rollout-recovery-"),
+  );
+  const files = normalFiles.length > 0 ? normalFiles : discoveredFiles;
+  const candidates = files
+    .flatMap((entry) => {
+      const path = join(sessionDir, entry.name);
+      try {
+        const stats = lstatSync(path, { bigint: true });
+        return [{ path, mtimeNs: stats.mtimeNs }];
+      } catch {
+        budget.incompleteReason ??= "source_unavailable";
+        return [];
+      }
+    })
+    .sort((left, right) =>
+      left.mtimeNs === right.mtimeNs
+        ? right.path.localeCompare(left.path)
+        : left.mtimeNs > right.mtimeNs
+          ? -1
+          : 1,
+    );
+  const selected = candidates[0];
+  return selected === undefined
+    ? null
+    : candidateFromPath(sessionId, selected.path, selected.mtimeNs, budget);
+}
+
+function candidatesUnderProjectDir(
+  projectDir: string,
+  budget: SearchBudget,
+): readonly ResumeCandidate[] {
+  const sessions = boundedEntries(
+    join(projectDir, "sessions"),
+    RESUME_SEARCH_LIMITS.sessionsPerProject,
+    budget,
+    "session_limit",
+  );
+  const candidates: ResumeCandidate[] = [];
+  for (const entry of sessions) {
+    if (budget.incompleteReason !== undefined) break;
+    if (!entry.directory || !isSafeSessionIdSegment(entry.name)) continue;
+    const candidate = candidateUnderProjectDir(projectDir, entry.name, budget);
+    if (candidate !== null) candidates.push(candidate);
+  }
+  return candidates;
+}
+
 function legacyProjectDirFor(cwd: string): string {
   const root = findProjectRootSync(cwd, DEFAULT_SESSION_ROOT_MARKERS);
   const slugInput = root ? root.rootDir : cwd;
   return join(getAgencHomeDir(), "projects", sanitizePath(slugInput));
 }
 
-/**
- * Project session ids from BOTH the current-scheme and legacy-scheme
- * project directories. Dedups while preserving the newest-first order
- * from the current scheme, then appends any legacy-only ids.
- */
-function projectSessionsCrossSlug(cwd: string): readonly string[] {
-  const seen = new Set<string>();
-  const ids: string[] = [];
-
-  for (const id of projectSessions(cwd)) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    ids.push(id);
-  }
-
-  const legacyDir = legacyProjectDirFor(cwd);
-  for (const id of sessionIdsUnderProjectDir(legacyDir)) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    ids.push(id);
-  }
-
-  return ids;
+function localProjectDirs(cwd: string): readonly string[] {
+  return [...new Set([getProjectDir(cwd), legacyProjectDirFor(cwd)])];
 }
 
-/**
- * Conv-id shape: `conv-` followed by 6+ alphanumerics. Only conv-prefixed
- * ids are unique enough to safely match across projects without colliding
- * with raw UUIDs that might appear under multiple project slugs.
- */
+function projectCandidatesCrossSlug(
+  cwd: string,
+  budget: SearchBudget,
+): readonly ResumeCandidate[] {
+  const candidates = localProjectDirs(cwd).flatMap((projectDir) =>
+    candidatesUnderProjectDir(projectDir, budget),
+  );
+  const byPath = new Map<string, ResumeCandidate>();
+  for (const candidate of candidates)
+    byPath.set(candidate.rolloutPath, candidate);
+  return [...byPath.values()].sort((left, right) =>
+    left.mtimeNs === right.mtimeNs
+      ? right.rolloutPath.localeCompare(left.rolloutPath)
+      : left.mtimeNs > right.mtimeNs
+        ? -1
+        : 1,
+  );
+}
+
+function exactLocalCandidates(
+  cwd: string,
+  id: string,
+  budget: SearchBudget,
+): readonly ResumeCandidate[] {
+  const matches = localProjectDirs(cwd)
+    .flatMap((projectDir) => {
+      const candidate = candidateUnderProjectDir(projectDir, id, budget);
+      return candidate === null ? [] : [candidate];
+    })
+    .sort((left, right) =>
+      left.mtimeNs === right.mtimeNs
+        ? right.rolloutPath.localeCompare(left.rolloutPath)
+        : left.mtimeNs > right.mtimeNs
+          ? -1
+          : 1,
+    );
+  return matches;
+}
+
 function isLikelyConvId(id: string): boolean {
-  return /^conv-[A-Za-z0-9]{6,}$/.test(id);
+  return /^conv-[A-Za-z0-9]{6,}$/u.test(id);
 }
 
-/**
- * Search every `~/.agenc/projects/*` for `<projectDir>/sessions/<id>/`.
- * Used as a last resort when neither the canonical nor legacy local
- * project dir contains the id - a conv-id alone identifies a session
- * uniquely regardless of which project slug holds it.
- */
-function findConvIdGlobally(id: string): string | undefined {
-  const projectsDir = join(getAgencHomeDir(), "projects");
-  let entries: string[];
+function globalCandidates(
+  id: string,
+  budget: SearchBudget,
+): readonly ResumeCandidate[] {
+  const projectsDir = budget.projectsRoot;
+  if (projectsDir === undefined) return [];
+  const projects = boundedEntries(
+    projectsDir,
+    RESUME_SEARCH_LIMITS.projects,
+    budget,
+    "project_limit",
+  );
+  const candidates: ResumeCandidate[] = [];
+  for (const project of projects) {
+    if (budget.incompleteReason !== undefined) break;
+    if (!project.directory) continue;
+    const candidate = candidateUnderProjectDir(
+      join(projectsDir, project.name),
+      id,
+      budget,
+    );
+    if (candidate !== null) candidates.push(candidate);
+  }
+  return candidates;
+}
+
+function budget(): SearchBudget {
+  let projectsRoot: string | undefined;
+  let incompleteReason: SearchBudget["incompleteReason"];
   try {
-    entries = readdirSync(projectsDir);
-  } catch {
-    return undefined;
+    projectsRoot = realpathSync(resolve(getAgencHomeDir(), "projects"));
+  } catch (error) {
+    projectsRoot = undefined;
+    if (!isMissingPathError(error)) incompleteReason = "source_unavailable";
   }
-  for (const entry of entries) {
-    const candidate = join(projectsDir, entry, "sessions", id);
-    try {
-      if (statSync(candidate).isDirectory()) return id;
-    } catch {
-      // Missing or unreadable - keep scanning.
+  return {
+    deadlineMs: Date.now() + RESUME_SEARCH_LIMITS.milliseconds,
+    projectsRoot,
+    metadataBytes: 0,
+    ...(incompleteReason !== undefined ? { incompleteReason } : {}),
+  };
+}
+
+function incomplete(
+  input: string,
+  search: SearchBudget,
+): ResumeSessionResolution | undefined {
+  return search.incompleteReason === undefined
+    ? undefined
+    : { kind: "search_incomplete", input, reason: search.incompleteReason };
+}
+
+function resolveMatches(
+  input: string,
+  matches: readonly ResumeCandidate[],
+  search: SearchBudget,
+): ResumeSessionResolution {
+  if (matches.length === 1) {
+    const descriptor = sealCandidate(matches[0]!, search);
+    if (descriptor === null) {
+      return incomplete(input, search) ?? { kind: "not_found", input };
     }
+    return { kind: "ok", ...descriptor };
   }
-  return undefined;
+  if (matches.length > 1) {
+    const counts = new Map<string, number>();
+    for (const candidate of matches) {
+      counts.set(
+        candidate.sessionId,
+        (counts.get(candidate.sessionId) ?? 0) + 1,
+      );
+    }
+    return {
+      kind: "ambiguous",
+      input,
+      matches: matches
+        .slice(0, 8)
+        .map((candidate) =>
+          (counts.get(candidate.sessionId) ?? 0) > 1
+            ? `${candidate.sessionId} @ ${candidate.rolloutPath}`
+            : candidate.sessionId,
+        ),
+    };
+  }
+  return { kind: "not_found", input };
 }
 
 export function resolveLatestSessionId(cwd: string): ResumeSessionResolution {
-  const latest = projectSessionsCrossSlug(cwd)[0];
-  return latest ? { kind: "ok", sessionId: latest } : { kind: "none" };
+  const search = budget();
+  const latest = projectCandidatesCrossSlug(cwd, search)[0];
+  const stopped = incomplete("--continue", search);
+  if (stopped !== undefined) return stopped;
+  if (latest === undefined) return { kind: "none" };
+  const descriptor = sealCandidate(latest, search);
+  return descriptor === null
+    ? (incomplete("--continue", search) ?? { kind: "none" })
+    : { kind: "ok", ...descriptor };
 }
 
 export function resolveResumeSessionId(
@@ -141,39 +638,31 @@ export function resolveResumeSessionId(
   input: string,
 ): ResumeSessionResolution {
   const trimmed = input.trim();
-  if (trimmed.length === 0) {
+  if (!isSafeSessionIdSegment(trimmed)) {
     return { kind: "not_found", input };
   }
+  const exactSearch = budget();
+  const exact = exactLocalCandidates(cwd, trimmed, exactSearch);
+  const exactStopped = incomplete(trimmed, exactSearch);
+  if (exactStopped !== undefined) return exactStopped;
+  if (exact.length > 0) return resolveMatches(trimmed, exact, exactSearch);
 
-  const sessionIds = projectSessionsCrossSlug(cwd);
-
-  const exact = sessionIds.find((sessionId) => sessionId === trimmed);
-  if (exact !== undefined) {
-    return { kind: "ok", sessionId: exact };
-  }
-
-  const prefixMatches = sessionIds.filter((sessionId) =>
-    sessionId.startsWith(trimmed),
+  const prefixSearch = budget();
+  const prefixMatches = projectCandidatesCrossSlug(cwd, prefixSearch).filter(
+    (candidate) => candidate.sessionId.startsWith(trimmed),
   );
-  if (prefixMatches.length === 1) {
-    return { kind: "ok", sessionId: prefixMatches[0]! };
-  }
-  if (prefixMatches.length > 1) {
-    return {
-      kind: "ambiguous",
-      input: trimmed,
-      matches: prefixMatches.slice(0, 8),
-    };
+  const prefixStopped = incomplete(trimmed, prefixSearch);
+  if (prefixStopped !== undefined) return prefixStopped;
+  if (prefixMatches.length > 0) {
+    return resolveMatches(trimmed, prefixMatches, prefixSearch);
   }
 
-  // Conv-id fallback: the id alone is unique across projects, so accept
-  // a hit from any project slug as a valid resume target.
   if (isLikelyConvId(trimmed)) {
-    const found = findConvIdGlobally(trimmed);
-    if (found !== undefined) {
-      return { kind: "ok", sessionId: found };
-    }
+    const globalSearch = budget();
+    const matches = globalCandidates(trimmed, globalSearch);
+    const globalStopped = incomplete(trimmed, globalSearch);
+    if (globalStopped !== undefined) return globalStopped;
+    return resolveMatches(trimmed, matches, globalSearch);
   }
-
   return { kind: "not_found", input: trimmed };
 }

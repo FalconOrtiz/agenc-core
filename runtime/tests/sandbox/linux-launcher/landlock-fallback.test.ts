@@ -10,6 +10,7 @@ import {
   type PermissionProfile,
 } from "../../../src/sandbox/engine/index.js";
 import { probeLandlock } from "../../../src/sandbox/landlock-run.js";
+import { preferredBubblewrapLauncher } from "../../../src/sandbox/linux-launcher/launcher.js";
 
 const canRunLive = process.platform === "linux" && probeLandlock() === "full";
 
@@ -35,6 +36,23 @@ function workspaceWriteProfile(
       [
         { path: { kind: "special", value: { kind: "root" } }, access: "read" },
         { path: { kind: "path", path: workspace }, access: "write" },
+      ],
+      { includePlatformDefaults: true },
+    ),
+    network,
+  };
+}
+
+function readOnlyProfile(
+  network: PermissionProfile["network"] = "disabled",
+): PermissionProfile {
+  return {
+    fileSystem: restrictedFileSystemPolicy(
+      [
+        {
+          path: { kind: "special", value: { kind: "root" } },
+          access: "read",
+        },
       ],
       { includePlatformDefaults: true },
     ),
@@ -68,6 +86,28 @@ async function runFallback(
   return { exitCode, stderr };
 }
 
+async function runInheritedFallback(
+  profile: PermissionProfile,
+  command: readonly string[],
+): Promise<{ exitCode: number; stderr: string[] }> {
+  const stderr: string[] = [];
+  const exitCode = await runLinuxSandboxMain(
+    [
+      "--inherited-readonly-command-cwd",
+      "--permission-profile",
+      JSON.stringify(profile),
+      "--no-proc",
+      "--",
+      ...command,
+    ],
+    {
+      preferredLauncher: () => null,
+      onStderr: (line) => stderr.push(line),
+    },
+  );
+  return { exitCode, stderr };
+}
+
 describe("planLandlockConfinement refusals", () => {
   const base = {
     sandboxPolicyCwd: "/tmp",
@@ -87,13 +127,34 @@ describe("planLandlockConfinement refusals", () => {
     expect(plan).toMatchObject({ kind: "refused" });
   });
 
-  it("refuses inherited read-only cwd", () => {
-    const plan = planLandlockConfinement({
+  it("accepts an inherited cwd only after writable roots are removed", () => {
+    const refused = planLandlockConfinement({
       ...base,
       inheritedCwd: true,
       fileSystem: plainPolicy,
     });
-    expect(plan).toMatchObject({ kind: "refused" });
+    expect(refused).toEqual({
+      kind: "refused",
+      reason: "inherited read-only cwd cannot retain writable filesystem roots",
+    });
+
+    const accepted = planLandlockConfinement({
+      ...base,
+      inheritedCwd: true,
+      fileSystem: restrictedFileSystemPolicy(
+        [
+          {
+            path: { kind: "special", value: { kind: "root" } },
+            access: "read",
+          },
+        ],
+        { includePlatformDefaults: true },
+      ),
+    });
+    expect(accepted).toMatchObject({
+      kind: "ok",
+      readWrite: expect.not.arrayContaining(["/tmp"]),
+    });
   });
 
 
@@ -149,6 +210,102 @@ describe("planLandlockConfinement refusals", () => {
 });
 
 describe.runIf(canRunLive)("Landlock fallback through the real helper", () => {
+  it("runs a descriptor-bound read in a git workspace with writes and network removed", async () => {
+    const root = withTempDir("agenc-landlock-bound-read-");
+    const workspace = path.join(root, "workspace");
+    const unexpectedWrite = path.join(workspace, "unexpected.txt");
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(path.join(workspace, ".git"));
+    fs.writeFileSync(path.join(workspace, "sentinel.txt"), "bound-read\n");
+    const savedCwd = process.cwd();
+    process.chdir(workspace);
+    try {
+      const read = await runInheritedFallback(
+        readOnlyProfile(),
+        ["/bin/sh", "-c", 'test "$(cat sentinel.txt)" = bound-read'],
+      );
+      expect(read).toEqual({ exitCode: 0, stderr: [] });
+
+      const write = await runInheritedFallback(
+        readOnlyProfile(),
+        ["/bin/sh", "-c", `printf unexpected > ${unexpectedWrite}`],
+      );
+      expect(write.exitCode).not.toBe(0);
+      expect(fs.existsSync(unexpectedWrite)).toBe(false);
+
+      if (fs.existsSync("/usr/bin/python3")) {
+        const network = await runInheritedFallback(
+          readOnlyProfile(),
+          [
+            "/usr/bin/python3",
+            "-c",
+            "import socket, sys\n" +
+              "try:\n" +
+              "  socket.socket(socket.AF_INET)\n" +
+              "except PermissionError:\n" +
+              "  sys.exit(0)\n" +
+              "sys.exit(9)",
+          ],
+        );
+        expect(network.exitCode).toBe(0);
+      }
+    } finally {
+      process.chdir(savedCwd);
+    }
+  });
+
+  it("uses Landlock when installed bubblewrap cannot create namespaces", async () => {
+    const root = withTempDir("agenc-landlock-bwrap-denied-");
+    const workspace = path.join(root, "workspace");
+    const trusted = path.join(root, "trusted-bin");
+    fs.mkdirSync(workspace);
+    fs.mkdirSync(trusted);
+    const fakeBwrap = path.join(trusted, "bwrap");
+    fs.writeFileSync(
+      fakeBwrap,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "--help" ]; then',
+        "  echo '--argv0 --ro-bind-fd'",
+        "  exit 0",
+        "fi",
+        "echo 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' >&2",
+        "exit 1",
+      ].join("\n") + "\n",
+      { mode: 0o755 },
+    );
+    const capture = path.join(workspace, "result.txt");
+    const stderr: string[] = [];
+
+    const exitCode = await runLinuxSandboxMain(
+      [
+        "--sandbox-policy-cwd",
+        workspace,
+        "--command-cwd",
+        workspace,
+        "--permission-profile",
+        JSON.stringify(workspaceWriteProfile(workspace, "disabled")),
+        "--",
+        "/bin/sh",
+        "-c",
+        `printf fallback-ok > ${capture}`,
+      ],
+      {
+        preferredLauncher: (options = {}) =>
+          preferredBubblewrapLauncher({
+            ...options,
+            searchPath: trusted,
+            trustedDirectories: [trusted],
+          }),
+        onStderr: (line) => stderr.push(line),
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(fs.readFileSync(capture, "utf8")).toBe("fallback-ok");
+  });
+
   it("confines writes to the workspace when bubblewrap is unavailable", async () => {
     const workspace = withTempDir("agenc-landlock-fallback-ws-");
     const outside = withTempDir("agenc-landlock-fallback-out-");

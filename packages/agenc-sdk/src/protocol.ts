@@ -86,6 +86,7 @@ export const AGENC_SDK_DAEMON_METHODS = [
   "health.ready",
   "health.stats",
   "daemon.reload",
+  "daemon.shutdown",
   "auth.login",
   "auth.whoami",
   "auth.logout",
@@ -126,6 +127,16 @@ export interface DaemonProtocolInfo extends JsonObject {
   readonly version: string;
 }
 
+/** Authenticated identity of the exact daemon process serving the connection. */
+export interface DaemonInstanceIdentity extends JsonObject {
+  readonly pid: number;
+  readonly instanceId: string;
+  readonly processStart: string;
+  readonly runtimeVersion: string;
+  readonly commit: string;
+  readonly buildTime: string;
+}
+
 export interface InitializeParams extends JsonObject {
   readonly protocolVersion?: string;
   readonly protocol?: DaemonProtocolInfo;
@@ -137,6 +148,10 @@ export interface InitializeParams extends JsonObject {
 export interface RequestCancelParams extends JsonObject {
   readonly requestId: RequestId;
   readonly reason?: string;
+}
+
+export interface DaemonShutdownParams extends JsonObject {
+  readonly instanceId: string;
 }
 
 export type PermissionMode =
@@ -540,6 +555,7 @@ export interface AgencParamsByMethod {
   readonly "health.ready": EmptyParams;
   readonly "health.stats": EmptyParams;
   readonly "daemon.reload": EmptyParams;
+  readonly "daemon.shutdown": DaemonShutdownParams;
   readonly "auth.login": EmptyParams;
   readonly "auth.whoami": EmptyParams;
   readonly "auth.logout": EmptyParams;
@@ -589,6 +605,7 @@ export interface InitializeResult extends JsonObject {
   readonly protocolVersion: string;
   readonly protocol: DaemonProtocolInfo;
   readonly capabilities: JsonObject;
+  readonly daemonIdentity?: DaemonInstanceIdentity;
 }
 
 export interface RequestCancelResult extends JsonObject {
@@ -1280,6 +1297,11 @@ export interface DaemonReloadResult extends JsonObject {
   readonly mcpServer: JsonObject;
 }
 
+export interface DaemonShutdownResult extends JsonObject {
+  readonly shuttingDown: true;
+  readonly instanceId: string;
+}
+
 export interface AuthWhoamiResult extends JsonObject {
   readonly authenticated: boolean;
   readonly provider?: string;
@@ -1347,6 +1369,7 @@ export interface AgencResultByMethod {
   readonly "health.ready": HealthReadyResult;
   readonly "health.stats": HealthStatsResult;
   readonly "daemon.reload": DaemonReloadResult;
+  readonly "daemon.shutdown": DaemonShutdownResult;
   readonly "auth.login": AuthLoginResult;
   readonly "auth.whoami": AuthWhoamiResult;
   readonly "auth.logout": AuthLogoutResult;

@@ -82,10 +82,10 @@ Documentation map: [`docs/INDEX.md`](docs/INDEX.md). Architecture:
   `BUFFER` (embedded `nvim --embed` preferred). See
   [`docs/embedded-neovim-buffer.md`](docs/embedded-neovim-buffer.md).
 - **16 built-in providers** — default provider **grok**; fresh-config session
-  model **grok-4.5** (fresh config and provider-map). Selectable **Grok 4.3**
-  remains in the catalog; **Grok 4.5** is the 500k-context default with
-  low/medium/high reasoning (high by default for that model), vision, tools,
-  and structured output; also
+  model **grok-4.6** (fresh config and direct-provider map). **Grok 4.6** has a
+  500k context window, low/medium/high/xhigh reasoning (high by default),
+  vision, tools, and structured output; **Grok 4.5** and **Grok 4.3** remain
+  selectable in the catalog; also
   openai, anthropic, ollama, lmstudio, openai-compatible, openrouter, groq,
   deepseek, gemini, mistral, nvidia-nim, minimax, github, amazon-bedrock, agenc.
   See [`docs/reference/providers.md`](docs/reference/providers.md).
@@ -126,7 +126,7 @@ Ledger verification, and the independently versioned SDK.
   the bundled process-containment broker. Published standalone/runtime
   artifacts already include that broker.
 - **A provider** before real model calls. Default: **xAI** via `XAI_API_KEY`
-  (also accepts `GROK_API_KEY`); default model `grok-4.5` (`AGENC_MODEL`
+  (also accepts `GROK_API_KEY`); default model `grok-4.6` (`AGENC_MODEL`
   overrides). Inspect with `agenc providers`, `agenc login`, `agenc config`.
 
 ## Quick start
@@ -273,7 +273,7 @@ shared NFS/SMB/multi-host container volumes are rejected for runtime locks.
 | --- | --- |
 | `AGENC_HOME` | Root for on-disk state (default `~/.agenc`) |
 | `XAI_API_KEY` / `GROK_API_KEY` | Default provider credentials |
-| `AGENC_MODEL` | Override default model (`grok-4.5`) |
+| `AGENC_MODEL` | Override default model (`grok-4.6`) |
 | `AGENC_AUTH_BACKEND` | `local` or `remote` |
 | `AGENC_DAEMON_AUTOSTART=0` | Disable launcher daemon autostart |
 | `AGENC_DAEMON_READY_TIMEOUT_MS` | Launcher daemon-ready timeout |

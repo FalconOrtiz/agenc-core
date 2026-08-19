@@ -3,7 +3,7 @@
  * AgenC flows through.
  *
  * Hand-port of agenc runtime `protocol/src/protocol.rs` EventMsg (78 variants)
- * reduced to the 18-variant AgenC subset per `docs/plan/agenc runtime-inventory.md §4`.
+ * reduced to AgenC's 82-variant runtime surface.
  *
  * Invariants wired here:
  *   I-8  (every error site emits a typed event) — `emitError()` helper
@@ -28,6 +28,10 @@ import type {
   EffectOutcome,
   EffectReviewResolution,
   RunTerminalStatus,
+  RunResumeReason,
+  RunRuntimeSettingsChangeReason,
+  RunRuntimeSettingsSnapshot,
+  RunSuspensionReason,
   RunUsageTotals,
 } from "../contracts/run-contracts.js";
 import type { ToolRecoveryCategory } from "../tools/types.js";
@@ -86,7 +90,7 @@ export interface Event {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Event payloads — 18 variants
+// Event payloads — 82 variants
 // ─────────────────────────────────────────────────────────────────────
 
 export interface SessionMetaLine {
@@ -571,6 +575,41 @@ export interface RunReopenedEvent {
   readonly reopenedAt: string;
 }
 
+/** Durable proof that an idle daemon writer relinquished this open epoch. */
+export interface RunSuspendedEvent {
+  readonly runId: string;
+  readonly epoch: number;
+  readonly reason: RunSuspensionReason;
+  readonly suspendedAt: string;
+}
+
+/** Durable proof that the exact suspended epoch regained one writer. */
+export interface RunResumedEvent {
+  readonly runId: string;
+  readonly epoch: number;
+  readonly suspensionEventId: string;
+  readonly reason: RunResumeReason;
+  readonly resumedAt: string;
+}
+
+/** Durable first-input activation for startup work deferred by a resume. */
+export interface RunStartupActivatedEvent {
+  readonly runId: string;
+  readonly epoch: number;
+  readonly resumeEventId: string;
+  readonly activatedAt: string;
+}
+
+/** Fsync-durable full desired runtime overlay for the active run epoch. */
+export interface RunRuntimeSettingsChangedEvent extends RunRuntimeSettingsSnapshot {
+  readonly runId: string;
+  readonly epoch: number;
+  readonly previousSettingsEventId: string | null;
+  readonly rollbackOfSettingsEventId: string | null;
+  readonly reason: RunRuntimeSettingsChangeReason;
+  readonly changedAt: string;
+}
+
 /**
  * Durable operator intent recorded before cancellation starts quiescing the
  * run. Startup recovery uses this boundary to fail closed when the daemon dies
@@ -911,7 +950,7 @@ export interface TurnContextItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// EventMsg discriminated union (18 variants)
+// EventMsg discriminated union (82 variants)
 // ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -1132,6 +1171,16 @@ export type EventMsg =
     }
   | { readonly type: "run_terminal"; readonly payload: RunTerminalEvent }
   | { readonly type: "run_reopened"; readonly payload: RunReopenedEvent }
+  | { readonly type: "run_suspended"; readonly payload: RunSuspendedEvent }
+  | { readonly type: "run_resumed"; readonly payload: RunResumedEvent }
+  | {
+      readonly type: "run_startup_activated";
+      readonly payload: RunStartupActivatedEvent;
+    }
+  | {
+      readonly type: "run_runtime_settings_changed";
+      readonly payload: RunRuntimeSettingsChangedEvent;
+    }
   | {
       readonly type: "run_cancel_requested";
       readonly payload: RunCancelRequestedEvent;
@@ -1366,6 +1415,10 @@ export const KNOWN_EVENT_TYPES = Object.freeze(
     "artifact_committed",
     "run_terminal",
     "run_reopened",
+    "run_suspended",
+    "run_resumed",
+    "run_startup_activated",
+    "run_runtime_settings_changed",
     "run_cancel_requested",
     "recovery_decision",
     "execution_admission",
@@ -1440,7 +1493,16 @@ const DURABLE_EVENT_TYPES = Object.freeze(
     "artifact_committed",
     "run_terminal",
     "run_reopened",
+    "run_suspended",
+    "run_resumed",
+    "run_startup_activated",
+    "run_runtime_settings_changed",
     "run_cancel_requested",
+    // Legacy plan inference is recovery authority only when both boundaries
+    // survive a crash, so these transition markers must not ride the batch
+    // durability window.
+    "plan_started",
+    "plan_exited",
     "recovery_decision",
   ]),
 );

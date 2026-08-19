@@ -14,7 +14,10 @@ import {
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
-import { SessionLock } from "../session/session-store.js";
+import {
+  hasSupportedFileIdentity,
+  SessionLock,
+} from "../session/session-store.js";
 
 export class OfflineRolloutSourceMissingError extends Error {
   constructor(sourcePath: string) {
@@ -67,6 +70,11 @@ export interface PinnedOfflineRolloutReader {
   ): PinnedOfflineRolloutSnapshot;
   /** Prove the retained inode and pathname still match the captured snapshot. */
   assertSnapshot(snapshot: PinnedOfflineRolloutSnapshot): void;
+  /**
+   * Open the exact pinned inode for append-capable SessionStore adoption.
+   * The caller owns the returned descriptor and must close or transfer it.
+   */
+  openAppendDescriptor(): number;
 }
 
 /**
@@ -101,6 +109,7 @@ export function withPinnedOfflineRolloutReadLease<T>(
     );
     assertOpenSourceIdentity(scope, pinned, fd);
     const sourceFd = fd;
+    let appendDescriptorTransferred = false;
     const rollout: PinnedOfflineRolloutReader = {
       sourcePath: scope.sourcePath,
       stat: () => descriptorSnapshot(scope, pinned, sourceFd),
@@ -133,12 +142,74 @@ export function withPinnedOfflineRolloutReadLease<T>(
       assertSnapshot: (snapshot) => {
         assertDescriptorSnapshot(scope, pinned, sourceFd, snapshot);
       },
+      openAppendDescriptor: () => {
+        if (appendDescriptorTransferred) {
+          throw new Error(
+            "offline canonical rollout append descriptor was already transferred",
+          );
+        }
+        const appendFd = openPinnedAppendDescriptor(scope, pinned, sourceFd);
+        appendDescriptorTransferred = true;
+        return appendFd;
+      },
     };
     return operation(rollout);
   } finally {
     if (fd !== undefined) closeSync(fd);
     lock.release();
     closePinnedOfflineRollout(pinned);
+  }
+}
+
+function openPinnedAppendDescriptor(
+  scope: OfflineRolloutScope,
+  pinned: PinnedOfflineRolloutState,
+  readFd: number,
+): number {
+  assertOpenSourceIdentity(scope, pinned, readFd);
+  const expected = fstatSync(readFd, { bigint: true });
+  if (
+    !expected.isFile() ||
+    expected.nlink !== 1n ||
+    !hasSupportedFileIdentity(expected)
+  ) {
+    throw new OfflineRolloutUnsafePathError(
+      scope.sourcePath,
+      "pinned source has no supported regular-file identity",
+    );
+  }
+  const appendFd = openSync(
+    join(pinned.sessionDirectory.operationPath, scope.sourceName),
+    fsConstants.O_RDWR | fsConstants.O_APPEND | noFollowFlag(),
+  );
+  try {
+    assertOpenSourceIdentity(scope, pinned, appendFd);
+    const opened = fstatSync(appendFd, { bigint: true });
+    const bound = lstatSync(scope.sourcePath, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !bound.isFile() ||
+      bound.isSymbolicLink() ||
+      bound.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened) ||
+      !hasSupportedFileIdentity(bound) ||
+      opened.dev !== expected.dev ||
+      opened.ino !== expected.ino ||
+      opened.size !== expected.size ||
+      bound.dev !== expected.dev ||
+      bound.ino !== expected.ino ||
+      bound.size !== expected.size
+    ) {
+      throw new OfflineRolloutUnsafePathError(
+        scope.sourcePath,
+        "append descriptor does not match the pinned source snapshot",
+      );
+    }
+    return appendFd;
+  } catch (error) {
+    closeSync(appendFd);
+    throw error;
   }
 }
 

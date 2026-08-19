@@ -12,6 +12,12 @@ describe("agenc top-level help surface", () => {
     expect(source).toContain(
       '"       agenc providers [--json] [--no-local-check]",',
     );
+    expect(source).toContain(
+      '"       agenc run <start|status|result|replay|evidence|cancel> [<run-id>] [options]",',
+    );
+    expect(source).toContain(
+      '"  run                                     Start, inspect, replay, export, or cancel a durable run",',
+    );
     expect(source).toContain('"       agenc plugin <command> [options]",');
     expect(source).toContain('"       agenc permissions <command>",');
     expect(source).toContain(

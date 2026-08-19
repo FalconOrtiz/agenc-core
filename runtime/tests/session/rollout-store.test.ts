@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -13,10 +14,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import type { AgentMetadata } from "../agents/registry.js";
 import { upsertAgentRun } from "../state/agent-runs.js";
+import { createOperatorEffectReviewResolution } from "../state/effect-review.js";
 import {
   openStateDatabases,
   resolveStateDatabasePaths,
 } from "../state/sqlite-driver.js";
+import type { Event } from "./event-log.js";
 import { RolloutStore } from "./rollout-store.js";
 import { getProjectDir, getSessionDir } from "./session-store.js";
 
@@ -29,12 +32,20 @@ function openStore(opts: {
   cwd: string;
   sessionId: string;
   resume?: boolean;
+  reopenTerminalRun?: boolean;
+  resumeSuspendedRun?: boolean;
+  suspendedResumeReason?: "daemon_startup_restore" | "explicit_continue";
 }): RolloutStore {
   const store = new RolloutStore({
     cwd: opts.cwd,
     sessionId: opts.sessionId,
     agencVersion: "0.2.0",
     ...(opts.resume ? { resume: true } : {}),
+    ...(opts.reopenTerminalRun ? { reopenTerminalRun: true } : {}),
+    ...(opts.resumeSuspendedRun ? { resumeSuspendedRun: true } : {}),
+    ...(opts.suspendedResumeReason !== undefined
+      ? { suspendedResumeReason: opts.suspendedResumeReason }
+      : {}),
   });
   store.open({
     sessionId: opts.sessionId,
@@ -84,6 +95,117 @@ function metadata(
     agentRole: "default",
     depth,
   };
+}
+
+function appendReviewedReopenFixture(
+  store: RolloutStore,
+  sessionId: string,
+  reviewBeforeReopen: boolean,
+): void {
+  const intent: Event = {
+    eventId: `effect-intent:${sessionId}`,
+    id: `effect-intent:${sessionId}`,
+    seq: 1,
+    msg: {
+      type: "effect_intent",
+      payload: {
+        formatVersion: 2,
+        minimumReaderRuntime: "0.14.0",
+        runId: sessionId,
+        stepId: "step-reviewed",
+        callId: "call-reviewed",
+        toolName: "side-effecting-test",
+        recoveryCategory: "side-effecting",
+        intentDigest: "digest-reviewed",
+        attempt: 1,
+        recordedAt: "2026-08-19T00:00:00.000Z",
+      },
+    },
+  };
+  const unknown: Event = {
+    eventId: `effect-unknown:${sessionId}`,
+    id: `effect-unknown:${sessionId}`,
+    seq: 2,
+    msg: {
+      type: "effect_unknown_outcome",
+      payload: {
+        formatVersion: 2,
+        minimumReaderRuntime: "0.14.0",
+        runId: sessionId,
+        stepId: "step-reviewed",
+        callId: "call-reviewed",
+        toolName: "side-effecting-test",
+        recoveryCategory: "side-effecting",
+        intentEventSeq: 1,
+        outcome: "unknown_outcome",
+        reason: "acknowledgement_lost",
+        requiresReview: true,
+        recordedAt: "2026-08-19T00:00:01.000Z",
+      },
+    },
+  };
+  const terminal: Event = {
+    eventId: `run-terminal:${sessionId}:1`,
+    id: `run-terminal:${sessionId}:1`,
+    seq: 3,
+    msg: {
+      type: "run_terminal",
+      payload: {
+        runId: sessionId,
+        epoch: 1,
+        status: "completed",
+        exitCode: 0,
+        stopReason: "turn_completed",
+        finalMessage: "done",
+        usage: null,
+        lastSequenceBeforeTerminal: 2,
+        finishedAt: "2026-08-19T00:00:02.000Z",
+      },
+    },
+  };
+  const review: Event = {
+    eventId: `effect-review:${sessionId}`,
+    id: `effect-review:${sessionId}`,
+    seq: reviewBeforeReopen ? 4 : 5,
+    msg: {
+      type: "effect_review_resolved",
+      payload: {
+        runId: sessionId,
+        stepId: "step-reviewed",
+        callId: "call-reviewed",
+        resolution: createOperatorEffectReviewResolution({
+          disposition: "confirmed_committed",
+          actorId: "operator-reviewed",
+          evidenceRef: "operator-observation:reviewed",
+          evidenceSha256: "b".repeat(64),
+          reviewedAt: "2026-08-19T00:00:03.000Z",
+        }),
+      },
+    },
+  };
+  const reopened: Event = {
+    eventId: `run-reopened:${sessionId}:2`,
+    id: `run-reopened:${sessionId}:2`,
+    seq: reviewBeforeReopen ? 5 : 4,
+    msg: {
+      type: "run_reopened",
+      payload: {
+        runId: sessionId,
+        previousEpoch: 1,
+        epoch: 2,
+        reason: "user_session_continue",
+        reopenedAt: "2026-08-19T00:00:04.000Z",
+      },
+    },
+  };
+  for (const event of [
+    intent,
+    unknown,
+    terminal,
+    ...(reviewBeforeReopen ? [review, reopened] : [reopened, review]),
+  ]) {
+    expect(store.append(event, { durable: true })).toBe(true);
+  }
 }
 
 beforeEach(() => {
@@ -276,6 +398,650 @@ describe("RolloutStore thread-spawn edges", () => {
       }
     },
   );
+
+  it("explicitly reopens a completed canonical run once and survives another restart", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-explicit";
+    const original = openStore({ cwd, sessionId });
+    try {
+      expect(
+        original.append(
+          {
+            eventId: `run-terminal:${sessionId}:1`,
+            id: `run-terminal:${sessionId}:1`,
+            seq: 1,
+            msg: {
+              type: "run_terminal",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                status: "completed",
+                exitCode: 0,
+                stopReason: "turn_completed",
+                finalMessage: "done",
+                usage: null,
+                lastSequenceBeforeTerminal: null,
+                finishedAt: "2026-08-19T00:00:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
+      try {
+        expect(resumed.runEpoch).toBe(2);
+        expect(
+          resumed
+            .readAll()
+            .filter(
+              (item) =>
+                item.type === "event_msg" &&
+                item.payload.msg.type === "run_reopened",
+            ),
+        ).toHaveLength(1);
+      } finally {
+        resumed.close();
+      }
+
+      const restarted = openStore({ cwd, sessionId, resume: true });
+      try {
+        expect(restarted.runEpoch).toBe(2);
+        expect(
+          restarted
+            .readAll()
+            .filter(
+              (item) =>
+                item.type === "event_msg" &&
+                item.payload.msg.type === "run_reopened",
+            ),
+        ).toHaveLength(1);
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("projects a fsynced reopen boundary after a pre-SQLite crash without duplicating it", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-crash-window";
+    const original = openStore({ cwd, sessionId });
+    try {
+      expect(
+        original.append(
+          {
+            eventId: `run-terminal:${sessionId}:1`,
+            id: `run-terminal:${sessionId}:1`,
+            seq: 1,
+            msg: {
+              type: "run_terminal",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                status: "completed",
+                exitCode: 0,
+                stopReason: "turn_completed",
+                finalMessage: "done",
+                usage: null,
+                lastSequenceBeforeTerminal: null,
+                finishedAt: "2026-08-19T00:00:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      // Models a process death after the canonical reopen fsync but before
+      // StateRunDurabilityRepository.reopenRun projected epoch 2.
+      expect(
+        original.append(
+          {
+            eventId: `run-reopened:${sessionId}:2`,
+            id: `run-reopened:${sessionId}:2`,
+            seq: 2,
+            msg: {
+              type: "run_reopened",
+              payload: {
+                runId: sessionId,
+                previousEpoch: 1,
+                epoch: 2,
+                reason: "user_session_continue",
+                reopenedAt: "2026-08-19T00:00:01.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
+      try {
+        expect(resumed.runEpoch).toBe(2);
+        expect(
+          resumed
+            .readAll()
+            .filter(
+              (item) =>
+                item.type === "event_msg" &&
+                item.payload.msg.type === "run_reopened",
+            ),
+        ).toHaveLength(1);
+      } finally {
+        resumed.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("projects a canonical effect review that precedes its reopen boundary", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-reviewed-before-boundary";
+    const original = openStore({ cwd, sessionId });
+    try {
+      appendReviewedReopenFixture(original, sessionId, true);
+      original.close();
+
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
+      try {
+        expect(resumed.runEpoch).toBe(2);
+        const driver = openStateDatabases({ cwd });
+        try {
+          const row = driver
+            .prepareState<
+              [string, string],
+              { readonly review_status: string | null }
+            >(
+              `SELECT review_status
+               FROM run_effects
+               WHERE run_id = ? AND step_id = ?`,
+            )
+            .get(sessionId, "step-reviewed");
+          expect(row?.review_status).toBe("resolved");
+        } finally {
+          driver.close();
+        }
+      } finally {
+        resumed.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an effect review recorded after its canonical reopen boundary", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-reviewed-after-boundary";
+    const original = openStore({ cwd, sessionId });
+    try {
+      appendReviewedReopenFixture(original, sessionId, false);
+      original.close();
+
+      expect(() =>
+        openStore({
+          cwd,
+          sessionId,
+          resume: true,
+          reopenTerminalRun: true,
+        }),
+      ).toThrow(/run reopen follows an unsettled effect/u);
+
+      const driver = openStateDatabases({ cwd });
+      try {
+        expect(
+          driver
+            .prepareState<[string], { readonly epoch: number }>(
+              `SELECT epoch
+               FROM run_lifecycle_epochs
+               WHERE run_id = ?
+               ORDER BY epoch DESC
+               LIMIT 1`,
+            )
+            .get(sessionId)?.epoch,
+        ).toBe(1);
+      } finally {
+        driver.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a cancelled terminal even when no effect review is pending", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-cancelled-clean";
+    const original = openStore({ cwd, sessionId });
+    try {
+      expect(
+        original.append(
+          {
+            eventId: `run-terminal:${sessionId}:1`,
+            id: `run-terminal:${sessionId}:1`,
+            seq: 1,
+            msg: {
+              type: "run_terminal",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                status: "cancelled",
+                exitCode: null,
+                stopReason: "signal_received",
+                finalMessage: null,
+                usage: null,
+                lastSequenceBeforeTerminal: null,
+                finishedAt: "2026-08-19T00:00:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      expect(() =>
+        openStore({
+          cwd,
+          sessionId,
+          resume: true,
+          reopenTerminalRun: true,
+        }),
+      ).toThrow(/cancelled terminal epoch 1 cannot be reopened/);
+      expect(readFileSync(original.rolloutPath, "utf8")).not.toContain(
+        '"type":"run_reopened"',
+      );
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps explicit reopen blocked when a side effect has unknown outcome", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "terminal-resume-review-blocked";
+    const original = openStore({ cwd, sessionId });
+    const intent = {
+      eventId: "effect-intent-before-terminal",
+      id: "effect-intent-before-terminal",
+      seq: 1,
+      msg: {
+        type: "effect_intent" as const,
+        payload: {
+          formatVersion: 2,
+          minimumReaderRuntime: "0.14.0",
+          runId: sessionId,
+          stepId: "step-1",
+          callId: "call-1",
+          toolName: "side-effecting-test",
+          recoveryCategory: "side-effecting" as const,
+          intentDigest: "digest-1",
+          attempt: 1,
+          recordedAt: "2026-08-19T00:00:00.000Z",
+        },
+      },
+    };
+    try {
+      expect(original.append(intent, { durable: true })).toBe(true);
+      original.recordEffectEvent(intent);
+      expect(
+        original.append(
+          {
+            eventId: `run-terminal:${sessionId}:1`,
+            id: `run-terminal:${sessionId}:1`,
+            seq: 2,
+            msg: {
+              type: "run_terminal",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                status: "completed",
+                exitCode: 0,
+                stopReason: "turn_completed",
+                finalMessage: "done",
+                usage: null,
+                lastSequenceBeforeTerminal: 1,
+                finishedAt: "2026-08-19T00:00:01.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      expect(() =>
+        openStore({
+          cwd,
+          sessionId,
+          resume: true,
+          reopenTerminalRun: true,
+        }),
+      ).toThrow(/unknown-outcome effect\(s\) require review/);
+      const content = readFileSync(original.rolloutPath, "utf8");
+      expect(content).toContain('"type":"effect_unknown_outcome"');
+      expect(content).not.toContain('"type":"run_reopened"');
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resumes two clean daemon suspensions without changing the epoch", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "suspended-resume-cycles";
+    const original = openStore({ cwd, sessionId });
+    try {
+      const firstSuspension = {
+        eventId: "run-suspended-cycle-1",
+        id: "run-suspended-cycle-1",
+        seq: 1,
+        msg: {
+          type: "run_suspended" as const,
+          payload: {
+            runId: sessionId,
+            epoch: 1,
+            reason: "daemon_shutdown_idle" as const,
+            suspendedAt: "2026-08-19T00:00:00.000Z",
+          },
+        },
+      };
+      expect(original.append(firstSuspension, { durable: true })).toBe(true);
+      original.recordRunSuspensionEvent(firstSuspension);
+      original.close();
+
+      expect(() => openStore({ cwd, sessionId, resume: true })).toThrow(
+        /explicit suspended resume is required/,
+      );
+      const firstResume = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        resumeSuspendedRun: true,
+        suspendedResumeReason: "explicit_continue",
+      });
+      expect(firstResume.runEpoch).toBe(1);
+      const secondSuspension = {
+        eventId: "run-suspended-cycle-2",
+        id: "run-suspended-cycle-2",
+        seq: 3,
+        msg: {
+          type: "run_suspended" as const,
+          payload: {
+            runId: sessionId,
+            epoch: 1,
+            reason: "daemon_shutdown_idle" as const,
+            suspendedAt: "2026-08-19T00:02:00.000Z",
+          },
+        },
+      };
+      expect(firstResume.append(secondSuspension, { durable: true })).toBe(
+        true,
+      );
+      firstResume.recordRunSuspensionEvent(secondSuspension);
+      firstResume.close();
+
+      const secondResume = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        resumeSuspendedRun: true,
+        suspendedResumeReason: "daemon_startup_restore",
+      });
+      try {
+        expect(secondResume.runEpoch).toBe(1);
+        const lifecycle = secondResume
+          .readAll()
+          .flatMap((item) =>
+            item.type === "event_msg" &&
+            (item.payload.msg.type === "run_suspended" ||
+              item.payload.msg.type === "run_resumed")
+              ? [item.payload.msg.type]
+              : [],
+          );
+        expect(lifecycle).toEqual([
+          "run_suspended",
+          "run_resumed",
+          "run_suspended",
+          "run_resumed",
+        ]);
+      } finally {
+        secondResume.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("adopts a recovery-named source after the bound normal path was moved", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "suspended-rewrite-old-moved";
+    const original = openStore({ cwd, sessionId });
+    const suspension = {
+      eventId: "run-suspended-old-moved",
+      id: "run-suspended-old-moved",
+      seq: 1,
+      msg: {
+        type: "run_suspended" as const,
+        payload: {
+          runId: sessionId,
+          epoch: 1,
+          reason: "daemon_shutdown_idle" as const,
+          suspendedAt: "2026-08-19T00:00:00.000Z",
+        },
+      },
+    };
+    try {
+      expect(original.append(suspension, { durable: true })).toBe(true);
+      original.recordRunSuspensionEvent(suspension);
+      const normalPath = original.rolloutPath;
+      original.close();
+      const recoveryPath = join(
+        original.store.sessionDir,
+        `rollout-recovery-1-crash-${sessionId}.jsonl`,
+      );
+      renameSync(normalPath, recoveryPath);
+
+      const resumed = new RolloutStore({
+        cwd,
+        sessionId,
+        agencVersion: "0.2.0",
+        resume: true,
+        resumeRolloutPath: recoveryPath,
+        resumeSuspendedRun: true,
+        suspendedResumeReason: "daemon_startup_restore",
+      });
+      try {
+        resumed.open({
+          sessionId,
+          timestamp: "2026-08-19T00:01:00.000Z",
+          cwd,
+          originator: "rollout-store-test",
+          agencVersion: "0.2.0",
+          model: "test-model",
+          modelProvider: "test-provider",
+        });
+        expect(resumed.rolloutPath).toBe(recoveryPath);
+        expect(resumed.runEpoch).toBe(1);
+        expect(
+          resumed
+            .readAll()
+            .flatMap((item) =>
+              item.type === "event_msg" &&
+              (item.payload.msg.type === "run_suspended" ||
+                item.payload.msg.type === "run_resumed")
+                ? [item.payload.msg.type]
+                : [],
+            ),
+        ).toEqual(["run_suspended", "run_resumed"]);
+      } finally {
+        resumed.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("replays a fsynced run_resumed crash window without duplicating it", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "suspended-resume-crash-window";
+    const original = openStore({ cwd, sessionId });
+    try {
+      const suspension = {
+        eventId: "run-suspended-crash-window",
+        id: "run-suspended-crash-window",
+        seq: 1,
+        msg: {
+          type: "run_suspended" as const,
+          payload: {
+            runId: sessionId,
+            epoch: 1,
+            reason: "daemon_shutdown_idle" as const,
+            suspendedAt: "2026-08-19T00:00:00.000Z",
+          },
+        },
+      };
+      expect(original.append(suspension, { durable: true })).toBe(true);
+      original.recordRunSuspensionEvent(suspension);
+      expect(
+        original.append(
+          {
+            eventId: "run-resumed-crash-window",
+            id: "run-resumed-crash-window",
+            seq: 2,
+            msg: {
+              type: "run_resumed",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                suspensionEventId: suspension.eventId,
+                reason: "explicit_continue",
+                resumedAt: "2026-08-19T00:01:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        resumeSuspendedRun: true,
+      });
+      try {
+        expect(resumed.runEpoch).toBe(1);
+        expect(
+          resumed
+            .readAll()
+            .filter(
+              (item) =>
+                item.type === "event_msg" &&
+                item.payload.msg.type === "run_resumed",
+            ),
+        ).toHaveLength(1);
+      } finally {
+        resumed.close();
+      }
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resume a suspension preceded by an unsettled effect intent", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "suspended-resume-effect-gate";
+    const original = openStore({ cwd, sessionId });
+    try {
+      expect(
+        original.append(
+          {
+            eventId: "effect-intent-before-suspension",
+            id: "effect-intent-before-suspension",
+            seq: 1,
+            msg: {
+              type: "effect_intent",
+              payload: {
+                formatVersion: 2,
+                minimumReaderRuntime: "0.14.0",
+                runId: sessionId,
+                stepId: "step-before-suspension",
+                callId: "call-before-suspension",
+                toolName: "side-effecting-test",
+                recoveryCategory: "side-effecting",
+                intentDigest: "digest-before-suspension",
+                attempt: 1,
+                recordedAt: "2026-08-19T00:00:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      expect(
+        original.append(
+          {
+            eventId: "invalid-suspension-after-intent",
+            id: "invalid-suspension-after-intent",
+            seq: 2,
+            msg: {
+              type: "run_suspended",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                reason: "daemon_shutdown_idle",
+                suspendedAt: "2026-08-19T00:01:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+      original.close();
+
+      expect(() =>
+        openStore({
+          cwd,
+          sessionId,
+          resume: true,
+          resumeSuspendedRun: true,
+        }),
+      ).toThrow(/unsettled effect/);
+      expect(readFileSync(original.rolloutPath, "utf8")).not.toContain(
+        '"type":"run_resumed"',
+      );
+    } finally {
+      original.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 
   it("fails closed instead of reopening a corrupted persisted edge status", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));

@@ -5,6 +5,11 @@ import type {
   EffectReviewResolution,
   EffectReviewWorkflowStatus,
   RunId,
+  RunResumedBoundary,
+  RunRuntimeSettingsBoundary,
+  RunRuntimeSettingsSnapshot,
+  RunStartupActivatedBoundary,
+  RunSuspendedBoundary,
   RunTerminalResult,
   RunUsageTotals,
 } from "../contracts/run-contracts.js";
@@ -23,10 +28,16 @@ import { stableStringify } from "../utils/stableStringify.js";
 import type { StateSqliteDriver } from "./sqlite-driver.js";
 import { assertRecoverySha256 } from "./recovery-contract.js";
 import type { CanonicalJournalFormat } from "./recovery-journal-contract.js";
+import { isCancelLockedAgentRunStatus } from "./run-cancellation.js";
 
 export type RunDurabilityConflictCode =
   | "RUN_EPOCH_CONFLICT"
   | "RUN_EPOCH_NOT_TERMINAL"
+  | "RUN_SUSPENSION_CONFLICT"
+  | "RUN_SUSPENSION_EFFECT_PENDING"
+  | "RUN_CANCELLATION_CONFLICT"
+  | "RUN_STARTUP_ACTIVATION_CONFLICT"
+  | "RUN_RUNTIME_SETTINGS_CONFLICT"
   | "RUN_REOPEN_REVIEW_REQUIRED"
   | "RUN_TERMINAL_RESULT_CONFLICT"
   | "RUN_EFFECT_INTENT_CONFLICT"
@@ -86,6 +97,28 @@ export interface RunLifecycleEpoch {
 export interface DurableRunTerminalRecord extends RunTerminalResult {
   readonly epoch: number;
   readonly eventId: string;
+}
+
+export interface DurableRunSuspension extends RunSuspendedBoundary {
+  readonly suspensionSequence: number;
+  readonly resumeEventId?: string;
+  readonly resumeSequence?: number;
+  readonly resumeReason?: RunResumedBoundary["reason"];
+  readonly resumedAt?: string;
+  readonly activationEventId?: string;
+  readonly activationSequence?: number;
+  readonly activatedAt?: string;
+}
+
+export interface DurableRunRuntimeSettings extends RunRuntimeSettingsSnapshot {
+  readonly runId: RunId;
+  readonly epoch: number;
+  readonly eventId: string;
+  readonly eventSequence: number;
+  readonly previousSettingsEventId: string | null;
+  readonly rollbackOfSettingsEventId: string | null;
+  readonly reason: RunRuntimeSettingsBoundary["reason"];
+  readonly changedAt: string;
 }
 
 export type EffectReviewStatus = "none" | EffectReviewWorkflowStatus;
@@ -172,6 +205,44 @@ interface TerminalRow {
   readonly event_id: string;
 }
 
+interface SuspensionRow {
+  readonly run_id: string;
+  readonly epoch: number;
+  readonly suspension_event_id: string;
+  readonly suspension_sequence: number;
+  readonly reason: RunSuspendedBoundary["reason"];
+  readonly suspended_at: string;
+  readonly resume_event_id: string | null;
+  readonly resume_sequence: number | null;
+  readonly resume_reason: RunResumedBoundary["reason"] | null;
+  readonly resumed_at: string | null;
+  readonly activation_event_id: string | null;
+  readonly activation_sequence: number | null;
+  readonly activated_at: string | null;
+}
+
+interface RuntimeSettingsRow {
+  readonly run_id: string;
+  readonly epoch: number;
+  readonly settings_event_id: string;
+  readonly settings_sequence: number;
+  readonly previous_settings_event_id: string | null;
+  readonly rollback_of_settings_event_id: string | null;
+  readonly reason: RunRuntimeSettingsBoundary["reason"];
+  readonly changed_at: string;
+  readonly permission_mode: RunRuntimeSettingsSnapshot["permissionMode"];
+  readonly pre_plan_mode: RunRuntimeSettingsSnapshot["prePlanMode"];
+  readonly auto_mode_active: number;
+  readonly bypass_permissions_workspace: string | null;
+  readonly model: string;
+  readonly provider: string;
+  readonly profile: string | null;
+  readonly reasoning_effort: RunRuntimeSettingsSnapshot["reasoningEffort"];
+  readonly model_verbosity: RunRuntimeSettingsSnapshot["modelVerbosity"];
+  readonly service_tier: RunRuntimeSettingsSnapshot["serviceTier"];
+  readonly hooks_disabled: number;
+}
+
 interface EffectRow {
   readonly run_id: string;
   readonly step_id: string;
@@ -254,6 +325,18 @@ const JOURNAL_BINDING_COLUMNS = `
   authoritative_source_size_bytes, authoritative_source_mtime_ms,
   journal_format, minimum_reader_runtime, bound_at, updated_at`;
 
+const SUSPENSION_COLUMNS = `
+  run_id, epoch, suspension_event_id, suspension_sequence, reason,
+  suspended_at, resume_event_id, resume_sequence, resume_reason, resumed_at,
+  activation_event_id, activation_sequence, activated_at`;
+
+const RUNTIME_SETTINGS_COLUMNS = `
+  run_id, epoch, settings_event_id, settings_sequence,
+  previous_settings_event_id, rollback_of_settings_event_id, reason,
+  changed_at, permission_mode, pre_plan_mode, auto_mode_active,
+  bypass_permissions_workspace, model, provider, profile, reasoning_effort,
+  model_verbosity, service_tier, hooks_disabled`;
+
 /**
  * Durable run lifecycle/effect state plus bindings into the canonical rollout
  * JSONL projection. Event payload bytes belong only to the rollout store.
@@ -330,6 +413,495 @@ export class StateRunDurabilityRepository {
     return row === undefined ? undefined : epochFromRow(row);
   }
 
+  /** Read one canonical lifecycle epoch for ordered journal reconciliation. */
+  getEpoch(runId: RunId, epoch: number): RunLifecycleEpoch | undefined {
+    const row = this.driver
+      .prepareState<[string, number], EpochRow>(
+        `SELECT run_id, epoch, opened_at, opened_event_id,
+                reopened_from_epoch, reopen_reason
+         FROM run_lifecycle_epochs
+         WHERE run_id = ? AND epoch = ?`,
+      )
+      .get(runId, epoch);
+    return row === undefined ? undefined : epochFromRow(row);
+  }
+
+  recordRunSuspended(params: {
+    readonly runId: RunId;
+    readonly epoch: number;
+    readonly eventId: string;
+    readonly eventSequence: number;
+    readonly reason: RunSuspendedBoundary["reason"];
+    readonly suspendedAt: string;
+  }): DurableWriteOutcome<DurableRunSuspension> {
+    return this.driver.transactionImmediate(() => {
+      const replayed = this.driver
+        .prepareState<[string, string], SuspensionRow>(
+          `SELECT ${SUSPENSION_COLUMNS}
+           FROM run_suspensions
+           WHERE run_id = ? AND suspension_event_id = ?`,
+        )
+        .get(params.runId, params.eventId);
+      if (replayed !== undefined) {
+        const value = suspensionFromRow(replayed);
+        if (
+          value.epoch === params.epoch &&
+          value.suspensionSequence === params.eventSequence &&
+          value.reason === params.reason &&
+          value.suspendedAt === params.suspendedAt
+        ) {
+          return { applied: false, value };
+        }
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `suspension event ${params.eventId} conflicts with its durable projection`,
+        );
+      }
+      const current = this.requireEpoch(params.runId, params.epoch);
+      this.assertNotCancellationLocked(params.runId);
+      if (
+        current.epoch !== params.epoch ||
+        this.currentEpoch(params.runId)?.epoch !== params.epoch
+      ) {
+        throw conflict(
+          "RUN_EPOCH_CONFLICT",
+          `run ${params.runId} epoch ${params.epoch} is not active`,
+        );
+      }
+      if (this.getTerminalResult(params.runId, params.epoch) !== undefined) {
+        throw conflict(
+          "RUN_EPOCH_CONFLICT",
+          `run ${params.runId} epoch ${params.epoch} is already terminal`,
+        );
+      }
+      if (this.getActiveSuspension(params.runId) !== undefined) {
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `run ${params.runId} epoch ${params.epoch} is already suspended`,
+        );
+      }
+      this.assertNoPendingEffects(params.runId);
+      this.assertSequenceUnclaimed(params.runId, params.eventSequence);
+      this.driver
+        .prepareState<[string, number, string, number, string, string]>(
+          `INSERT INTO run_suspensions (
+             run_id, epoch, suspension_event_id, suspension_sequence,
+             reason, suspended_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          required(params.runId, "runId"),
+          positiveInteger(params.epoch, "epoch"),
+          required(params.eventId, "eventId"),
+          positiveInteger(params.eventSequence, "eventSequence"),
+          params.reason,
+          required(params.suspendedAt, "suspendedAt"),
+        );
+      return {
+        applied: true,
+        value: {
+          runId: params.runId,
+          epoch: params.epoch,
+          eventId: params.eventId,
+          suspensionSequence: params.eventSequence,
+          reason: params.reason,
+          suspendedAt: params.suspendedAt,
+        },
+      };
+    });
+  }
+
+  recordRunResumed(params: {
+    readonly runId: RunId;
+    readonly epoch: number;
+    readonly suspensionEventId: string;
+    readonly eventId: string;
+    readonly eventSequence: number;
+    readonly reason: RunResumedBoundary["reason"];
+    readonly resumedAt: string;
+  }): DurableWriteOutcome<DurableRunSuspension> {
+    return this.driver.transactionImmediate(() => {
+      const replayed = this.driver
+        .prepareState<[string, string], SuspensionRow>(
+          `SELECT ${SUSPENSION_COLUMNS}
+           FROM run_suspensions
+           WHERE run_id = ? AND resume_event_id = ?`,
+        )
+        .get(params.runId, params.eventId);
+      if (replayed !== undefined) {
+        const value = suspensionFromRow(replayed);
+        if (
+          value.epoch === params.epoch &&
+          value.eventId === params.suspensionEventId &&
+          value.resumeSequence === params.eventSequence &&
+          value.resumeReason === params.reason &&
+          value.resumedAt === params.resumedAt
+        ) {
+          return { applied: false, value };
+        }
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `resume event ${params.eventId} conflicts with its durable projection`,
+        );
+      }
+      const current = this.currentEpoch(params.runId);
+      this.assertNotCancellationLocked(params.runId);
+      if (current?.epoch !== params.epoch) {
+        throw conflict(
+          "RUN_EPOCH_CONFLICT",
+          `run ${params.runId} epoch ${params.epoch} is not active`,
+        );
+      }
+      if (this.getTerminalResult(params.runId, params.epoch) !== undefined) {
+        throw conflict(
+          "RUN_EPOCH_CONFLICT",
+          `run ${params.runId} epoch ${params.epoch} is terminal and cannot resume`,
+        );
+      }
+      const suspension = this.getActiveSuspension(params.runId);
+      if (
+        suspension === undefined ||
+        suspension.epoch !== params.epoch ||
+        suspension.eventId !== params.suspensionEventId
+      ) {
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `run ${params.runId} has no matching active suspension`,
+        );
+      }
+      if (params.eventSequence <= suspension.suspensionSequence) {
+        throw conflict(
+          "RUN_EVENT_SEQUENCE_CONFLICT",
+          `resume sequence must follow suspension ${params.suspensionEventId}`,
+        );
+      }
+      this.assertNoPendingEffects(params.runId);
+      this.assertSequenceUnclaimed(params.runId, params.eventSequence);
+      this.driver
+        .prepareState<[string, number, string, string, string, string]>(
+          `UPDATE run_suspensions
+           SET resume_event_id = ?, resume_sequence = ?, resume_reason = ?, resumed_at = ?
+           WHERE run_id = ? AND suspension_event_id = ? AND resume_event_id IS NULL`,
+        )
+        .run(
+          required(params.eventId, "eventId"),
+          positiveInteger(params.eventSequence, "eventSequence"),
+          params.reason,
+          required(params.resumedAt, "resumedAt"),
+          params.runId,
+          params.suspensionEventId,
+        );
+      return {
+        applied: true,
+        value: {
+          ...suspension,
+          resumeEventId: params.eventId,
+          resumeSequence: params.eventSequence,
+          resumeReason: params.reason,
+          resumedAt: params.resumedAt,
+        },
+      };
+    });
+  }
+
+  recordRunStartupActivated(params: {
+    readonly runId: RunId;
+    readonly epoch: number;
+    readonly resumeEventId: string;
+    readonly eventId: string;
+    readonly eventSequence: number;
+    readonly activatedAt: string;
+  }): DurableWriteOutcome<RunStartupActivatedBoundary> {
+    return this.driver.transactionImmediate(() => {
+      const replayed = this.driver
+        .prepareState<[string, string], SuspensionRow>(
+          `SELECT ${SUSPENSION_COLUMNS}
+           FROM run_suspensions
+           WHERE run_id = ? AND activation_event_id = ?`,
+        )
+        .get(params.runId, params.eventId);
+      if (replayed !== undefined) {
+        if (
+          replayed.epoch === params.epoch &&
+          replayed.resume_event_id === params.resumeEventId &&
+          replayed.activation_sequence === params.eventSequence &&
+          replayed.activated_at === params.activatedAt
+        ) {
+          return {
+            applied: false,
+            value: {
+              runId: params.runId,
+              epoch: params.epoch,
+              eventId: params.eventId,
+              resumeEventId: params.resumeEventId,
+              activatedAt: params.activatedAt,
+            },
+          };
+        }
+        throw conflict(
+          "RUN_STARTUP_ACTIVATION_CONFLICT",
+          `startup activation ${params.eventId} conflicts with its durable projection`,
+        );
+      }
+      this.assertNotCancellationLocked(params.runId);
+      if (
+        this.currentEpoch(params.runId)?.epoch !== params.epoch ||
+        this.getTerminalResult(params.runId, params.epoch) !== undefined ||
+        this.getActiveSuspension(params.runId) !== undefined
+      ) {
+        throw conflict(
+          "RUN_STARTUP_ACTIVATION_CONFLICT",
+          `run ${params.runId} is not an open resumed epoch`,
+        );
+      }
+      const resumed = this.driver
+        .prepareState<[string, string], SuspensionRow>(
+          `SELECT ${SUSPENSION_COLUMNS}
+           FROM run_suspensions
+           WHERE run_id = ? AND resume_event_id = ?`,
+        )
+        .get(params.runId, params.resumeEventId);
+      if (
+        resumed === undefined ||
+        resumed.epoch !== params.epoch ||
+        resumed.resume_sequence === null ||
+        resumed.activation_event_id !== null ||
+        params.eventSequence <= resumed.resume_sequence
+      ) {
+        throw conflict(
+          "RUN_STARTUP_ACTIVATION_CONFLICT",
+          `run ${params.runId} has no matching pending startup activation`,
+        );
+      }
+      this.assertSequenceUnclaimed(params.runId, params.eventSequence);
+      const update = this.driver
+        .prepareState<[string, number, string, string, string]>(
+          `UPDATE run_suspensions
+           SET activation_event_id = ?, activation_sequence = ?, activated_at = ?
+           WHERE run_id = ? AND resume_event_id = ?
+             AND activation_event_id IS NULL`,
+        )
+        .run(
+          required(params.eventId, "eventId"),
+          positiveInteger(params.eventSequence, "eventSequence"),
+          required(params.activatedAt, "activatedAt"),
+          params.runId,
+          params.resumeEventId,
+        );
+      if (update.changes !== 1) {
+        throw conflict(
+          "RUN_STARTUP_ACTIVATION_CONFLICT",
+          `run ${params.runId} startup activation raced another writer`,
+        );
+      }
+      return {
+        applied: true,
+        value: {
+          runId: params.runId,
+          epoch: params.epoch,
+          eventId: params.eventId,
+          resumeEventId: params.resumeEventId,
+          activatedAt: params.activatedAt,
+        },
+      };
+    });
+  }
+
+  getPendingStartupActivation(runId: RunId): DurableRunSuspension | undefined {
+    const row = this.driver
+      .prepareState<[string], SuspensionRow>(
+        `SELECT ${SUSPENSION_COLUMNS}
+         FROM run_suspensions
+         WHERE run_id = ? AND resume_event_id IS NOT NULL
+           AND activation_event_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM run_suspensions later
+             WHERE later.run_id = run_suspensions.run_id
+               AND later.suspension_sequence > run_suspensions.resume_sequence
+           )
+         ORDER BY epoch DESC, resume_sequence DESC
+         LIMIT 1`,
+      )
+      .get(runId);
+    return row === undefined ? undefined : suspensionFromRow(row);
+  }
+
+  getActiveSuspension(runId: RunId): DurableRunSuspension | undefined {
+    const row = this.driver
+      .prepareState<[string], SuspensionRow>(
+        `SELECT ${SUSPENSION_COLUMNS}
+         FROM run_suspensions
+         WHERE run_id = ? AND resume_event_id IS NULL
+         ORDER BY epoch DESC, suspension_sequence DESC
+         LIMIT 1`,
+      )
+      .get(runId);
+    return row === undefined ? undefined : suspensionFromRow(row);
+  }
+
+  listSuspensions(runId: RunId): readonly DurableRunSuspension[] {
+    return this.driver
+      .prepareState<[string], SuspensionRow>(
+        `SELECT ${SUSPENSION_COLUMNS}
+         FROM run_suspensions
+         WHERE run_id = ?
+         ORDER BY epoch ASC, suspension_sequence ASC`,
+      )
+      .all(runId)
+      .map(suspensionFromRow);
+  }
+
+  recordRuntimeSettingsChanged(params: {
+    readonly runId: RunId;
+    readonly epoch: number;
+    readonly eventId: string;
+    readonly eventSequence: number;
+    readonly previousSettingsEventId: string | null;
+    readonly rollbackOfSettingsEventId: string | null;
+    readonly reason: RunRuntimeSettingsBoundary["reason"];
+    readonly changedAt: string;
+    readonly settings: RunRuntimeSettingsSnapshot;
+  }): DurableWriteOutcome<DurableRunRuntimeSettings> {
+    return this.driver.transactionImmediate(() => {
+      const replayed = this.driver
+        .prepareState<[string, string], RuntimeSettingsRow>(
+          `SELECT ${RUNTIME_SETTINGS_COLUMNS}
+           FROM run_runtime_settings
+           WHERE run_id = ? AND settings_event_id = ?`,
+        )
+        .get(params.runId, params.eventId);
+      if (replayed !== undefined) {
+        const value = runtimeSettingsFromRow(replayed);
+        if (
+          value.epoch === params.epoch &&
+          value.eventSequence === params.eventSequence &&
+          value.previousSettingsEventId === params.previousSettingsEventId &&
+          value.rollbackOfSettingsEventId ===
+            params.rollbackOfSettingsEventId &&
+          value.reason === params.reason &&
+          value.changedAt === params.changedAt &&
+          runtimeSettingsEqual(value, params.settings)
+        ) {
+          return { applied: false, value };
+        }
+        throw conflict(
+          "RUN_RUNTIME_SETTINGS_CONFLICT",
+          `runtime settings event ${params.eventId} conflicts with its durable projection`,
+        );
+      }
+      this.assertNotCancellationLocked(params.runId);
+      if (
+        this.currentEpoch(params.runId)?.epoch !== params.epoch ||
+        this.getTerminalResult(params.runId, params.epoch) !== undefined ||
+        this.getActiveSuspension(params.runId) !== undefined
+      ) {
+        throw conflict(
+          "RUN_RUNTIME_SETTINGS_CONFLICT",
+          `run ${params.runId} cannot change settings outside an open epoch`,
+        );
+      }
+      const latest = this.getCurrentRuntimeSettings(params.runId);
+      if (
+        params.previousSettingsEventId !== (latest?.eventId ?? null) ||
+        (latest === undefined
+          ? params.reason !== "initial"
+          : params.reason === "initial")
+      ) {
+        throw conflict(
+          "RUN_RUNTIME_SETTINGS_CONFLICT",
+          `run ${params.runId} runtime settings chain is not contiguous`,
+        );
+      }
+      if (params.reason === "compensating_rollback") {
+        const preceding = this.driver
+          .prepareState<[string, number], RuntimeSettingsRow>(
+            `SELECT ${RUNTIME_SETTINGS_COLUMNS}
+             FROM run_runtime_settings
+             WHERE run_id = ? AND settings_sequence < ?
+             ORDER BY settings_sequence DESC
+             LIMIT 1`,
+          )
+          .get(params.runId, latest!.eventSequence);
+        if (
+          params.rollbackOfSettingsEventId !== latest!.eventId ||
+          preceding === undefined ||
+          !runtimeSettingsEqual(
+            runtimeSettingsFromRow(preceding),
+            params.settings,
+          )
+        ) {
+          throw conflict(
+            "RUN_RUNTIME_SETTINGS_CONFLICT",
+            `run ${params.runId} settings compensation is not an exact rollback`,
+          );
+        }
+      } else if (params.rollbackOfSettingsEventId !== null) {
+        throw conflict(
+          "RUN_RUNTIME_SETTINGS_CONFLICT",
+          `run ${params.runId} non-compensating settings event names a rollback target`,
+        );
+      }
+      this.assertSequenceUnclaimed(params.runId, params.eventSequence);
+      this.driver
+        .prepareState(
+          `INSERT INTO run_runtime_settings (
+             run_id, epoch, settings_event_id, settings_sequence,
+             previous_settings_event_id, rollback_of_settings_event_id,
+             reason, changed_at, permission_mode, pre_plan_mode,
+             auto_mode_active, bypass_permissions_workspace, model, provider,
+             profile, reasoning_effort, model_verbosity, service_tier,
+             hooks_disabled
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          required(params.runId, "runId"),
+          positiveInteger(params.epoch, "epoch"),
+          required(params.eventId, "eventId"),
+          positiveInteger(params.eventSequence, "eventSequence"),
+          optionalRequired(
+            params.previousSettingsEventId ?? undefined,
+            "previousSettingsEventId",
+          ),
+          optionalRequired(
+            params.rollbackOfSettingsEventId ?? undefined,
+            "rollbackOfSettingsEventId",
+          ),
+          params.reason,
+          required(params.changedAt, "changedAt"),
+          params.settings.permissionMode,
+          params.settings.prePlanMode,
+          params.settings.autoModeActive ? 1 : 0,
+          params.settings.bypassPermissionsWorkspace,
+          required(params.settings.model, "model"),
+          required(params.settings.provider, "provider"),
+          params.settings.profile,
+          params.settings.reasoningEffort,
+          params.settings.modelVerbosity,
+          params.settings.serviceTier,
+          params.settings.hooksDisabled ? 1 : 0,
+        );
+      return {
+        applied: true,
+        value: this.getCurrentRuntimeSettings(params.runId)!,
+      };
+    });
+  }
+
+  getCurrentRuntimeSettings(
+    runId: RunId,
+  ): DurableRunRuntimeSettings | undefined {
+    const row = this.driver
+      .prepareState<[string], RuntimeSettingsRow>(
+        `SELECT ${RUNTIME_SETTINGS_COLUMNS}
+         FROM run_runtime_settings
+         WHERE run_id = ?
+         ORDER BY settings_sequence DESC
+         LIMIT 1`,
+      )
+      .get(runId);
+    return row === undefined ? undefined : runtimeSettingsFromRow(row);
+  }
+
   reopenRun(params: {
     readonly runId: RunId;
     readonly fromEpoch: number;
@@ -362,6 +934,7 @@ export class StateRunDurabilityRepository {
       }
 
       const current = this.currentEpoch(params.runId);
+      this.assertNotCancellationLocked(params.runId);
       if (current === undefined || current.epoch !== params.fromEpoch) {
         throw conflict(
           "RUN_EPOCH_CONFLICT",
@@ -374,6 +947,12 @@ export class StateRunDurabilityRepository {
         throw conflict(
           "RUN_EPOCH_NOT_TERMINAL",
           `run ${params.runId} epoch ${params.fromEpoch} is not terminal`,
+        );
+      }
+      if (this.getActiveSuspension(params.runId) !== undefined) {
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `run ${params.runId} cannot reopen while suspended`,
         );
       }
       const pending = this.listPendingEffectReviews(params.runId);
@@ -439,6 +1018,12 @@ export class StateRunDurabilityRepository {
         throw conflict(
           "RUN_TERMINAL_RESULT_CONFLICT",
           `run ${params.result.runId} epoch ${params.epoch} already has a different terminal result`,
+        );
+      }
+      if (this.getActiveSuspension(params.result.runId) !== undefined) {
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `run ${params.result.runId} cannot become terminal while suspended`,
         );
       }
       this.assertSequenceUnclaimed(
@@ -564,6 +1149,15 @@ export class StateRunDurabilityRepository {
         params.projection !== "canonical_replay"
       ) {
         this.assertDependentMutationAllowed(params.runId);
+      }
+      if (
+        params.projection !== "canonical_replay" &&
+        this.getActiveSuspension(params.runId) !== undefined
+      ) {
+        throw conflict(
+          "RUN_SUSPENSION_CONFLICT",
+          `run ${params.runId} cannot begin an effect while suspended`,
+        );
       }
       if (
         params.recoveryCategory === "idempotent" &&
@@ -1428,11 +2022,80 @@ export class StateRunDurabilityRepository {
          LIMIT 1`,
       )
       .get(runId, normalized);
-    if (effect === undefined && terminal === undefined) return;
+    const suspension = this.driver
+      .prepareState<
+        [string, number, number, number],
+        { readonly epoch: number }
+      >(
+        `SELECT epoch
+         FROM run_suspensions
+         WHERE run_id = ?
+           AND (suspension_sequence = ? OR resume_sequence = ?
+             OR activation_sequence = ?)
+         LIMIT 1`,
+      )
+      .get(runId, normalized, normalized, normalized);
+    const settings = this.driver
+      .prepareState<[string, number], { readonly epoch: number }>(
+        `SELECT epoch
+         FROM run_runtime_settings
+         WHERE run_id = ? AND settings_sequence = ?
+         LIMIT 1`,
+      )
+      .get(runId, normalized);
+    if (
+      effect === undefined &&
+      terminal === undefined &&
+      suspension === undefined &&
+      settings === undefined
+    )
+      return;
     throw conflict(
       "RUN_EVENT_SEQUENCE_CONFLICT",
       `run ${runId} sequence ${normalized} is already projected`,
     );
+  }
+
+  private assertNoPendingEffects(runId: RunId): void {
+    const unsettled = this.listEffects(runId).filter(
+      (effect) =>
+        effect.outcome === undefined || effect.reviewStatus === "pending",
+    );
+    if (unsettled.length === 0) return;
+    throw conflict(
+      "RUN_SUSPENSION_EFFECT_PENDING",
+      `run ${runId} has unsettled effect(s): ${unsettled
+        .map((effect) => effect.stepId)
+        .join(", ")}`,
+    );
+  }
+
+  private assertNotCancellationLocked(runId: RunId): void {
+    const state = this.driver
+      .prepareState<
+        [string, string],
+        { readonly admission_cancelled: number; readonly status: string | null }
+      >(
+        `SELECT
+           EXISTS (
+             SELECT 1
+             FROM execution_admission_cancellations
+             WHERE run_id = ?
+           ) AS admission_cancelled,
+           (SELECT status FROM agent_runs WHERE id = ?) AS status`,
+      )
+      .get(runId, runId);
+    if (
+      state?.admission_cancelled === 1 ||
+      (state?.status !== null &&
+        state?.status !== undefined &&
+        isCancelLockedAgentRunStatus(state.status))
+    ) {
+      throw conflict(
+        "RUN_CANCELLATION_CONFLICT",
+        `run ${runId} is cancellation-locked and cannot cross an executable lifecycle boundary`,
+      );
+    }
   }
 }
 
@@ -1464,6 +2127,77 @@ function terminalFromRow(row: TerminalRow): DurableRunTerminalRecord {
     finishedAt: row.finished_at,
     eventId: row.event_id,
   };
+}
+
+function suspensionFromRow(row: SuspensionRow): DurableRunSuspension {
+  return {
+    runId: row.run_id,
+    epoch: row.epoch,
+    eventId: row.suspension_event_id,
+    suspensionSequence: row.suspension_sequence,
+    reason: row.reason,
+    suspendedAt: row.suspended_at,
+    ...(row.resume_event_id !== null
+      ? { resumeEventId: row.resume_event_id }
+      : {}),
+    ...(row.resume_sequence !== null
+      ? { resumeSequence: row.resume_sequence }
+      : {}),
+    ...(row.resume_reason !== null ? { resumeReason: row.resume_reason } : {}),
+    ...(row.resumed_at !== null ? { resumedAt: row.resumed_at } : {}),
+    ...(row.activation_event_id !== null
+      ? { activationEventId: row.activation_event_id }
+      : {}),
+    ...(row.activation_sequence !== null
+      ? { activationSequence: row.activation_sequence }
+      : {}),
+    ...(row.activated_at !== null ? { activatedAt: row.activated_at } : {}),
+  };
+}
+
+function runtimeSettingsFromRow(
+  row: RuntimeSettingsRow,
+): DurableRunRuntimeSettings {
+  return {
+    runId: row.run_id,
+    epoch: row.epoch,
+    eventId: row.settings_event_id,
+    eventSequence: row.settings_sequence,
+    previousSettingsEventId: row.previous_settings_event_id,
+    rollbackOfSettingsEventId: row.rollback_of_settings_event_id,
+    reason: row.reason,
+    changedAt: row.changed_at,
+    permissionMode: row.permission_mode,
+    prePlanMode: row.pre_plan_mode,
+    autoModeActive: row.auto_mode_active === 1,
+    bypassPermissionsWorkspace: row.bypass_permissions_workspace,
+    model: row.model,
+    provider: row.provider,
+    profile: row.profile,
+    reasoningEffort: row.reasoning_effort,
+    modelVerbosity: row.model_verbosity,
+    serviceTier: row.service_tier,
+    hooksDisabled: row.hooks_disabled === 1,
+  };
+}
+
+function runtimeSettingsEqual(
+  left: RunRuntimeSettingsSnapshot,
+  right: RunRuntimeSettingsSnapshot,
+): boolean {
+  return (
+    left.permissionMode === right.permissionMode &&
+    left.prePlanMode === right.prePlanMode &&
+    left.autoModeActive === right.autoModeActive &&
+    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
+    left.model === right.model &&
+    left.provider === right.provider &&
+    left.profile === right.profile &&
+    left.reasoningEffort === right.reasoningEffort &&
+    left.modelVerbosity === right.modelVerbosity &&
+    left.serviceTier === right.serviceTier &&
+    left.hooksDisabled === right.hooksDisabled
+  );
 }
 
 function effectFromRow(row: EffectRow): DurableRunEffect {

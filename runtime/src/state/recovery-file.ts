@@ -76,6 +76,8 @@ export interface PinnedCanonicalJournalReplay {
   ): PinnedCanonicalJournalProof;
   /** Final synchronous boundary for the surrounding SQLite transaction. */
   assertPinned(): void;
+  /** Transfer an append-capable descriptor for exact SessionStore adoption. */
+  openAppendDescriptor(): number;
 }
 
 export interface PinnedCanonicalJournalOptions extends Pick<
@@ -115,8 +117,7 @@ export interface PinnedCanonicalJournalRunOptions {
   ) => void;
 }
 
-export interface RecoveryRunIdentityRegistry
-  extends CanonicalJournalIdentityRegistry {
+export interface RecoveryRunIdentityRegistry extends CanonicalJournalIdentityRegistry {
   close(): void;
 }
 
@@ -267,11 +268,7 @@ function prepareRunReplays(
   try {
     identityRegistry = createIdentityRegistry();
   } catch (error) {
-    throw mappedIdentityRegistryFailure(
-      canonicalFirstSource,
-      error,
-      "open",
-    );
+    throw mappedIdentityRegistryFailure(canonicalFirstSource, error, "open");
   }
 
   let prepared: readonly PreparedReplay[] | undefined;
@@ -549,6 +546,10 @@ function prepareReplay(
         }
       },
       assertPinned: () => reader.assertSnapshot(snapshot),
+      openAppendDescriptor: () => {
+        reader.assertSnapshot(snapshot);
+        return reader.openAppendDescriptor();
+      },
     });
     return { replay, consumed: () => replayed };
   } catch (error) {
@@ -726,6 +727,35 @@ function journalProof(
     physicalLineCount: journal.physicalLineCount,
     eventCount: journal.eventCount,
     terminalCount: journal.terminalCount,
+    activeEpoch: journal.activeEpoch,
+    activeLifecycleState: journal.activeLifecycleState,
+    ...(journal.activeTerminalStatus !== undefined
+      ? { activeTerminalStatus: journal.activeTerminalStatus }
+      : {}),
+    ...(journal.activeSuspensionEventId !== undefined
+      ? { activeSuspensionEventId: journal.activeSuspensionEventId }
+      : {}),
+    ...(journal.activeCancellationRequestEventId !== undefined
+      ? {
+          activeCancellationRequestEventId:
+            journal.activeCancellationRequestEventId,
+        }
+      : {}),
+    ...(journal.activeStartupActivationResumeEventId !== undefined
+      ? {
+          activeStartupActivationResumeEventId:
+            journal.activeStartupActivationResumeEventId,
+        }
+      : {}),
+    ...(journal.activeRuntimeSettings !== undefined
+      ? {
+          activeRuntimeSettings: journal.activeRuntimeSettings,
+          activeRuntimeSettingsEventId: journal.activeRuntimeSettingsEventId!,
+        }
+      : {}),
+    ...(journal.legacyPermissionMode !== undefined
+      ? { legacyPermissionMode: journal.legacyPermissionMode }
+      : {}),
     digestAnchored: journal.digestAnchored,
     snapshot,
   });
@@ -743,6 +773,14 @@ function assertMatchingProof(
     "physicalLineCount",
     "eventCount",
     "terminalCount",
+    "activeEpoch",
+    "activeLifecycleState",
+    "activeTerminalStatus",
+    "activeSuspensionEventId",
+    "activeCancellationRequestEventId",
+    "activeStartupActivationResumeEventId",
+    "activeRuntimeSettingsEventId",
+    "legacyPermissionMode",
   ] as const) {
     if (expected[key] !== observed[key]) {
       throw new CanonicalJournalIntegrityError(
@@ -750,6 +788,15 @@ function assertMatchingProof(
         `canonical journal ${key} changed between validation passes`,
       );
     }
+  }
+  if (
+    JSON.stringify(expected.activeRuntimeSettings) !==
+    JSON.stringify(observed.activeRuntimeSettings)
+  ) {
+    throw new CanonicalJournalIntegrityError(
+      "source_changed",
+      "canonical journal activeRuntimeSettings changed between validation passes",
+    );
   }
 }
 

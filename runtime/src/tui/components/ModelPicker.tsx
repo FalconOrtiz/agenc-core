@@ -8,7 +8,7 @@ import { FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeCooldown, isFas
 import { Box, Text } from '../ink.js';
 import { useKeybindings } from '../keybindings/useKeybinding.js';
 import { useAppState, useSetAppState } from '../state/AppState.js';
-import { convertEffortValueToLevel, type EffortLevel, getDefaultEffortForModel, modelSupportsEffort, modelSupportsMaxEffort, resolvePickerEffortPersistence, toPersistableEffort } from '../../utils/effort.js'; // upstream-import: keep target is owned by another Z-PURGE item
+import { convertEffortValueToLevel, type AvailableEffortLevel, getAvailableEffortLevels, getDefaultEffortForModel, modelSupportsEffort, resolvePickerEffortPersistence, toPersistableEffort } from '../../utils/effort.js'; // upstream-import: keep target is owned by another Z-PURGE item
 import { getDefaultMainLoopModel, type ModelSetting, modelDisplayString, parseUserSpecifiedModel } from '../../utils/model/model.js'; // upstream-import: keep target is owned by another Z-PURGE item
 import { getModelOptions } from '../../utils/model/modelOptions.js'; // upstream-import: keep target is owned by another Z-PURGE item
 import { getSettingsForSource, updateSettingsForSource } from '../../utils/settings/settings.js'; // upstream-import: keep target is owned by another Z-PURGE item
@@ -21,7 +21,7 @@ import { Popup } from './v2/primitives.js';
 export type Props = {
   initial: string | null;
   sessionModel?: ModelSetting;
-  onSelect: (model: string | null, effort: EffortLevel | undefined) => void;
+  onSelect: (model: string | null, effort: AvailableEffortLevel | undefined) => void;
   onCancel?: () => void;
   isStandaloneCommand?: boolean;
   showFastModeNotice?: boolean;
@@ -152,8 +152,8 @@ export function ModelPicker(t0) {
   let t8;
   if ($[20] !== focusedValue) {
     const focusedModel = resolveOptionModel(focusedValue);
-    focusedSupportsEffort = focusedModel ? modelSupportsEffort(focusedModel) : false;
-    t8 = focusedModel ? modelSupportsMaxEffort(focusedModel) : false;
+    t8 = focusedModel ? getAvailableEffortLevels(focusedModel) : [];
+    focusedSupportsEffort = t8.length > 0;
     $[20] = focusedValue;
     $[21] = focusedSupportsEffort;
     $[22] = t8;
@@ -161,7 +161,7 @@ export function ModelPicker(t0) {
     focusedSupportsEffort = $[21];
     t8 = $[22];
   }
-  const focusedSupportsMax = t8;
+  const focusedEffortLevels = t8;
   let t9;
   if ($[23] !== focusedValue) {
     t9 = getDefaultEffortLevelForOption(focusedValue);
@@ -171,7 +171,7 @@ export function ModelPicker(t0) {
     t9 = $[24];
   }
   const focusedDefaultEffort = t9;
-  const displayEffort = effort === "max" && !focusedSupportsMax ? "high" : effort;
+  const displayEffort = normalizeEffortLevelForModel(effort, focusedEffortLevels);
   let t10;
   if ($[25] !== effortValue || $[26] !== hasToggledEffort) {
     t10 = value => {
@@ -188,17 +188,17 @@ export function ModelPicker(t0) {
   }
   const handleFocus = t10;
   let t11;
-  if ($[28] !== focusedDefaultEffort || $[29] !== focusedSupportsEffort || $[30] !== focusedSupportsMax) {
+  if ($[28] !== focusedDefaultEffort || $[29] !== focusedSupportsEffort || $[30] !== focusedEffortLevels) {
     t11 = direction => {
       if (!focusedSupportsEffort) {
         return;
       }
-      setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction, focusedSupportsMax));
+      setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction, focusedEffortLevels));
       setHasToggledEffort(true);
     };
     $[28] = focusedDefaultEffort;
     $[29] = focusedSupportsEffort;
-    $[30] = focusedSupportsMax;
+    $[30] = focusedEffortLevels;
     $[31] = t11;
   } else {
     t11 = $[31];
@@ -418,11 +418,22 @@ function EffortLevelIndicator(t0) {
   }
   return t4;
 }
-function cycleEffortLevel(current: EffortLevel, direction: 'left' | 'right', includeMax: boolean): EffortLevel {
-  const levels: EffortLevel[] = includeMax ? ['low', 'medium', 'high', 'max'] : ['low', 'medium', 'high'];
-  // If the current level isn't in the cycle (e.g. 'max' after switching to a
-  // non-Opus model), clamp to 'high'.
-  const idx = levels.indexOf(current);
+function normalizeEffortLevelForModel(
+  effort: AvailableEffortLevel | undefined,
+  levels: readonly AvailableEffortLevel[],
+): AvailableEffortLevel | undefined {
+  if (effort === undefined) return undefined;
+  if (effort === 'max' && levels.includes('xhigh')) return 'xhigh';
+  if (effort === 'xhigh' && levels.includes('max')) return 'max';
+  if (levels.includes(effort)) return effort;
+  return levels.includes('high') ? 'high' : levels[0];
+}
+function cycleEffortLevel(current: AvailableEffortLevel, direction: 'left' | 'right', available: readonly AvailableEffortLevel[]): AvailableEffortLevel {
+  const levels = available.length > 0 ? available : ['low', 'medium', 'high'];
+  const normalized = normalizeEffortLevelForModel(current, levels) ?? 'high';
+  // If the current level isn't in the cycle after switching models, clamp to
+  // high before advancing.
+  const idx = levels.indexOf(normalized);
   const currentIndex = idx !== -1 ? idx : levels.indexOf('high');
   if (direction === 'right') {
     return levels[(currentIndex + 1) % levels.length]!;
@@ -430,7 +441,7 @@ function cycleEffortLevel(current: EffortLevel, direction: 'left' | 'right', inc
     return levels[(currentIndex - 1 + levels.length) % levels.length]!;
   }
 }
-function getDefaultEffortLevelForOption(value?: string): EffortLevel {
+function getDefaultEffortLevelForOption(value?: string): AvailableEffortLevel {
   const resolved = resolveOptionModel(value) ?? getDefaultMainLoopModel();
   const defaultValue = getDefaultEffortForModel(resolved);
   return defaultValue !== undefined ? convertEffortValueToLevel(defaultValue) : 'high';

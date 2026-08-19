@@ -76,7 +76,9 @@ export const INTERNAL_PERMISSION_MODES: readonly PermissionMode[] =
  * modes. Mirrors upstream `isExternalPermissionMode`.
  */
 export function isExternalPermissionMode(mode: PermissionMode): boolean {
-  return (EXTERNAL_PERMISSION_MODES as readonly PermissionMode[]).includes(mode);
+  return (EXTERNAL_PERMISSION_MODES as readonly PermissionMode[]).includes(
+    mode,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +193,12 @@ let planAutoModeResolver: (() => boolean) | null = null;
 function envBoolean(value: string | undefined): boolean {
   if (value === undefined) return false;
   const normalized = value.trim().toLowerCase();
-  return normalized === "1" ||
+  return (
+    normalized === "1" ||
     normalized === "true" ||
     normalized === "yes" ||
-    normalized === "on";
+    normalized === "on"
+  );
 }
 
 export function shouldPlanUseAutoMode(): boolean {
@@ -429,9 +433,10 @@ export function prepareContextForPlanMode(
   const prePlanMode = ctx.mode;
 
   if (opts.shouldUseAutoInPlan && ctx.mode !== "bypassPermissions") {
-    const autoPrepared = ctx.autoModeActive === true
-      ? ctx
-      : stripDangerousPermissionsForAutoMode(ctx);
+    const autoPrepared =
+      ctx.autoModeActive === true
+        ? ctx
+        : stripDangerousPermissionsForAutoMode(ctx);
     return {
       ...autoPrepared,
       autoModeActive: true,
@@ -451,7 +456,9 @@ export function prepareContextForPlanMode(
  * rule auto-approves sub-agent spawns before the classifier can see the
  * prompt (delegation attack surface).
  */
-const DANGEROUS_TOOLS: readonly string[] = Object.freeze(["spawn_agent"] as const);
+const DANGEROUS_TOOLS: readonly string[] = Object.freeze([
+  "spawn_agent",
+] as const);
 
 /**
  * Returns true if a Bash permission rule is dangerous for auto mode.
@@ -521,10 +528,7 @@ function isDangerousPowerShellPermission(
     if (content === `${p} *`) return true;
     if (content.startsWith(`${p} -`) && content.endsWith("*")) return true;
     const sp = p.indexOf(" ");
-    const exe =
-      sp === -1
-        ? `${p}.exe`
-        : `${p.slice(0, sp)}.exe${p.slice(sp)}`;
+    const exe = sp === -1 ? `${p}.exe` : `${p.slice(0, sp)}.exe${p.slice(sp)}`;
     if (content === exe) return true;
     if (content === `${exe}:*`) return true;
     if (content === `${exe}*`) return true;
@@ -689,6 +693,18 @@ export type ModeChangeSubscriber = (
 ) => void;
 
 /**
+ * Optional durability barrier invoked under the registry lock immediately
+ * before a new context becomes visible. Daemon-owned sessions use this to
+ * fsync a complete canonical settings snapshot. Throwing leaves `current()`
+ * unchanged, including for same-mode context transitions.
+ */
+export type PermissionContextBeforeUpdateHook = (
+  next: ToolPermissionContext,
+  current: ToolPermissionContext,
+  metadata: unknown,
+) => Promise<void> | void;
+
+/**
  * Registry owning the current `ToolPermissionContext` and the set of
  * subscribers notified on mode change. All mutations go through
  * `AsyncLock<void>.with(...)` so concurrent Shift+Tab events (or SDK
@@ -703,6 +719,7 @@ export class PermissionModeRegistry {
   private ctx: ToolPermissionContext;
   private readonly subscribers = new Set<ModeChangeSubscriber>();
   private readonly lock = new AsyncLock<void>(undefined);
+  private beforeUpdateHook: PermissionContextBeforeUpdateHook | undefined;
 
   constructor(initial: ToolPermissionContext) {
     this.ctx = initial;
@@ -731,9 +748,13 @@ export class PermissionModeRegistry {
    * and only when the mode actually changes. The lock guarantees that two
    * concurrent `update()` calls observe consistent old/new mode pairs.
    */
-  async update(newCtx: ToolPermissionContext): Promise<void> {
-    await this.lock.with(() => {
+  async update(
+    newCtx: ToolPermissionContext,
+    metadata?: unknown,
+  ): Promise<void> {
+    await this.lock.with(async () => {
       const oldMode = this.ctx.mode;
+      await this.beforeUpdateHook?.(newCtx, this.ctx, metadata);
       this.ctx = newCtx;
       const newMode = newCtx.mode;
       if (newMode === oldMode) return;
@@ -748,6 +769,19 @@ export class PermissionModeRegistry {
         }
       }
     });
+  }
+
+  /** Install the sole session-owner durability barrier. */
+  installBeforeUpdateHook(hook: PermissionContextBeforeUpdateHook): () => void {
+    if (this.beforeUpdateHook !== undefined) {
+      throw new Error(
+        "permission context before-update hook already installed",
+      );
+    }
+    this.beforeUpdateHook = hook;
+    return () => {
+      if (this.beforeUpdateHook === hook) this.beforeUpdateHook = undefined;
+    };
   }
 
   /**

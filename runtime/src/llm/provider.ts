@@ -1614,6 +1614,7 @@ export function createProvider(
       });
     }
     case "ollama": {
+      const numCtx = extra.numCtx ?? extra.contextWindowTokens;
       const cfg: OllamaProviderConfig = {
         ...buildCommonConfig(extra),
         model: requireModel(
@@ -1630,7 +1631,7 @@ export function createProvider(
           normalizeOllamaHost(defaultBaseURLFor("ollama")),
         ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
         ...(extra.keepAlive ? { keepAlive: extra.keepAlive } : {}),
-        ...(extra.numCtx !== undefined ? { numCtx: extra.numCtx } : {}),
+        ...(numCtx !== undefined ? { numCtx } : {}),
         ...(extra.numGpu !== undefined ? { numGpu: extra.numGpu } : {}),
       };
       return markFactoryProvider(new OllamaProvider(cfg), {

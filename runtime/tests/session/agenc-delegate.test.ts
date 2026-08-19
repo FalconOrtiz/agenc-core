@@ -62,6 +62,7 @@ import {
 import {
   ReviewerModelMismatchError,
   buildGuardianReviewSessionConfig,
+  deriveReviewChildSessionId,
   runAgenCReviewOneShot,
   spawnAgenCDelegateThread,
   type AgenCReviewOneShotRequest,
@@ -78,8 +79,12 @@ import {
 } from "../budget/admission-client.js";
 import type { AdmissionLease } from "../budget/admission-types.js";
 import { RolloutStore } from "./rollout-store.js";
+import { isSafeSessionIdSegment } from "./session-store.js";
 import { AgenCDaemonRunInspectionService } from "../app-server/run-inspection.js";
 import { resolveStateDatabasePaths } from "../state/sqlite-driver.js";
+
+const TEST_REVIEW_CHILD_SESSION_ID =
+  "review-70258a22d095bbaef7e15b5457a92c30c382f5bd2e4af2c54fcbf2e2e4da8a2d";
 
 // ─────────────────────────────────────────────────────────────────────
 // Fixtures (mirrors tasks.test.ts::buildSession and review.test.ts)
@@ -293,7 +298,7 @@ function delegateAdmissionHarness(opts?: {
   const leaseAbort = new AbortController();
   const child = {
     scope: {
-      runId: "conv-delegate-test:review:review-delegate-A",
+      runId: TEST_REVIEW_CHILD_SESSION_ID,
       workspaceId: "workspace",
       sessionId: "review-child-session",
       parentRunId: "root-review-run",
@@ -548,6 +553,27 @@ async function exerciseDelegateProviderOwnership(
 // ─────────────────────────────────────────────────────────────────────
 
 describe("review delegate spawn admission", () => {
+  it("derives deterministic collision-resistant filesystem-safe child ids", () => {
+    expect(
+      deriveReviewChildSessionId("conv-delegate-test", "review-delegate-A"),
+    ).toBe(TEST_REVIEW_CHILD_SESSION_ID);
+    expect(isSafeSessionIdSegment(TEST_REVIEW_CHILD_SESSION_ID)).toBe(true);
+    expect(TEST_REVIEW_CHILD_SESSION_ID).toHaveLength(71);
+
+    const hostile = deriveReviewChildSessionId(
+      "../CON:parent. ",
+      "..\\AUX:review/child",
+    );
+    expect(isSafeSessionIdSegment(hostile)).toBe(true);
+    expect(hostile).toMatch(/^review-[a-f0-9]{64}$/u);
+    expect(deriveReviewChildSessionId("ab", "c")).not.toBe(
+      deriveReviewChildSessionId("a", "bc"),
+    );
+    expect(
+      deriveReviewChildSessionId("p".repeat(1_024), "s".repeat(1_024)),
+    ).toHaveLength(71);
+  });
+
   it("journals the spawn commit and binds a distinct canonical child run", async () => {
     const admission = delegateAdmissionHarness();
     const cwd = mkdtempSync(join(tmpdir(), "agenc-review-admission-"));
@@ -588,7 +614,7 @@ describe("review delegate spawn admission", () => {
       {
         boundary: "spawn_commit",
         details: {
-          childSessionId: "conv-delegate-test:review:review-delegate-A",
+          childSessionId: TEST_REVIEW_CHILD_SESSION_ID,
           parentSessionId: "conv-delegate-test",
           rootRunId: "root-review-run",
           reviewerDelegate: true,
@@ -600,17 +626,15 @@ describe("review delegate spawn admission", () => {
       { inputTokens: 0, outputTokens: 0, costUsd: 0 },
     );
     expect(admission.forSession).toHaveBeenCalledWith({
-      runId: "conv-delegate-test:review:review-delegate-A",
-      sessionId: "conv-delegate-test:review:review-delegate-A",
+      runId: TEST_REVIEW_CHILD_SESSION_ID,
+      sessionId: TEST_REVIEW_CHILD_SESSION_ID,
       parentRunId: "root-review-run",
       parentScopeId: "conv-delegate-test",
     });
     expect(thread.childSession.services.executionAdmission).toBe(
       admission.child,
     );
-    expect(admission.child.scope.runId).toBe(
-      "conv-delegate-test:review:review-delegate-A",
-    );
+    expect(admission.child.scope.runId).toBe(TEST_REVIEW_CHILD_SESSION_ID);
     expect(thread.childSession.rolloutStore).not.toBeNull();
     expect(admission.voidReservation).not.toHaveBeenCalled();
     expect(admission.holdUnknown).not.toHaveBeenCalled();
@@ -652,8 +676,8 @@ describe("review delegate spawn admission", () => {
     });
 
     expect(admission.forSession).toHaveBeenCalledWith({
-      runId: "conv-delegate-test:review:review-delegate-A",
-      sessionId: "conv-delegate-test:review:review-delegate-A",
+      runId: TEST_REVIEW_CHILD_SESSION_ID,
+      sessionId: TEST_REVIEW_CHILD_SESSION_ID,
       parentRunId: "root-review-run",
       parentScopeId: "conv-delegate-test",
     });
@@ -666,7 +690,10 @@ describe("review delegate spawn admission", () => {
     expect(admission.acknowledgeCompletion).toHaveBeenCalledWith(
       "review-spawn-reservation",
     );
-    const childRunId = `${session.conversationId}:review:${req.subId}`;
+    const childRunId = deriveReviewChildSessionId(
+      session.conversationId,
+      req.subId,
+    );
     const inspection = new AgenCDaemonRunInspectionService({
       stateDatabasePaths: () => [resolveStateDatabasePaths({ cwd })],
     });
@@ -801,7 +828,10 @@ describe("runAgenCReviewOneShot happy-path review", () => {
       const session = mkSession(provider, undefined, { cwd });
       mountTestRollout(session);
       const req = mkOneShotRequest(session);
-      const childRunId = `${session.conversationId}:review:${req.subId}`;
+      const childRunId = deriveReviewChildSessionId(
+        session.conversationId,
+        req.subId,
+      );
       const childController = new AbortController();
       let thread:
         Awaited<ReturnType<typeof spawnAgenCDelegateThread>> | undefined;
@@ -881,7 +911,10 @@ describe("runAgenCReviewOneShot happy-path review", () => {
     );
     mountTestRollout(session);
     const req = mkOneShotRequest(session);
-    const childRunId = `${session.conversationId}:review:${req.subId}`;
+    const childRunId = deriveReviewChildSessionId(
+      session.conversationId,
+      req.subId,
+    );
     const parentEvents: Event[] = [];
     const unsubscribe = session.eventLog.subscribe((event) => {
       parentEvents.push(event);
@@ -940,7 +973,10 @@ describe("runAgenCReviewOneShot happy-path review", () => {
     );
     const parentStore = mountTestRollout(session);
     const req = mkOneShotRequest(session);
-    const childRunId = `${session.conversationId}:review:${req.subId}`;
+    const childRunId = deriveReviewChildSessionId(
+      session.conversationId,
+      req.subId,
+    );
     const childSessionDir = join(
       join(parentStore.store.sessionDir, ".."),
       childRunId,

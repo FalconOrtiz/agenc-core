@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -52,7 +53,10 @@ interface RecoveryReport {
     };
     readonly effectRecovery: string;
     readonly pendingEffectReviews: number;
-    readonly jobs: ReadonlyArray<{ readonly id: string; readonly status: string }>;
+    readonly jobs: ReadonlyArray<{
+      readonly id: string;
+      readonly status: string;
+    }>;
     readonly reservations: ReadonlyArray<{
       readonly id: string;
       readonly status: string;
@@ -240,14 +244,13 @@ async function recoverAfter(
   return JSON.parse(lines[0]!) as RecoveryReport;
 }
 
-async function connectFreshDaemon(
-  stateDirectory: string,
-): Promise<{
+async function connectFreshDaemon(stateDirectory: string): Promise<{
   readonly client: AgencClient;
   readonly stop: () => Promise<void>;
 }> {
   const home = join(stateDirectory, "home");
   const cwd = join(stateDirectory, "workspace");
+  chmodSync(home, 0o700);
   const env = {
     ...cleanChildEnvironment(),
     AGENC_HOME: home,
@@ -333,9 +336,7 @@ async function verifyFreshDaemonSdk(
     expect(events.map((event) => event.sequence)).toEqual(
       Array.from({ length: events.length }, (_, index) => index + 1),
     );
-    expectedKeys = events.map(
-      (event) => `${event.sequence}:${event.eventId}`,
-    );
+    expectedKeys = events.map((event) => `${event.sequence}:${event.eventId}`);
     expect(new Set(expectedKeys).size).toBe(expectedKeys.length);
     cursor = attachment.cursor().afterSequence;
     expect(cursor).toBe(events.at(-1)?.sequence);

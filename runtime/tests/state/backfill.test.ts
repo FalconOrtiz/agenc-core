@@ -31,6 +31,66 @@ afterEach(() => {
 });
 
 describe("backfillProjectRollouts", () => {
+  it("prefers normal rollout generations and falls back to recovery names", () => {
+    const preferredDir = join(driver.projectDir, "sessions", "thread-normal");
+    const fallbackDir = join(driver.projectDir, "sessions", "thread-recovery");
+    mkdirSync(preferredDir, { recursive: true });
+    mkdirSync(fallbackDir, { recursive: true });
+    const rollout = (sessionId: string, content: string) =>
+      serializeRolloutItem({
+        type: "session_meta",
+        payload: {
+          sessionId,
+          timestamp: "2026-04-29T00:00:00.000Z",
+          cwd,
+          originator: "test",
+          agencVersion: "0.2.0",
+          rolloutSchemaVersion: ROLLOUT_SCHEMA_VERSION,
+          model: "grok-4",
+          modelProvider: "xai",
+        },
+      }) +
+      serializeRolloutItem({
+        type: "response_item",
+        payload: { role: "user", content },
+      });
+    const normalPath = join(
+      preferredDir,
+      "rollout-2026-04-29T00-00-01-000Z-thread-normal.jsonl",
+    );
+    const staleRecoveryPath = join(
+      preferredDir,
+      "rollout-recovery-1-stale-thread-normal.jsonl",
+    );
+    const fallbackRecoveryPath = join(
+      fallbackDir,
+      "rollout-recovery-2-only-thread-recovery.jsonl",
+    );
+    writeFileSync(normalPath, rollout("thread-normal", "normal wins"));
+    writeFileSync(
+      staleRecoveryPath,
+      rollout("thread-normal", "stale recovery must be ignored"),
+    );
+    writeFileSync(
+      fallbackRecoveryPath,
+      rollout("thread-recovery", "recovery fallback"),
+    );
+
+    expect(
+      backfillProjectRollouts({ projectDir: driver.projectDir, driver }),
+    ).toMatchObject({ filesScanned: 2, filesIndexed: 2, itemsIndexed: 4 });
+    const indexedSources = driver
+      .prepareState<[], { readonly source_path: string }>(
+        `SELECT DISTINCT source_path
+         FROM thread_rollout_items
+         ORDER BY source_path ASC`,
+      )
+      .all()
+      .map(({ source_path }) => source_path);
+    expect(indexedSources).toEqual([fallbackRecoveryPath, normalPath].sort());
+    expect(indexedSources).not.toContain(staleRecoveryPath);
+  });
+
   it("indexes rollout files idempotently and rebuilds changed rows", () => {
     const sessionDir = join(driver.projectDir, "sessions", "thread-1");
     mkdirSync(sessionDir, { recursive: true });
@@ -58,13 +118,15 @@ describe("backfillProjectRollouts", () => {
           payload: { role: "user", content: "hello" },
         }),
     );
-    expect(backfillProjectRollouts({ projectDir: driver.projectDir, driver }))
-      .toMatchObject({ filesIndexed: 1, itemsIndexed: 2 });
+    expect(
+      backfillProjectRollouts({ projectDir: driver.projectDir, driver }),
+    ).toMatchObject({ filesIndexed: 1, itemsIndexed: 2 });
     // Re-indexing an unchanged file is now a no-op: it neither re-reads nor
     // re-INSERTs the prior items (no O(N^2) DELETE-all + re-INSERT-all), so it
     // reports zero items indexed while leaving the already-indexed rows intact.
-    expect(backfillProjectRollouts({ projectDir: driver.projectDir, driver }))
-      .toMatchObject({ filesIndexed: 1, itemsIndexed: 0 });
+    expect(
+      backfillProjectRollouts({ projectDir: driver.projectDir, driver }),
+    ).toMatchObject({ filesIndexed: 1, itemsIndexed: 0 });
     expect(
       driver
         .prepareState<[], { count: number }>(
@@ -74,7 +136,10 @@ describe("backfillProjectRollouts", () => {
     ).toBe(2);
     expect(
       driver
-        .prepareState<[], { model: string | null; model_provider: string | null }>(
+        .prepareState<
+          [],
+          { model: string | null; model_provider: string | null }
+        >(
           "SELECT model, model_provider FROM threads WHERE thread_id = 'thread-1'",
         )
         .get(),
@@ -133,7 +198,11 @@ describe("backfillProjectRollouts", () => {
   });
 
   it("keeps archived rollout files out of active thread listings", () => {
-    const sessionDir = join(driver.projectDir, "archived_sessions", "archived-1");
+    const sessionDir = join(
+      driver.projectDir,
+      "archived_sessions",
+      "archived-1",
+    );
     mkdirSync(sessionDir, { recursive: true });
     const rolloutPath = join(
       sessionDir,

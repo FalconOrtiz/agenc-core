@@ -29,6 +29,7 @@ import {
 } from "../landlock-run.js";
 import {
   preferredBubblewrapLauncher,
+  type PreferredBubblewrapLauncherOptions,
   spawnBubblewrap,
   type BubblewrapLauncher,
 } from "./launcher.js";
@@ -49,7 +50,9 @@ export interface LinuxSandboxRunDeps {
   readonly env?: NodeJS.ProcessEnv;
   readonly argv?: readonly string[];
   readonly selfCommand?: readonly string[];
-  readonly preferredLauncher?: () => BubblewrapLauncher | null;
+  readonly preferredLauncher?: (
+    options: PreferredBubblewrapLauncherOptions,
+  ) => BubblewrapLauncher | null;
   readonly onStderr?: (line: string) => void;
 }
 
@@ -177,7 +180,11 @@ async function runLinuxSandboxOptions(
         argv0: options.command[0] ?? LINUX_SANDBOX_ARG0,
       });
     }
-    const launcher = (deps.preferredLauncher ?? preferredBubblewrapLauncher)();
+    const launcher = (deps.preferredLauncher ?? preferredBubblewrapLauncher)({
+      cwd: hostCommandCwd,
+      env,
+      requireNamespaces: true,
+    });
     if (launcher === null) {
       // Bubblewrap is unusable. Before failing, try the Landlock rung: a
       // kernel allow-list needing no namespaces, carrying the same network
@@ -484,10 +491,15 @@ async function runCommandWithInnerSeccomp(
     readonly cwd: string;
     readonly env: NodeJS.ProcessEnv;
     readonly seccompMode: NetworkSeccompMode;
-    readonly preferredLauncher?: () => BubblewrapLauncher | null;
+    readonly preferredLauncher?: (
+      options: PreferredBubblewrapLauncherOptions,
+    ) => BubblewrapLauncher | null;
   },
 ): Promise<number> {
-  const launcher = (options.preferredLauncher ?? preferredBubblewrapLauncher)();
+  const launcher = (options.preferredLauncher ?? preferredBubblewrapLauncher)({
+    cwd: options.cwd,
+    env: options.env,
+  });
   if (launcher === null) {
     throw new Error(
       "AgenC could not find bubblewrap on PATH for inner seccomp application",

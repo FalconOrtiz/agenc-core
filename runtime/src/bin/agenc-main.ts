@@ -11,7 +11,7 @@
  *
  * Env:
  *   XAI_API_KEY        required — xAI API key (also accepts GROK_API_KEY)
- *   AGENC_MODEL        optional — model override (default: grok-4.5)
+ *   AGENC_MODEL        optional — model override (default: grok-4.6)
  *   AGENC_WORKSPACE    optional — project root (default: process.cwd())
  *   AGENC_HOME         optional — state dir (default: $HOME/.agenc)
  *
@@ -22,7 +22,15 @@
  *   I-52 (AGENC_HOME / $HOME/.agenc writable precheck)
  */
 
-import { mkdirSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
 import { cwd as processCwd } from "node:process";
@@ -62,6 +70,7 @@ import { editorInteractionSystemPrompt } from "../session/editor-interaction.js"
 import { seedFileMentionSessionReads } from "../session/file-mention-session-reads.js";
 import type { Terminal } from "../session/turn-state.js";
 import {
+  hasSupportedFileIdentity,
   SchemaMismatchError,
   SessionLockedError,
 } from "../session/session-store.js";
@@ -96,6 +105,7 @@ import { enableConfigs } from "../config/init.js";
 import {
   resolveLatestSessionId,
   resolveResumeSessionId,
+  type ResolvedResumeSession,
 } from "./resume-session.js";
 import {
   formatAgenCDaemonCliHelpText,
@@ -121,6 +131,7 @@ import {
   createAgenCDaemonOnlyTuiContext,
   findAgenCDaemonAgentBySessionId,
   listAgenCDaemonAgents,
+  resumeAgenCDaemonPromptAgent,
   startAgenCDaemonPromptAgent,
   stopAgenCDaemonPromptAgent,
 } from "../app-server-client/index.js";
@@ -131,6 +142,7 @@ import {
 } from "./tui-local-events.js";
 import type {
   AgentCreateParams,
+  AgentSummary,
   AgentStopParams,
   AgenCDaemonKnownMethod,
   AgenCDaemonKnownResultByMethod,
@@ -255,6 +267,7 @@ import type { AgenCTuiBridgeSession } from "../tui/daemon-session.js";
 
 type AgenCDaemonCliDeps = {
   readonly startPromptAgent: typeof startAgenCDaemonPromptAgent;
+  readonly resumePromptAgent: typeof resumeAgenCDaemonPromptAgent;
   readonly stopPromptAgent: typeof stopAgenCDaemonPromptAgent;
   readonly createConnectedTuiClient: typeof createConnectedAgenCJsonLineDaemonTuiClient;
   readonly findAgentBySessionId: typeof findAgenCDaemonAgentBySessionId;
@@ -270,6 +283,7 @@ type AgenCDaemonCliDeps = {
 
 const DEFAULT_DAEMON_CLI_DEPS: AgenCDaemonCliDeps = {
   startPromptAgent: startAgenCDaemonPromptAgent,
+  resumePromptAgent: resumeAgenCDaemonPromptAgent,
   stopPromptAgent: stopAgenCDaemonPromptAgent,
   createConnectedTuiClient: createConnectedAgenCJsonLineDaemonTuiClient,
   findAgentBySessionId: findAgenCDaemonAgentBySessionId,
@@ -334,7 +348,7 @@ export function formatCliHelpText(): string {
     "       agenc security audit [--json] [--fix]",
     "       agenc gateway <status|pairing> [args]",
     "       agenc budget <status|reset> [args]",
-    "       agenc run <status|result|replay|evidence|cancel> <run-id> [options]",
+    "       agenc run <start|status|result|replay|evidence|cancel> [<run-id>] [options]",
     "       agenc init [--force]",
     "       agenc <login|logout|whoami>",
     "       agenc providers [--json] [--no-local-check]",
@@ -359,7 +373,7 @@ export function formatCliHelpText(): string {
     "  security                                Audit local exposure; --fix applies safe fixes",
     "  gateway                                 Inspect/operate the channel gateway (pairing)",
     "  budget                                  Inspect/operate cost-bounded autonomy",
-    "  run                                     Inspect, replay, export, or cancel a durable run",
+    "  run                                     Start, inspect, replay, export, or cancel a durable run",
     "  init                                    Create .agenc/config.json and AGENC.md",
     "  login | logout | whoami                  Manage the configured auth session",
     "  providers                               Check provider readiness and local health",
@@ -2049,8 +2063,7 @@ async function runDaemonOneShotPrompt(params: {
   readonly provider?: string;
   readonly profile?: string;
   readonly initialContent?: string | readonly MessageContentBlock[];
-  readonly permissionMode?:
-    "default" | "plan" | "acceptEdits" | "bypassPermissions";
+  readonly permissionMode?: AgentCreateParams["permissionMode"];
 }): Promise<number> {
   await params.deps.ensureDaemonReady(params.env)();
   const daemonClient = await params.deps.createConnectedTuiClient({
@@ -2394,8 +2407,6 @@ export async function oneShotCLI(
     // Forward --yolo / dangerously-skip flags to the daemon so the
     // print-mode oneShot agent runs under bypassPermissions, matching
     // the bootTUI path. See GAP-PE-GUARDIAN-YOLO-LEAK.
-    const isYoloOneShot =
-      startupCliFlags.allowDangerouslySkipPermissions === true;
     // Honor a validated `--permission-mode <value>` in the print path. Without
     // this, only --yolo/bypass propagated and acceptEdits/plan/default were
     // silently dropped. readStartupCliFlags already validated the flag (throwing
@@ -2407,14 +2418,7 @@ export async function oneShotCLI(
     // bypassPermissions takes precedence over any other forwarded mode. Narrow
     // to the daemon-accepted subset (agent.create rejects dontAsk/auto); other
     // user-addressable modes fall back to the unattended default as before.
-    const oneShotPermissionMode = isYoloOneShot
-      ? ("bypassPermissions" as const)
-      : startupCliFlags.permissionMode === "default" ||
-          startupCliFlags.permissionMode === "plan" ||
-          startupCliFlags.permissionMode === "acceptEdits" ||
-          startupCliFlags.permissionMode === "bypassPermissions"
-        ? startupCliFlags.permissionMode
-        : undefined;
+    const oneShotPermissionMode = startupPermissionMode(startupCliFlags);
     return await runDaemonOneShotPrompt({
       deps: daemonCliDeps(),
       prompt: daemonPrompt,
@@ -2816,9 +2820,7 @@ type TuiSessionShape = DeferredWorkspaceEditorSessionSurface & {
   resolveDaemonToolCall?: (params: {
     readonly toolCallId: string;
     readonly disposition:
-      | "confirmed_committed"
-      | "confirmed_no_effect"
-      | "remains_unknown";
+      "confirmed_committed" | "confirmed_no_effect" | "remains_unknown";
     readonly evidenceRef: string;
     readonly evidenceSha256: string;
     readonly reviewer?: string;
@@ -2914,8 +2916,7 @@ async function createDeferredDaemonPromptTuiSession(params: {
   readonly provider?: string;
   readonly profile?: string;
   readonly preparePrompt?: typeof prepareDaemonTuiPrompt;
-  readonly permissionMode?:
-    "default" | "plan" | "acceptEdits" | "bypassPermissions";
+  readonly permissionMode?: AgentCreateParams["permissionMode"];
 }): Promise<{
   readonly session: unknown;
   readonly close: () => Promise<void>;
@@ -3657,9 +3658,7 @@ async function createDeferredDaemonPromptTuiSession(params: {
     resolveDaemonToolCall: async (params: {
       readonly toolCallId: string;
       readonly disposition:
-        | "confirmed_committed"
-        | "confirmed_no_effect"
-        | "remains_unknown";
+        "confirmed_committed" | "confirmed_no_effect" | "remains_unknown";
       readonly evidenceRef: string;
       readonly evidenceSha256: string;
       readonly reviewer?: string;
@@ -3805,7 +3804,12 @@ async function createDeferredDaemonPromptTuiSession(params: {
         // Validated above against USER_ADDRESSABLE_PERMISSION_MODES, which is a
         // subset of the daemon prompt-agent permissionMode union.
         pendingPermissionMode = mode as
-          "default" | "plan" | "acceptEdits" | "bypassPermissions";
+          | "default"
+          | "plan"
+          | "acceptEdits"
+          | "bypassPermissions"
+          | "dontAsk"
+          | "auto";
         if (registry?.update !== undefined && registry.current !== undefined) {
           await registry.update({ ...registry.current(), mode });
         }
@@ -4426,6 +4430,48 @@ export const __wrapDaemonTuiSessionWithPromptPreparationForTest =
 
 type BootTUIEntryArgs = BootTUIArgs & { readonly resumeId?: string };
 
+async function resumeColdDaemonSession(params: {
+  readonly deps: AgenCDaemonCliDeps;
+  readonly descriptor: ResolvedResumeSession;
+}): Promise<AgentSummary> {
+  const startupFlags = readStartupCliFlags(process.argv);
+  const permissionMode = startupPermissionMode(startupFlags);
+  return params.deps.resumePromptAgent({
+    sessionId: params.descriptor.sessionId,
+    rolloutPath: params.descriptor.rolloutPath,
+    sourceProof: {
+      dev: params.descriptor.sourceDev,
+      ino: params.descriptor.sourceIno,
+      size: params.descriptor.sourceSize,
+      sha256: params.descriptor.sourceSha256,
+      cwdDev: params.descriptor.cwdDev,
+      cwdIno: params.descriptor.cwdIno,
+    },
+    cwd: params.descriptor.cwd,
+    env: process.env,
+    ...(startupFlags.model !== undefined ? { model: startupFlags.model } : {}),
+    ...(startupFlags.provider !== undefined
+      ? { provider: startupFlags.provider }
+      : {}),
+    ...(startupFlags.profile !== undefined
+      ? { profile: startupFlags.profile }
+      : {}),
+    ...(permissionMode !== undefined ? { permissionMode } : {}),
+  });
+}
+
+function startupPermissionMode(
+  flags: ReturnType<typeof readStartupCliFlags>,
+): AgentCreateParams["permissionMode"] {
+  if (flags.allowDangerouslySkipPermissions === true) {
+    return "bypassPermissions";
+  }
+  return flags.permissionMode !== undefined &&
+    USER_ADDRESSABLE_PERMISSION_MODES.includes(flags.permissionMode)
+    ? (flags.permissionMode as AgentCreateParams["permissionMode"])
+    : undefined;
+}
+
 /** Boot the TUI, preserving argv prompts and any pre-Ink typed draft text. */
 export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
   const startupCliFlags = readStartupCliFlags(process.argv);
@@ -4434,6 +4480,7 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
     return writeUnavailableCliCwd();
   }
   if (
+    args.resumeId === undefined &&
     !(await requireProjectTrustForTui({
       env: process.env,
       argv: process.argv,
@@ -4459,43 +4506,27 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
       process.stderr.write(`${oomNotice}\n`);
     }
     if (args.resumeId !== undefined) {
-      const deps = daemonCliDeps();
-      const daemonClient = await deps.createConnectedTuiClient();
-      let transferred = false;
-      try {
-        const agent = await deps.findAgentBySessionId(
-          daemonClient,
-          args.resumeId,
-        );
-        if (agent === null) {
-          // todo-113: cold disk sessions are not yet auto-restored into a live
-          // daemon agent (restoreAgent is crash-recovery only). Surface that
-          // distinction so operators know the rollout may still exist on disk.
-          process.stderr.write(
-            `agenc: no live daemon agent for session '${args.resumeId}'. ` +
-              `Disk rollouts after a clean exit are not cold-resumed yet; ` +
-              `start a new agent or keep the prior process attached.\n`,
-          );
-          return 1;
-        }
-        transferred = true;
-        const code = await attachAgentTuiEntry({
-          agentId: agent.agentId,
-          clientId: `agenc-tui-${process.pid}`,
-          daemonClient,
+      const resolved = resolveResumeSessionId(cliCwd.cwd, args.resumeId);
+      if (resolved.kind === "ok") {
+        return resumeResolvedTUIEntry(resolved, args.resumeId, {
           initialComposerText: consumeEarlyInput(),
-          startupImages: args.startupImages,
+          ...(args.startupImages !== undefined
+            ? { startupImages: args.startupImages }
+            : {}),
         });
-        // attachAgentTuiEntry has closed its client + detached the prior
-        // session; relaunch now if the /resume picker requested it.
-        return exitOrResumeAfterTui(code);
-      } finally {
-        if (!transferred) {
-          await daemonClient.close().catch(() => {
-            /* best effort */
-          });
-        }
       }
+      if (resolved.kind === "ambiguous") {
+        process.stderr.write(
+          `agenc: ambiguous session id '${resolved.input}' matches: ${resolved.matches.join(", ")}\n`,
+        );
+      } else if (resolved.kind === "search_incomplete") {
+        process.stderr.write(
+          `agenc: session search stopped at its ${resolved.reason.replaceAll("_", " ")} safety limit\n`,
+        );
+      } else {
+        process.stderr.write(`agenc: session not found: ${args.resumeId}\n`);
+      }
+      return 1;
     }
     const capturedEarlyInput = consumeEarlyInput();
     const initialPrompt = args.initialPrompt?.trim();
@@ -4506,8 +4537,7 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
       startupImages.length === 0
     ) {
       const deps = daemonCliDeps();
-      const isYoloIdle =
-        startupCliFlags.allowDangerouslySkipPermissions === true;
+      const idlePermissionMode = startupPermissionMode(startupCliFlags);
       const {
         configStore,
         workspaceRoot,
@@ -4527,7 +4557,9 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
         ...(startupCliFlags.profile !== undefined
           ? { profile: startupCliFlags.profile }
           : {}),
-        ...(isYoloIdle ? { permissionMode: "bypassPermissions" as const } : {}),
+        ...(idlePermissionMode !== undefined
+          ? { permissionMode: idlePermissionMode }
+          : {}),
       });
       const deferred = await createDeferredDaemonPromptTuiSession({
         baseSession,
@@ -4552,14 +4584,9 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
         // createTuiContext above does: an explicit `--yolo` forces bypass,
         // otherwise honor the startup `--permission-mode` flag. Pre-first-turn
         // `/permissions mode` / `/plan` then overwrite this staged value.
-        ...(isYoloIdle
-          ? { permissionMode: "bypassPermissions" as const }
-          : startupCliFlags.permissionMode === "default" ||
-              startupCliFlags.permissionMode === "plan" ||
-              startupCliFlags.permissionMode === "acceptEdits" ||
-              startupCliFlags.permissionMode === "bypassPermissions"
-            ? { permissionMode: startupCliFlags.permissionMode }
-            : {}),
+        ...(idlePermissionMode !== undefined
+          ? { permissionMode: idlePermissionMode }
+          : {}),
       });
       const boot = await loadBootTUI();
       try {
@@ -4627,8 +4654,7 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
     // this, --yolo only affected the local CLI bootstrap and dropped on
     // the wire — see GAP-PE-GUARDIAN-YOLO-LEAK and the daemon-side
     // forwarding in background-agent-runner.buildBootstrapArgv.
-    const isYoloFromCli =
-      startupCliFlags.allowDangerouslySkipPermissions === true;
+    const promptPermissionMode = startupPermissionMode(startupCliFlags);
     const started = await deps.startPromptAgent({
       prompt: preparedObjective,
       env: process.env,
@@ -4639,8 +4665,8 @@ export async function bootTUIEntry(args: BootTUIEntryArgs): Promise<number> {
         ? { profile: startup.profileName }
         : {}),
       ...(initialContent !== undefined ? { initialContent } : {}),
-      ...(isYoloFromCli
-        ? { permissionMode: "bypassPermissions" as const }
+      ...(promptPermissionMode !== undefined
+        ? { permissionMode: promptPermissionMode }
         : {}),
       metadata: { mode: "tui" },
     });
@@ -4850,44 +4876,8 @@ export async function resumeTUIEntry(args: ResumeTUIArgs): Promise<number> {
   const workspaceRoot = cliCwd.cwd;
   const resolved = resolveResumeSessionId(workspaceRoot, args.resumeId);
   switch (resolved.kind) {
-    case "ok": {
-      const deps = daemonCliDeps();
-      await deps.ensureDaemonReady(process.env)();
-      const daemonClient = await deps.createConnectedTuiClient();
-      let transferred = false;
-      try {
-        const agent = await deps.findAgentBySessionId(
-          daemonClient,
-          resolved.sessionId,
-        );
-        if (agent === null) {
-          // todo-113: cold disk sessions are not yet auto-restored into a live
-          // daemon agent (restoreAgent is crash-recovery only). Surface that
-          // distinction so operators know the rollout may still exist on disk.
-          process.stderr.write(
-            `agenc: no live daemon agent for session '${args.resumeId}'. ` +
-              `Disk rollouts after a clean exit are not cold-resumed yet; ` +
-              `start a new agent or keep the prior process attached.\n`,
-          );
-          return 1;
-        }
-        transferred = true;
-        const code = await attachAgentTuiEntry({
-          agentId: agent.agentId,
-          clientId: `agenc-tui-${process.pid}`,
-          daemonClient,
-        });
-        // Chained /resume: if the user picks another session from within a
-        // resumed TUI, relaunch into it once teardown is complete.
-        return exitOrResumeAfterTui(code);
-      } finally {
-        if (!transferred) {
-          await daemonClient.close().catch(() => {
-            /* best effort */
-          });
-        }
-      }
-    }
+    case "ok":
+      return resumeResolvedTUIEntry(resolved, args.resumeId);
     case "ambiguous":
       process.stderr.write(
         `agenc: ambiguous session id '${resolved.input}' matches: ${resolved.matches.join(", ")}\n`,
@@ -4899,6 +4889,238 @@ export async function resumeTUIEntry(args: ResumeTUIArgs): Promise<number> {
         `agenc: session not found in either legacy or hashed project layout: ${args.resumeId}\n`,
       );
       return 1;
+    case "search_incomplete":
+      process.stderr.write(
+        `agenc: session search stopped at its ${resolved.reason.replaceAll("_", " ")} safety limit; narrow the session id and retry\n`,
+      );
+      return 1;
+  }
+}
+
+function sameResumeDescriptor(
+  left: ResolvedResumeSession,
+  right: ResolvedResumeSession,
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.rolloutPath === right.rolloutPath &&
+    left.cwd === right.cwd &&
+    left.sourceDev === right.sourceDev &&
+    left.sourceIno === right.sourceIno &&
+    left.sourceSize === right.sourceSize &&
+    left.sourceSha256 === right.sourceSha256 &&
+    left.cwdDev === right.cwdDev &&
+    left.cwdIno === right.cwdIno
+  );
+}
+
+function reproveResumeDescriptor(
+  expected: ResolvedResumeSession,
+): ResolvedResumeSession {
+  const observed = resolveResumeSessionId(expected.cwd, expected.sessionId);
+  if (observed.kind !== "ok" || !sameResumeDescriptor(expected, observed)) {
+    throw new Error(
+      `canonical resume source for ${expected.sessionId} changed during authorization`,
+    );
+  }
+  return observed;
+}
+
+interface ResumeCwdProof {
+  readonly fd: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+function openResumeCwdProof(cwd: string): ResumeCwdProof {
+  const before = lstatSync(cwd, { bigint: true });
+  if (
+    !before.isDirectory() ||
+    before.isSymbolicLink() ||
+    !hasSupportedFileIdentity(before) ||
+    realpathSync(cwd) !== cwd
+  ) {
+    throw new Error("canonical resume workspace is unavailable or unsafe");
+  }
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  const directoryOnly =
+    "O_DIRECTORY" in fsConstants ? (fsConstants.O_DIRECTORY as number) : 0;
+  const fd = openSync(cwd, fsConstants.O_RDONLY | noFollow | directoryOnly);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error("canonical resume workspace changed while being opened");
+    }
+    return { fd, dev: opened.dev, ino: opened.ino };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function assertResumeCwdProof(cwd: string, proof: ResumeCwdProof): void {
+  const opened = fstatSync(proof.fd, { bigint: true });
+  const observed = lstatSync(cwd, { bigint: true });
+  if (
+    !opened.isDirectory() ||
+    !observed.isDirectory() ||
+    observed.isSymbolicLink() ||
+    !hasSupportedFileIdentity(opened) ||
+    !hasSupportedFileIdentity(observed) ||
+    opened.dev !== proof.dev ||
+    opened.ino !== proof.ino ||
+    observed.dev !== proof.dev ||
+    observed.ino !== proof.ino ||
+    realpathSync(cwd) !== cwd
+  ) {
+    throw new Error("canonical resume workspace changed during authorization");
+  }
+}
+
+function assertLiveAgentMatchesResumeDescriptor(
+  agent: AgentSummary,
+  descriptor: ResolvedResumeSession,
+): void {
+  const metadataPath =
+    typeof agent.metadata?.agentPath === "string"
+      ? agent.metadata.agentPath
+      : undefined;
+  const rolloutPath =
+    typeof agent.metadata?.canonicalRolloutPath === "string"
+      ? agent.metadata.canonicalRolloutPath
+      : undefined;
+  const rolloutDev =
+    typeof agent.metadata?.canonicalRolloutDev === "string"
+      ? agent.metadata.canonicalRolloutDev
+      : undefined;
+  const rolloutIno =
+    typeof agent.metadata?.canonicalRolloutIno === "string"
+      ? agent.metadata.canonicalRolloutIno
+      : undefined;
+  if (
+    agent.cwd !== descriptor.cwd ||
+    (agent.agentPath ?? metadataPath) !== "/root" ||
+    rolloutPath !== descriptor.rolloutPath ||
+    rolloutDev !== descriptor.sourceDev ||
+    rolloutIno !== descriptor.sourceIno
+  ) {
+    throw new Error(
+      `live daemon agent ${agent.agentId} does not match the trusted resume workspace and root topology`,
+    );
+  }
+}
+
+async function resumeResolvedTUIEntry(
+  descriptor: ResolvedResumeSession,
+  displayId: string,
+  options: {
+    readonly initialComposerText?: string;
+    readonly startupImages?: readonly string[];
+  } = {},
+): Promise<number> {
+  let cwdProof: ResumeCwdProof;
+  try {
+    cwdProof = openResumeCwdProof(descriptor.cwd);
+  } catch (error) {
+    process.stderr.write(
+      `agenc: unable to resume session '${displayId}': ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
+    return 1;
+  }
+  try {
+    if (
+      !(await requireProjectTrustForTui({
+        env: process.env,
+        argv: process.argv,
+        cwd: descriptor.cwd,
+        useEnvWorkspace: false,
+      }))
+    ) {
+      return 1;
+    }
+    let authoritative: ResolvedResumeSession;
+    try {
+      assertResumeCwdProof(descriptor.cwd, cwdProof);
+      authoritative = reproveResumeDescriptor(descriptor);
+    } catch (error) {
+      process.stderr.write(
+        `agenc: unable to resume session '${displayId}': ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+      return 1;
+    }
+    const deps = daemonCliDeps();
+    try {
+      await deps.ensureDaemonReady(process.env)();
+      assertResumeCwdProof(authoritative.cwd, cwdProof);
+    } catch (error) {
+      process.stderr.write(
+        `agenc: unable to resume session '${displayId}': ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+      return 1;
+    }
+    const daemonClient = await deps.createConnectedTuiClient();
+    let transferred = false;
+    try {
+      let agent: AgentSummary;
+      try {
+        const live = await deps.findAgentBySessionId(
+          daemonClient,
+          authoritative.sessionId,
+        );
+        if (live === null) {
+          authoritative = reproveResumeDescriptor(authoritative);
+          assertResumeCwdProof(authoritative.cwd, cwdProof);
+          agent = await resumeColdDaemonSession({
+            deps,
+            descriptor: authoritative,
+          });
+        } else {
+          agent = live;
+        }
+        assertResumeCwdProof(authoritative.cwd, cwdProof);
+        assertLiveAgentMatchesResumeDescriptor(agent, authoritative);
+      } catch (error) {
+        process.stderr.write(
+          `agenc: unable to resume session '${displayId}': ${
+            error instanceof Error ? error.message : String(error)
+          }\n`,
+        );
+        return 1;
+      }
+      transferred = true;
+      const code = await attachAgentTuiEntry({
+        agentId: agent.agentId,
+        clientId: `agenc-tui-${process.pid}`,
+        daemonClient,
+        ...(options.initialComposerText !== undefined
+          ? { initialComposerText: options.initialComposerText }
+          : {}),
+        ...(options.startupImages !== undefined
+          ? { startupImages: options.startupImages }
+          : {}),
+      });
+      return exitOrResumeAfterTui(code);
+    } finally {
+      if (!transferred) {
+        await daemonClient.close().catch(() => {
+          /* best effort */
+        });
+      }
+    }
+  } finally {
+    closeSync(cwdProof.fd);
   }
 }
 
@@ -4912,11 +5134,17 @@ export async function continueTUIEntry(
   }
   const workspaceRoot = cliCwd.cwd;
   const resolved = resolveLatestSessionId(workspaceRoot);
+  if (resolved.kind === "search_incomplete") {
+    process.stderr.write(
+      `agenc: session search stopped at its ${resolved.reason.replaceAll("_", " ")} safety limit; retry with an exact session id\n`,
+    );
+    return 1;
+  }
   if (resolved.kind !== "ok") {
     process.stderr.write("agenc: no previous session found for this project\n");
     return 1;
   }
-  return resumeTUIEntry({ resumeId: resolved.sessionId });
+  return resumeResolvedTUIEntry(resolved, resolved.sessionId);
 }
 
 /**
@@ -5187,8 +5415,11 @@ async function runDefaultAgenCCliRoute(
     isTTY: Boolean(process.stdin.isTTY),
     isStdoutTTY: Boolean(process.stdout.isTTY),
   });
+  const targetResumeRoute =
+    routePlan.kind === "resumeTUI" || routePlan.kind === "continueTUI";
   const routeNeedsToolTrust =
-    routePlan.kind === "oneShotCLI" || isInteractiveTuiRoutePlan(routePlan);
+    routePlan.kind === "oneShotCLI" ||
+    (isInteractiveTuiRoutePlan(routePlan) && !targetResumeRoute);
   const routeCwd = routeNeedsToolTrust
     ? resolveCliCwdForStartup(process.env)
     : null;
@@ -5209,7 +5440,10 @@ async function runDefaultAgenCCliRoute(
       return 1;
     }
   }
-  if (await resolveAgenCDaemonAutostartEnabled(process.env)) {
+  if (
+    !targetResumeRoute &&
+    (await resolveAgenCDaemonAutostartEnabled(process.env))
+  ) {
     try {
       await ensureAgenCDaemonAutostart();
     } catch (error) {

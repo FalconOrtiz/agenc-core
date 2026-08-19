@@ -126,7 +126,7 @@ import {
   parseDirectMemberMessage,
   sendDirectMemberMessage,
 } from "../../../utils/directMemberMessage.js";
-import type { EffortLevel } from "../../../utils/effort.js";
+import type { AvailableEffortLevel } from "../../../utils/effort.js";
 import { env } from "../../../utils/env.js";
 import { errorMessage } from "../../../utils/errors.js";
 import { isBilledAsExtraUsage } from "../../../utils/extraUsage.js";
@@ -3544,7 +3544,7 @@ function PromptInput({
   // state (like notifications) changes. This prevents the inline model picker
   // from visually "jumping" when notifications arrive.
   const handleModelSelect = useCallback(
-    (model: string | null, _effort: EffortLevel | undefined) => {
+    (model: string | null, _effort: AvailableEffortLevel | undefined) => {
       let wasFastModeDisabled = false;
       setAppState((prev) => {
         wasFastModeDisabled =

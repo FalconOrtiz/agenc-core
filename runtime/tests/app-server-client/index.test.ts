@@ -26,6 +26,7 @@ function createListClient(
       readonly status: "idle" | "running" | "stopping" | "stopped" | "error";
       readonly createdAt: string;
       readonly activeSessionIds?: readonly string[];
+      readonly metadata?: Record<string, unknown>;
     }[];
     readonly nextCursor?: string;
   }>,
@@ -122,6 +123,135 @@ describe("app-server-client daemon helpers", () => {
     await expect(
       findAgenCDaemonAgentBySessionId(client as never, "session_shared"),
     ).rejects.toThrow("matches multiple agents");
+  });
+
+  it("finds a live canonical conversation id and ignores persisted-only rows", async () => {
+    const live = createListClient([
+      {
+        agents: [
+          {
+            agentId: "conv-livecanonical1",
+            status: "running",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            activeSessionIds: ["session_runtime_envelope"],
+          },
+        ],
+      },
+    ]);
+    await expect(
+      findAgenCDaemonAgentBySessionId(live as never, "conv-livecanonical1"),
+    ).resolves.toMatchObject({ agentId: "conv-livecanonical1" });
+
+    const persisted = createListClient([
+      {
+        agents: [
+          {
+            agentId: "conv-coldcanonical1",
+            status: "idle",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            activeSessionIds: ["conv-coldcanonical1"],
+            metadata: { recovered: true },
+          },
+        ],
+      },
+    ]);
+    await expect(
+      findAgenCDaemonAgentBySessionId(
+        persisted as never,
+        "conv-coldcanonical1",
+      ),
+    ).resolves.toBeNull();
+
+    const recoveredLive = createListClient([
+      {
+        agents: [
+          {
+            agentId: "conv-recoveredlive1",
+            status: "running",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            metadata: {
+              recovered: true,
+              recovery: { runtimeRestore: "available" },
+            },
+          },
+        ],
+      },
+    ]);
+    await expect(
+      findAgenCDaemonAgentBySessionId(
+        recoveredLive as never,
+        "conv-recoveredlive1",
+      ),
+    ).resolves.toMatchObject({ agentId: "conv-recoveredlive1" });
+
+    const stopped = createListClient([
+      {
+        agents: [
+          {
+            agentId: "conv-stoppedcold1",
+            status: "stopped",
+            createdAt: "2026-08-19T00:00:00.000Z",
+            activeSessionIds: ["conv-stoppedcold1"],
+          },
+        ],
+      },
+    ]);
+    await expect(
+      findAgenCDaemonAgentBySessionId(stopped as never, "conv-stoppedcold1"),
+    ).resolves.toBeNull();
+  });
+
+  it("sends an explicit canonical resume through agent.create", async () => {
+    vi.resetModules();
+    const createAgent = vi.fn(async (params: unknown) => ({
+      agentId: "conv-retained1",
+      objective: "conv-retained1",
+      status: "running" as const,
+      createdAt: "2026-08-19T00:00:00.000Z",
+      sessionId: "session_resumed",
+      params,
+    }));
+    vi.doMock("../app-server/agent-cli.js", async (importActual) => {
+      const actual =
+        await importActual<typeof import("../app-server/agent-cli.js")>();
+      return {
+        ...actual,
+        defaultEnsureDaemonReady: vi.fn(() => vi.fn(async () => {})),
+        createAgenCJsonLineDaemonClient: vi.fn(() => ({ createAgent })),
+      };
+    });
+
+    try {
+      const { resumeAgenCDaemonPromptAgent } = await import("./index.js");
+      await resumeAgenCDaemonPromptAgent({
+        sessionId: "conv-retained1",
+        rolloutPath:
+          "/agenc-home/projects/workspace/sessions/conv-retained1/rollout-2026-conv-retained1.jsonl",
+        cwd: "/workspace",
+        model: "grok-4.3",
+        provider: "grok",
+        permissionMode: "acceptEdits",
+      });
+      expect(createAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resumeSessionId: "conv-retained1",
+          resumeRolloutPath:
+            "/agenc-home/projects/workspace/sessions/conv-retained1/rollout-2026-conv-retained1.jsonl",
+          cwd: "/workspace",
+          model: "grok-4.3",
+          provider: "grok",
+          permissionMode: "acceptEdits",
+        }),
+      );
+      expect(createAgent.mock.calls[0]?.[0]).not.toHaveProperty("objective");
+      expect(createAgent.mock.calls[0]?.[0]).not.toHaveProperty("metadata");
+      expect(createAgent.mock.calls[0]?.[0]).not.toHaveProperty(
+        "initialContent",
+      );
+    } finally {
+      vi.doUnmock("../app-server/agent-cli.js");
+      vi.resetModules();
+    }
   });
 
   it("passes startup multimodal content through agent.create", async () => {

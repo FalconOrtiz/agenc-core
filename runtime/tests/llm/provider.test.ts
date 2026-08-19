@@ -1322,6 +1322,30 @@ describe("createProvider", () => {
     ).toBe("http://localhost:11434");
   });
 
+  test("maps resolved providers.ollama.context_window_tokens to the native request", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      model: "llama3.3",
+      message: { role: "assistant", content: "ok" },
+      prompt_eval_count: 1,
+      eval_count: 1,
+    });
+    const provider = createProvider("ollama", {
+      model: "llama3.3",
+      extra: { contextWindowTokens: 131_072 },
+    });
+    (provider as unknown as { client: unknown }).client = { chat };
+
+    await provider.chat([{ role: "user", content: "hello" }], {
+      singleWireAttempt: true,
+    });
+
+    expect(chat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({ num_ctx: 131_072 }),
+      }),
+    );
+  });
+
   test.each([
     {
       name: "ollama",

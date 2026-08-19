@@ -55,18 +55,27 @@ import {
   ftruncateSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
+  realpathSync,
   renameSync,
   statSync,
   writeSync,
   unlinkSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
-import { createHash } from "node:crypto";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import {
   MAX_RECOVERY_CANONICAL_LINE_BYTES,
   RECOVERY_SCAN_CHUNK_BYTES,
@@ -100,6 +109,7 @@ import {
   readCompactionRolloutPayload,
 } from "./compaction-event-reader.js";
 import { DegradedStore } from "./degraded-store.js";
+import { isUnsupportedDirectorySync } from "../utils/durable-atomic-file.js";
 import {
   createTrajectoryExportSink,
   type TrajectoryExportSink,
@@ -318,10 +328,7 @@ export function getSessionDir(
   );
 }
 
-function buildRolloutFilename(
-  timestampMs: number,
-  sessionId: string,
-): string {
+function buildRolloutFilename(timestampMs: number, sessionId: string): string {
   const iso = new Date(timestampMs).toISOString().replace(/[:.]/g, "-");
   return `rollout-${iso}-${sessionId}.jsonl`;
 }
@@ -354,47 +361,109 @@ export function readAndValidateSchemaVersion(
   rolloutPath: string,
 ): SessionMetaLine | null {
   if (!existsSync(rolloutPath)) return null;
-  const stat = statSync(rolloutPath);
-  if (stat.size === 0) return null;
   const fd = openSync(rolloutPath, "r");
   try {
-    const headBuf = Buffer.alloc(Math.min(stat.size, 64 * 1024));
-    readSync(fd, headBuf, 0, headBuf.length, 0);
-    const firstLine = headBuf
-      .toString("utf8")
-      .split("\n")[0]
-      ?.trim();
-    if (!firstLine) return null;
-    const parsed = parseRolloutLine(firstLine);
-    if (parsed?.type !== "session_meta") return null;
-    const meta = parsed.payload;
-    if (meta.rolloutSchemaVersion > ROLLOUT_SCHEMA_VERSION) {
-      throw new SchemaMismatchError(
-        meta.rolloutSchemaVersion,
-        ROLLOUT_SCHEMA_VERSION,
-      );
-    }
-    return meta;
+    return readAndValidateSchemaVersionFd(fd);
   } finally {
     closeSync(fd);
   }
 }
 
+export function readAndValidateSchemaVersionFd(
+  fd: number,
+): SessionMetaLine | null {
+  const stats = fstatSync(fd, { bigint: true });
+  if (!stats.isFile() || stats.size === 0n) return null;
+  const maxHeaderBytes = 64 * 1024;
+  const headerBytes =
+    stats.size > BigInt(maxHeaderBytes) ? maxHeaderBytes : Number(stats.size);
+  const headBuf = Buffer.alloc(headerBytes);
+  const bytesRead = readSync(fd, headBuf, 0, headBuf.length, 0);
+  const newline = headBuf.subarray(0, bytesRead).indexOf(0x0a);
+  if (newline < 0 && stats.size > BigInt(bytesRead)) {
+    throw new Error("rollout session metadata exceeds its byte limit");
+  }
+  const firstLine = headBuf
+    .subarray(0, newline < 0 ? bytesRead : newline)
+    .toString("utf8")
+    .trim();
+  if (!firstLine) return null;
+  const parsed = parseRolloutLine(firstLine);
+  if (
+    parsed?.type !== "session_meta" ||
+    !isValidSessionMetaLine(parsed.payload)
+  ) {
+    return null;
+  }
+  const meta = parsed.payload;
+  if (meta.rolloutSchemaVersion > ROLLOUT_SCHEMA_VERSION) {
+    throw new SchemaMismatchError(
+      meta.rolloutSchemaVersion,
+      ROLLOUT_SCHEMA_VERSION,
+    );
+  }
+  return meta;
+}
+
+function isValidSessionMetaLine(value: SessionMetaLine): boolean {
+  return (
+    typeof value.sessionId === "string" &&
+    value.sessionId.length > 0 &&
+    typeof value.timestamp === "string" &&
+    Number.isFinite(Date.parse(value.timestamp)) &&
+    typeof value.cwd === "string" &&
+    value.cwd.length > 0 &&
+    typeof value.originator === "string" &&
+    typeof value.agencVersion === "string" &&
+    Number.isSafeInteger(value.rolloutSchemaVersion) &&
+    value.rolloutSchemaVersion >= 0
+  );
+}
+
 function maxEventSeqInRollout(path: string): EventSeq {
   if (!existsSync(path)) return 0;
+  const fd = openSync(path, fsConstants.O_RDONLY);
+  try {
+    return maxEventSeqInRolloutFd(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function maxEventSeqInRolloutFd(fd: number): EventSeq {
   let maxSeq: EventSeq = 0;
-  for (const line of readFileSync(path, "utf8").split("\n")) {
-    if (line.trim().length === 0) continue;
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let pending = Buffer.alloc(0);
+  let position = 0;
+  const inspect = (lineBytes: Buffer): void => {
+    const line = lineBytes.toString("utf8");
+    if (line.trim().length === 0) return;
     try {
       const parsed = parseRolloutLine(line);
-      if (parsed?.type !== "event_msg") continue;
+      if (parsed?.type !== "event_msg") return;
       const seq = validEventSeq(parsed.payload.seq);
       if (seq !== undefined && seq > maxSeq) maxSeq = seq;
     } catch {
       // Tail repair runs before this scan; ignore any remaining malformed
       // row and preserve the highest valid sequence we can recover.
     }
+  };
+  for (;;) {
+    const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, position);
+    if (bytesRead === 0) break;
+    position += bytesRead;
+    pending = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+    if (pending.byteLength > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
+      throw new Error("canonical rollout row exceeds its recovery byte limit");
+    }
+    for (;;) {
+      const newline = pending.indexOf(0x0a);
+      if (newline < 0) break;
+      inspect(pending.subarray(0, newline));
+      pending = pending.subarray(newline + 1);
+    }
   }
+  if (pending.byteLength > 0) inspect(pending);
   return maxSeq;
 }
 
@@ -525,7 +594,11 @@ export class SessionLock {
     const tmpPath = `${this.lockPath}.${process.pid}.${this.startNs}.tmp`;
     // Write the tmp payload.
     try {
-      const tfd = openSync(tmpPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+      const tfd = openSync(
+        tmpPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        0o600,
+      );
       try {
         writeSync(tfd, payload);
         fsyncSync(tfd);
@@ -536,8 +609,16 @@ export class SessionLock {
       // If the tmp already existed (very unlikely given the unique
       // pid/startNs suffix), remove and retry once.
       if ((err as { code?: string })?.code === "EEXIST") {
-        try { unlinkSync(tmpPath); } catch { /* ignore */ }
-        const tfd = openSync(tmpPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          /* ignore */
+        }
+        const tfd = openSync(
+          tmpPath,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+          0o600,
+        );
         try {
           writeSync(tfd, payload);
           fsyncSync(tfd);
@@ -554,25 +635,41 @@ export class SessionLock {
       linkSync(tmpPath, this.lockPath);
       // Success — unlink the tmp (the lock file is a separate inode via
       // link but shares the payload).
-      try { unlinkSync(tmpPath); } catch { /* ignore */ }
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        /* ignore */
+      }
       return true;
     } catch (linkErr) {
       const code = (linkErr as { code?: string })?.code;
       if (code === "EEXIST") {
         // Another process owns (or a stale lockfile remains). Caller
         // will inspect and decide to reclaim.
-        try { unlinkSync(tmpPath); } catch { /* ignore */ }
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          /* ignore */
+        }
         return false;
       }
       // Windows / filesystems without hardlink support (EPERM/ENOSYS):
       // fall back to the `wx` open path. This is strictly weaker but
       // still atomic on NTFS / local POSIX FSes.
       if (code === "EPERM" || code === "ENOSYS" || code === "EXDEV") {
-        try { unlinkSync(tmpPath); } catch { /* ignore */ }
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          /* ignore */
+        }
         return this.tryAcquireWxFallback(payload);
       }
       // Unexpected — clean up and propagate.
-      try { unlinkSync(tmpPath); } catch { /* ignore */ }
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        /* ignore */
+      }
       throw linkErr;
     }
   }
@@ -609,12 +706,18 @@ export class SessionLock {
     if (raw.length === 0) return null;
     try {
       const parsed = JSON.parse(raw) as Partial<LockRecord>;
-      if (typeof parsed.pid === "number" && Number.isFinite(parsed.pid) && parsed.pid > 0) {
+      if (
+        typeof parsed.pid === "number" &&
+        Number.isFinite(parsed.pid) &&
+        parsed.pid > 0
+      ) {
         return {
           pid: parsed.pid,
           startNs: typeof parsed.startNs === "string" ? parsed.startNs : "",
           acquiredAtIso:
-            typeof parsed.acquiredAtIso === "string" ? parsed.acquiredAtIso : "",
+            typeof parsed.acquiredAtIso === "string"
+              ? parsed.acquiredAtIso
+              : "",
         };
       }
       return null;
@@ -656,7 +759,10 @@ export class SessionLock {
 }
 
 export class SessionLockedError extends Error {
-  constructor(public readonly holderPid: number, public readonly lockPath: string) {
+  constructor(
+    public readonly holderPid: number,
+    public readonly lockPath: string,
+  ) {
     super(
       `session locked by pid ${holderPid} (${lockPath}) — another AgenC process owns this session`,
     );
@@ -715,15 +821,22 @@ export function rewriteAtomically(
     /* ignore */
   }
   // Step 1 + 2: write and fsync the tmp.
-  const flags =
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL;
+  const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL;
   const fd = openSync(tmpPath, flags, mode);
   try {
     writeSync(fd, bytes as never);
     fsyncSync(fd);
   } catch (err) {
-    try { closeSync(fd); } catch { /* ignore */ }
-    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+    try {
+      closeSync(fd);
+    } catch {
+      /* ignore */
+    }
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
     throw err;
   }
   try {
@@ -735,7 +848,11 @@ export function rewriteAtomically(
   try {
     renameSync(tmpPath, targetPath);
   } catch (err) {
-    try { unlinkSync(tmpPath); } catch { /* ignore */ }
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
     throw err;
   }
   // Step 4: fsync the parent directory so the rename is durable.
@@ -757,32 +874,38 @@ export function rewriteAtomically(
 /** Read exactly the first newline-terminated canonical row with a hard cap. */
 function readBoundedCanonicalHeader(path: string): Buffer {
   const fd = openSync(path, fsConstants.O_RDONLY);
-  const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
-  const parts: Buffer[] = [];
-  let totalBytes = 0;
-  let position = 0;
   try {
-    for (;;) {
-      const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, position);
-      if (bytesRead === 0) {
-        throw new Error("canonical rollout header is unterminated");
-      }
-      const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
-      const selectedBytes = newline < 0 ? bytesRead : newline + 1;
-      totalBytes += selectedBytes;
-      if (totalBytes - 1 > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
-        throw new Error("canonical rollout header exceeds its line limit");
-      }
-      parts.push(Buffer.from(chunk.subarray(0, selectedBytes)));
-      if (newline >= 0) return Buffer.concat(parts);
-      position += bytesRead;
-    }
+    return readBoundedCanonicalHeaderFd(fd);
   } finally {
     closeSync(fd);
   }
 }
 
-function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutItem[] {
+function readBoundedCanonicalHeaderFd(fd: number): Buffer {
+  const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
+  const parts: Buffer[] = [];
+  let totalBytes = 0;
+  let position = 0;
+  for (;;) {
+    const bytesRead = readSync(fd, chunk, 0, chunk.byteLength, position);
+    if (bytesRead === 0) {
+      throw new Error("canonical rollout header is unterminated");
+    }
+    const newline = chunk.subarray(0, bytesRead).indexOf(0x0a);
+    const selectedBytes = newline < 0 ? bytesRead : newline + 1;
+    totalBytes += selectedBytes;
+    if (totalBytes - 1 > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
+      throw new Error("canonical rollout header exceeds its line limit");
+    }
+    parts.push(Buffer.from(chunk.subarray(0, selectedBytes)));
+    if (newline >= 0) return Buffer.concat(parts);
+    position += bytesRead;
+  }
+}
+
+function hydrateManifestCompactionItems(
+  items: readonly RolloutItem[],
+): RolloutItem[] {
   const chunks = new Map<
     string,
     Map<CompactionPayloadKind, CompactionPayloadChunkV1[]>
@@ -795,28 +918,33 @@ function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutI
     byKind.set(item.payload.payload_kind, ordered);
     chunks.set(item.payload.attempt_id, byKind);
   }
-  const releasedAttemptIds = new Set(items.flatMap((item) =>
-    item.type === "compaction_source_release" ? [item.payload.attempt_id] : []
-  ));
+  const releasedAttemptIds = new Set(
+    items.flatMap((item) =>
+      item.type === "compaction_source_release"
+        ? [item.payload.attempt_id]
+        : [],
+    ),
+  );
   const payloadChunks = (
     manifest: Parameters<typeof reconstructCompactionPayloadV1>[0],
   ): readonly CompactionPayloadChunkV1[] =>
     chunks.get(manifest.attempt_id)?.get(manifest.payload_kind) ?? [];
   const reconstruct = (
     manifest: Parameters<typeof reconstructCompactionPayloadV1>[0],
-  ): unknown => reconstructCompactionPayloadV1(
-    manifest,
-    payloadChunks(manifest),
-  );
-  const hydratedIntents = new Map<string, Extract<
-    RolloutItem,
-    { readonly type: "compaction_intent" }
-  >["payload"]>();
+  ): unknown =>
+    reconstructCompactionPayloadV1(manifest, payloadChunks(manifest));
+  const hydratedIntents = new Map<
+    string,
+    Extract<RolloutItem, { readonly type: "compaction_intent" }>["payload"]
+  >();
   return items.map((item) => {
     if (item.type === "compaction_intent") {
       const raw = item.payload as unknown;
-      if (typeof raw !== "object" || raw === null ||
-          !("source_history_manifest" in raw)) {
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        !("source_history_manifest" in raw)
+      ) {
         hydratedIntents.set(item.payload.attempt_id, item.payload);
         return item;
       }
@@ -825,13 +953,19 @@ function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutI
         persisted.source.active_history_refs_manifest,
       );
       if (!Array.isArray(entries)) {
-        throw new Error("active-history payload manifest did not reconstruct an array");
+        throw new Error(
+          "active-history payload manifest did not reconstruct an array",
+        );
       }
       const { active_history_refs_manifest: _manifest, ...sourceBase } =
         persisted.source;
-      const sourceHistoryChunks = payloadChunks(persisted.source_history_manifest);
-      if (sourceHistoryChunks.length > 0 ||
-          !releasedAttemptIds.has(persisted.attempt_id)) {
+      const sourceHistoryChunks = payloadChunks(
+        persisted.source_history_manifest,
+      );
+      if (
+        sourceHistoryChunks.length > 0 ||
+        !releasedAttemptIds.has(persisted.attempt_id)
+      ) {
         const sourceHistory = reconstruct(persisted.source_history_manifest);
         readCompactionRolloutPayload("compaction_rollback_committed", {
           format_version: persisted.format_version,
@@ -873,8 +1007,12 @@ function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutI
     }
     if (item.type === "compaction_committed") {
       const raw = item.payload as unknown;
-      if (typeof raw !== "object" || raw === null ||
-          !("final_summary_manifest" in raw)) return item;
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        !("final_summary_manifest" in raw)
+      )
+        return item;
       const persisted = readCompactionPersistedCommittedV1(raw);
       const intent = hydratedIntents.get(persisted.attempt_id);
       if (intent === undefined) {
@@ -886,7 +1024,8 @@ function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutI
         attempt_id: persisted.attempt_id,
         recorded_at_ms: persisted.recorded_at_ms,
         committed_at_ms: persisted.committed_at_ms,
-        rollback_retention_deadline_ms: persisted.rollback_retention_deadline_ms,
+        rollback_retention_deadline_ms:
+          persisted.rollback_retention_deadline_ms,
         source: intent.source,
         selected_history_indexes: persisted.selected_history_indexes,
         policy_digest: persisted.policy_digest,
@@ -894,19 +1033,29 @@ function hydrateManifestCompactionItems(items: readonly RolloutItem[]): RolloutI
         summary: reconstruct(persisted.final_summary_manifest),
         summary_dag: reconstruct(persisted.summary_dag_manifest),
         accounting: persisted.accounting,
-        replacement_history: reconstruct(persisted.replacement_history_manifest),
+        replacement_history: reconstruct(
+          persisted.replacement_history_manifest,
+        ),
         cleanup_state: persisted.cleanup_state,
       }) as Extract<RolloutItem, { type: "compaction_committed" }>["payload"];
       return { ...item, payload };
     }
     if (item.type === "compaction_rollback_committed") {
       const raw = item.payload as unknown;
-      if (typeof raw !== "object" || raw === null ||
-          !("source_history_manifest" in raw)) return item;
+      if (
+        typeof raw !== "object" ||
+        raw === null ||
+        !("source_history_manifest" in raw)
+      )
+        return item;
       const persisted = readCompactionPersistedRollbackCommittedV1(raw);
-      const sourceHistoryChunks = payloadChunks(persisted.source_history_manifest);
-      if (sourceHistoryChunks.length === 0 &&
-          releasedAttemptIds.has(persisted.attempt_id)) {
+      const sourceHistoryChunks = payloadChunks(
+        persisted.source_history_manifest,
+      );
+      if (
+        sourceHistoryChunks.length === 0 &&
+        releasedAttemptIds.has(persisted.attempt_id)
+      ) {
         // The release tombstone proves that no live rollback owner remains.
         // Preserve the manifest-backed rollback row as audit evidence without
         // reconstructing payload bytes that were durably garbage-collected.
@@ -962,36 +1111,43 @@ export function truncateCorruptTail(
   readonly newSize: number;
 } {
   if (!existsSync(rolloutPath)) return { truncated: false, newSize: 0 };
-  const stat = statSync(rolloutPath);
-  if (stat.size === 0) return { truncated: false, newSize: 0 };
-  // Read last 1MB (or file size, whichever smaller).
-  const tailSize = Math.min(stat.size, 1024 * 1024);
   const fd = openSync(rolloutPath, "r+");
   try {
-    const buf = Buffer.alloc(tailSize);
-    readSync(fd, buf, 0, tailSize, stat.size - tailSize);
-    const text = buf.toString("utf8");
-    // Search for last newline.
-    const lastNewline = text.lastIndexOf("\n");
-    if (lastNewline === -1) {
-      // Entire tail window has no newline — file has a single
-      // un-terminated line. Truncate to zero.
-      (repair.truncate ?? ftruncateSync)(fd, 0);
-      (repair.sync ?? fsyncSync)(fd);
-      return { truncated: true, newSize: 0 };
-    }
-    // Check if tail after last newline is empty (normal complete file).
-    const afterLastNewlineIdx = (stat.size - tailSize) + lastNewline + 1;
-    if (afterLastNewlineIdx >= stat.size) {
-      return { truncated: false, newSize: stat.size };
-    }
-    // Partial line exists after last newline — truncate.
-    (repair.truncate ?? ftruncateSync)(fd, afterLastNewlineIdx);
-    (repair.sync ?? fsyncSync)(fd);
-    return { truncated: true, newSize: afterLastNewlineIdx };
+    return truncateCorruptTailFd(fd, repair);
   } finally {
     closeSync(fd);
   }
+}
+
+function truncateCorruptTailFd(
+  fd: number,
+  repair: {
+    readonly truncate?: (fd: number, length: number) => void;
+    readonly sync?: (fd: number) => void;
+  } = {},
+): { readonly truncated: boolean; readonly newSize: number } {
+  const stats = fstatSync(fd, { bigint: true });
+  if (stats.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("rollout file exceeds the safe mutation size limit");
+  }
+  const fileSize = Number(stats.size);
+  if (fileSize === 0) return { truncated: false, newSize: 0 };
+  const tailSize = Math.min(fileSize, 1024 * 1024);
+  const buf = Buffer.alloc(tailSize);
+  readSync(fd, buf, 0, tailSize, fileSize - tailSize);
+  const lastNewline = buf.lastIndexOf(0x0a);
+  if (lastNewline === -1) {
+    (repair.truncate ?? ftruncateSync)(fd, 0);
+    (repair.sync ?? fsyncSync)(fd);
+    return { truncated: true, newSize: 0 };
+  }
+  const afterLastNewline = fileSize - tailSize + lastNewline + 1;
+  if (afterLastNewline >= fileSize) {
+    return { truncated: false, newSize: fileSize };
+  }
+  (repair.truncate ?? ftruncateSync)(fd, afterLastNewline);
+  (repair.sync ?? fsyncSync)(fd);
+  return { truncated: true, newSize: afterLastNewline };
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1005,6 +1161,16 @@ export interface SessionStoreOpts {
   /** Whether to open existing rollout (resume) or create new. */
   readonly resume?: boolean;
   /**
+   * Exact canonical rollout selected by the resume resolver. Explicit resume
+   * must never silently substitute a newer file from the same directory.
+   */
+  readonly resumeRolloutPath?: string;
+  /**
+   * Daemon-validated descriptor handoff. `claim()` transfers ownership exactly
+   * once; the store retains the descriptor until close or open failure.
+   */
+  readonly resumeRolloutLease?: ResumeRolloutDescriptorLease;
+  /**
    * Marker files/directories used to resolve the project root slug.
    * When provided, the store slugs from the nearest ancestor that
    * contains one of these markers so checkouts nested under the same
@@ -1013,6 +1179,166 @@ export interface SessionStoreOpts {
    * omitted, and to the raw cwd when no marker ancestor exists.
    */
   readonly projectRootMarkers?: readonly string[];
+  /** Test-only race seam before a descriptor-bound inode swap. */
+  readonly beforeBoundResumeRewritePublishForTestingOnly?: () => void;
+  /** Test-only cross-platform rename/failpoint seams. */
+  readonly boundResumeRewriteRenameForTestingOnly?: (
+    from: string,
+    to: string,
+  ) => void;
+  readonly afterBoundResumeRewriteStepForTestingOnly?: (
+    step:
+      | "old_moved"
+      | "new_published"
+      | "directory_synced"
+      | "new_opened"
+      | "metadata_validated"
+      | "before_old_close",
+  ) => void;
+  readonly beforeBoundResumeSchemaUpgradeReadForTestingOnly?: () => void;
+  readonly afterBoundResumeSchemaUpgradeReadForTestingOnly?: () => void;
+  /** Test-only seam after the first descriptor-bound streaming read. */
+  readonly afterBoundResumeStreamingRewriteReadForTestingOnly?: () => void;
+  readonly boundResumeRewriteDirectorySyncForTestingOnly?: (fd: number) => void;
+  readonly boundResumeRewritePlatformForTestingOnly?: NodeJS.Platform;
+  readonly boundResumeRewriteUnlinkForTestingOnly?: (path: string) => void;
+  /** Test-only seam for an explicit-resume descriptor close report. */
+  readonly resumeSourceCloseForTestingOnly?: (fd: number) => void;
+}
+
+export interface ResumeRolloutDescriptorLease {
+  readonly rolloutPath: string;
+  claim(): number;
+  closeUnclaimed(): void;
+}
+
+export function createResumeRolloutDescriptorLease(
+  rolloutPath: string,
+  fd: number,
+): ResumeRolloutDescriptorLease {
+  let availableFd: number | undefined = fd;
+  return {
+    rolloutPath,
+    claim(): number {
+      if (availableFd === undefined) {
+        throw new Error("resume rollout descriptor lease was already consumed");
+      }
+      const claimed = availableFd;
+      availableFd = undefined;
+      return claimed;
+    },
+    closeUnclaimed(): void {
+      if (availableFd === undefined) return;
+      const unclaimed = availableFd;
+      availableFd = undefined;
+      closeSync(unclaimed);
+    },
+  };
+}
+
+/** A session id is a single, non-special filesystem segment. */
+const UNSUPPORTED_FILE_ID_SENTINEL = 0xffff_ffff_ffff_ffffn;
+
+export function hasSupportedFileIdentity(identity: {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}): boolean {
+  return (
+    identity.dev > 0n &&
+    identity.ino > 0n &&
+    identity.dev !== UNSUPPORTED_FILE_ID_SENTINEL &&
+    identity.ino !== UNSUPPORTED_FILE_ID_SENTINEL
+  );
+}
+
+export type CanonicalSessionCwdResolution =
+  | {
+      readonly kind: "ok";
+      readonly cwd: string;
+      readonly dev: bigint;
+      readonly ino: bigint;
+    }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "identity_unsupported" };
+
+/**
+ * Resolve a persisted workspace spelling to one stable canonical directory.
+ *
+ * Older rollouts may contain a symlink/case-alias spelling. The alias itself
+ * is not trusted: both observations must resolve to the same non-symlink
+ * target generation before callers bind it to a held directory descriptor.
+ */
+export function resolveCanonicalSessionCwd(
+  cwd: string,
+): CanonicalSessionCwdResolution {
+  if (!isAbsolute(cwd) || resolve(cwd) !== cwd) {
+    return { kind: "unavailable" };
+  }
+  try {
+    const canonical = realpathSync(cwd);
+    const before = lstatSync(canonical, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink()) {
+      return { kind: "unavailable" };
+    }
+    if (!hasSupportedFileIdentity(before)) {
+      return { kind: "identity_unsupported" };
+    }
+    const observedCanonical = realpathSync(cwd);
+    const after = lstatSync(canonical, { bigint: true });
+    if (
+      observedCanonical !== canonical ||
+      !after.isDirectory() ||
+      after.isSymbolicLink() ||
+      !hasSupportedFileIdentity(after) ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino
+    ) {
+      return { kind: "unavailable" };
+    }
+    return {
+      kind: "ok",
+      cwd: canonical,
+      dev: before.dev,
+      ino: before.ino,
+    };
+  } catch {
+    return { kind: "unavailable" };
+  }
+}
+
+function sessionCwdMatches(storedCwd: string, requestedCwd: string): boolean {
+  if (storedCwd === requestedCwd) return true;
+  const stored = resolveCanonicalSessionCwd(storedCwd);
+  const requested = resolveCanonicalSessionCwd(requestedCwd);
+  return (
+    stored.kind === "ok" &&
+    requested.kind === "ok" &&
+    stored.cwd === requested.cwd &&
+    stored.dev === requested.dev &&
+    stored.ino === requested.ino
+  );
+}
+
+export function isSafeSessionIdSegment(value: string): boolean {
+  const windowsStem = value.split(".", 1)[0]?.toUpperCase();
+  const reservedWindowsName =
+    windowsStem === "CON" ||
+    windowsStem === "PRN" ||
+    windowsStem === "AUX" ||
+    windowsStem === "NUL" ||
+    windowsStem === "CLOCK$" ||
+    /^COM[1-9]$/u.test(windowsStem ?? "") ||
+    /^LPT[1-9]$/u.test(windowsStem ?? "");
+  return (
+    value !== "." &&
+    value !== ".." &&
+    value.length > 0 &&
+    value.length <= 255 &&
+    !value.endsWith(".") &&
+    !value.endsWith(" ") &&
+    !reservedWindowsName &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(value)
+  );
 }
 
 export interface AppendOptions {
@@ -1107,25 +1433,136 @@ export class SessionStore {
   /** Exact pre-append boundary whose rollback could not be durably proven. */
   private uncertainAppendStart: number | undefined;
   private readonly trajectoryExport: TrajectoryExportSink;
+  private readonly explicitResumeRolloutPath: boolean;
+  private readonly resumeRolloutLease: ResumeRolloutDescriptorLease | undefined;
+  private resumeSourceIdentity: ResumeSourceIdentity | undefined;
+  /** Lifetime-pinned no-follow descriptor for an explicitly resumed source. */
+  private resumeSourceFd: number | undefined;
+  /** A failed post-publication rollback permanently revokes writer authority. */
+  private resumeSourceFaulted = false;
+  /** Exact source bytes most recently read through the lifetime fd. */
+  private lastBoundReadProof: ResumeSourceReadProof | undefined;
+  private readonly beforeBoundResumeRewritePublishForTestingOnly?: () => void;
+  private readonly boundResumeRewriteRename: (from: string, to: string) => void;
+  private readonly afterBoundResumeRewriteStepForTestingOnly?: SessionStoreOpts["afterBoundResumeRewriteStepForTestingOnly"];
+  private readonly beforeBoundResumeSchemaUpgradeReadForTestingOnly?: () => void;
+  private readonly afterBoundResumeSchemaUpgradeReadForTestingOnly?: () => void;
+  private readonly afterBoundResumeStreamingRewriteReadForTestingOnly?: () => void;
+  private readonly boundResumeRewriteDirectorySync: (fd: number) => void;
+  private readonly boundResumeRewritePlatform: NodeJS.Platform;
+  private readonly boundResumeRewriteUnlink: (path: string) => void;
+  private readonly resumeSourceClose: (fd: number) => void;
 
   constructor(opts: SessionStoreOpts) {
+    if (!isSafeSessionIdSegment(opts.sessionId)) {
+      throw new Error("session id must be a safe single path segment");
+    }
+    if (opts.resumeRolloutPath !== undefined && opts.resume !== true) {
+      throw new Error("resumeRolloutPath requires resume mode");
+    }
+    if (
+      opts.resumeRolloutLease !== undefined &&
+      (opts.resumeRolloutPath === undefined ||
+        opts.resumeRolloutLease.rolloutPath !== opts.resumeRolloutPath)
+    ) {
+      throw new Error(
+        "resume rollout descriptor lease does not match its path",
+      );
+    }
     this.cwd = opts.cwd;
     this.sessionId = opts.sessionId;
     this.agencVersion = opts.agencVersion;
-    this.sessionDir = getSessionDir(
-      opts.cwd,
-      opts.sessionId,
-      opts.projectRootMarkers ?? DEFAULT_SESSION_ROOT_MARKERS,
-    );
-    mkdirSync(this.sessionDir, { recursive: true });
+    const explicitRolloutPath = opts.resumeRolloutPath;
+    this.explicitResumeRolloutPath = explicitRolloutPath !== undefined;
+    this.resumeRolloutLease = opts.resumeRolloutLease;
+    this.beforeBoundResumeRewritePublishForTestingOnly =
+      opts.beforeBoundResumeRewritePublishForTestingOnly;
+    this.boundResumeRewriteRename =
+      opts.boundResumeRewriteRenameForTestingOnly ?? renameSync;
+    this.afterBoundResumeRewriteStepForTestingOnly =
+      opts.afterBoundResumeRewriteStepForTestingOnly;
+    this.beforeBoundResumeSchemaUpgradeReadForTestingOnly =
+      opts.beforeBoundResumeSchemaUpgradeReadForTestingOnly;
+    this.afterBoundResumeSchemaUpgradeReadForTestingOnly =
+      opts.afterBoundResumeSchemaUpgradeReadForTestingOnly;
+    this.afterBoundResumeStreamingRewriteReadForTestingOnly =
+      opts.afterBoundResumeStreamingRewriteReadForTestingOnly;
+    this.boundResumeRewriteDirectorySync =
+      opts.boundResumeRewriteDirectorySyncForTestingOnly ?? fsyncSync;
+    this.boundResumeRewritePlatform =
+      opts.boundResumeRewritePlatformForTestingOnly ?? process.platform;
+    this.boundResumeRewriteUnlink =
+      opts.boundResumeRewriteUnlinkForTestingOnly ?? unlinkSync;
+    this.resumeSourceClose = opts.resumeSourceCloseForTestingOnly ?? closeSync;
+    if (
+      explicitRolloutPath !== undefined &&
+      (!isAbsolute(explicitRolloutPath) ||
+        resolve(explicitRolloutPath) !== explicitRolloutPath)
+    ) {
+      throw new Error("resume rollout path must be absolute and normalized");
+    }
+    this.sessionDir =
+      explicitRolloutPath === undefined
+        ? getSessionDir(
+            opts.cwd,
+            opts.sessionId,
+            opts.projectRootMarkers ?? DEFAULT_SESSION_ROOT_MARKERS,
+          )
+        : dirname(explicitRolloutPath);
+    if (explicitRolloutPath === undefined) {
+      mkdirSync(this.sessionDir, { recursive: true });
+    } else if (
+      basename(this.sessionDir) !== opts.sessionId ||
+      !basename(explicitRolloutPath).startsWith("rollout-") ||
+      !basename(explicitRolloutPath).endsWith(`-${opts.sessionId}.jsonl`)
+    ) {
+      throw new Error("resume rollout source is not bound to its session id");
+    }
+    if (explicitRolloutPath !== undefined) {
+      const cwdStats = lstatSync(opts.cwd);
+      if (
+        !cwdStats.isDirectory() ||
+        cwdStats.isSymbolicLink() ||
+        realpathSync(opts.cwd) !== opts.cwd
+      ) {
+        throw new Error("resume cwd must be a canonical non-symlink directory");
+      }
+      let projectsRoot: string;
+      try {
+        projectsRoot = realpathSync(resolve(getAgencHomeDir(), "projects"));
+      } catch {
+        throw new Error("resume rollout projects root is unavailable");
+      }
+      const projectDir = dirname(dirname(this.sessionDir));
+      const relativeSource = relative(projectsRoot, explicitRolloutPath);
+      if (
+        relativeSource.length === 0 ||
+        relativeSource === ".." ||
+        relativeSource.startsWith("../") ||
+        relativeSource.startsWith("..\\") ||
+        isAbsolute(relativeSource) ||
+        basename(dirname(this.sessionDir)) !== "sessions" ||
+        dirname(projectDir) !== projectsRoot ||
+        basename(projectDir).length === 0
+      ) {
+        throw new Error(
+          "resume rollout source must be under AGENC_HOME/projects",
+        );
+      }
+    }
     const rolloutFilename = buildRolloutFilename(Date.now(), opts.sessionId);
     // If resuming, find the most-recent rollout in the session dir.
-    if (opts.resume) {
+    if (explicitRolloutPath !== undefined) {
+      this.rolloutPath = explicitRolloutPath;
+    } else if (opts.resume) {
       const existing = readdirSync(this.sessionDir)
         .filter((f) => f.startsWith("rollout-") && f.endsWith(".jsonl"))
         .sort();
       if (existing.length > 0) {
-        this.rolloutPath = join(this.sessionDir, existing[existing.length - 1]!);
+        this.rolloutPath = join(
+          this.sessionDir,
+          existing[existing.length - 1]!,
+        );
       } else {
         this.rolloutPath = join(this.sessionDir, rolloutFilename);
       }
@@ -1152,12 +1589,45 @@ export class SessionStore {
    */
   open(meta: Omit<SessionMetaLine, "rolloutSchemaVersion">): void {
     if (this.opened) return;
+    let resumeFdToClose: number | undefined;
     this.lock.acquire();
     try {
-      if (existsSync(this.rolloutPath)) {
-        // Schema check + tail truncation.
-        readAndValidateSchemaVersion(this.rolloutPath);
-        const truncResult = truncateCorruptTail(this.rolloutPath);
+      if (this.explicitResumeRolloutPath || existsSync(this.rolloutPath)) {
+        // Keep the no-follow descriptor open across metadata validation, tail
+        // repair, fsync, and sequence reconstruction. A pathname re-open here
+        // would let a rename swap redirect recovery mutation to unproved bytes.
+        const resumeHandle = this.explicitResumeRolloutPath
+          ? this.resumeRolloutLease === undefined
+            ? openRegularBoundResumeSource(this.rolloutPath)
+            : adoptRegularBoundResumeSource(
+                this.rolloutPath,
+                this.resumeRolloutLease,
+              )
+          : undefined;
+        resumeFdToClose = resumeHandle?.fd;
+        if (resumeHandle !== undefined) {
+          this.resumeSourceIdentity = resumeHandle.identity;
+        }
+        const existingMeta =
+          resumeHandle === undefined
+            ? readAndValidateSchemaVersion(this.rolloutPath)
+            : readAndValidateSchemaVersionFd(resumeHandle.fd);
+        if (
+          existingMeta === null ||
+          existingMeta.sessionId !== this.sessionId ||
+          !sessionCwdMatches(existingMeta.cwd, this.cwd)
+        ) {
+          throw new Error(
+            "resume rollout source does not match the requested session id and cwd",
+          );
+        }
+        this.lastSessionMeta = existingMeta;
+        const truncResult =
+          resumeHandle === undefined
+            ? truncateCorruptTail(this.rolloutPath)
+            : truncateCorruptTailFd(resumeHandle.fd, {
+                sync: (fd) => this.fsyncImpl(fd),
+              });
         if (truncResult.truncated) {
           this.emitDiagnostic({
             at: Date.now(),
@@ -1170,8 +1640,22 @@ export class SessionStore {
         // fsync failed before it died. Re-sync the surviving canonical prefix
         // under this source's exclusive lease before any caller treats those
         // bytes as durable recovery evidence.
-        this.syncCanonicalFile();
-        this.fileSize = statSync(this.rolloutPath).size;
+        if (resumeHandle === undefined) {
+          this.syncCanonicalFile();
+          this.fileSize = statSync(this.rolloutPath).size;
+        } else {
+          this.fsyncImpl(resumeHandle.fd);
+          assertBoundResumeSourceFd(
+            resumeHandle.fd,
+            this.rolloutPath,
+            resumeHandle.identity,
+          );
+          const openedStats = fstatSync(resumeHandle.fd, { bigint: true });
+          if (openedStats.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+            throw new Error("resume rollout exceeds the safe file size limit");
+          }
+          this.fileSize = Number(openedStats.size);
+        }
         const snapshot = readIndexSnapshot(this.indexPath);
         if (snapshot && snapshot.rolloutPath === this.rolloutPath) {
           const snapshotSeq = validEventSeq(snapshot.snapshotSequenceNumber);
@@ -1203,21 +1687,37 @@ export class SessionStore {
             }
           }
           this.offsetsBySeq.clear();
-          for (const [seq, offset] of Object.entries(snapshot.offsetsBySeq ?? {})) {
+          for (const [seq, offset] of Object.entries(
+            snapshot.offsetsBySeq ?? {},
+          )) {
             const parsedSeq = Number(seq);
             if (Number.isFinite(parsedSeq) && typeof offset === "number") {
               this.offsetsBySeq.set(parsedSeq, offset);
             }
           }
         }
-        const rolloutSeq = maxEventSeqInRollout(this.rolloutPath);
+        const rolloutSeq =
+          resumeHandle === undefined
+            ? maxEventSeqInRollout(this.rolloutPath)
+            : maxEventSeqInRolloutFd(resumeHandle.fd);
         if (rolloutSeq > this.lastSeqWritten) {
           this.lastSeqWritten = rolloutSeq;
         }
+        if (resumeHandle !== undefined) {
+          assertBoundResumeSourceFd(
+            resumeHandle.fd,
+            this.rolloutPath,
+            resumeHandle.identity,
+          );
+          this.resumeSourceFd = resumeHandle.fd;
+          resumeFdToClose = undefined;
+        }
       } else {
         // Fresh file — write session_meta.
+        const canonicalCwd = resolveCanonicalSessionCwd(meta.cwd);
         const sessionMeta: SessionMetaLine = {
           ...meta,
+          ...(canonicalCwd.kind === "ok" ? { cwd: canonicalCwd.cwd } : {}),
           rolloutSchemaVersion: ROLLOUT_SCHEMA_VERSION,
         };
         const item: RolloutItem = {
@@ -1244,8 +1744,25 @@ export class SessionStore {
       this.degraded.start();
       this.opened = true;
     } catch (err) {
-      this.lock.release();
-      throw err;
+      const cleanupErrors: unknown[] = [];
+      if (resumeFdToClose !== undefined) {
+        try {
+          this.resumeSourceClose(resumeFdToClose);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      try {
+        this.lock.release();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length === 0) throw err;
+      throw new AggregateError(
+        [err, ...cleanupErrors],
+        "session store open failed while releasing resume resources",
+        { cause: err },
+      );
     }
   }
 
@@ -1331,6 +1848,7 @@ export class SessionStore {
    */
   append(event: Event, opts: AppendOptions = {}): boolean {
     if (!this.opened || this.closed) return false;
+    this.lastBoundReadProof = undefined;
     // I-27: seq monotonicity check. Caller assigns via EventLog; we
     // just verify.
     if (event.seq !== undefined && event.seq <= this.lastSeqWritten) {
@@ -1501,7 +2019,10 @@ export class SessionStore {
       if (item.type === "event_msg" && item.payload.seq !== undefined) {
         this.offsetsBySeq.set(item.payload.seq, offsetAccumulator);
       }
-      offsetAccumulator += Buffer.byteLength(serializeRolloutItem(item), "utf8");
+      offsetAccumulator += Buffer.byteLength(
+        serializeRolloutItem(item),
+        "utf8",
+      );
     }
     this.boundIndexMap(this.offsetsBySeq);
 
@@ -1588,23 +2109,84 @@ export class SessionStore {
 
   private syncCanonicalFile(): void {
     const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND;
-    const fd = openSync(this.rolloutPath, flags, 0o600);
+    const fd = this.openCanonicalFile(flags, 0o600);
     try {
       this.repairUncertainAppendTail(fd);
       this.fsyncImpl(fd);
+      this.assertCanonicalFileStillBound(fd);
     } finally {
-      closeSync(fd);
+      this.closeCanonicalOperationFd(fd);
     }
   }
 
   private writeBytesAppendOnly(content: string): void {
-    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
-    const fd = openSync(this.rolloutPath, flags, 0o600);
+    this.lastBoundReadProof = undefined;
+    const flags =
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+    const fd = this.openCanonicalFile(flags, 0o600);
     try {
       this.writeAll(fd, content);
+      this.assertCanonicalFileStillBound(fd);
     } finally {
-      closeSync(fd);
+      this.closeCanonicalOperationFd(fd);
     }
+  }
+
+  private openCanonicalFile(flags: number, mode: number): number {
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
+    const expected = this.resumeSourceIdentity;
+    if (expected === undefined) return openSync(this.rolloutPath, flags, mode);
+    if (this.resumeSourceFd !== undefined) {
+      assertBoundResumeSourceFd(
+        this.resumeSourceFd,
+        this.rolloutPath,
+        expected,
+      );
+      return this.resumeSourceFd;
+    }
+    const noFollow =
+      "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+    const before = lstatSync(this.rolloutPath, { bigint: true });
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.nlink !== 1n ||
+      before.dev !== expected.dev ||
+      before.ino !== expected.ino ||
+      realpathSync(this.rolloutPath) !== this.rolloutPath
+    ) {
+      throw new Error("resume rollout source changed before mutation");
+    }
+    const fd = openSync(
+      this.rolloutPath,
+      (flags & ~fsConstants.O_CREAT) | noFollow,
+      mode,
+    );
+    try {
+      assertBoundResumeSourceFd(fd, this.rolloutPath, expected);
+      return fd;
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
+  }
+
+  private closeCanonicalOperationFd(fd: number): void {
+    if (fd !== this.resumeSourceFd) closeSync(fd);
+  }
+
+  private assertCanonicalFileStillBound(fd: number): void {
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
+    if (this.resumeSourceIdentity === undefined) return;
+    assertBoundResumeSourceFd(fd, this.rolloutPath, this.resumeSourceIdentity);
   }
 
   /**
@@ -1633,18 +2215,20 @@ export class SessionStore {
     content: string,
     onRetryFailure?: (err: unknown) => void,
   ): boolean {
-    const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
-    const fd = openSync(this.rolloutPath, flags, 0o600);
+    const flags =
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND;
+    const fd = this.openCanonicalFile(flags, 0o600);
     let firstErr: unknown;
     try {
       this.writeAll(fd, content);
       try {
         this.fsyncImpl(fd);
+        this.assertCanonicalFileStillBound(fd);
       } catch (err) {
         firstErr = err;
       }
     } finally {
-      closeSync(fd);
+      this.closeCanonicalOperationFd(fd);
     }
     if (firstErr !== undefined) {
       // I-38: defer the retry via setTimeout so we don't pin the event
@@ -1664,7 +2248,12 @@ export class SessionStore {
     let offset = 0;
     try {
       while (offset < bytes.length) {
-        const written = this.writeImpl(fd, bytes, offset, bytes.length - offset);
+        const written = this.writeImpl(
+          fd,
+          bytes,
+          offset,
+          bytes.length - offset,
+        );
         if (
           !Number.isSafeInteger(written) ||
           written <= 0 ||
@@ -1719,11 +2308,12 @@ export class SessionStore {
         let retryErr: unknown;
         try {
           const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND;
-          const rfd = openSync(this.rolloutPath, flags, 0o600);
+          const rfd = this.openCanonicalFile(flags, 0o600);
           try {
             this.fsyncImpl(rfd);
+            this.assertCanonicalFileStillBound(rfd);
           } finally {
-            closeSync(rfd);
+            this.closeCanonicalOperationFd(rfd);
           }
         } catch (err2) {
           retryErr = err2;
@@ -1800,16 +2390,325 @@ export class SessionStore {
    * outside this module can route through the same durability dance.
    */
   rewriteRolloutAtomically(bytes: string | Buffer): void {
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
     if (!this.opened || this.closed) {
       throw new Error("rewriteRolloutAtomically called on unopened store");
     }
-    rewriteAtomically(this.rolloutPath, bytes);
+    if (this.resumeSourceFd !== undefined) {
+      this.rewriteDescriptorBoundRollout(bytes);
+    } else {
+      rewriteAtomically(this.rolloutPath, bytes);
+    }
     // Refresh the in-memory EOF for subsequent appends. Callers using raw
     // bytes own any semantic index changes; rewriteRolloutItemsAtomically()
     // rebuilds offsets and sequence state from its typed item sequence.
-    this.fileSize = typeof bytes === "string"
-      ? Buffer.byteLength(bytes, "utf8")
-      : bytes.byteLength;
+    this.fileSize =
+      typeof bytes === "string"
+        ? Buffer.byteLength(bytes, "utf8")
+        : bytes.byteLength;
+  }
+
+  private rewriteDescriptorBoundRollout(bytes: string | Buffer): void {
+    const sourceFd = this.resumeSourceFd;
+    const sourceIdentity = this.resumeSourceIdentity;
+    if (sourceFd === undefined || sourceIdentity === undefined) {
+      throw new Error(
+        "resumed rollout descriptor is unavailable for replacement",
+      );
+    }
+    const expectedSourceRead = this.lastBoundReadProof;
+    if (expectedSourceRead === undefined) {
+      throw new Error(
+        "descriptor-bound rollout rewrite requires an exact source read proof",
+      );
+    }
+    assertBoundResumeSourceReadProof(
+      sourceFd,
+      this.rolloutPath,
+      sourceIdentity,
+      expectedSourceRead,
+    );
+    const encoded =
+      typeof bytes === "string" ? Buffer.from(bytes, "utf8") : bytes;
+    const temporaryPath = this.uniqueBoundRewritePath();
+    const noFollow =
+      "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+    let targetFd: number | undefined = openSync(
+      temporaryPath,
+      fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      0o600,
+    );
+    let published = false;
+    try {
+      let offset = 0;
+      while (offset < encoded.byteLength) {
+        const written = writeSync(
+          targetFd,
+          encoded,
+          offset,
+          encoded.byteLength - offset,
+        );
+        if (written <= 0)
+          throw new Error("short write during resumed rollout rewrite");
+        offset += written;
+      }
+      fsyncSync(targetFd);
+      const expectedSha256 = createHash("sha256").update(encoded).digest("hex");
+      this.assertPreparedReplacement(
+        targetFd,
+        temporaryPath,
+        encoded.byteLength,
+        expectedSha256,
+      );
+      closeSync(targetFd);
+      targetFd = undefined;
+      this.publishDescriptorBoundReplacement({
+        temporaryPath,
+        expectedSize: encoded.byteLength,
+        expectedSha256,
+        expectedSourceProof: {
+          kind: "content",
+          read: expectedSourceRead,
+        },
+      });
+      this.lastBoundReadProof = undefined;
+      published = true;
+    } catch (error) {
+      if (targetFd !== undefined) {
+        try {
+          closeSync(targetFd);
+        } catch {
+          /* best effort */
+        }
+        targetFd = undefined;
+      }
+      throw error;
+    } finally {
+      if (!published) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {
+          /* best effort */
+        }
+      }
+    }
+  }
+
+  private uniqueBoundRewritePath(): string {
+    return join(
+      this.sessionDir,
+      `.${basename(this.rolloutPath)}.rewrite-${process.pid}-${randomUUID()}.tmp`,
+    );
+  }
+
+  private assertPreparedReplacement(
+    fd: number,
+    path: string,
+    expectedSize: number,
+    expectedSha256: string,
+  ): void {
+    const opened = fstatSync(fd, { bigint: true });
+    const observed = lstatSync(path, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened) ||
+      observed.dev !== opened.dev ||
+      observed.ino !== opened.ino ||
+      observed.size !== opened.size ||
+      opened.size !== BigInt(expectedSize) ||
+      realpathSync(path) !== path ||
+      sha256OfDescriptor(fd, expectedSize) !== expectedSha256
+    ) {
+      throw new Error("prepared resumed rollout replacement failed validation");
+    }
+  }
+
+  private publishDescriptorBoundReplacement(params: {
+    readonly temporaryPath: string;
+    readonly expectedSize: number;
+    readonly expectedSha256: string;
+    readonly expectedSourceProof: ResumeSourceRewriteProof;
+  }): void {
+    const oldFd = this.resumeSourceFd;
+    const oldIdentity = this.resumeSourceIdentity;
+    if (oldFd === undefined || oldIdentity === undefined) {
+      throw new Error(
+        "resumed rollout descriptor is unavailable for replacement",
+      );
+    }
+    const preparedHandle = openRegularBoundResumeSource(params.temporaryPath);
+    let expectedReplacementIdentity: ResumeSourceIdentity;
+    try {
+      this.assertPreparedReplacement(
+        preparedHandle.fd,
+        params.temporaryPath,
+        params.expectedSize,
+        params.expectedSha256,
+      );
+      expectedReplacementIdentity = preparedHandle.identity;
+    } finally {
+      closeSync(preparedHandle.fd);
+    }
+    const directoryProof = openBoundDirectory(this.sessionDir);
+    const recoveryPath = join(
+      this.sessionDir,
+      `rollout-recovery-${Date.now()}-${randomUUID()}-${this.sessionId}.jsonl`,
+    );
+    const displacedPath = this.uniqueBoundRewritePath();
+    let nextHandle: ReturnType<typeof openRegularBoundResumeSource> | undefined;
+    let oldMoved = false;
+    let newPublished = false;
+    try {
+      assertBoundDirectory(directoryProof, this.sessionDir);
+      assertBoundResumeSourceRewriteProof(
+        oldFd,
+        this.rolloutPath,
+        oldIdentity,
+        params.expectedSourceProof,
+      );
+      this.beforeBoundResumeRewritePublishForTestingOnly?.();
+      assertBoundDirectory(directoryProof, this.sessionDir);
+      assertBoundResumeSourceRewriteProof(
+        oldFd,
+        this.rolloutPath,
+        oldIdentity,
+        params.expectedSourceProof,
+      );
+
+      // Two directory-entry renames avoid replace-over-open failures on
+      // Windows while the old no-follow descriptor remains our authority.
+      // The recovery name is itself a valid rollout candidate, so a crash in
+      // the narrow gap before the new generation is published remains cold-
+      // resumable rather than appearing to have lost the session.
+      this.boundResumeRewriteRename(this.rolloutPath, recoveryPath);
+      oldMoved = true;
+      this.afterBoundResumeRewriteStepForTestingOnly?.("old_moved");
+      assertBoundDirectory(directoryProof, this.sessionDir);
+      assertBoundResumeSourceFd(oldFd, recoveryPath, oldIdentity);
+
+      this.boundResumeRewriteRename(params.temporaryPath, this.rolloutPath);
+      newPublished = true;
+      this.afterBoundResumeRewriteStepForTestingOnly?.("new_published");
+      const publishedStats = lstatSync(this.rolloutPath, { bigint: true });
+      if (
+        publishedStats.dev !== expectedReplacementIdentity.dev ||
+        publishedStats.ino !== expectedReplacementIdentity.ino
+      ) {
+        throw new Error(
+          "resumed rollout replacement changed during publication",
+        );
+      }
+      this.syncBoundResumeRewriteDirectory(directoryProof.fd);
+      this.afterBoundResumeRewriteStepForTestingOnly?.("directory_synced");
+      assertBoundDirectory(directoryProof, this.sessionDir);
+      nextHandle = openRegularBoundResumeSource(this.rolloutPath);
+      this.afterBoundResumeRewriteStepForTestingOnly?.("new_opened");
+      this.assertPreparedReplacement(
+        nextHandle.fd,
+        this.rolloutPath,
+        params.expectedSize,
+        params.expectedSha256,
+      );
+      const meta = readAndValidateSchemaVersionFd(nextHandle.fd);
+      if (
+        meta === null ||
+        meta.sessionId !== this.sessionId ||
+        !sessionCwdMatches(meta.cwd, this.cwd)
+      ) {
+        throw new Error(
+          "resumed rollout replacement changed canonical metadata",
+        );
+      }
+      this.afterBoundResumeRewriteStepForTestingOnly?.("metadata_validated");
+      this.afterBoundResumeRewriteStepForTestingOnly?.("before_old_close");
+      this.resumeSourceFd = nextHandle.fd;
+      this.resumeSourceIdentity = nextHandle.identity;
+      nextHandle = undefined;
+      // The new fd is fully validated and durably named before old authority
+      // is released. A late close report must not turn a committed replacement
+      // into an apparent failure with an orphaned writer.
+      try {
+        closeSync(oldFd);
+      } catch {
+        /* new canonical fd owns authority */
+      }
+      try {
+        this.boundResumeRewriteUnlink(recoveryPath);
+      } catch {
+        /* recoverable stale generation; normal rollout wins lookup */
+      }
+      try {
+        this.syncBoundResumeRewriteDirectory(directoryProof.fd);
+      } catch {
+        /* replacement was already committed before cleanup */
+      }
+    } catch (error) {
+      if (nextHandle !== undefined) {
+        closeSync(nextHandle.fd);
+        nextHandle = undefined;
+      }
+      if (oldMoved) {
+        try {
+          assertBoundDirectory(directoryProof, this.sessionDir);
+          if (newPublished && existsSync(this.rolloutPath)) {
+            const current = lstatSync(this.rolloutPath, { bigint: true });
+            if (
+              current.dev !== expectedReplacementIdentity.dev ||
+              current.ino !== expectedReplacementIdentity.ino
+            ) {
+              throw new Error(
+                "published rollout changed before replacement rollback",
+              );
+            }
+            this.boundResumeRewriteRename(this.rolloutPath, displacedPath);
+          }
+          if (!existsSync(this.rolloutPath) && existsSync(recoveryPath)) {
+            this.boundResumeRewriteRename(recoveryPath, this.rolloutPath);
+          }
+          this.syncBoundResumeRewriteDirectory(directoryProof.fd);
+          assertBoundResumeSourceFd(oldFd, this.rolloutPath, oldIdentity);
+          try {
+            unlinkSync(displacedPath);
+          } catch {
+            /* best effort */
+          }
+        } catch (rollbackError) {
+          this.resumeSourceFaulted = true;
+          this.resumeSourceFd = undefined;
+          this.resumeSourceIdentity = undefined;
+          try {
+            closeSync(oldFd);
+          } catch {
+            /* authority already revoked */
+          }
+          throw new AggregateError(
+            [error, rollbackError],
+            "resumed rollout replacement failed and could not restore its prior generation",
+            { cause: error },
+          );
+        }
+      }
+      throw error;
+    } finally {
+      if (nextHandle !== undefined) closeSync(nextHandle.fd);
+      closeSync(directoryProof.fd);
+    }
+  }
+
+  private syncBoundResumeRewriteDirectory(fd: number): void {
+    try {
+      this.boundResumeRewriteDirectorySync(fd);
+    } catch (error) {
+      if (isUnsupportedDirectorySync(error, this.boundResumeRewritePlatform)) {
+        return;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1830,11 +2729,14 @@ export class SessionStore {
     ) {
       throw new Error("exact rollout line count does not match item count");
     }
-    const lines = exactEncodedLines === undefined
-      ? items.map(serializeRolloutItem)
-      : [...exactEncodedLines];
+    const lines =
+      exactEncodedLines === undefined
+        ? items.map(serializeRolloutItem)
+        : [...exactEncodedLines];
     if (lines.some((line) => !line.endsWith("\n"))) {
-      throw new Error("exact rollout lines must include their newline terminator");
+      throw new Error(
+        "exact rollout lines must include their newline terminator",
+      );
     }
     const nextOffsetsBySeq = new Map<EventSeq, number>();
     let nextLastSeq: EventSeq = 0;
@@ -1873,6 +2775,11 @@ export class SessionStore {
     exclusions: readonly RolloutPhysicalLineExclusion[],
     digestDomain: string,
   ): void {
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
     if (!this.opened || this.closed) {
       throw new Error("streaming rollout rewrite requires an open store");
     }
@@ -1882,32 +2789,69 @@ export class SessionStore {
     const byLine = new Map<number, (typeof exclusions)[number]>();
     for (const exclusion of exclusions) {
       const existing = byLine.get(exclusion.lineNumber);
-      if (existing !== undefined &&
-          (existing.encodedBytes !== exclusion.encodedBytes ||
-            existing.sha256 !== exclusion.sha256 ||
-            existing.itemType !== exclusion.itemType ||
-            (existing.itemType === "compaction_payload_chunk" &&
-              exclusion.itemType === "compaction_payload_chunk" &&
-              (existing.attemptId !== exclusion.attemptId ||
-                existing.payloadKind !== exclusion.payloadKind)))) {
+      if (
+        existing !== undefined &&
+        (existing.encodedBytes !== exclusion.encodedBytes ||
+          existing.sha256 !== exclusion.sha256 ||
+          existing.itemType !== exclusion.itemType ||
+          (existing.itemType === "compaction_payload_chunk" &&
+            exclusion.itemType === "compaction_payload_chunk" &&
+            (existing.attemptId !== exclusion.attemptId ||
+              existing.payloadKind !== exclusion.payloadKind)))
+      ) {
         throw new Error("conflicting physical-row exclusion authority");
       }
       byLine.set(exclusion.lineNumber, exclusion);
     }
     if (byLine.size === 0) return;
 
-    const temporaryPath = `${this.rolloutPath}.tmp`;
-    try { unlinkSync(temporaryPath); } catch { /* no stale temporary */ }
-    const sourceFd = openSync(this.rolloutPath, fsConstants.O_RDONLY);
+    const boundSource = this.resumeSourceFd !== undefined;
+    const temporaryPath = boundSource
+      ? this.uniqueBoundRewritePath()
+      : `${this.rolloutPath}.tmp`;
+    if (!boundSource) {
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        /* no stale temporary */
+      }
+    }
+    const sourceFd =
+      this.resumeSourceFd ?? openSync(this.rolloutPath, fsConstants.O_RDONLY);
+    if (boundSource) this.assertCanonicalFileStillBound(sourceFd);
+    const expectedSourceVersion = boundSource
+      ? snapshotBoundResumeSource(
+          sourceFd,
+          this.rolloutPath,
+          this.resumeSourceIdentity!,
+        )
+      : undefined;
+    if (
+      expectedSourceVersion !== undefined &&
+      expectedSourceVersion.size > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      throw new Error(
+        "resume rollout exceeds the safe streaming rewrite size limit",
+      );
+    }
+    const sourceLimit =
+      expectedSourceVersion === undefined
+        ? undefined
+        : Number(expectedSourceVersion.size);
     let targetFd: number;
     try {
+      const noFollow =
+        "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
       targetFd = openSync(
         temporaryPath,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        fsConstants.O_RDWR |
+          fsConstants.O_CREAT |
+          fsConstants.O_EXCL |
+          noFollow,
         0o600,
       );
     } catch (error) {
-      closeSync(sourceFd);
+      if (!boundSource) closeSync(sourceFd);
       throw error;
     }
     const matched = new Set<number>();
@@ -1915,9 +2859,12 @@ export class SessionStore {
     let nextLastSeq: EventSeq = 0;
     let latestMeta: SessionMetaLine | undefined;
     let outputOffset = 0;
+    let sourcePosition = 0;
+    const outputHash = createHash("sha256");
     let lineNumber = 0;
     let pending = Buffer.alloc(0);
     const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
+    let streamingReadHookCalled = false;
     const writePhysical = (physical: Buffer): void => {
       lineNumber += 1;
       const exclusion = byLine.get(lineNumber);
@@ -1925,20 +2872,25 @@ export class SessionStore {
       const item = parseRolloutLine(
         new TextDecoder("utf-8", { fatal: true }).decode(content),
       );
-      if (item === null) throw new Error("canonical rollout rewrite found a blank row");
+      if (item === null)
+        throw new Error("canonical rollout rewrite found a blank row");
       if (exclusion !== undefined) {
         const digest = createHash("sha256")
           .update(digestDomain, "utf8")
           .update(physical)
           .digest("hex");
-        if (physical.byteLength !== exclusion.encodedBytes ||
-            digest !== exclusion.sha256 ||
-            item.type !== exclusion.itemType ||
-            (exclusion.itemType === "compaction_payload_chunk" &&
-              (item.type !== "compaction_payload_chunk" ||
-                item.payload.attempt_id !== exclusion.attemptId ||
-                item.payload.payload_kind !== exclusion.payloadKind))) {
-          throw new Error("physical-row exclusion no longer matches canonical source");
+        if (
+          physical.byteLength !== exclusion.encodedBytes ||
+          digest !== exclusion.sha256 ||
+          item.type !== exclusion.itemType ||
+          (exclusion.itemType === "compaction_payload_chunk" &&
+            (item.type !== "compaction_payload_chunk" ||
+              item.payload.attempt_id !== exclusion.attemptId ||
+              item.payload.payload_kind !== exclusion.payloadKind))
+        ) {
+          throw new Error(
+            "physical-row exclusion no longer matches canonical source",
+          );
         }
         matched.add(lineNumber);
         return;
@@ -1951,9 +2903,11 @@ export class SessionStore {
           written,
           physical.byteLength - written,
         );
-        if (count <= 0) throw new Error("short write during streaming rollout rewrite");
+        if (count <= 0)
+          throw new Error("short write during streaming rollout rewrite");
         written += count;
       }
+      outputHash.update(physical);
       if (item.type === "event_msg" && item.payload.seq !== undefined) {
         nextOffsetsBySeq.set(item.payload.seq, outputOffset);
         nextLastSeq = Math.max(nextLastSeq, item.payload.seq);
@@ -1965,11 +2919,35 @@ export class SessionStore {
     let rewriteError: unknown;
     try {
       for (;;) {
-        const bytesRead = readSync(sourceFd, chunk, 0, chunk.byteLength, null);
-        if (bytesRead === 0) break;
-        const available = pending.byteLength === 0
-          ? chunk.subarray(0, bytesRead)
-          : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
+        const remaining =
+          sourceLimit === undefined
+            ? chunk.byteLength
+            : sourceLimit - sourcePosition;
+        if (remaining === 0) break;
+        const bytesRead = readSync(
+          sourceFd,
+          chunk,
+          0,
+          Math.min(chunk.byteLength, remaining),
+          sourcePosition,
+        );
+        if (bytesRead === 0) {
+          if (sourceLimit !== undefined) {
+            throw new Error(
+              "resume rollout source changed during streaming rewrite",
+            );
+          }
+          break;
+        }
+        sourcePosition += bytesRead;
+        if (boundSource && !streamingReadHookCalled) {
+          streamingReadHookCalled = true;
+          this.afterBoundResumeStreamingRewriteReadForTestingOnly?.();
+        }
+        const available =
+          pending.byteLength === 0
+            ? chunk.subarray(0, bytesRead)
+            : Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
         let start = 0;
         for (;;) {
           const newline = available.indexOf(0x0a, start);
@@ -1979,41 +2957,95 @@ export class SessionStore {
         }
         pending = Buffer.from(available.subarray(start));
         if (pending.byteLength > MAX_RECOVERY_CANONICAL_LINE_BYTES) {
-          throw new Error("canonical row exceeds the streaming rewrite line limit");
+          throw new Error(
+            "canonical row exceeds the streaming rewrite line limit",
+          );
         }
       }
       if (pending.byteLength !== 0) {
         throw new Error("canonical rollout ends with an unterminated row");
       }
       if (matched.size !== byLine.size) {
-        throw new Error("streaming rewrite did not find every authorized source row");
+        throw new Error(
+          "streaming rewrite did not find every authorized source row",
+        );
+      }
+      if (expectedSourceVersion !== undefined) {
+        if (readSync(sourceFd, chunk, 0, 1, sourcePosition) !== 0) {
+          throw new Error(
+            "resume rollout source changed during streaming rewrite",
+          );
+        }
+        assertBoundResumeSourceVersion(
+          sourceFd,
+          this.rolloutPath,
+          this.resumeSourceIdentity!,
+          expectedSourceVersion,
+        );
       }
       fsyncSync(targetFd);
     } catch (error) {
       rewriteFailed = true;
       rewriteError = error;
     } finally {
-      closeSync(sourceFd);
+      if (!boundSource) closeSync(sourceFd);
       closeSync(targetFd);
     }
     if (rewriteFailed) {
       // Windows refuses to unlink an open file, so cleanup must happen only
       // after both descriptors are closed.
-      try { unlinkSync(temporaryPath); } catch { /* best effort */ }
+      try {
+        unlinkSync(temporaryPath);
+      } catch {
+        /* best effort */
+      }
       throw rewriteError;
     }
-    try {
-      renameSync(temporaryPath, this.rolloutPath);
-    } catch (error) {
-      try { unlinkSync(temporaryPath); } catch { /* best effort */ }
-      throw error;
+    if (boundSource) {
+      try {
+        this.publishDescriptorBoundReplacement({
+          temporaryPath,
+          expectedSize: outputOffset,
+          expectedSha256: outputHash.digest("hex"),
+          expectedSourceProof: {
+            kind: "version",
+            version: expectedSourceVersion!,
+          },
+        });
+      } catch (error) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {
+          /* best effort */
+        }
+        throw error;
+      }
+    } else {
+      try {
+        renameSync(temporaryPath, this.rolloutPath);
+      } catch (error) {
+        try {
+          unlinkSync(temporaryPath);
+        } catch {
+          /* best effort */
+        }
+        throw error;
+      }
+      try {
+        const directoryFd = openSync(
+          dirname(this.rolloutPath),
+          fsConstants.O_RDONLY,
+        );
+        try {
+          fsyncSync(directoryFd);
+        } finally {
+          closeSync(directoryFd);
+        }
+      } catch {
+        /* best effort on filesystems that cannot fsync directories */
+      }
     }
-    try {
-      const directoryFd = openSync(dirname(this.rolloutPath), fsConstants.O_RDONLY);
-      try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
-    } catch {
-      /* best effort on filesystems that cannot fsync directories */
-    }
+    this.lastBoundReadProof = undefined;
     this.fileSize = outputOffset;
     this.offsetsBySeq.clear();
     for (const [sequence, offset] of nextOffsetsBySeq) {
@@ -2039,7 +3071,24 @@ export class SessionStore {
       throw new Error(`unsupported rollout schema upgrade ${targetVersion}`);
     }
     this.syncCanonicalTail();
-    const physicalHeader = readBoundedCanonicalHeader(this.rolloutPath);
+    const boundFd = this.resumeSourceFd;
+    if (boundFd !== undefined) this.assertCanonicalFileStillBound(boundFd);
+    this.beforeBoundResumeSchemaUpgradeReadForTestingOnly?.();
+    let physicalHeader: Buffer;
+    let boundBytes: Buffer | undefined;
+    try {
+      physicalHeader =
+        boundFd === undefined
+          ? readBoundedCanonicalHeader(this.rolloutPath)
+          : readBoundedCanonicalHeaderFd(boundFd);
+      boundBytes =
+        boundFd === undefined
+          ? undefined
+          : this.readResumeDescriptorBytes(boundFd);
+    } finally {
+      this.afterBoundResumeSchemaUpgradeReadForTestingOnly?.();
+    }
+    if (boundFd !== undefined) this.assertCanonicalFileStillBound(boundFd);
     const headerText = new TextDecoder("utf-8", { fatal: true }).decode(
       physicalHeader.subarray(0, physicalHeader.byteLength - 1),
     );
@@ -2058,7 +3107,8 @@ export class SessionStore {
     // Legacy upgrades are one-time migrations. Keep the common current-schema
     // C2 path header-bounded; the A3 migration path still owns its full atomic
     // rewrite and exact typed-index rebuild.
-    const bytes = readFileSync(this.rolloutPath);
+    const bytes =
+      boundFd === undefined ? readFileSync(this.rolloutPath) : boundBytes!;
     if (!bytes.subarray(0, physicalHeader.byteLength).equals(physicalHeader)) {
       throw new Error("canonical rollout header changed during schema upgrade");
     }
@@ -2192,10 +3242,61 @@ export class SessionStore {
     return this.degraded.isDegraded;
   }
 
+  /** Current canonical inode identity under the lifetime writer lease. */
+  canonicalSourceIdentity(): {
+    readonly rolloutPath: string;
+    readonly dev: string;
+    readonly ino: string;
+  } {
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
+    const fd = this.resumeSourceFd;
+    if (fd !== undefined && this.resumeSourceIdentity !== undefined) {
+      assertBoundResumeSourceFd(
+        fd,
+        this.rolloutPath,
+        this.resumeSourceIdentity,
+      );
+      const stats = fstatSync(fd, { bigint: true });
+      return {
+        rolloutPath: this.rolloutPath,
+        dev: stats.dev.toString(10),
+        ino: stats.ino.toString(10),
+      };
+    }
+    const stats = lstatSync(this.rolloutPath, { bigint: true });
+    if (
+      !stats.isFile() ||
+      stats.isSymbolicLink() ||
+      stats.nlink !== 1n ||
+      !hasSupportedFileIdentity(stats) ||
+      realpathSync(this.rolloutPath) !== this.rolloutPath
+    ) {
+      throw new Error("canonical rollout source is unavailable or unsafe");
+    }
+    return {
+      rolloutPath: this.rolloutPath,
+      dev: stats.dev.toString(10),
+      ino: stats.ino.toString(10),
+    };
+  }
+
   /** Read the rollout file fully and return the parsed items. */
   readAll(): RolloutItem[] {
-    if (!existsSync(this.rolloutPath)) return [];
-    const content = readFileSync(this.rolloutPath, "utf8");
+    if (this.resumeSourceFaulted) {
+      throw new Error(
+        "resumed rollout writer authority was revoked after replacement failure",
+      );
+    }
+    const content =
+      this.resumeSourceFd !== undefined
+        ? this.readBoundResumeSourceUtf8()
+        : existsSync(this.rolloutPath)
+          ? readFileSync(this.rolloutPath, "utf8")
+          : "";
     const items: RolloutItem[] = [];
     let malformed = 0;
     for (const line of content.split("\n")) {
@@ -2213,10 +3314,85 @@ export class SessionStore {
     return hydrateManifestCompactionItems(items);
   }
 
+  private readBoundResumeSourceUtf8(): string {
+    return this.readBoundResumeSourceBytes().toString("utf8");
+  }
+
+  private readBoundResumeSourceBytes(): Buffer {
+    const fd = this.resumeSourceFd;
+    if (fd === undefined || this.resumeSourceIdentity === undefined) {
+      throw new Error("resume rollout descriptor is unavailable");
+    }
+    assertBoundResumeSourceFd(fd, this.rolloutPath, this.resumeSourceIdentity);
+    const bytes = this.readResumeDescriptorBytes(fd);
+    assertBoundResumeSourceFd(fd, this.rolloutPath, this.resumeSourceIdentity);
+    return bytes;
+  }
+
+  private readResumeDescriptorBytes(fd: number): Buffer {
+    const boundVersion =
+      fd === this.resumeSourceFd && this.resumeSourceIdentity !== undefined
+        ? snapshotResumeSourceFd(fd, this.resumeSourceIdentity)
+        : undefined;
+    const stats = fstatSync(fd, { bigint: true });
+    const size = boundVersion?.size ?? stats.size;
+    if (size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new Error("resume rollout exceeds the safe read size limit");
+    }
+    const bytes = Buffer.alloc(Number(size));
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const read = readSync(
+        fd,
+        bytes,
+        offset,
+        bytes.byteLength - offset,
+        offset,
+      );
+      if (read === 0) {
+        throw new Error("resume rollout changed while being read");
+      }
+      offset += read;
+    }
+    const after = fstatSync(fd, { bigint: true });
+    if (
+      after.dev !== stats.dev ||
+      after.ino !== stats.ino ||
+      after.size !== size ||
+      after.nlink !== stats.nlink ||
+      after.mtimeNs !== stats.mtimeNs ||
+      after.ctimeNs !== stats.ctimeNs
+    ) {
+      throw new Error("resume rollout changed while being read");
+    }
+    if (boundVersion !== undefined) {
+      const proof: ResumeSourceReadProof = {
+        dev: boundVersion.dev,
+        ino: boundVersion.ino,
+        nlink: boundVersion.nlink,
+        size: boundVersion.size,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+      assertResumeSourceFdReadProof(fd, this.resumeSourceIdentity!, proof);
+      this.lastBoundReadProof = proof;
+    }
+    return bytes;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (this.pending.length > 0) this.flushBatch(true);
+    const errors: unknown[] = [];
+    const capture = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    capture(() => {
+      if (this.pending.length > 0) this.flushBatch(true);
+    });
     // gaphunt3 #19: final best-effort drain of the degraded ring buffer
     // before stopping its retry timer. If the disk recovered after an
     // I-12/I-38 failure but the 30s retry tick has not yet fired, those
@@ -2224,32 +3400,49 @@ export class SessionStore {
     // response_item) would otherwise be silently dropped on shutdown.
     // Drain + one synchronous append; on persistent failure accept the
     // loss (the disk is genuinely still unavailable).
-    if (this.degraded.isDegraded) {
-      const remaining = this.degraded.drain();
-      if (remaining.length > 0) {
-        try {
-          const lines = remaining.map(serializeRolloutItem).join("");
-          this.writeBytesWithFsync(lines);
-          this.fileSize += Buffer.byteLength(lines, "utf8");
-          this.trajectoryExport.writeItems(remaining);
-        } catch (err) {
-          this.emitDiagnostic({
-            at: Date.now(),
-            level: "error",
-            cause: "rollout_degraded",
-            message: `${(err as { code?: string }).code ?? "unknown"} during close drain — ${remaining.length} buffered events lost`,
-          });
+    capture(() => {
+      if (this.degraded.isDegraded) {
+        const remaining = this.degraded.drain();
+        if (remaining.length > 0) {
+          try {
+            const lines = remaining.map(serializeRolloutItem).join("");
+            this.writeBytesWithFsync(lines);
+            this.fileSize += Buffer.byteLength(lines, "utf8");
+            this.trajectoryExport.writeItems(remaining);
+          } catch (err) {
+            this.emitDiagnostic({
+              at: Date.now(),
+              level: "error",
+              cause: "rollout_degraded",
+              message: `${(err as { code?: string }).code ?? "unknown"} during close drain — ${remaining.length} buffered events lost`,
+            });
+          }
         }
       }
-    }
-    this.degraded.stop();
+    });
+    capture(() => this.degraded.stop());
     // Write index snapshot atomically (I-24 tmp+rename for the
     // snapshot — the rollout body stays append-only with tail
     // truncation). I-25 says snapshot is advisory; we still emit it
     // as a reconstruction speedup.
-    this.writeIndexSnapshot();
-    this.trajectoryExport.close();
-    this.lock.release();
+    capture(() => this.writeIndexSnapshot());
+    capture(() => this.trajectoryExport.close());
+    capture(() => {
+      if (this.resumeSourceFd === undefined) return;
+      const resumeFd = this.resumeSourceFd;
+      this.resumeSourceFd = undefined;
+      this.resumeSourceIdentity = undefined;
+      closeSync(resumeFd);
+    });
+    capture(() => this.lock.release());
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(
+        errors,
+        "session store close failed while releasing canonical resources",
+        { cause: errors[0] },
+      );
+    }
   }
 
   /**
@@ -2326,6 +3519,333 @@ export class SessionStore {
     const dir = getSessionDir(cwd, sessionId, projectRootMarkers);
     mkdirSync(dir, { recursive: true });
     accessSync(dir, fsConstants.W_OK);
+  }
+}
+
+interface ResumeSourceIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+interface ResumeSourceVersion extends ResumeSourceIdentity {
+  readonly nlink: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+}
+
+interface ResumeSourceReadProof extends ResumeSourceIdentity {
+  readonly nlink: bigint;
+  readonly size: bigint;
+  readonly sha256: string;
+}
+
+type ResumeSourceRewriteProof =
+  | { readonly kind: "version"; readonly version: ResumeSourceVersion }
+  | { readonly kind: "content"; readonly read: ResumeSourceReadProof };
+
+interface BoundDirectoryProof {
+  readonly fd: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+function openBoundDirectory(path: string): BoundDirectoryProof {
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  const directoryOnly =
+    "O_DIRECTORY" in fsConstants ? (fsConstants.O_DIRECTORY as number) : 0;
+  const before = lstatSync(path, { bigint: true });
+  if (
+    !before.isDirectory() ||
+    before.isSymbolicLink() ||
+    !hasSupportedFileIdentity(before) ||
+    realpathSync(path) !== path
+  ) {
+    throw new Error("resume rollout parent directory is unsafe");
+  }
+  const fd = openSync(path, fsConstants.O_RDONLY | noFollow | directoryOnly);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (
+      !opened.isDirectory() ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino
+    ) {
+      throw new Error("resume rollout parent directory changed while opening");
+    }
+    return { fd, dev: opened.dev, ino: opened.ino };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function assertBoundDirectory(proof: BoundDirectoryProof, path: string): void {
+  const opened = fstatSync(proof.fd, { bigint: true });
+  const observed = lstatSync(path, { bigint: true });
+  if (
+    !opened.isDirectory() ||
+    !observed.isDirectory() ||
+    observed.isSymbolicLink() ||
+    !hasSupportedFileIdentity(opened) ||
+    !hasSupportedFileIdentity(observed) ||
+    opened.dev !== proof.dev ||
+    opened.ino !== proof.ino ||
+    observed.dev !== proof.dev ||
+    observed.ino !== proof.ino ||
+    realpathSync(path) !== path
+  ) {
+    throw new Error(
+      "resume rollout parent directory changed during replacement",
+    );
+  }
+}
+
+function sha256OfDescriptor(fd: number, size: number): string {
+  const hash = createHash("sha256");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (position < size) {
+    const bytesRead = readSync(
+      fd,
+      chunk,
+      0,
+      Math.min(chunk.byteLength, size - position),
+      position,
+    );
+    if (bytesRead === 0) {
+      throw new Error("resumed rollout replacement changed while hashing");
+    }
+    hash.update(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return hash.digest("hex");
+}
+
+function adoptRegularBoundResumeSource(
+  path: string,
+  lease: ResumeRolloutDescriptorLease,
+): {
+  readonly fd: number;
+  readonly identity: ResumeSourceIdentity;
+} {
+  const fd = lease.claim();
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened)
+    ) {
+      throw new Error(
+        "resume rollout descriptor is not a supported regular file",
+      );
+    }
+    const identity = { dev: opened.dev, ino: opened.ino };
+    assertBoundResumeSourceFd(fd, path, identity);
+    return { fd, identity };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function openRegularBoundResumeSource(path: string): {
+  readonly fd: number;
+  readonly identity: ResumeSourceIdentity;
+} {
+  const pathStats = lstatSync(path, { bigint: true });
+  if (
+    !pathStats.isFile() ||
+    pathStats.isSymbolicLink() ||
+    pathStats.nlink !== 1n ||
+    !hasSupportedFileIdentity(pathStats)
+  ) {
+    throw new Error("resume rollout source must be a regular non-symlink file");
+  }
+  if (realpathSync(path) !== path) {
+    throw new Error("resume rollout source may not traverse symbolic links");
+  }
+  const noFollow =
+    "O_NOFOLLOW" in fsConstants ? (fsConstants.O_NOFOLLOW as number) : 0;
+  const fd = openSync(
+    path,
+    fsConstants.O_RDWR | fsConstants.O_APPEND | noFollow,
+  );
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== pathStats.dev ||
+      opened.ino !== pathStats.ino
+    ) {
+      throw new Error("resume rollout source changed while being opened");
+    }
+    return { fd, identity: { dev: opened.dev, ino: opened.ino } };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+function assertBoundResumeSourceFd(
+  fd: number,
+  path: string,
+  expected: ResumeSourceIdentity,
+): void {
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const observed = lstatSync(path, { bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      !hasSupportedFileIdentity(opened) ||
+      opened.dev !== expected.dev ||
+      opened.ino !== expected.ino ||
+      !observed.isFile() ||
+      observed.isSymbolicLink() ||
+      observed.nlink !== 1n ||
+      !hasSupportedFileIdentity(observed) ||
+      observed.dev !== expected.dev ||
+      observed.ino !== expected.ino ||
+      realpathSync(path) !== path
+    ) {
+      throw new Error("resume rollout source changed during validation");
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message === "resume rollout source changed during validation"
+    ) {
+      throw error;
+    }
+    throw new Error("resume rollout source changed during validation");
+  }
+}
+
+function snapshotBoundResumeSource(
+  fd: number,
+  path: string,
+  identity: ResumeSourceIdentity,
+): ResumeSourceVersion {
+  assertBoundResumeSourceFd(fd, path, identity);
+  return snapshotResumeSourceFd(fd, identity);
+}
+
+function snapshotResumeSourceFd(
+  fd: number,
+  identity: ResumeSourceIdentity,
+): ResumeSourceVersion {
+  const stats = fstatSync(fd, { bigint: true });
+  if (
+    !stats.isFile() ||
+    stats.nlink !== 1n ||
+    !hasSupportedFileIdentity(stats) ||
+    stats.dev !== identity.dev ||
+    stats.ino !== identity.ino
+  ) {
+    throw new Error("resume rollout source changed during validation");
+  }
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    nlink: stats.nlink,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+  };
+}
+
+function assertBoundResumeSourceVersion(
+  fd: number,
+  path: string,
+  identity: ResumeSourceIdentity,
+  expected: ResumeSourceVersion,
+): void {
+  assertBoundResumeSourceFd(fd, path, identity);
+  assertResumeSourceFdVersion(fd, identity, expected);
+}
+
+function assertBoundResumeSourceReadProof(
+  fd: number,
+  path: string,
+  identity: ResumeSourceIdentity,
+  expected: ResumeSourceReadProof,
+): void {
+  assertBoundResumeSourceFd(fd, path, identity);
+  assertResumeSourceFdReadProof(fd, identity, expected);
+}
+
+function assertBoundResumeSourceRewriteProof(
+  fd: number,
+  path: string,
+  identity: ResumeSourceIdentity,
+  expected: ResumeSourceRewriteProof,
+): void {
+  if (expected.kind === "version") {
+    assertBoundResumeSourceVersion(fd, path, identity, expected.version);
+    return;
+  }
+  assertBoundResumeSourceReadProof(fd, path, identity, expected.read);
+}
+
+function assertResumeSourceFdVersion(
+  fd: number,
+  identity: ResumeSourceIdentity,
+  expected: ResumeSourceVersion,
+): void {
+  const stats = fstatSync(fd, { bigint: true });
+  if (
+    !stats.isFile() ||
+    !hasSupportedFileIdentity(stats) ||
+    stats.dev !== identity.dev ||
+    stats.ino !== identity.ino ||
+    stats.dev !== expected.dev ||
+    stats.ino !== expected.ino ||
+    stats.nlink !== expected.nlink ||
+    stats.size !== expected.size ||
+    stats.mtimeNs !== expected.mtimeNs ||
+    stats.ctimeNs !== expected.ctimeNs
+  ) {
+    throw new Error("resume rollout source changed during streaming rewrite");
+  }
+}
+
+function assertResumeSourceFdReadProof(
+  fd: number,
+  identity: ResumeSourceIdentity,
+  expected: ResumeSourceReadProof,
+): void {
+  const before = fstatSync(fd, { bigint: true });
+  if (
+    !before.isFile() ||
+    !hasSupportedFileIdentity(before) ||
+    before.dev !== identity.dev ||
+    before.ino !== identity.ino ||
+    before.dev !== expected.dev ||
+    before.ino !== expected.ino ||
+    before.nlink !== expected.nlink ||
+    before.size !== expected.size ||
+    expected.size > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new Error("resume rollout source changed after its exact read");
+  }
+  const sha256 = sha256OfDescriptor(fd, Number(expected.size));
+  const after = fstatSync(fd, { bigint: true });
+  if (
+    after.dev !== before.dev ||
+    after.ino !== before.ino ||
+    after.nlink !== before.nlink ||
+    after.size !== before.size ||
+    after.mtimeNs !== before.mtimeNs ||
+    after.ctimeNs !== before.ctimeNs ||
+    sha256 !== expected.sha256
+  ) {
+    throw new Error("resume rollout source changed after its exact read");
   }
 }
 
@@ -2496,7 +4016,9 @@ export function listResumableSessions(projectDir: string): ResumableSession[] {
       lastModified: pick.mtimeMs,
       fileSize: pick.size,
       summary,
-      ...(snapshot?.agencVersion ? { agencVersion: snapshot.agencVersion } : {}),
+      ...(snapshot?.agencVersion
+        ? { agencVersion: snapshot.agencVersion }
+        : {}),
       ...(snapshot?.schemaVersion !== undefined
         ? { schemaVersion: snapshot.schemaVersion }
         : {}),

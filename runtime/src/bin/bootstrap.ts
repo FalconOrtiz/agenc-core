@@ -1,5 +1,6 @@
 import { VERSION } from "../version.js";
 import { randomUUID } from "node:crypto";
+import { fstatSync, lstatSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -43,7 +44,10 @@ import {
   SchemaMismatchError,
   SessionLockedError,
   getProjectDir,
+  hasSupportedFileIdentity,
   readIndexSnapshot,
+  resolveCanonicalSessionCwd,
+  type ResumeRolloutDescriptorLease,
 } from "../session/session-store.js";
 import { RolloutStore } from "../session/rollout-store.js";
 import { recordInitialHistoryOnResume } from "../session/agent-task-lifecycle.js";
@@ -60,6 +64,7 @@ import { bindActiveCostSidecar } from "../cost/tracker.js";
 import { shutdownSessionLifecycle } from "../session/lifecycle.js";
 import type { EventMsg } from "../session/event-log.js";
 import type { RolloutItem } from "../session/rollout-item.js";
+import type { RunResumeReason } from "../contracts/run-contracts.js";
 import { AgentControl } from "../agents/control.js";
 import { ThreadManager } from "../agents/thread-manager.js";
 import { ConversationThreadManager } from "../conversation/thread-manager.js";
@@ -834,6 +839,18 @@ export interface BootstrapLocalRuntimeSessionOptions {
   readonly cwd?: string;
   readonly conversationId?: string;
   readonly resumeConversation?: boolean;
+  /** Exact canonical JSONL selected by the trusted resume resolver. */
+  readonly resumeRolloutPath?: string;
+  readonly resumeRolloutLease?: ResumeRolloutDescriptorLease;
+  /** Daemon-observed cwd inode identity for cold-resume swap defense. */
+  readonly resumeCwdIdentity?: { readonly dev: string; readonly ino: string };
+  readonly resumeCwdFd?: number;
+  /** Explicitly continue a cleanly terminal canonical run under a new epoch. */
+  readonly reopenTerminalConversation?: boolean;
+  /** Explicitly resume a daemon-suspended run in its existing epoch. */
+  readonly resumeSuspendedConversation?: boolean;
+  /** Internal suspension disposition; never inferred from caller prose. */
+  readonly suspendedResumeReason?: RunResumeReason;
   readonly toolRegistryOptions?: Omit<
     BuildToolRegistryOptions,
     "workspaceRoot"
@@ -890,6 +907,66 @@ export interface LocalRuntimeBootstrap {
   readonly autonomousModeEnabled: boolean;
 }
 
+function parsePositiveFileIdentity(value: string, label: string): bigint {
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new Error(`cold-resume workspace ${label} identity is invalid`);
+  }
+  const parsed = BigInt(value);
+  if (parsed <= 0n) {
+    throw new Error(`cold-resume workspace ${label} identity is invalid`);
+  }
+  return parsed;
+}
+
+function assertPinnedResumeCwd(
+  options: BootstrapLocalRuntimeSessionOptions,
+  workspaceRoot: string,
+): void {
+  if (
+    (options.resumeCwdIdentity === undefined) !==
+    (options.resumeCwdFd === undefined)
+  ) {
+    throw new Error(
+      "cold-resume workspace identity and descriptor must be provided together",
+    );
+  }
+  if (
+    options.resumeCwdIdentity === undefined ||
+    options.resumeCwdFd === undefined
+  ) {
+    return;
+  }
+  const expectedDev = parsePositiveFileIdentity(
+    options.resumeCwdIdentity.dev,
+    "device",
+  );
+  const expectedIno = parsePositiveFileIdentity(
+    options.resumeCwdIdentity.ino,
+    "inode",
+  );
+  if (!hasSupportedFileIdentity({ dev: expectedDev, ino: expectedIno })) {
+    throw new Error("cold-resume workspace file identity is unsupported");
+  }
+  const opened = fstatSync(options.resumeCwdFd, { bigint: true });
+  const observed = lstatSync(workspaceRoot, { bigint: true });
+  if (
+    !opened.isDirectory() ||
+    !observed.isDirectory() ||
+    observed.isSymbolicLink() ||
+    !hasSupportedFileIdentity(opened) ||
+    !hasSupportedFileIdentity(observed) ||
+    opened.dev !== expectedDev ||
+    opened.ino !== expectedIno ||
+    observed.dev !== expectedDev ||
+    observed.ino !== expectedIno ||
+    realpathSync(workspaceRoot) !== workspaceRoot
+  ) {
+    throw new Error(
+      "cold-resume workspace identity changed after authorization",
+    );
+  }
+}
+
 export async function bootstrapLocalRuntimeSession(
   options: BootstrapLocalRuntimeSessionOptions,
 ): Promise<LocalRuntimeBootstrap> {
@@ -907,8 +984,14 @@ export async function bootstrapLocalRuntimeSession(
   // AGENC_WORKSPACE from the first launch shell would pin every later
   // session to that folder (audit finding #2). Matches the
   // precedence already used by project-trust resolution.
-  const workspaceRoot =
+  const requestedWorkspaceRoot =
     options.cwd ?? resolveWorkspaceFromEnv(env) ?? process.cwd();
+  const canonicalWorkspace = resolveCanonicalSessionCwd(requestedWorkspaceRoot);
+  const workspaceRoot =
+    canonicalWorkspace.kind === "ok"
+      ? canonicalWorkspace.cwd
+      : requestedWorkspaceRoot;
+  assertPinnedResumeCwd(options, workspaceRoot);
   const configMigrations = await runStartupConfigMigrations({
     home: agencHome,
     cwd: workspaceRoot,
@@ -963,6 +1046,24 @@ export async function bootstrapLocalRuntimeSession(
   const resumeConversation =
     options.conversationId !== undefined &&
     options.resumeConversation !== false;
+  if (options.reopenTerminalConversation === true && !resumeConversation) {
+    throw new Error(
+      "terminal conversation reopen requires an explicit conversation id",
+    );
+  }
+  if (options.resumeSuspendedConversation === true && !resumeConversation) {
+    throw new Error(
+      "suspended conversation resume requires an explicit conversation id",
+    );
+  }
+  if (
+    options.reopenTerminalConversation === true &&
+    options.resumeSuspendedConversation === true
+  ) {
+    throw new Error(
+      "terminal conversation reopen and suspended resume are mutually exclusive",
+    );
+  }
 
   const projectTrust = resolveProjectTrustStateSync({
     agencHome,
@@ -1639,11 +1740,31 @@ export async function bootstrapLocalRuntimeSession(
           conversationId,
         });
 
+        // Reprove the daemon-held directory handle immediately before the
+        // canonical rollout descriptor is claimed and any resumed writer is
+        // activated.
+        assertPinnedResumeCwd(options, workspaceRoot);
         const rolloutStore = new RolloutStore({
           cwd: workspaceRoot,
           sessionId: conversationId,
           agencVersion: VERSION,
           ...(resumeConversation ? { resume: true } : {}),
+          ...(options.resumeRolloutPath !== undefined
+            ? { resumeRolloutPath: options.resumeRolloutPath }
+            : {}),
+          ...(options.resumeRolloutLease !== undefined
+            ? { resumeRolloutLease: options.resumeRolloutLease }
+            : {}),
+          ...(options.reopenTerminalConversation === true
+            ? { reopenTerminalRun: true }
+            : {}),
+          ...(options.resumeSuspendedConversation === true
+            ? {
+                resumeSuspendedRun: true,
+                suspendedResumeReason:
+                  options.suspendedResumeReason ?? "explicit_continue",
+              }
+            : {}),
           ...(sessionProjectRootMarkers !== undefined
             ? { projectRootMarkers: sessionProjectRootMarkers }
             : {}),
@@ -1653,6 +1774,7 @@ export async function bootstrapLocalRuntimeSession(
           timestamp: new Date().toISOString(),
           cwd: workspaceRoot,
           originator: "agenc-cli",
+          source: "interactive-root",
           agencVersion: VERSION,
           model,
           modelProvider: resolvedProvider,

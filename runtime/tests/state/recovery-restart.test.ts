@@ -1,21 +1,28 @@
 import {
   mkdirSync,
   mkdtempSync,
+  fstatSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { recoverDaemonStateOnStartup } from "./recovery.js";
-import type { Event } from "../../src/session/event-log.js";
+import {
+  ROLLOUT_SCHEMA_VERSION,
+  type Event,
+} from "../../src/session/event-log.js";
 import { serializeRolloutItem } from "../../src/session/rollout-item.js";
 import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
 import { StateRecoveryIncidentRepository } from "../../src/state/recovery-incidents.js";
 import { StartupRecoveryBudget } from "../../src/state/recovery-cutover.js";
 import {
   recoverCanonicalRunJournalForRun,
+  recoverCanonicalRunJournalsOnStartup,
+  StartupResumeSourceBudget,
 } from "../../src/state/startup-run-journal-recovery.js";
 import { openStateDatabases, type StateSqliteDriver } from "./sqlite-driver.js";
 import { openFndFixtureCatalog } from "../helpers/fnd-fixtures.js";
@@ -63,9 +70,14 @@ describe("recoverDaemonStateOnStartup", () => {
     ]);
     bindRunJournal("run-cancel-request-crash", rolloutPath);
 
-    const report = recoverDaemonStateOnStartup(driver);
+    const resumeBudget = new StartupResumeSourceBudget(1);
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: resumeBudget,
+    });
 
     expect(report.recoveredRuns).toEqual([]);
+    expect(resumeBudget.retainedSources).toBe(0);
     expect(agentRunStatus("run-cancel-request-crash")).toBe("cancelled");
     expect(
       new StateRunDurabilityRepository(driver).getCurrentTerminalResult(
@@ -97,6 +109,99 @@ describe("recoverDaemonStateOnStartup", () => {
 
     expect(report.recoveredRuns).toEqual([]);
     expect(agentRunStatus("run-admission-cancel-crash")).toBe("cancelled");
+  });
+
+  it("keeps a canonically projected run listable when live cwd authority is unavailable", () => {
+    const runId = "run-runtime-cwd-unavailable";
+    insertAgentRun({
+      id: runId,
+      objective: "remain cold and listable",
+      status: "running",
+      currentSessionId: runId,
+    });
+    const rolloutPath = writeRuntimeResumeJournal(
+      runId,
+      join(cwd, "missing-workspace"),
+    );
+    bindRunJournal(runId, rolloutPath);
+    const resumeBudget = new StartupResumeSourceBudget(1);
+
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: resumeBudget,
+    });
+
+    expect(report.recoveryExclusions).toEqual([]);
+    expect(report.recoveredRuns).toEqual([
+      expect.objectContaining({ id: runId, status: "running" }),
+    ]);
+    expect(report.recoveredRuns[0]?.resumeSource).toBeUndefined();
+    expect(projectedRolloutRows(rolloutPath)).toBe(1);
+    expect(agentRunStatus(runId)).toBe("running");
+    expect(resumeBudget.retainedSources).toBe(0);
+  });
+
+  it("retains append authority from the active root binding instead of a longer historical source", () => {
+    const runId = "run-active-short-source";
+    insertAgentRun({
+      id: runId,
+      objective: "resume only the active source",
+      status: "running",
+      currentSessionId: runId,
+    });
+    const directory = join(driver.projectDir, "sessions", runId);
+    mkdirSync(directory, { recursive: true });
+    const oldPath = join(directory, `rollout-old-${runId}.jsonl`);
+    const activePath = join(directory, `rollout-new-${runId}.jsonl`);
+    const meta = (model: string) =>
+      serializeRolloutItem({
+        type: "session_meta",
+        payload: {
+          sessionId: runId,
+          timestamp: "2026-05-01T00:00:00.000Z",
+          cwd,
+          originator: "recovery-restart-test",
+          source: "interactive-root",
+          agencVersion: "0.16.1",
+          rolloutSchemaVersion: ROLLOUT_SCHEMA_VERSION,
+          model,
+          modelProvider: "test-provider",
+        },
+      });
+    writeFileSync(oldPath, meta("historical-" + "x".repeat(2_048)), {
+      mode: 0o600,
+    });
+    writeFileSync(activePath, meta("active"), { mode: 0o600 });
+    const repository = new StateRunDurabilityRepository(driver);
+    repository.ensureInitialEpoch({
+      runId,
+      openedAt: "2026-05-01T00:00:00.000Z",
+    });
+    repository.bindJournalSource({
+      runId,
+      epoch: 1,
+      childRunId: runId,
+      sessionId: runId,
+      sourcePath: oldPath,
+      boundAt: "2026-05-01T00:01:00.000Z",
+    });
+    repository.bindJournalSource({
+      runId,
+      epoch: 1,
+      childRunId: runId,
+      sessionId: runId,
+      sourcePath: activePath,
+      boundAt: "2026-05-01T00:02:00.000Z",
+    });
+
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: new StartupResumeSourceBudget(1),
+    });
+
+    expect(report.recoveryExclusions).toEqual([]);
+    expect(report.recoveredRuns[0]?.resumeSource?.rolloutPath).toBe(activePath);
+    report.recoveredRuns[0]?.resumeSource?.close();
   });
 
   it("projects a fsynced terminal event before a stale running row can be restored", () => {
@@ -412,6 +517,265 @@ describe("recoverDaemonStateOnStartup", () => {
       ),
     ).toMatchObject({ epoch: 1, outcome: "committed" });
     expect(repository.currentEpoch("run-partial-reopen")?.epoch).toBe(2);
+  });
+
+  it("projects suspension and resume crash windows in the same epoch", () => {
+    insertAgentRun({
+      id: "run-suspension-restart",
+      objective: "resume after daemon restart",
+      status: "running",
+      currentSessionId: "run-suspension-restart",
+    });
+    const suspendedEvent: Event = {
+      eventId: "suspend-cycle-1",
+      id: "suspend-cycle-1",
+      seq: 1,
+      msg: {
+        type: "run_suspended",
+        payload: {
+          runId: "run-suspension-restart",
+          epoch: 1,
+          reason: "daemon_shutdown_idle",
+          suspendedAt: "2026-05-01T00:06:00.000Z",
+        },
+      },
+    };
+    const rolloutPath = writeRunJournal("run-suspension-restart", [
+      suspendedEvent,
+    ]);
+    bindRunJournal("run-suspension-restart", rolloutPath);
+
+    const first = recoverDaemonStateOnStartup(driver);
+    const repository = new StateRunDurabilityRepository(driver);
+    expect(first.recoveryExclusions).toEqual([]);
+    expect(agentRunStatus("run-suspension-restart")).toBe("suspended");
+    expect(
+      repository.getActiveSuspension("run-suspension-restart"),
+    ).toMatchObject({ epoch: 1, eventId: "suspend-cycle-1" });
+
+    const resumedEvent: Event = {
+      eventId: "resume-cycle-1",
+      id: "resume-cycle-1",
+      seq: 2,
+      msg: {
+        type: "run_resumed",
+        payload: {
+          runId: "run-suspension-restart",
+          epoch: 1,
+          suspensionEventId: "suspend-cycle-1",
+          reason: "daemon_startup_restore",
+          resumedAt: "2026-05-01T00:07:00.000Z",
+        },
+      },
+    };
+    writeFileSync(
+      rolloutPath,
+      [suspendedEvent, resumedEvent]
+        .map((event) =>
+          serializeRolloutItem({ type: "event_msg", payload: event }),
+        )
+        .join(""),
+      { mode: 0o600 },
+    );
+    const resumed = recoverCanonicalRunJournalForRun(
+      driver,
+      "run-suspension-restart",
+    );
+    expect(resumed.exclusion).toBeUndefined();
+    expect(agentRunStatus("run-suspension-restart")).toBe("running");
+    expect(repository.currentEpoch("run-suspension-restart")?.epoch).toBe(1);
+    expect(
+      repository.getActiveSuspension("run-suspension-restart"),
+    ).toBeUndefined();
+  });
+
+  it("bounds retained startup resume descriptor pairs without hiding projected runs", () => {
+    for (const runId of ["run-resume-budget-a", "run-resume-budget-b"]) {
+      insertAgentRun({
+        id: runId,
+        objective: "retain exact startup source",
+        status: "running",
+        currentSessionId: runId,
+      });
+      bindRunJournal(runId, writeRuntimeResumeJournal(runId));
+    }
+    const budget = new StartupResumeSourceBudget(1);
+
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: budget,
+    });
+
+    expect(report.recoveredRuns.map(({ id }) => id)).toEqual([
+      "run-resume-budget-a",
+      "run-resume-budget-b",
+    ]);
+    expect(report.recoveryExclusions).toEqual([]);
+    const source = report.recoveredRuns[0]?.resumeSource;
+    expect(source).toBeDefined();
+    expect(report.recoveredRuns[1]?.resumeSource).toBeUndefined();
+    expect(budget.retainedSources).toBe(1);
+    expect(() => fstatSync(source!.cwdFd)).not.toThrow();
+
+    source!.close();
+    source!.close();
+    expect(budget.retainedSources).toBe(0);
+    expect(() => fstatSync(source!.cwdFd)).toThrow(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+    expect(() => source!.rolloutLease.claim()).toThrow(/already consumed/);
+  });
+
+  it("retains the recovery generation when a descriptor rewrite crashed after moving the normal path", () => {
+    const runId = "run-rewrite-old-moved";
+    insertAgentRun({
+      id: runId,
+      objective: "resume the exact moved generation",
+      status: "running",
+      currentSessionId: runId,
+    });
+    const normalPath = writeRuntimeResumeJournal(runId);
+    bindRunJournal(runId, normalPath);
+    const recoveryPath = join(
+      dirname(normalPath),
+      `rollout-recovery-1-crash-${runId}.jsonl`,
+    );
+    renameSync(normalPath, recoveryPath);
+    const budget = new StartupResumeSourceBudget(1);
+
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: budget,
+    });
+
+    expect(report.recoveryExclusions).toEqual([]);
+    expect(report.recoveredRuns).toHaveLength(1);
+    const source = report.recoveredRuns[0]?.resumeSource;
+    expect(source?.rolloutPath).toBe(recoveryPath);
+    expect(source?.sessionId).toBe(runId);
+    expect(source?.lifecycleState).toBe("open");
+    source?.close();
+    expect(budget.retainedSources).toBe(0);
+  });
+
+  it("keeps the pinned startup cwd valid while a child changes directory nlink", () => {
+    const runId = "run-resume-cwd-child-race";
+    insertAgentRun({
+      id: runId,
+      objective: "retain cwd identity across child mutation",
+      status: "running",
+      currentSessionId: runId,
+    });
+    bindRunJournal(runId, writeRuntimeResumeJournal(runId));
+    const budget = new StartupResumeSourceBudget(1);
+    const mutateChild = vi.fn(() => {
+      mkdirSync(join(cwd, "concurrent-child"));
+    });
+
+    const report = recoverDaemonStateOnStartup(driver, {
+      retainRuntimeResumeSources: true,
+      startupResumeSourceBudget: budget,
+      afterStartupResumeCwdOpenForTestingOnly: mutateChild,
+    });
+
+    expect(mutateChild).toHaveBeenCalledOnce();
+    expect(report.recoveryExclusions).toEqual([]);
+    expect(report.recoveredRuns[0]?.resumeSource?.cwd).toBe(cwd);
+    report.recoveredRuns[0]?.resumeSource?.close();
+    expect(budget.retainedSources).toBe(0);
+  });
+
+  it("releases a retained startup source when its delivery callback fails", () => {
+    const runId = "run-resume-delivery-failure";
+    insertAgentRun({
+      id: runId,
+      objective: "fail while delivering exact startup source",
+      status: "running",
+      currentSessionId: runId,
+    });
+    bindRunJournal(runId, writeRuntimeResumeJournal(runId));
+    const budget = new StartupResumeSourceBudget(1);
+    let retainedCwdFd: number | undefined;
+    let retainedLease: { claim(): number; closeUnclaimed(): void } | undefined;
+    const delivered = vi.fn(
+      (source: {
+        readonly cwdFd: number;
+        readonly rolloutLease: {
+          claim(): number;
+          closeUnclaimed(): void;
+        };
+      }) => {
+        retainedCwdFd = source.cwdFd;
+        retainedLease = source.rolloutLease;
+        throw new Error("delivery failed after descriptor creation");
+      },
+    );
+
+    const projection = recoverCanonicalRunJournalsOnStartup(driver, {
+      recoverableStatuses: ["running"],
+      resumeSourceBudget: budget,
+      onResumeSource: delivered,
+    });
+
+    expect(delivered).toHaveBeenCalledOnce();
+    expect(projection.exclusions).toEqual([
+      expect.objectContaining({ runId, kind: "deferred" }),
+    ]);
+    expect(budget.retainedSources).toBe(0);
+    expect(retainedCwdFd).toBeTypeOf("number");
+    expect(() => fstatSync(retainedCwdFd!)).toThrow(
+      expect.objectContaining({ code: "EBADF" }),
+    );
+    expect(() => retainedLease!.claim()).toThrow(/already consumed/);
+  });
+
+  it("quarantines SQLite lifecycle state ahead of pinned canonical history", () => {
+    insertAgentRun({
+      id: "run-sqlite-ahead",
+      objective: "never trust a phantom reopen",
+      status: "running",
+      currentSessionId: "run-sqlite-ahead",
+    });
+    const repository = new StateRunDurabilityRepository(driver);
+    repository.ensureInitialEpoch({
+      runId: "run-sqlite-ahead",
+      openedAt: "2026-05-01T00:00:00.000Z",
+    });
+    driver
+      .prepareState(
+        `INSERT INTO run_lifecycle_epochs (
+           run_id, epoch, opened_at, opened_event_id,
+           reopened_from_epoch, reopen_reason
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "run-sqlite-ahead",
+        2,
+        "2026-05-01T00:07:00.000Z",
+        "phantom-reopen",
+        1,
+        "stale_projection",
+      );
+    const rolloutPath = writeRunJournal("run-sqlite-ahead", [
+      {
+        eventId: "canonical-turn-complete",
+        id: "canonical-turn-complete",
+        seq: 1,
+        msg: {
+          type: "turn_complete",
+          payload: { turnId: "turn-1" },
+        },
+      },
+    ]);
+    bindRunJournal("run-sqlite-ahead", rolloutPath);
+
+    const report = recoverDaemonStateOnStartup(driver);
+
+    expect(report.recoveredRuns).toEqual([]);
+    expect(report.recoveryExclusions).toEqual([
+      expect.objectContaining({ runId: "run-sqlite-ahead" }),
+    ]);
+    expect(repository.currentEpoch("run-sqlite-ahead")?.epoch).toBe(2);
   });
 
   it("fails closed instead of restoring a run whose active canonical journal is missing", () => {
@@ -1404,6 +1768,34 @@ function writeRunJournal(runId: string, events: readonly Event[]): string {
         return serializeRolloutItem({ type: "event_msg", payload: canonical });
       })
       .join(""),
+    { mode: 0o600 },
+  );
+  return rolloutPath;
+}
+
+function writeRuntimeResumeJournal(runId: string, resumeCwd = cwd): string {
+  const directory = join(driver.projectDir, "sessions", runId);
+  mkdirSync(directory, { recursive: true });
+  const rolloutPath = join(
+    directory,
+    `rollout-2026-05-01T00-00-00-000Z-${runId}.jsonl`,
+  );
+  writeFileSync(
+    rolloutPath,
+    serializeRolloutItem({
+      type: "session_meta",
+      payload: {
+        sessionId: runId,
+        timestamp: "2026-05-01T00:00:00.000Z",
+        cwd: resumeCwd,
+        originator: "recovery-restart-test",
+        source: "interactive-root",
+        agencVersion: "0.16.1",
+        rolloutSchemaVersion: ROLLOUT_SCHEMA_VERSION,
+        model: "test-model",
+        modelProvider: "test-provider",
+      },
+    }),
     { mode: 0o600 },
   );
   return rolloutPath;

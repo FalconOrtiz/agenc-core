@@ -30,7 +30,19 @@ export const OPENAI_EFFORT_LEVELS = [
 ] as const
 
 export type OpenAIEffortLevel = typeof OPENAI_EFFORT_LEVELS[number]
-export type EffortValue = EffortLevel | number
+export type AvailableEffortLevel = EffortLevel | OpenAIEffortLevel
+export type EffortValue = AvailableEffortLevel | number
+
+function getRegisteredGrokEffortLevels(
+  model: string,
+): AvailableEffortLevel[] | undefined {
+  const entry = resolveRegisteredModelCatalogEntry({
+    provider: 'grok',
+    model,
+  })
+  if (entry === undefined) return undefined
+  return entry.supportedReasoningLevels.filter(isOpenAIEffortLevel)
+}
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
@@ -42,14 +54,12 @@ export function modelSupportsEffort(model: string): boolean {
   if (supported3P !== undefined) {
     return supported3P
   }
-  // Grok reasoning models: the model catalog is the source of truth — grok
-  // 4.3/4.5 declare supportedReasoningLevels (low/medium/high) accepted via
-  // the xAI reasoning_effort parameter. Entries without levels (e.g.
-  // grok-composer) correctly return false.
+  // Grok reasoning models: the model catalog is the source of truth. Entries
+  // without levels (e.g. grok-composer) correctly return false.
   if (m.startsWith('grok-')) {
-    const grokEntry = resolveRegisteredModelCatalogEntry({ provider: 'grok', model })
-    if (grokEntry !== undefined) {
-      return grokEntry.supportedReasoningLevels.length > 0
+    const levels = getRegisteredGrokEffortLevels(model)
+    if (levels !== undefined) {
+      return levels.length > 0
     }
   }
   if (modelUsesOpenAIEffort(model) && supportsProviderCodeReasoningEffort(model)) {
@@ -112,12 +122,24 @@ export function isOpenAIEffortLevel(value: string): value is OpenAIEffortLevel {
   return (OPENAI_EFFORT_LEVELS as readonly string[]).includes(value)
 }
 
+export function isAvailableEffortLevel(
+  value: string,
+): value is AvailableEffortLevel {
+  return isEffortLevel(value) || isOpenAIEffortLevel(value)
+}
+
 export function modelUsesOpenAIEffort(_model: string): boolean {
   const provider = getAPIProvider()
   return provider === 'openai' || provider === 'agenc'
 }
 
-export function getAvailableEffortLevels(model: string): EffortLevel[] | OpenAIEffortLevel[] {
+export function getAvailableEffortLevels(
+  model: string,
+): AvailableEffortLevel[] {
+  const grokLevels = getRegisteredGrokEffortLevels(model)
+  if (grokLevels !== undefined) {
+    return grokLevels
+  }
   if (!modelSupportsEffort(model)) {
     return []
   }
@@ -131,7 +153,7 @@ export function getAvailableEffortLevels(model: string): EffortLevel[] | OpenAIE
   return levels
 }
 
-export function getEffortLevelLabel(level: EffortLevel | OpenAIEffortLevel): string {
+export function getEffortLevelLabel(level: AvailableEffortLevel): string {
   if (level === 'xhigh') return 'Extra High'
   if (level === 'max') return 'Max'
   return capitalize(level)
@@ -159,7 +181,7 @@ export function parseEffortValue(value: unknown): EffortValue | undefined {
     return value
   }
   const str = String(value).toLowerCase()
-  if (isEffortLevel(str)) {
+  if (isAvailableEffortLevel(str)) {
     return str
   }
   const numericValue = parseInt(str, 10)
@@ -184,6 +206,12 @@ export function toPersistableEffort(
   if (value === 'max') {
     return value
   }
+  // Persist provider-native xhigh using the stable settings vocabulary. At
+  // request time it is restored only for a model whose catalog advertises
+  // xhigh; older Grok models continue to clamp max to high.
+  if (value === 'xhigh') {
+    return 'max'
+  }
   return undefined
 }
 
@@ -207,11 +235,11 @@ export function getInitialEffortSetting(): EffortLevel | undefined {
  * deliberately do not write to settings.json).
  */
 export function resolvePickerEffortPersistence(
-  picked: EffortLevel | undefined,
-  modelDefault: EffortLevel,
+  picked: AvailableEffortLevel | undefined,
+  modelDefault: AvailableEffortLevel,
   priorPersisted: EffortLevel | undefined,
   toggledInPicker: boolean,
-): EffortLevel | undefined {
+): AvailableEffortLevel | undefined {
   const hadExplicit = priorPersisted !== undefined || toggledInPicker
   return hadExplicit || picked !== modelDefault ? picked : undefined
 }
@@ -242,9 +270,16 @@ export function resolveAppliedEffort(
   }
   const resolved =
     envOverride ?? appStateEffortValue ?? getDefaultEffortForModel(model)
-  // API rejects 'max' on non-Opus-4.6 models — downgrade to 'high'.
-  if (resolved === 'max' && !modelSupportsMaxEffort(model)) {
-    return 'high'
+  if (resolved === 'max') {
+    // The persisted cross-provider vocabulary calls its top tier `max`, while
+    // xAI calls Grok 4.6's catalogued top tier `xhigh`.
+    if (getRegisteredGrokEffortLevels(model)?.includes('xhigh')) {
+      return 'xhigh'
+    }
+    // API rejects 'max' on non-Opus-4.6 models — downgrade to 'high'.
+    if (!modelSupportsMaxEffort(model)) {
+      return 'high'
+    }
   }
   return resolved
 }
@@ -257,7 +292,7 @@ export function resolveAppliedEffort(
 export function getDisplayedEffortLevel(
   model: string,
   appStateEffort: EffortValue | undefined,
-): EffortLevel {
+): AvailableEffortLevel {
   const resolved = resolveAppliedEffort(model, appStateEffort) ?? 'high'
   return convertEffortValueToLevel(resolved)
 }
@@ -282,12 +317,14 @@ export function isValidNumericEffort(value: number): boolean {
   return Number.isInteger(value)
 }
 
-export function convertEffortValueToLevel(value: EffortValue): EffortLevel {
+export function convertEffortValueToLevel(
+  value: EffortValue,
+): AvailableEffortLevel {
   if (typeof value === 'string') {
     // Runtime guard: value may come from remote config (GrowthBook) where
     // TypeScript types can't help us. Coerce unknown strings to 'high'
     // rather than passing them through unchecked.
-    return isEffortLevel(value) ? value : 'high'
+    return isAvailableEffortLevel(value) ? value : 'high'
   }
   if (process.env.USER_TYPE === 'ant' && typeof value === 'number') {
     if (value <= 50) return 'low'
@@ -304,7 +341,7 @@ export function convertEffortValueToLevel(value: EffortValue): EffortLevel {
  * @param level The effort level to describe
  * @returns Human-readable description
  */
-export function getEffortLevelDescription(level: EffortLevel | OpenAIEffortLevel): string {
+export function getEffortLevelDescription(level: AvailableEffortLevel): string {
   switch (level) {
     case 'low':
       return 'Quick, straightforward implementation with minimal overhead'
@@ -315,7 +352,7 @@ export function getEffortLevelDescription(level: EffortLevel | OpenAIEffortLevel
     case 'max':
       return 'Maximum capability with deepest reasoning (Opus 4.6 only)'
     case 'xhigh':
-      return 'Extra high reasoning effort for complex tasks (openai/Agenc)'
+      return 'Extra high reasoning effort for complex tasks on supported models'
   }
 }
 

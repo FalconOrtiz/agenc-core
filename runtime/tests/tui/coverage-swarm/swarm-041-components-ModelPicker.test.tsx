@@ -80,6 +80,12 @@ vi.mock("../../utils/fastMode.js", () => ({
 
 vi.mock("../../utils/effort.js", () => ({
   convertEffortValueToLevel: (value: string | undefined) => value,
+  getAvailableEffortLevels: (model: string) =>
+    harness.unsupportedModels.has(model)
+      ? []
+      : harness.maxModels.has(model)
+        ? ["low", "medium", "high", "max"]
+        : ["low", "medium", "high"],
   getDefaultEffortForModel: (model: string) => harness.defaultEfforts.get(model),
   modelSupportsEffort: (model: string) =>
     !harness.unsupportedModels.has(model),

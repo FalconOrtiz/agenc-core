@@ -5,8 +5,8 @@
  * if needed, wait until it is ready, then hand control to a connector hook.
  */
 
-import { lstat, readFile, readdir } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstat, readFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   createNodeDaemonCliHost,
   readAgenCDaemonPid,
@@ -15,20 +15,32 @@ import {
   resolveAgenCDaemonCookiePath,
   resolveAgenCDaemonPidPath,
   resolveAgenCDaemonReadyTimeoutMs,
+  requestAgenCDaemonInstanceIdentity,
+  requestAgenCDaemonShutdown,
   resolveAgenCDaemonSocketPath,
   runAgenCDaemonCli,
   resolveAgenCDaemonHome,
+  withAgenCDaemonLifecycleLock,
   writeAgenCDaemonPid,
   type AgenCDaemonCliHost,
   type AgenCDaemonCliIo,
 } from "./daemon-cli.js";
 import {
+  daemonInstanceIdentityFromRuntimeInfo,
   readDaemonRuntimeInfo,
   readDistVersion,
   removeDaemonRuntimeInfo,
   resolveAgenCDaemonRuntimeInfoPath,
   resolveRuntimePackageRootFromUrl,
 } from "./daemon-runtime-info.js";
+import {
+  findLinuxAgenCDaemonProcesses,
+  inspectLinuxAgenCDaemonProcess,
+  readAgenCDaemonProcessStart,
+  sameAgenCDaemonInstanceIdentity,
+  type AgenCDaemonInstanceIdentity,
+  type AgenCDaemonProcessIdentity,
+} from "./daemon-instance-identity.js";
 import { loadConfig } from "../config/loader.js";
 import {
   resolveMcpServeDefaults,
@@ -53,13 +65,44 @@ export type AgenCDaemonAutostartStatus = "already-running" | "started";
 export const AGENC_DAEMON_AUTOSTART_READY_TIMEOUT_MS =
   resolveAgenCDaemonReadyTimeoutMs({});
 
+const AGENC_DAEMON_BUILD_SKEW_STOP_TIMEOUT_MS = 5_000;
+const AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS = 1_000;
+const AGENC_DAEMON_FORCE_STOP_GRACE_MS = 2_000;
+const AGENC_DAEMON_STOP_POLL_MS = 50;
+
 export interface AgenCDaemonConnectionTarget {
   readonly pid: number;
   readonly pidPath: string;
 }
 
-export interface AgenCDaemonAutostartResult
-  extends AgenCDaemonConnectionTarget {
+/**
+ * Autostart-specific process identity seam. The token must remain stable for
+ * one process lifetime and change when the operating system reuses a PID.
+ */
+interface AgenCDaemonAutostartHost extends AgenCDaemonCliHost {
+  /** Test seam for cross-platform forced-signal policy. */
+  readonly platform?: NodeJS.Platform;
+  readonly requestDaemonInstanceIdentity?: (
+    target: AgenCDaemonConnectionTarget,
+  ) => Promise<AgenCDaemonInstanceIdentity> | AgenCDaemonInstanceIdentity;
+  readonly requestDaemonShutdown?: (
+    expected: AgenCDaemonInstanceIdentity,
+  ) => Promise<void> | void;
+  /** @internal Full argv/home/start proof seam for lifecycle race tests. */
+  readonly inspectLegacyDaemonProcess?: (
+    pid: number,
+  ) =>
+    | Promise<AgenCDaemonProcessIdentity | null>
+    | AgenCDaemonProcessIdentity
+    | null;
+}
+
+interface BoundAgenCDaemonInstance {
+  readonly identity: AgenCDaemonInstanceIdentity;
+  readonly process: AgenCDaemonProcessIdentity;
+}
+
+export interface AgenCDaemonAutostartResult extends AgenCDaemonConnectionTarget {
   readonly status: AgenCDaemonAutostartStatus;
   readonly ready: true;
   readonly connected: boolean;
@@ -71,14 +114,22 @@ export interface AgenCDaemonAutostartConfig {
 }
 
 export interface AgenCDaemonAutostartOptions {
-  readonly host?: AgenCDaemonCliHost;
+  readonly host?: AgenCDaemonAutostartHost;
   readonly io?: AgenCDaemonCliIo;
   readonly waitTimeoutMs?: number;
   readonly pollMs?: number;
   readonly isReady?: (
     target: AgenCDaemonConnectionTarget,
   ) => boolean | Promise<boolean>;
-  readonly connect?: (target: AgenCDaemonConnectionTarget) => Promise<void> | void;
+  readonly connect?: (
+    target: AgenCDaemonConnectionTarget,
+  ) => Promise<void> | void;
+  /** Isolated contract-test seam for the post-socket identity barrier. */
+  readonly identityPublicationBarrier?: (
+    host: AgenCDaemonCliHost,
+  ) => Promise<void> | void;
+  /** Isolated race seam while verified metadata removal holds its lock. */
+  readonly afterVerifiedExitBeforeMetadataRemoval?: () => Promise<void> | void;
   readonly findOrphanDaemonPids?: (
     targetHome: string,
   ) => Promise<readonly number[]> | readonly number[];
@@ -92,6 +143,20 @@ export interface AgenCDaemonAutostartOptions {
     targetHome: string,
   ) => Promise<readonly number[]> | readonly number[];
   readonly terminateOrphanDaemonPid?: (pid: number) => Promise<void> | void;
+  readonly inspectLegacyDaemonProcess?: (
+    pid: number,
+  ) =>
+    | Promise<AgenCDaemonProcessIdentity | null>
+    | AgenCDaemonProcessIdentity
+    | null;
+  /** Test seam for the authenticated initialize identity round-trip. */
+  readonly requestDaemonInstanceIdentity?: (
+    target: AgenCDaemonConnectionTarget,
+  ) => Promise<AgenCDaemonInstanceIdentity> | AgenCDaemonInstanceIdentity;
+  /** Test seam for the authenticated daemon self-shutdown RPC. */
+  readonly requestDaemonShutdown?: (
+    expected: AgenCDaemonInstanceIdentity,
+  ) => Promise<void> | void;
 }
 
 export class AgenCDaemonAutostartError extends Error {
@@ -135,185 +200,473 @@ export async function resolveAgenCDaemonAutostartConfig(
 export async function ensureAgenCDaemonAutostart(
   options: AgenCDaemonAutostartOptions = {},
 ): Promise<AgenCDaemonAutostartResult> {
-  const host = options.host ?? createNodeDaemonCliHost();
+  const host: AgenCDaemonAutostartHost =
+    options.host ?? createNodeDaemonCliHost();
   const io = options.io ?? silentIo();
   const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
   const daemonHome = resolveAgenCDaemonHome(host.env, host.userHome);
   const runtimeInfoPath = resolveAgenCDaemonRuntimeInfoPath(dirname(pidPath));
   let status: AgenCDaemonAutostartStatus = "already-running";
   let pid = await readAgenCDaemonPid(pidPath);
+  let spawnedPid: number | null = null;
+  let spawnedProcess: AgenCDaemonProcessIdentity | null = null;
+  let postSpawnPhase = false;
+  let spawnedControlReleased = false;
 
-  // Detect runtime-build skew: if the running daemon was launched
-  // against an older `dist/VERSION` than the one currently on disk
-  // (typical scenario: `npm run build` while the daemon was alive),
-  // its in-memory bundle still references chunk filenames that
-  // `clean: true` deleted. Any dynamic `import()` in a turn fails
-  // with "Cannot find module" and the spinner hangs forever. Kill
-  // the stale daemon here so the start-fresh branch below replaces
-  // it transparently.
-  let respawnReason: string | null = null;
-  if (pid !== null && host.isPidRunning(pid)) {
+  try {
+    // A stale pid file may name a live but unrelated reused PID while the real
+    // daemon has already published a fresh sidecar. Never probe or signal that
+    // numeric PID as the daemon: bind the sidecar to the authenticated socket
+    // and stable process identity, then repair the pid file while the lifecycle
+    // transaction excludes a concurrent publisher.
+    await withAgenCDaemonLifecycleLock(host, async () => {
+      pid = await readAgenCDaemonPid(pidPath);
+      const sidecarIdentity = daemonInstanceIdentityFromRuntimeInfo(
+        readDaemonRuntimeInfo(runtimeInfoPath),
+      );
+      if (
+        pid !== null &&
+        host.isPidRunning(pid) &&
+        sidecarIdentity !== null &&
+        sidecarIdentity.pid !== pid
+      ) {
+        const stalePid = pid;
+        const rebound = await proveRecordedAgenCDaemonInstance({
+          expectedPid: sidecarIdentity.pid,
+          pidPath,
+          runtimeInfoPath,
+          host,
+          options,
+        });
+        const sidecarNow = daemonInstanceIdentityFromRuntimeInfo(
+          readDaemonRuntimeInfo(runtimeInfoPath),
+        );
+        if (
+          rebound !== null &&
+          (await readAgenCDaemonPid(pidPath)) === stalePid &&
+          sidecarNow !== null &&
+          sameAgenCDaemonInstanceIdentity(rebound.identity, sidecarNow)
+        ) {
+          await writeAgenCDaemonPid(pidPath, rebound.identity.pid);
+          pid = rebound.identity.pid;
+        } else {
+          pid = await readAgenCDaemonPid(pidPath);
+        }
+      }
+    });
+
+    let respawnReason: string | null = null;
+    if (pid !== null && !host.isPidRunning(pid)) {
+      respawnReason = `daemon pid ${pid} not running — stale pid file`;
+    } else if (pid === null) {
+      respawnReason = "no daemon pid recorded";
+    }
+
+    if (pid === null || !host.isPidRunning(pid)) {
+      const recoveredPid = await recoverPidlessAgenCDaemon({
+        daemonHome,
+        pidPath,
+        host,
+        options,
+      });
+      if (recoveredPid !== null) {
+        pid = recoveredPid;
+        respawnReason = null;
+      }
+    }
+
+    if (pid === null || !host.isPidRunning(pid)) {
+      // On Linux, a replacement must not begin startup recovery while a daemon
+      // from a superseded install still owns rollout locks for this home. Reap
+      // every discoverable untracked same-home daemon before spawning; the
+      // post-spawn pass below remains as a bounded race check for a concurrent
+      // external launch. Other platforms retain their existing pid/socket
+      // lifecycle because this module has no safe arbitrary-process ownership
+      // proof for them.
+      await reapSupersededAgenCDaemons({
+        daemonHome,
+        keepPid: null,
+        host,
+        options,
+        io,
+      });
+      // Round-2 M-NEW3: previously the autostart respawned silently
+      // because `io` defaulted to `silentIo`. Surface the start event
+      // on stderr so the user sees that a daemon respawn happened
+      // (without bypassing the silent default for tests that pass
+      // their own io). Reason is set above based on which branch
+      // triggered the respawn.
+      if (respawnReason !== null) {
+        io.stderr.write(`agenc: starting daemon (${respawnReason})\n`);
+      }
+      const startingHost: AgenCDaemonAutostartHost = {
+        ...host,
+        spawnDetachedDaemon: (env) => {
+          const childPid = host.spawnDetachedDaemon(env);
+          spawnedPid = childPid;
+          return childPid;
+        },
+      };
+      const startExit = await runAgenCDaemonCli(
+        { kind: "command", action: "start" },
+        {
+          host: startingHost,
+          io,
+          // Autostart owns the richer ready/exited/timeout diagnosis below and
+          // the post-ready authenticated instance proof. The CLI start helper
+          // still serializes its mutation and publishes the provisional pid.
+          deferDaemonReadyWaitToCaller: true,
+          inspectLegacyDaemonProcess: options.inspectLegacyDaemonProcess,
+          requestDaemonInstanceIdentity: async (readyHost) => {
+            const readyPid = await readAgenCDaemonPid(pidPath);
+            if (readyPid === null) {
+              throw new Error("daemon pid disappeared during start");
+            }
+            const requestIdentity =
+              options.requestDaemonInstanceIdentity ??
+              startingHost.requestDaemonInstanceIdentity;
+            return requestIdentity === undefined
+              ? requestAgenCDaemonInstanceIdentity(readyHost)
+              : requestIdentity({ pid: readyPid, pidPath });
+          },
+        },
+      );
+      if (startExit !== 0) {
+        throw new AgenCDaemonAutostartError("AgenC daemon start failed");
+      }
+      postSpawnPhase = spawnedPid !== null;
+      pid = await readAgenCDaemonPid(pidPath);
+      if (spawnedPid !== null) {
+        spawnedProcess = await captureAgenCDaemonProcessIdentity(
+          spawnedPid,
+          host,
+        );
+        status = "started";
+      }
+    }
+
+    if (pid === null) {
+      throw new AgenCDaemonAutostartError(
+        "AgenC daemon pid file was not written",
+      );
+    }
+
+    const target = { pid, pidPath };
+    const ready = await waitForAgenCDaemonReady(target, host, options);
+    if (ready === "exited") {
+      // The daemon process died before becoming ready. Waiting longer cannot
+      // help, and calling this a timeout sends the operator debugging the
+      // wrong thing — surface the captured early-crash stderr instead.
+      const stderrTail = readAgenCDaemonSpawnStderrTail(
+        host.env,
+        host.userHome,
+      );
+      const error = new AgenCDaemonAutostartError(
+        `AgenC daemon exited before becoming ready (pid ${pid})` +
+          (stderrTail.length > 0 ? `: ${stderrTail}` : ""),
+      );
+      if (status === "started") {
+        throw error;
+      }
+      await removeExitedAgenCDaemonMetadata({
+        pid,
+        pidPath,
+        runtimeInfoPath,
+        host,
+      });
+      throw error;
+    }
+    if (ready !== "ready") {
+      const error = new AgenCDaemonAutostartError(
+        `AgenC daemon did not become ready before timeout (pid ${pid})`,
+      );
+      if (status === "started") {
+        throw error;
+      }
+      throw error;
+    }
+
+    // The foreground child binds its socket before committing the identity
+    // sidecar and final pid. Crossing the same lifecycle transaction here turns
+    // socket readiness into a causal publication barrier: proof below can never
+    // mistake a healthy, still-publishing replacement for an unbound process.
+    if (options.identityPublicationBarrier === undefined) {
+      await withAgenCDaemonLifecycleLock(host, async () => {});
+    } else {
+      await Promise.resolve(options.identityPublicationBarrier(host));
+    }
+
+    const runtimeInfoBeforeProof = readDaemonRuntimeInfo(runtimeInfoPath);
+    if (
+      runtimeInfoBeforeProof === null ||
+      (runtimeInfoBeforeProof.pid === pid &&
+        daemonInstanceIdentityFromRuntimeInfo(runtimeInfoBeforeProof) === null)
+    ) {
+      const legacyPid = pid;
+      if (hostPlatform(host) !== "linux") {
+        throw instanceProofFailed(
+          legacyPid,
+          "legacy daemon has no portable instance binding; stop it with the OS service/process manager after verifying its command and home, then retry",
+        );
+      }
+      const legacyProcess = await withAgenCDaemonLifecycleLock(
+        host,
+        async (): Promise<AgenCDaemonProcessIdentity> => {
+          if (
+            (await readAgenCDaemonPid(pidPath)) !== legacyPid ||
+            JSON.stringify(readDaemonRuntimeInfo(runtimeInfoPath)) !==
+              JSON.stringify(runtimeInfoBeforeProof)
+          ) {
+            throw instanceProofFailed(
+              legacyPid,
+              "legacy daemon metadata changed",
+            );
+          }
+          const inspectLegacy =
+            options.inspectLegacyDaemonProcess ??
+            host.inspectLegacyDaemonProcess ??
+            ((targetPid: number) =>
+              inspectLinuxAgenCDaemonProcess(
+                targetPid,
+                host,
+                daemonHome,
+                "any-install",
+              ));
+          const inspected = await Promise.resolve(inspectLegacy(legacyPid));
+          if (inspected === null) {
+            throw instanceProofFailed(
+              legacyPid,
+              "legacy daemon could not be proven as a same-home Linux daemon",
+            );
+          }
+          return inspected;
+        },
+      );
+      await terminateAgenCDaemonPid(
+        legacyProcess,
+        daemonHome,
+        host,
+        options,
+        AGENC_DAEMON_BUILD_SKEW_STOP_TIMEOUT_MS,
+      );
+      await withAgenCDaemonLifecycleLock(host, async () => {
+        if (
+          (await readAgenCDaemonPid(pidPath)) !== legacyPid ||
+          host.isPidRunning(legacyPid)
+        ) {
+          return;
+        }
+        await removeAgenCDaemonPid(pidPath, legacyPid);
+        if (
+          runtimeInfoBeforeProof !== null &&
+          JSON.stringify(readDaemonRuntimeInfo(runtimeInfoPath)) ===
+            JSON.stringify(runtimeInfoBeforeProof)
+        ) {
+          removeDaemonRuntimeInfo(runtimeInfoPath);
+        }
+      });
+      return ensureAgenCDaemonAutostart(options);
+    }
+
+    let verifiedInstance: BoundAgenCDaemonInstance | null;
+    try {
+      verifiedInstance = await proveRecordedAgenCDaemonInstance({
+        expectedPid: pid,
+        pidPath,
+        runtimeInfoPath,
+        host,
+        options,
+      });
+    } catch (error) {
+      throw error;
+    }
+    if (verifiedInstance === null) {
+      const error = instanceProofFailed(pid, "identity sidecar is unavailable");
+      if (status === "started") {
+        throw error;
+      }
+      throw error;
+    }
+    // Compare builds only after the complete identity proof. A PID and mutable
+    // sidecar alone are never authority to stop a process.
     const runtimeRoot = resolveRuntimePackageRootFromUrl(import.meta.url);
     const currentVersion =
       runtimeRoot !== null ? readDistVersion(runtimeRoot) : null;
-    const daemonInfo = readDaemonRuntimeInfo(runtimeInfoPath);
     if (
       currentVersion !== null &&
-      daemonInfo !== null &&
-      daemonInfo.buildTime !== currentVersion.buildTime
+      (verifiedInstance.identity.runtimeVersion !==
+        currentVersion.runtimeVersion ||
+        verifiedInstance.identity.commit !== currentVersion.commit ||
+        verifiedInstance.identity.buildTime !== currentVersion.buildTime)
     ) {
-      respawnReason = `daemon build skew (running buildTime ${daemonInfo.buildTime} != on-disk ${currentVersion.buildTime})`;
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
-      const skewDeadline = Date.now() + 5000;
-      while (Date.now() < skewDeadline && host.isPidRunning(pid)) {
-        await host.sleep(50);
-      }
-      if (host.isPidRunning(pid)) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }
-      await removeAgenCDaemonPid(pidPath, pid);
-      removeDaemonRuntimeInfo(runtimeInfoPath);
-      pid = null;
-    }
-  } else if (pid !== null && !host.isPidRunning(pid)) {
-    respawnReason = `daemon pid ${pid} not running — stale pid file`;
-  } else if (pid === null) {
-    respawnReason = "no daemon pid recorded";
-  }
-
-  if (pid === null || !host.isPidRunning(pid)) {
-    const recoveredPid = await recoverPidlessAgenCDaemon({
-      daemonHome,
-      pidPath,
-      host,
-      options,
-    });
-    if (recoveredPid !== null) {
-      pid = recoveredPid;
-      respawnReason = null;
-    }
-  }
-
-  if (pid === null || !host.isPidRunning(pid)) {
-    // Round-2 M-NEW3: previously the autostart respawned silently
-    // because `io` defaulted to `silentIo`. Surface the start event
-    // on stderr so the user sees that a daemon respawn happened
-    // (without bypassing the silent default for tests that pass
-    // their own io). Reason is set above based on which branch
-    // triggered the respawn.
-    if (respawnReason !== null) {
       io.stderr.write(
-        `agenc: starting daemon (${respawnReason})\n`,
+        `agenc: starting daemon (daemon build identity differs from on-disk runtime)\n`,
       );
+      try {
+        await terminateRecordedAgenCDaemonInstance({
+          expected: verifiedInstance,
+          daemonHome,
+          pidPath,
+          runtimeInfoPath,
+          host,
+          options,
+          gracefulTimeoutMs: AGENC_DAEMON_BUILD_SKEW_STOP_TIMEOUT_MS,
+        });
+        await removeVerifiedAgenCDaemonMetadata({
+          expected: verifiedInstance,
+          pidPath,
+          runtimeInfoPath,
+          host,
+          options,
+        });
+      } catch (error) {
+        throw error;
+      }
+      return ensureAgenCDaemonAutostart(options);
     }
-    const startExit = await runAgenCDaemonCli(
-      { kind: "command", action: "start" },
-      {
+    try {
+      await reapSupersededAgenCDaemons({
+        daemonHome,
+        keepPid: pid,
         host,
+        options,
         io,
-        // The autostart path owns its own readiness wait below
-        // (`waitForAgenCDaemonReady`, honoring this call's `isReady`/timeout
-        // options), so opt the bare `start` control out of its own duplicate
-        // socket-readiness gate. This keeps autostart's start→ready sequence
-        // byte-for-byte identical to before the bare-control readiness gate
-        // was added.
-        waitForDaemonReady: async () => true,
-      },
-    );
-    if (startExit !== 0) {
-      throw new AgenCDaemonAutostartError("AgenC daemon start failed");
+      });
+    } catch (error) {
+      throw error;
     }
-    pid = await readAgenCDaemonPid(pidPath);
-    status = "started";
-  }
 
-  if (pid === null) {
-    throw new AgenCDaemonAutostartError("AgenC daemon pid file was not written");
+    try {
+      await Promise.resolve(options.connect?.(target));
+    } catch (error) {
+      throw error;
+    }
+    if (status === "started" && spawnedPid !== null) {
+      host.releaseSpawnedDaemonControl?.(spawnedPid);
+      spawnedControlReleased = true;
+    }
+    return {
+      ...target,
+      status,
+      ready: true,
+      connected: options.connect !== undefined,
+    };
+  } catch (error) {
+    if (postSpawnPhase && spawnedPid !== null && !spawnedControlReleased) {
+      return failStartedAgenCDaemonReplacement({
+        error,
+        spawnedPid,
+        spawnedProcess,
+        daemonHome,
+        pidPath,
+        runtimeInfoPath,
+        host,
+        options,
+      });
+    }
+    throw error;
   }
-
-  await reapSupersededAgenCDaemons({
-    daemonHome,
-    keepPid: pid,
-    host,
-    options,
-    io,
-  });
-
-  const target = { pid, pidPath };
-  const ready = await waitForAgenCDaemonReady(target, host, options);
-  if (ready === "exited") {
-    // The daemon process died before becoming ready. Waiting longer cannot
-    // help, and calling this a timeout sends the operator debugging the
-    // wrong thing — surface the captured early-crash stderr instead.
-    await removeAgenCDaemonPid(pidPath, pid);
-    const stderrTail = readAgenCDaemonSpawnStderrTail(host.env, host.userHome);
-    throw new AgenCDaemonAutostartError(
-      `AgenC daemon exited before becoming ready (pid ${pid})` +
-        (stderrTail.length > 0 ? `: ${stderrTail}` : ""),
-    );
-  }
-  if (ready !== "ready") {
-    throw new AgenCDaemonAutostartError(
-      `AgenC daemon did not become ready before timeout (pid ${pid})`,
-    );
-  }
-
-  await Promise.resolve(options.connect?.(target));
-  return {
-    ...target,
-    status,
-    ready: true,
-    connected: options.connect !== undefined,
-  };
 }
 
 async function recoverPidlessAgenCDaemon(params: {
   readonly daemonHome: string;
   readonly pidPath: string;
-  readonly host: AgenCDaemonCliHost;
+  readonly host: AgenCDaemonAutostartHost;
   readonly options: AgenCDaemonAutostartOptions;
 }): Promise<number | null> {
-  const orphanPids = [
-    ...await Promise.resolve(
-      params.options.findOrphanDaemonPids?.(params.daemonHome) ??
-        findPidlessAgenCDaemonPids(params.host, params.daemonHome),
-    ),
-  ].filter((pid) => params.host.isPidRunning(pid));
-  if (orphanPids.length === 0) return null;
+  const runtimeInfoPath = resolveAgenCDaemonRuntimeInfoPath(
+    dirname(params.pidPath),
+  );
+  const recoveredPid = await withAgenCDaemonLifecycleLock(
+    params.host,
+    async () => {
+      const pidSnapshot = await readAgenCDaemonPid(params.pidPath);
+      const recorded = await proveRecordedAgenCDaemonInstance({
+        pidPath: params.pidPath,
+        runtimeInfoPath,
+        host: params.host,
+        options: params.options,
+      });
+      if (recorded === null) {
+        // A concurrent detached start may have published its provisional pid
+        // before the foreground child publishes the authenticated sidecar.
+        // Preserve that generation and let the normal readiness/publication
+        // barrier below prove it instead of spawning an overlap.
+        return pidSnapshot !== null && params.host.isPidRunning(pidSnapshot)
+          ? pidSnapshot
+          : null;
+      }
 
+      const sidecarNow = daemonInstanceIdentityFromRuntimeInfo(
+        readDaemonRuntimeInfo(runtimeInfoPath),
+      );
+      if (
+        (await readAgenCDaemonPid(params.pidPath)) !== pidSnapshot ||
+        sidecarNow === null ||
+        !sameAgenCDaemonInstanceIdentity(recorded.identity, sidecarNow)
+      ) {
+        throw instanceProofFailed(
+          recorded.identity.pid,
+          "daemon metadata changed while repairing the missing pid file",
+        );
+      }
+      if (pidSnapshot !== recorded.identity.pid) {
+        await writeAgenCDaemonPid(params.pidPath, recorded.identity.pid);
+      }
+      const sidecarAfter = daemonInstanceIdentityFromRuntimeInfo(
+        readDaemonRuntimeInfo(runtimeInfoPath),
+      );
+      if (
+        (await readAgenCDaemonPid(params.pidPath)) !== recorded.identity.pid ||
+        sidecarAfter === null ||
+        !sameAgenCDaemonInstanceIdentity(recorded.identity, sidecarAfter)
+      ) {
+        throw instanceProofFailed(
+          recorded.identity.pid,
+          "daemon metadata changed while publishing the repaired pid file",
+        );
+      }
+      return recorded.identity.pid;
+    },
+  );
+  if (recoveredPid !== null) return recoveredPid;
+
+  const orphanProcesses =
+    params.options.findOrphanDaemonPids === undefined
+      ? await findPidlessAgenCDaemonProcesses(params.host, params.daemonHome)
+      : await captureInjectedAgenCDaemonProcesses(
+          await Promise.resolve(
+            params.options.findOrphanDaemonPids(params.daemonHome),
+          ),
+          params.host,
+        );
   const socketPath = resolveAgenCDaemonSocketPath(
     params.host.env,
     params.host.userHome,
   );
-  // Only adopt the orphan when the leftover socket is actually accepting
-  // connections. A stale socket inode (left after a crash without unlink)
-  // passes a bare lstat()/isSocket() check but has no listener, so adopting
-  // it would make autostart wait/connect forever against a dead socket.
-  // `canConnectToUnixSocket` performs a real connect() probe (the same
-  // liveness check `prepareAgenCUnixSocketPath` uses to decide if a socket
-  // is in use). The lstat precondition keeps us from attempting a connect
-  // against a missing or non-socket path.
-  if (
+  const socketAccepting =
     (await isAgenCDaemonSocketPresent(socketPath)) &&
-    (await canConnectToUnixSocket(socketPath))
-  ) {
-    const recoveredPid = orphanPids[0];
-    if (recoveredPid === undefined) return null;
-    await writeAgenCDaemonPid(params.pidPath, recoveredPid);
-    return recoveredPid;
+    (await canConnectToUnixSocket(socketPath));
+  if (orphanProcesses.length === 0) {
+    if (socketAccepting) {
+      throw new AgenCDaemonAutostartError(
+        "AgenC daemon socket is active but its instance identity is unbound",
+      );
+    }
+    return null;
   }
 
+  // A discoverable process without a matching sidecar + authenticated RPC is
+  // never adopted. Linux same-home discovery (or an explicit test seam) may
+  // safely terminate it; portable adoption requires the full tuple proof.
   await Promise.all(
-    orphanPids.map((pid) =>
-      terminatePidlessAgenCDaemonPid(pid, params.host, params.options),
+    orphanProcesses.map((processIdentity) =>
+      terminatePidlessAgenCDaemonPid(
+        processIdentity,
+        params.daemonHome,
+        params.host,
+        params.options,
+      ),
     ),
   );
   return null;
@@ -330,8 +683,8 @@ async function recoverPidlessAgenCDaemon(params: {
  */
 async function reapSupersededAgenCDaemons(params: {
   readonly daemonHome: string;
-  readonly keepPid: number;
-  readonly host: AgenCDaemonCliHost;
+  readonly keepPid: number | null;
+  readonly host: AgenCDaemonAutostartHost;
   readonly options: AgenCDaemonAutostartOptions;
   readonly io: AgenCDaemonCliIo;
 }): Promise<readonly number[]> {
@@ -343,58 +696,865 @@ async function reapSupersededAgenCDaemons(params: {
   ) {
     return [];
   }
-  const superseded = [
-    ...await Promise.resolve(
-      params.options.findSupersededDaemonPids?.(params.daemonHome) ??
-        findPidlessAgenCDaemonPids(
+  const discovered =
+    params.options.findSupersededDaemonPids === undefined
+      ? await findPidlessAgenCDaemonProcesses(
           params.host,
           params.daemonHome,
           "any-install",
-        ),
-    ),
-  ].filter((pid) => pid !== params.keepPid && params.host.isPidRunning(pid));
+        )
+      : await captureInjectedAgenCDaemonProcesses(
+          await Promise.resolve(
+            params.options.findSupersededDaemonPids(params.daemonHome),
+          ),
+          params.host,
+        );
+  const superseded = discovered.filter(
+    (processIdentity) =>
+      params.keepPid === null || processIdentity.pid !== params.keepPid,
+  );
   if (superseded.length === 0) return [];
 
   params.io.stderr.write(
     `agenc: stopping ${superseded.length} superseded daemon(s) for this home ` +
-      `(pid ${superseded.join(", ")})\n`,
+      `(pid ${superseded.map(({ pid }) => pid).join(", ")})\n`,
   );
   await Promise.all(
-    superseded.map((pid) =>
-      terminatePidlessAgenCDaemonPid(pid, params.host, params.options),
+    superseded.map((processIdentity) =>
+      terminatePidlessAgenCDaemonPid(
+        processIdentity,
+        params.daemonHome,
+        params.host,
+        params.options,
+      ),
     ),
   );
-  return superseded;
+  return superseded.map(({ pid }) => pid);
 }
 
 async function terminatePidlessAgenCDaemonPid(
-  pid: number,
-  host: AgenCDaemonCliHost,
+  identity: AgenCDaemonProcessIdentity,
+  daemonHome: string,
+  host: AgenCDaemonAutostartHost,
   options: AgenCDaemonAutostartOptions,
 ): Promise<void> {
+  if (hostPlatform(host) !== "linux") {
+    throw instanceProofFailed(
+      identity.pid,
+      "an unbound daemon cannot be signalled on this platform",
+    );
+  }
   if (options.terminateOrphanDaemonPid !== undefined) {
-    await Promise.resolve(options.terminateOrphanDaemonPid(pid));
+    const signalled = await withAgenCDaemonLifecycleLock(host, async () => {
+      if (
+        !(await reproveLinuxAgenCDaemonProcess(
+          identity,
+          daemonHome,
+          host,
+          options,
+        ))
+      ) {
+        return false;
+      }
+      await Promise.resolve(options.terminateOrphanDaemonPid?.(identity.pid));
+      return true;
+    });
+    if (!signalled) return;
+    if (
+      await waitForAgenCDaemonPidExit(
+        host,
+        identity,
+        AGENC_DAEMON_FORCE_STOP_GRACE_MS,
+      )
+    ) {
+      return;
+    }
+    throw daemonSurvivedTermination(identity.pid);
+  }
+
+  await terminateAgenCDaemonPid(
+    identity,
+    daemonHome,
+    host,
+    options,
+    AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
+  );
+}
+
+async function terminateAgenCDaemonPid(
+  identity: AgenCDaemonProcessIdentity,
+  daemonHome: string,
+  host: AgenCDaemonAutostartHost,
+  options: AgenCDaemonAutostartOptions,
+  gracefulTimeoutMs: number,
+): Promise<void> {
+  const termSignalled = await withAgenCDaemonLifecycleLock(host, async () => {
+    if (
+      !(await reproveLinuxAgenCDaemonProcess(
+        identity,
+        daemonHome,
+        host,
+        options,
+      ))
+    ) {
+      return false;
+    }
+    try {
+      host.terminatePid(identity.pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+    return true;
+  });
+  if (!termSignalled) return;
+  if (await waitForAgenCDaemonPidExit(host, identity, gracefulTimeoutMs))
+    return;
+  const killSignalled = await withAgenCDaemonLifecycleLock(host, async () => {
+    if (
+      !(await reproveLinuxAgenCDaemonProcess(
+        identity,
+        daemonHome,
+        host,
+        options,
+      ))
+    ) {
+      return false;
+    }
+    try {
+      host.terminatePid(identity.pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    return true;
+  });
+  if (!killSignalled) return;
+  if (
+    await waitForAgenCDaemonPidExit(
+      host,
+      identity,
+      AGENC_DAEMON_FORCE_STOP_GRACE_MS,
+    )
+  ) {
+    return;
+  }
+  throw daemonSurvivedTermination(identity.pid);
+}
+
+async function reproveLinuxAgenCDaemonProcess(
+  expected: AgenCDaemonProcessIdentity,
+  daemonHome: string,
+  host: AgenCDaemonAutostartHost,
+  options: AgenCDaemonAutostartOptions,
+): Promise<boolean> {
+  const inspect =
+    options.inspectLegacyDaemonProcess ??
+    host.inspectLegacyDaemonProcess ??
+    ((pid: number) =>
+      inspectLinuxAgenCDaemonProcess(pid, host, daemonHome, "any-install"));
+  const observed = await Promise.resolve(inspect(expected.pid));
+  return observed !== null && observed.processStart === expected.processStart;
+}
+
+async function waitForAgenCDaemonPidExit(
+  host: AgenCDaemonAutostartHost,
+  identity: AgenCDaemonProcessIdentity,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!host.isPidRunning(identity.pid)) return true;
+    await host.sleep(AGENC_DAEMON_STOP_POLL_MS);
+  }
+  if (!host.isPidRunning(identity.pid)) return true;
+  // Off Linux this wait is used only after an authenticated, instance-bound
+  // self-shutdown request. Polling (or even one final poll) through a fresh
+  // PowerShell process on Windows is both unboundedly expensive and cannot
+  // authorize a numeric signal anyway. A still-live numeric PID therefore
+  // remains a survivor; Linux retains its cheap exact-token final check.
+  if (hostPlatform(host) !== "linux") return false;
+  return !(await isAgenCDaemonProcessIdentityCurrent(identity, host));
+}
+
+async function captureInjectedAgenCDaemonProcesses(
+  pids: readonly number[],
+  host: AgenCDaemonAutostartHost,
+): Promise<readonly AgenCDaemonProcessIdentity[]> {
+  const identities: AgenCDaemonProcessIdentity[] = [];
+  const seen = new Set<number>();
+  for (const pid of pids) {
+    if (
+      !Number.isSafeInteger(pid) ||
+      pid <= 1 ||
+      pid === host.pid ||
+      seen.has(pid)
+    ) {
+      continue;
+    }
+    seen.add(pid);
+    const identity = await captureAgenCDaemonProcessIdentity(pid, host);
+    if (identity !== null) identities.push(identity);
+  }
+  return identities;
+}
+
+async function captureAgenCDaemonProcessIdentity(
+  pid: number,
+  host: AgenCDaemonAutostartHost,
+): Promise<AgenCDaemonProcessIdentity | null> {
+  if (!host.isPidRunning(pid)) return null;
+  const processStart = await readAgenCDaemonProcessStart(
+    pid,
+    host.readProcessIdentity,
+  );
+  if (processStart === null) {
+    if (!host.isPidRunning(pid)) return null;
+    throw processIdentityUnavailable(pid);
+  }
+  return { pid, processStart };
+}
+
+async function isAgenCDaemonProcessIdentityCurrent(
+  expected: AgenCDaemonProcessIdentity,
+  host: AgenCDaemonAutostartHost,
+): Promise<boolean> {
+  if (!host.isPidRunning(expected.pid)) return false;
+  const observed = await captureAgenCDaemonProcessIdentity(expected.pid, host);
+  return observed !== null && observed.processStart === expected.processStart;
+}
+
+async function proveRecordedAgenCDaemonInstance(params: {
+  readonly expectedPid?: number;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<BoundAgenCDaemonInstance | null> {
+  // Deliberate proof order: immutable sidecar snapshot, stable OS process
+  // identity, authenticated RPC, sidecar reread, then OS identity recapture.
+  const before = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (before === null) return null;
+  if (params.expectedPid !== undefined && before.pid !== params.expectedPid) {
+    throw instanceProofFailed(
+      params.expectedPid,
+      `sidecar records pid ${before.pid}`,
+    );
+  }
+  const processBefore = await captureAgenCDaemonProcessIdentity(
+    before.pid,
+    params.host,
+  );
+  if (processBefore === null) return null;
+  if (processBefore.processStart !== before.processStart) {
+    throw instanceProofFailed(before.pid, "process start identity changed");
+  }
+
+  let rpcIdentity: AgenCDaemonInstanceIdentity;
+  try {
+    const requestIdentity =
+      params.options.requestDaemonInstanceIdentity ??
+      params.host.requestDaemonInstanceIdentity;
+    rpcIdentity = await Promise.resolve(
+      requestIdentity?.({
+        pid: before.pid,
+        pidPath: params.pidPath,
+      }) ?? requestAgenCDaemonInstanceIdentity(params.host),
+    );
+  } catch (error) {
+    throw instanceProofFailed(
+      before.pid,
+      `authenticated identity RPC failed: ${formatProofError(error)}`,
+    );
+  }
+  if (!sameAgenCDaemonInstanceIdentity(before, rpcIdentity)) {
+    throw instanceProofFailed(
+      before.pid,
+      "authenticated identity does not match the sidecar",
+    );
+  }
+
+  const after = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (after === null || !sameAgenCDaemonInstanceIdentity(before, after)) {
+    throw instanceProofFailed(before.pid, "sidecar changed during proof");
+  }
+  const processAfter =
+    hostPlatform(params.host) === "linux"
+      ? await captureAgenCDaemonProcessIdentity(before.pid, params.host)
+      : processBefore;
+  if (
+    processAfter === null ||
+    processAfter.processStart !== processBefore.processStart ||
+    processAfter.processStart !== after.processStart
+  ) {
+    throw instanceProofFailed(
+      before.pid,
+      "process identity changed during proof",
+    );
+  }
+  return { identity: after, process: processAfter };
+}
+
+async function revalidateRecordedAgenCDaemonInstance(params: {
+  readonly expected: BoundAgenCDaemonInstance;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<BoundAgenCDaemonInstance> {
+  if (hostPlatform(params.host) === "linux") {
+    const current = await proveRecordedAgenCDaemonInstance({
+      expectedPid: params.expected.identity.pid,
+      pidPath: params.pidPath,
+      runtimeInfoPath: params.runtimeInfoPath,
+      host: params.host,
+      options: params.options,
+    });
+    if (
+      current === null ||
+      !sameAgenCDaemonInstanceIdentity(
+        current.identity,
+        params.expected.identity,
+      )
+    ) {
+      throw instanceProofFailed(
+        params.expected.identity.pid,
+        "identity changed before authenticated shutdown",
+      );
+    }
+    return current;
+  }
+
+  // Off Linux, the initial full proof already captured the stable OS token.
+  // Revalidate the sidecar -> authenticated RPC -> sidecar binding without a
+  // second expensive creation-time query. A process replacement before or
+  // after the RPC cannot accept the subsequent instanceId-bound shutdown, and
+  // this path never authorizes a numeric signal.
+  const before = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (
+    before === null ||
+    !sameAgenCDaemonInstanceIdentity(before, params.expected.identity) ||
+    !params.host.isPidRunning(params.expected.identity.pid)
+  ) {
+    throw instanceProofFailed(
+      params.expected.identity.pid,
+      "identity changed before authenticated shutdown",
+    );
+  }
+  let observed: AgenCDaemonInstanceIdentity;
+  try {
+    const requestIdentity =
+      params.options.requestDaemonInstanceIdentity ??
+      params.host.requestDaemonInstanceIdentity;
+    observed = await Promise.resolve(
+      requestIdentity?.({
+        pid: before.pid,
+        pidPath: params.pidPath,
+      }) ?? requestAgenCDaemonInstanceIdentity(params.host),
+    );
+  } catch (error) {
+    throw instanceProofFailed(
+      before.pid,
+      `authenticated identity RPC failed: ${formatProofError(error)}`,
+    );
+  }
+  const after = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (
+    !sameAgenCDaemonInstanceIdentity(observed, params.expected.identity) ||
+    after === null ||
+    !sameAgenCDaemonInstanceIdentity(after, params.expected.identity) ||
+    !params.host.isPidRunning(params.expected.identity.pid)
+  ) {
+    throw instanceProofFailed(
+      params.expected.identity.pid,
+      "identity changed before authenticated shutdown",
+    );
+  }
+  return params.expected;
+}
+
+async function terminateRecordedAgenCDaemonInstance(params: {
+  readonly expected: BoundAgenCDaemonInstance;
+  readonly daemonHome: string;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+  readonly gracefulTimeoutMs: number;
+}): Promise<void> {
+  await revalidateRecordedAgenCDaemonInstance({
+    expected: params.expected,
+    pidPath: params.pidPath,
+    runtimeInfoPath: params.runtimeInfoPath,
+    host: params.host,
+    options: params.options,
+  });
+  let shutdownError: unknown;
+  try {
+    const requestShutdown =
+      params.options.requestDaemonShutdown ?? params.host.requestDaemonShutdown;
+    if (requestShutdown !== undefined) {
+      await Promise.resolve(requestShutdown(params.expected.identity));
+    } else {
+      await requestAgenCDaemonShutdown(params.host, params.expected.identity);
+    }
+  } catch (error) {
+    shutdownError = error;
+  }
+  if (
+    shutdownError === undefined &&
+    (await waitForAgenCDaemonPidExit(
+      params.host,
+      params.expected.process,
+      params.gracefulTimeoutMs,
+    ))
+  ) {
+    return;
+  }
+  if (shutdownError !== undefined && hostPlatform(params.host) !== "linux") {
+    throw instanceProofFailed(
+      params.expected.identity.pid,
+      `authenticated self-shutdown failed: ${formatProofError(shutdownError)}`,
+    );
+  }
+
+  // Numeric signals are a Linux-only fallback. Darwin's native lstart token
+  // is second-resolution, and Windows signalling by PID has the same handle
+  // rebinding problem, so neither can safely close the post-proof TOCTOU.
+  if (hostPlatform(params.host) !== "linux") {
+    throw daemonSurvivedTermination(params.expected.identity.pid);
+  }
+
+  await withAgenCDaemonLifecycleLock(params.host, async () => {
+    await rebindLinuxAgenCDaemonInstanceForSignal({
+      expected: params.expected,
+      daemonHome: params.daemonHome,
+      runtimeInfoPath: params.runtimeInfoPath,
+      host: params.host,
+      options: params.options,
+      signal: "SIGTERM",
+    });
+    params.host.terminatePid(params.expected.identity.pid, "SIGTERM");
+  });
+  if (
+    await waitForAgenCDaemonPidExit(
+      params.host,
+      params.expected.process,
+      params.gracefulTimeoutMs,
+    )
+  ) {
+    return;
+  }
+
+  // Re-read Linux's same-home argv/environment and boot-id + starttime token
+  // immediately before the numeric force-stop fallback.
+  await withAgenCDaemonLifecycleLock(params.host, async () => {
+    await rebindLinuxAgenCDaemonInstanceForSignal({
+      expected: params.expected,
+      daemonHome: params.daemonHome,
+      runtimeInfoPath: params.runtimeInfoPath,
+      host: params.host,
+      options: params.options,
+      signal: "SIGKILL",
+    });
+    params.host.terminatePid(params.expected.identity.pid, "SIGKILL");
+  });
+  if (
+    await waitForAgenCDaemonPidExit(
+      params.host,
+      params.expected.process,
+      AGENC_DAEMON_FORCE_STOP_GRACE_MS,
+    )
+  ) {
+    return;
+  }
+  throw daemonSurvivedTermination(params.expected.identity.pid);
+}
+
+async function rebindLinuxAgenCDaemonInstanceForSignal(params: {
+  readonly expected: BoundAgenCDaemonInstance;
+  readonly daemonHome: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+  readonly signal: "SIGKILL" | "SIGTERM";
+}): Promise<void> {
+  const sidecarBefore = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (
+    sidecarBefore === null ||
+    !sameAgenCDaemonInstanceIdentity(sidecarBefore, params.expected.identity)
+  ) {
+    throw instanceProofFailed(
+      params.expected.identity.pid,
+      `identity sidecar changed before Linux ${params.signal} fallback`,
+    );
+  }
+  const inspect =
+    params.options.inspectLegacyDaemonProcess ??
+    params.host.inspectLegacyDaemonProcess ??
+    ((pid: number) =>
+      inspectLinuxAgenCDaemonProcess(
+        pid,
+        params.host,
+        params.daemonHome,
+        "any-install",
+      ));
+  const process = await Promise.resolve(inspect(params.expected.identity.pid));
+  const sidecarAfter = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (
+    process === null ||
+    process.processStart !== params.expected.process.processStart ||
+    sidecarAfter === null ||
+    !sameAgenCDaemonInstanceIdentity(sidecarAfter, params.expected.identity)
+  ) {
+    throw instanceProofFailed(
+      params.expected.identity.pid,
+      `identity could not be rebound before Linux ${params.signal} fallback`,
+    );
+  }
+}
+
+async function cleanupFailedAgenCDaemonReplacement(params: {
+  readonly identity: BoundAgenCDaemonInstance;
+  readonly daemonHome: string;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<void> {
+  await terminateRecordedAgenCDaemonInstance({
+    expected: params.identity,
+    daemonHome: params.daemonHome,
+    pidPath: params.pidPath,
+    runtimeInfoPath: params.runtimeInfoPath,
+    host: params.host,
+    options: params.options,
+    gracefulTimeoutMs: AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
+  });
+
+  await removeVerifiedAgenCDaemonMetadata({
+    expected: params.identity,
+    pidPath: params.pidPath,
+    runtimeInfoPath: params.runtimeInfoPath,
+    host: params.host,
+    options: params.options,
+  });
+}
+
+async function failStartedAgenCDaemonReplacement(params: {
+  readonly error: unknown;
+  readonly spawnedPid: number | null;
+  readonly spawnedProcess: AgenCDaemonProcessIdentity | null;
+  readonly daemonHome: string;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<never> {
+  try {
+    await cleanupUnverifiedStartedAgenCDaemon(params);
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [params.error, cleanupError],
+      `AgenC daemon startup failed and replacement cleanup could not be verified${
+        params.spawnedPid === null ? "" : ` (pid ${params.spawnedPid})`
+      }`,
+    );
+  }
+  throw params.error;
+}
+
+async function cleanupUnverifiedStartedAgenCDaemon(params: {
+  readonly spawnedPid: number | null;
+  readonly spawnedProcess: AgenCDaemonProcessIdentity | null;
+  readonly daemonHome: string;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<void> {
+  if (params.spawnedPid === null) return;
+  const sidecarSnapshot = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  if (params.host.cancelSpawnedDaemon !== undefined) {
+    await Promise.resolve(params.host.cancelSpawnedDaemon(params.spawnedPid));
+    const exited =
+      params.spawnedProcess === null
+        ? await waitForNumericPidExit(
+            params.host,
+            params.spawnedPid,
+            AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
+          )
+        : await waitForAgenCDaemonPidExit(
+            params.host,
+            params.spawnedProcess,
+            AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
+          );
+    if (!exited) {
+      throw instanceProofFailed(
+        params.spawnedPid,
+        "spawned replacement acknowledged cleanup but remained alive",
+      );
+    }
+    await removeUnverifiedReplacementMetadata(params, sidecarSnapshot);
+    return;
+  }
+  if (params.spawnedProcess === null) {
+    await removeUnverifiedReplacementMetadata(params, sidecarSnapshot);
     return;
   }
 
   try {
-    host.terminatePid(pid);
+    const bound = await proveRecordedAgenCDaemonInstance({
+      expectedPid: params.spawnedPid,
+      pidPath: params.pidPath,
+      runtimeInfoPath: params.runtimeInfoPath,
+      host: params.host,
+      options: params.options,
+    });
+    if (bound !== null) {
+      await cleanupFailedAgenCDaemonReplacement({
+        identity: bound,
+        daemonHome: params.daemonHome,
+        pidPath: params.pidPath,
+        runtimeInfoPath: params.runtimeInfoPath,
+        host: params.host,
+        options: params.options,
+      });
+      return;
+    }
   } catch {
-    /* already gone */
+    // A raced socket may make authenticated proof impossible. Linux can still
+    // safely clean the child we just spawned using its captured start token;
+    // other platforms deliberately fail closed rather than signal by PID.
   }
-  const deadline = Date.now() + 1_000;
-  while (Date.now() < deadline && host.isPidRunning(pid)) {
-    await host.sleep(50);
+
+  if (!params.host.isPidRunning(params.spawnedPid)) {
+    await removeUnverifiedReplacementMetadata(params, sidecarSnapshot);
+    return;
   }
-  if (!host.isPidRunning(pid)) return;
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    /* already gone */
+  if (hostPlatform(params.host) !== "linux") {
+    throw instanceProofFailed(
+      params.spawnedPid,
+      "spawned replacement could not be rebound for portable cleanup",
+    );
   }
+  await terminateAgenCDaemonPid(
+    params.spawnedProcess,
+    params.daemonHome,
+    params.host,
+    params.options,
+    AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
+  );
+  await removeUnverifiedReplacementMetadata(params, sidecarSnapshot);
 }
 
-async function isAgenCDaemonSocketPresent(socketPath: string): Promise<boolean> {
+async function removeUnverifiedReplacementMetadata(
+  params: {
+    readonly spawnedPid: number | null;
+    readonly spawnedProcess: AgenCDaemonProcessIdentity | null;
+    readonly pidPath: string;
+    readonly runtimeInfoPath: string;
+    readonly host: AgenCDaemonAutostartHost;
+  },
+  expectedSidecar: AgenCDaemonInstanceIdentity | null,
+): Promise<void> {
+  if (params.spawnedPid === null) return;
+  const spawnedPid = params.spawnedPid;
+  await withAgenCDaemonLifecycleLock(params.host, async () => {
+    // A same-numbered replacement published after this child exited belongs
+    // to another generation. Preserve both of its metadata files.
+    if (
+      params.host.isPidRunning(spawnedPid) ||
+      (await readAgenCDaemonPid(params.pidPath)) !== spawnedPid
+    ) {
+      return;
+    }
+    const recordedBefore = daemonInstanceIdentityFromRuntimeInfo(
+      readDaemonRuntimeInfo(params.runtimeInfoPath),
+    );
+    if (
+      recordedBefore !== null &&
+      (expectedSidecar === null ||
+        !sameAgenCDaemonInstanceIdentity(recordedBefore, expectedSidecar) ||
+        recordedBefore.pid !== spawnedPid ||
+        (params.spawnedProcess !== null &&
+          recordedBefore.processStart !== params.spawnedProcess.processStart))
+    ) {
+      return;
+    }
+    if (
+      params.host.isPidRunning(spawnedPid) ||
+      (await readAgenCDaemonPid(params.pidPath)) !== spawnedPid
+    ) {
+      return;
+    }
+    const recordedAfter = daemonInstanceIdentityFromRuntimeInfo(
+      readDaemonRuntimeInfo(params.runtimeInfoPath),
+    );
+    if (
+      (recordedBefore === null) !== (recordedAfter === null) ||
+      (recordedBefore !== null &&
+        recordedAfter !== null &&
+        !sameAgenCDaemonInstanceIdentity(recordedBefore, recordedAfter))
+    ) {
+      return;
+    }
+    await removeAgenCDaemonPid(params.pidPath, spawnedPid);
+    if (recordedAfter !== null) {
+      removeDaemonRuntimeInfo(params.runtimeInfoPath, recordedAfter.instanceId);
+    }
+  });
+}
+
+async function waitForNumericPidExit(
+  host: AgenCDaemonAutostartHost,
+  pid: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!host.isPidRunning(pid)) return true;
+    await host.sleep(AGENC_DAEMON_STOP_POLL_MS);
+  }
+  return !host.isPidRunning(pid);
+}
+
+async function removeVerifiedAgenCDaemonMetadata(params: {
+  readonly expected: BoundAgenCDaemonInstance;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+  readonly options: AgenCDaemonAutostartOptions;
+}): Promise<void> {
+  await withAgenCDaemonLifecycleLock(params.host, async () => {
+    if (
+      (await readAgenCDaemonPid(params.pidPath)) !==
+      params.expected.identity.pid
+    ) {
+      return;
+    }
+    const recorded = daemonInstanceIdentityFromRuntimeInfo(
+      readDaemonRuntimeInfo(params.runtimeInfoPath),
+    );
+    if (
+      recorded !== null &&
+      !sameAgenCDaemonInstanceIdentity(params.expected.identity, recorded)
+    ) {
+      return;
+    }
+    // A live numeric PID is either the old daemon surviving shutdown or a
+    // same-numbered replacement. Preserve both metadata files in either case;
+    // removal is authorized only after the PID is absent while this lifecycle
+    // transaction excludes a concurrent provisional publisher.
+    if (params.host.isPidRunning(params.expected.identity.pid)) {
+      return;
+    }
+    await Promise.resolve(
+      params.options.afterVerifiedExitBeforeMetadataRemoval?.(),
+    );
+    if (
+      params.host.isPidRunning(params.expected.identity.pid) ||
+      (await readAgenCDaemonPid(params.pidPath)) !==
+        params.expected.identity.pid
+    ) {
+      return;
+    }
+    const sidecarAfter = daemonInstanceIdentityFromRuntimeInfo(
+      readDaemonRuntimeInfo(params.runtimeInfoPath),
+    );
+    if (
+      sidecarAfter !== null &&
+      !sameAgenCDaemonInstanceIdentity(params.expected.identity, sidecarAfter)
+    ) {
+      return;
+    }
+    await removeAgenCDaemonPid(params.pidPath, params.expected.identity.pid);
+    removeDaemonRuntimeInfo(
+      params.runtimeInfoPath,
+      params.expected.identity.instanceId,
+    );
+  });
+}
+
+async function removeExitedAgenCDaemonMetadata(params: {
+  readonly pid: number;
+  readonly pidPath: string;
+  readonly runtimeInfoPath: string;
+  readonly host: AgenCDaemonAutostartHost;
+}): Promise<void> {
+  const sidecarSnapshot = daemonInstanceIdentityFromRuntimeInfo(
+    readDaemonRuntimeInfo(params.runtimeInfoPath),
+  );
+  await withAgenCDaemonLifecycleLock(params.host, async () => {
+    if (
+      params.host.isPidRunning(params.pid) ||
+      (await readAgenCDaemonPid(params.pidPath)) !== params.pid
+    ) {
+      return;
+    }
+    const sidecarNow = daemonInstanceIdentityFromRuntimeInfo(
+      readDaemonRuntimeInfo(params.runtimeInfoPath),
+    );
+    if (
+      (sidecarSnapshot === null) !== (sidecarNow === null) ||
+      (sidecarSnapshot !== null &&
+        sidecarNow !== null &&
+        !sameAgenCDaemonInstanceIdentity(sidecarSnapshot, sidecarNow)) ||
+      (sidecarNow !== null && sidecarNow.pid !== params.pid)
+    ) {
+      return;
+    }
+    await removeAgenCDaemonPid(params.pidPath, params.pid);
+    if (sidecarNow !== null) {
+      removeDaemonRuntimeInfo(params.runtimeInfoPath, sidecarNow.instanceId);
+    }
+  });
+}
+
+function instanceProofFailed(
+  pid: number,
+  reason: string,
+): AgenCDaemonAutostartError {
+  return new AgenCDaemonAutostartError(
+    `AgenC daemon instance identity could not be verified (pid ${pid}): ${reason}`,
+  );
+}
+
+function formatProofError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function hostPlatform(host: AgenCDaemonAutostartHost): NodeJS.Platform {
+  return host.platform ?? process.platform;
+}
+
+function processIdentityUnavailable(pid: number): AgenCDaemonAutostartError {
+  return new AgenCDaemonAutostartError(
+    `AgenC daemon process identity could not be verified (pid ${pid})`,
+  );
+}
+
+function daemonSurvivedTermination(pid: number): AgenCDaemonAutostartError {
+  return new AgenCDaemonAutostartError(
+    `AgenC daemon survived forced termination (pid ${pid})`,
+  );
+}
+
+async function isAgenCDaemonSocketPresent(
+  socketPath: string,
+): Promise<boolean> {
   try {
     return (await lstat(socketPath)).isSocket();
   } catch (error) {
@@ -405,18 +1565,10 @@ async function isAgenCDaemonSocketPresent(socketPath: string): Promise<boolean> 
 }
 
 /**
- * True when `value` looks like an agenc runtime entrypoint from any install.
- * Superseded daemons live under a version-stamped runtime directory
- * (`.../.agenc/runtime/<version>/.../bin/agenc`), so their entrypoint never
- * equals the current one — matching on shape is what makes them visible.
- */
-function isAgenCDaemonEntrypointPath(value: string): boolean {
-  const base = value.split(/[\\/]/u).pop() ?? "";
-  return base === "agenc" || base === "agenc.js" || base === "agenc-main.js";
-}
-
-/**
- * Find daemon processes serving `daemonHome` that the pid file does not track.
+ * Find Linux daemon processes serving `daemonHome` that the pid file does not
+ * track. No equally strong arbitrary-process ownership proof exists in this
+ * module for Darwin or Windows, so callers deliberately receive no candidates
+ * there rather than pretending the same-home guarantee is portable.
  *
  * `entrypointMatch: "exact"` restricts the result to daemons running this very
  * runtime build — the only ones safe to ADOPT, since adopting a daemon from
@@ -428,88 +1580,22 @@ function isAgenCDaemonEntrypointPath(value: string): boolean {
  * pid file, so a second daemon serving it is untracked by construction, and
  * before this it survived every upgrade and accumulated indefinitely.
  */
-async function findPidlessAgenCDaemonPids(
-  host: AgenCDaemonCliHost,
+async function findPidlessAgenCDaemonProcesses(
+  host: AgenCDaemonAutostartHost,
   daemonHome: string,
   entrypointMatch: "exact" | "any-install" = "exact",
-): Promise<readonly number[]> {
-  if (process.platform !== "linux") return [];
-  if (entrypointMatch === "exact" && host.entrypointPath.length === 0) {
-    return [];
-  }
-  let entries: readonly import("node:fs").Dirent[];
+): Promise<readonly AgenCDaemonProcessIdentity[]> {
   try {
-    entries = await readdir("/proc", { withFileTypes: true });
-  } catch {
-    return [];
+    return await findLinuxAgenCDaemonProcesses(
+      host,
+      daemonHome,
+      entrypointMatch,
+    );
+  } catch (error) {
+    throw new AgenCDaemonAutostartError(
+      `AgenC daemon discovery could not inspect the Linux process table: ${String(error)}`,
+    );
   }
-
-  const expectedEntrypoint =
-    host.entrypointPath.length > 0 ? resolve(host.entrypointPath) : null;
-  const expectedHome = resolve(daemonHome);
-  const pids: number[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-    const candidatePid = Number.parseInt(entry.name, 10);
-    if (
-      !Number.isSafeInteger(candidatePid) ||
-      candidatePid <= 1 ||
-      candidatePid === host.pid
-    ) {
-      continue;
-    }
-    const procDir = join("/proc", entry.name);
-    const argv = await readProcList(join(procDir, "cmdline"));
-    const entrypointIndex = argv.findIndex((value) => {
-      try {
-        if (expectedEntrypoint !== null && resolve(value) === expectedEntrypoint) {
-          return true;
-        }
-        return (
-          entrypointMatch === "any-install" &&
-          isAgenCDaemonEntrypointPath(value)
-        );
-      } catch {
-        return false;
-      }
-    });
-    if (entrypointIndex === -1) continue;
-    const tail = argv.slice(entrypointIndex + 1);
-    if (
-      tail[0] !== "daemon" ||
-      tail[1] !== "start" ||
-      tail[2] !== "--foreground"
-    ) {
-      continue;
-    }
-
-    const env = await readProcEnv(join(procDir, "environ"));
-    const candidateHome =
-      env.AGENC_HOME ?? (env.HOME !== undefined ? join(env.HOME, ".agenc") : null);
-    if (candidateHome === null || resolve(candidateHome) !== expectedHome) {
-      continue;
-    }
-    pids.push(candidatePid);
-  }
-  return pids;
-}
-
-async function readProcList(path: string): Promise<readonly string[]> {
-  try {
-    return (await readFile(path, "utf8")).split("\0").filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
-async function readProcEnv(path: string): Promise<Record<string, string>> {
-  const env: Record<string, string> = {};
-  for (const entry of await readProcList(path)) {
-    const separator = entry.indexOf("=");
-    if (separator <= 0) continue;
-    env[entry.slice(0, separator)] = entry.slice(separator + 1);
-  }
-  return env;
 }
 
 type DaemonReadyWaitOutcome = "ready" | "exited" | "timeout";

@@ -84,6 +84,14 @@ vi.mock("../../utils/fastMode.js", () => ({
 
 vi.mock("../../utils/effort.js", () => ({
   convertEffortValueToLevel: (value: string | undefined) => value,
+  getAvailableEffortLevels: (model: string) =>
+    model === "basic-mini"
+      ? []
+      : model === "xhigh-model"
+        ? ["low", "medium", "high", "xhigh"]
+      : model === "max-model"
+        ? ["low", "medium", "high", "max"]
+        : ["low", "medium", "high"],
   getDefaultEffortForModel: (model: string) => {
     if (model === "basic-mini") return undefined;
     if (model === "max-model") return "max";
@@ -97,7 +105,8 @@ vi.mock("../../utils/effort.js", () => ({
     _persistedEffort: string | undefined,
     hasToggledEffort: boolean,
   ) => (hasToggledEffort ? effort : defaultEffort),
-  toPersistableEffort: (effort: string | undefined) => effort,
+  toPersistableEffort: (effort: string | undefined) =>
+    effort === "xhigh" ? "max" : effort,
 }));
 
 vi.mock("../../utils/model/model.js", () => ({
@@ -117,6 +126,11 @@ vi.mock("../../utils/model/modelOptions.js", () => ({
       value: "max-model",
       label: "Max Model",
       description: "Supports max effort",
+    },
+    {
+      value: "xhigh-model",
+      label: "XHigh Model",
+      description: "Supports xhigh effort",
     },
     {
       value: "basic-mini",
@@ -225,6 +239,20 @@ describe("ModelPicker coverage worker 021", () => {
         { effortLevel: "max" },
       );
 
+      selectPropsMock.current?.onFocus("xhigh-model");
+      await waitForRender();
+      expect(stripAnsi(output)).toContain("Xhigh effort");
+      keybindingsMock.current?.["modelPicker:decreaseEffort"]();
+      await waitForRender();
+      keybindingsMock.current?.["modelPicker:increaseEffort"]();
+      await waitForRender();
+      selectPropsMock.current?.onChange("xhigh-model");
+      expect(onSelect).toHaveBeenLastCalledWith("xhigh-model", "xhigh");
+      expect(settingsMock.updateSettingsForSource).toHaveBeenLastCalledWith(
+        "userSettings",
+        { effortLevel: "max" },
+      );
+
       selectPropsMock.current?.onFocus("basic-mini");
       await waitForRender();
       keybindingsMock.current?.["modelPicker:increaseEffort"]();
@@ -233,8 +261,8 @@ describe("ModelPicker coverage worker 021", () => {
       expect(onSelect).toHaveBeenLastCalledWith("basic-mini", undefined);
 
       selectPropsMock.current?.onCancel();
-      expect(appStateMock.setAppState).toHaveBeenCalledTimes(3);
-      expect(appStateMock.state.effortValue).toBe("max");
+      expect(appStateMock.setAppState).toHaveBeenCalledTimes(4);
+      expect(appStateMock.state.effortValue).toBe("xhigh");
     } finally {
       root.unmount();
       stdin.end();
