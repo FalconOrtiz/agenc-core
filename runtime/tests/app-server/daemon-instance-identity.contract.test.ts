@@ -126,6 +126,104 @@ describe("daemon instance identity", () => {
     },
   );
 
+  it.skipIf(process.platform !== "linux")(
+    "ignores an unrelated process whose cwd identity cannot be proved",
+    async () => {
+      const child = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1_000)", "unrelated-process"],
+        { stdio: "ignore" },
+      );
+      const cwdError = Object.assign(new Error("injected unreadable cwd"), {
+        code: "EACCES",
+      });
+      const readProcessCwdPath = vi.fn(async () => {
+        throw cwdError;
+      });
+
+      try {
+        await once(child, "spawn");
+        await expect(
+          findLinuxAgenCDaemonProcesses(
+            {
+              entrypointPath: join(process.cwd(), "bin", "agenc"),
+              pid: process.pid,
+              platform: "linux",
+              isPidRunning: (pid) =>
+                pid === child.pid && child.exitCode === null,
+            },
+            join(tmpdir(), "agenc-unrelated-daemon-home"),
+            "any-install",
+            { readProcessCwdPath },
+          ),
+        ).resolves.toEqual([]);
+        expect(readProcessCwdPath).not.toHaveBeenCalled();
+      } finally {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited.catch(() => {});
+      }
+    },
+  );
+
+  it.skipIf(process.platform !== "linux")(
+    "matches a relative daemon entrypoint and fails closed when its cwd proof fails",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "agenc-candidate-cwd-"));
+      const daemonHome = join(root, "daemon-home");
+      const entrypoint = join(root, "daemon-entrypoint.js");
+      await mkdir(daemonHome, { recursive: true });
+      await writeFile(entrypoint, "setInterval(() => {}, 1_000);\n");
+      const child = spawn(
+        process.execPath,
+        ["./daemon-entrypoint.js", "daemon", "start", "--foreground"],
+        {
+          cwd: root,
+          env: { ...process.env, AGENC_HOME: daemonHome },
+          stdio: "ignore",
+        },
+      );
+
+      try {
+        await once(child, "spawn");
+        const host = {
+          entrypointPath: entrypoint,
+          pid: process.pid,
+          platform: "linux" as const,
+          isPidRunning: (pid: number) =>
+            pid === child.pid && child.exitCode === null,
+        };
+        await expect(
+          findLinuxAgenCDaemonProcesses(host, daemonHome, "exact"),
+        ).resolves.toEqual([
+          expect.objectContaining({
+            pid: child.pid,
+          }),
+        ]);
+
+        const cwdError = Object.assign(new Error("injected unreadable cwd"), {
+          code: "EACCES",
+        });
+        const readProcessCwdPath = vi.fn(async () => {
+          throw cwdError;
+        });
+        await expect(
+          findLinuxAgenCDaemonProcesses(host, daemonHome, "exact", {
+            readProcessCwdPath,
+          }),
+        ).rejects.toBeInstanceOf(AgenCDaemonProcessScanIncompleteError);
+        expect(readProcessCwdPath).toHaveBeenCalledExactlyOnceWith(
+          `/proc/${child.pid}`,
+        );
+      } finally {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited.catch(() => {});
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("streams proc entries only to the bounded sentinel and preserves close failure context", async () => {
     let nextPid = 100;
     const read = vi.fn(async () => ({

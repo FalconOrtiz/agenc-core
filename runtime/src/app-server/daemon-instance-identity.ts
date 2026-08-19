@@ -42,6 +42,8 @@ export interface LinuxAgenCDaemonProcessScanLimits {
   readonly now?: () => number;
   /** @internal Deterministic streaming-directory contract-test seam. */
   readonly openProcDirectory?: OpenLinuxProcDirectory;
+  /** @internal Deterministic process-cwd contract-test seam. */
+  readonly readProcessCwdPath?: (procDir: string) => Promise<string>;
 }
 
 export class AgenCDaemonProcessScanIncompleteError extends Error {
@@ -92,6 +94,7 @@ interface LinuxAgenCDaemonProcessScanTracker {
   readonly maxIoOperations: number;
   readonly maxElapsedMs: number;
   readonly now: () => number;
+  readonly readProcessCwdPath?: (procDir: string) => Promise<string>;
   processEntries: number;
   ioOperations: number;
 }
@@ -359,11 +362,30 @@ async function inspectLinuxAgenCDaemonProcessWithTracker(
       host.readProcessIdentity,
     );
     if (initialProcessStart === null) return null;
-    const cwdBefore = await readLinuxProcessCwdIdentity(procDir, scanTracker);
-
     const argv = await readProcList(join(procDir, "cmdline"), scanTracker);
     const expectedEntrypoint =
       host.entrypointPath.length > 0 ? resolve(host.entrypointPath) : null;
+    const expectedEntrypointBasename =
+      expectedEntrypoint === null ? null : basename(expectedEntrypoint);
+    // An unrelated process may legitimately hide its cwd from this user. A
+    // basename match is only a cheap necessary condition: it authorizes no
+    // action, but lets us avoid cwd I/O when no argv token could resolve to
+    // either the exact entrypoint or a canonical <package>/bin/agenc path.
+    // Candidate-shaped argv still receives the complete fail-closed proof.
+    if (
+      !argv.some((value) => {
+        const candidateBasename = basename(resolve("/", value));
+        return (
+          (expectedEntrypointBasename !== null &&
+            candidateBasename === expectedEntrypointBasename) ||
+          (entrypointMatch === "any-install" && candidateBasename === "agenc")
+        );
+      })
+    ) {
+      return null;
+    }
+    const cwdBefore = await readLinuxProcessCwdIdentity(procDir, scanTracker);
+
     let entrypointIndex = -1;
     for (let index = 0; index < argv.length; index += 1) {
       const value = argv[index];
@@ -469,7 +491,10 @@ async function readLinuxProcessCwdIdentity(
   scanTracker?: LinuxAgenCDaemonProcessScanTracker,
 ): Promise<LinuxProcessCwdIdentity> {
   consumeLinuxAgenCDaemonScanIo(scanTracker);
-  const path = await realpath(join(procDir, "cwd"));
+  const path =
+    scanTracker?.readProcessCwdPath === undefined
+      ? await realpath(join(procDir, "cwd"))
+      : await scanTracker.readProcessCwdPath(procDir);
   consumeLinuxAgenCDaemonScanIo(scanTracker);
   const metadata = await stat(path, { bigint: true });
   if (!metadata.isDirectory()) {
@@ -725,6 +750,7 @@ function createLinuxAgenCDaemonProcessScanTracker(
       DEFAULT_LINUX_DAEMON_SCAN_MAX_ELAPSED_MS,
     ),
     now,
+    readProcessCwdPath: limits.readProcessCwdPath,
     processEntries: 0,
     ioOperations: 0,
   };
