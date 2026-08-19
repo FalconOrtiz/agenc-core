@@ -39,7 +39,7 @@ dropped. TOML aliases remapped before normalize:
 
 | Key | Default |
 | --- | --- |
-| `model` | `grok-4.5` |
+| `model` | `grok-4.6` |
 | `model_provider` | `grok` |
 | `approval_policy` | `on-request` |
 | `sandbox_mode` / `sandbox.mode` | `workspace-write` |
@@ -68,7 +68,7 @@ dropped. TOML aliases remapped before normalize:
 ### Top-level model / runtime
 
 ```toml
-model = "grok-4.5"
+model = "grok-4.6"
 model_provider = "grok"
 approval_policy = "on-request"   # untrusted | on-failure | on-request | never
 sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-access
@@ -357,7 +357,7 @@ Named override bundles. Only these keys apply (others silently ignored):
 
 ```toml
 [profiles.yolo]
-model = "grok-4.5"
+model = "grok-4.6"
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 ```

@@ -6,9 +6,15 @@ import {
   getActiveConfigModel,
 } from '../../../src/bootstrap/state.ts'
 import {
+  getDefaultHaikuModel,
   getDefaultMainLoopModel,
   getDefaultMainLoopModelSetting,
+  getDefaultOpusModel,
+  getDefaultSonnetModel,
+  getPublicModelDisplayName,
+  getSmallFastModel,
 } from '../../../src/utils/model/model.ts'
+import { BUILT_IN_PROVIDER_DEFAULT_MODELS } from '../../../src/llm/registry/provider-info.ts'
 
 const SAVED_ENV = {
   XAI_API_KEY: process.env.XAI_API_KEY,
@@ -54,11 +60,28 @@ test('getDefaultMainLoopModel reflects config.model for the active xai provider'
   expect(getDefaultMainLoopModel()).toBe('grok-build-0.1')
 })
 
-test('getDefaultMainLoopModel still defaults to grok-4.5 when config.model is unset', () => {
+test('xAI helper fallbacks stay aligned with the grok provider default', () => {
   process.env.XAI_API_KEY = 'xai-test'
   setActiveConfigModel(undefined)
 
-  expect(getDefaultMainLoopModel()).toBe('grok-4.5')
+  const providerDefault = BUILT_IN_PROVIDER_DEFAULT_MODELS.grok
+  expect(providerDefault).toBe('grok-4.6')
+  expect({
+    main: getDefaultMainLoopModel(),
+    setting: getDefaultMainLoopModelSetting(),
+    smallFast: getSmallFastModel(),
+    opus: getDefaultOpusModel(),
+    sonnet: getDefaultSonnetModel(),
+    haiku: getDefaultHaikuModel(),
+  }).toEqual({
+    main: providerDefault,
+    setting: providerDefault,
+    smallFast: providerDefault,
+    opus: providerDefault,
+    sonnet: providerDefault,
+    haiku: providerDefault,
+  })
+  expect(getPublicModelDisplayName(providerDefault)).toBe('Grok 4.6')
 })
 
 test('grok-4.3 keeps working when it is the configured model', () => {
@@ -81,5 +104,5 @@ test('config model for a different provider does not leak into xai default', () 
   // Published selection is for openai, but the active provider is xai.
   setActiveConfigModel({ provider: 'openai', model: 'gpt-5' })
 
-  expect(getDefaultMainLoopModel()).toBe('grok-4.5')
+  expect(getDefaultMainLoopModel()).toBe(BUILT_IN_PROVIDER_DEFAULT_MODELS.grok)
 })

@@ -5,7 +5,7 @@ import {
   EFFORT_MEDIUM,
 } from '../../constants/figures.js' // upstream-import: keep target is owned by another Z-PURGE item
 import {
-  type EffortLevel,
+  type AvailableEffortLevel,
   type EffortValue,
   getDisplayedEffortLevel,
   modelSupportsEffort,
@@ -24,7 +24,7 @@ export function getEffortNotificationText(
   return `${effortLevelToSymbol(level)} ${level} · /effort`
 }
 
-export function effortLevelToSymbol(level: EffortLevel): string {
+export function effortLevelToSymbol(level: AvailableEffortLevel): string {
   switch (level) {
     case 'low':
       return EFFORT_LOW
@@ -33,6 +33,7 @@ export function effortLevelToSymbol(level: EffortLevel): string {
     case 'high':
       return EFFORT_HIGH
     case 'max':
+    case 'xhigh':
       return EFFORT_MAX
     default:
       // Defensive: level can originate from remote config. If an unknown

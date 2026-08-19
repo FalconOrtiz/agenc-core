@@ -12,7 +12,7 @@ afterEach(() => {
 })
 
 async function importFreshEffortModule(options: {
-  provider: 'agenc' | 'openai'
+  provider: 'agenc' | 'openai' | 'xai'
 }) {
   vi.resetModules()
   vi.doMock(providersModulePath, () => ({
@@ -70,15 +70,40 @@ test('gpt-5.3-providercode-spark stays without effort controls', async () => {
   expect(getAvailableEffortLevels('gpt-5.3-providercode-spark')).toEqual([])
 })
 
-test('grok reasoning models expose effort selection from the model catalog', async () => {
-  const { modelSupportsEffort, getAvailableEffortLevels } =
+test('grok reasoning models expose their exact catalog effort levels', async () => {
+  const {
+    getAvailableEffortLevels,
+    modelSupportsEffort,
+    resolveAppliedEffort,
+    toPersistableEffort,
+  } =
     await importFreshEffortModule({
-      provider: 'agenc',
+      provider: 'xai',
     })
 
+  expect(modelSupportsEffort('grok-4.6')).toBe(true)
   expect(modelSupportsEffort('grok-4.5')).toBe(true)
   expect(modelSupportsEffort('grok-4.3')).toBe(true)
-  expect(getAvailableEffortLevels('grok-4.5')).toContain('high')
+  expect(getAvailableEffortLevels('grok-4.6')).toEqual([
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+  ])
+  expect(getAvailableEffortLevels('grok-4.5')).toEqual([
+    'low',
+    'medium',
+    'high',
+  ])
+  expect(getAvailableEffortLevels('grok-4.3')).toEqual([
+    'low',
+    'medium',
+    'high',
+  ])
+
+  expect(toPersistableEffort('xhigh')).toBe('max')
+  expect(resolveAppliedEffort('grok-4.6', 'max')).toBe('xhigh')
+  expect(resolveAppliedEffort('grok-4.5', 'max')).toBe('high')
 })
 
 test('grok models without catalog reasoning levels do not expose effort', async () => {

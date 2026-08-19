@@ -12,16 +12,16 @@ CLI: `agenc providers` · `agenc login` · `agenc config` · `/provider` and
 | Setting | Value |
 | --- | --- |
 | Default provider | `grok` (xAI; alias `xai` normalizes to `grok`) |
-| Fresh-config session model | `grok-4.5` (`defaultConfig().model`) |
-| Provider-map fallback (`BUILT_IN_PROVIDER_DEFAULT_MODELS.grok`) | `grok-4.5` |
+| Fresh-config session model | `grok-4.6` (`defaultConfig().model`) |
+| Provider-map fallback (`BUILT_IN_PROVIDER_DEFAULT_MODELS.grok`) | `grok-4.6` |
 | Managed OpenRouter paid default | `x-ai/grok-4.5` |
 | Config keys | `model_provider`, `model` in `config.toml` |
 | Env overrides | `AGENC_PROVIDER`, `AGENC_MODEL` |
 
 Bare interactive startup with a fresh install uses the **config** default
-(`grok-4.5`). When only a provider slug is resolved without an explicit model
-(or when managed OpenRouter picks its paid default), the registry uses
-**`grok-4.5`** / **`x-ai/grok-4.5`**.
+(`grok-4.6`). When only the direct `grok` provider slug is resolved without an
+explicit model, the registry also uses **`grok-4.6`**. Managed OpenRouter is a
+separate provider route and its paid default remains **`x-ai/grok-4.5`**.
 
 Grok credential resolution:
 
@@ -32,31 +32,37 @@ Grok credential resolution:
 4. `GROK_API_KEY`
 5. `AGENC_XAI_API_KEY`
 
-### Grok 4.5 catalog entry
+### Grok defaults and catalog entries
 
-`grok-4.5` is the provider-map default for `grok` and a full catalog entry.
-Fresh `config.toml` seeds `model = "grok-4.5"`. The
-runtime catalog for Grok 4.5 exposes:
+`grok-4.6` is the provider-map default for direct `grok` sessions and a full
+catalog entry. Fresh `config.toml` seeds `model = "grok-4.6"`. The runtime
+catalog for Grok 4.6 exposes:
 
 | Property | Value |
 | --- | --- |
 | Context window | 500,000 tokens |
 | Input modalities | text and image |
 | Runtime features | function tools, parallel tool calls, structured output, search integration |
-| Reasoning effort | `low`, `medium`, `high`; model default `high` |
-| Standard token rates | $2.00 / 1M input, $0.50 / 1M cached input, $6.00 / 1M output |
+| Reasoning effort | `low`, `medium`, `high`, `xhigh`; model default `high` |
+| Standard token rates below 200k prompt tokens | $2.00 / 1M input, $0.50 / 1M cached input, $6.00 / 1M output |
 
-The xAI reasoning gate is fail-closed: Grok 4.3, Grok 4.5, and the documented
-4.20 multi-agent family may receive the provider parameter; unknown variants
-have it stripped instead of inheriting support from a name prefix. Grok 4.3's
-catalog default effort is `low`; Grok 4.5's is `high`.
+`grok-4.5` remains a selectable 500k-context catalog entry with the same input
+modalities and runtime features. Its short-context cached-input rate is
+$0.30 / 1M, versus $0.50 / 1M for Grok 4.6; it supports
+`low`/`medium`/`high` reasoning and is still the managed OpenRouter paid
+default. The xAI reasoning gate is fail-closed: Grok 4.3, Grok 4.5, Grok 4.6,
+and the documented 4.20 multi-agent family may receive the provider parameter;
+unknown variants have it stripped instead of inheriting support from a name
+prefix. Grok 4.3's catalog default effort is `low`; Grok 4.5 and Grok 4.6
+default to `high`.
 
-Sources checked for this catalog entry on 2026-07-10:
+Sources checked for the Grok 4.5 catalog entry on 2026-07-10:
 [xAI Grok 4.5](https://docs.x.ai/developers/grok-4-5),
 [models](https://docs.x.ai/developers/models), and
 [pricing](https://docs.x.ai/developers/pricing). Model access can still depend
 on account and region; the runtime reports the provider error without replacing
-the configured model.
+the configured model. See the [0.16.0 release notes](../releases/0.16.0.md) for
+the Grok 4.6 default and capability change.
 
 **Composer / ACP models** (`grok-composer-*`) are not ordinary chat endpoints —
 they run only through the Grok Build CLI ACP path. See
@@ -66,7 +72,7 @@ they run only through the Grok Build CLI ACP path. See
 
 | Slug | Display name | Default model | Base URL | API key env (primary) |
 | --- | --- | --- | --- | --- |
-| `grok` | xAI Grok | `grok-4.5` | `https://api.x.ai/v1` | `XAI_API_KEY` |
+| `grok` | xAI Grok | `grok-4.6` | `https://api.x.ai/v1` | `XAI_API_KEY` |
 | `openai` | OpenAI | `gpt-5` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
 | `anthropic` | Anthropic | `claude-opus-4-7` | `https://api.anthropic.com/v1` | `ANTHROPIC_API_KEY` |
 | `ollama` | Ollama | `llama3.3` | `http://localhost:11434` | _(none required)_ |
@@ -109,7 +115,7 @@ See `runtime/src/auth/` and `runtime/src/llm/discovery/provider-discovery.ts`.
 ```toml
 # ~/.agenc/config.toml (illustrative)
 model_provider = "grok"
-model = "grok-4.5"
+model = "grok-4.6"
 
 [providers.openrouter]
 # provider-specific overrides live under [providers.<slug>] when configured

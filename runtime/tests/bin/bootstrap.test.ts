@@ -2129,7 +2129,7 @@ describe("bootstrapLocalRuntimeSession", () => {
 
       expect(boot.resolvedProvider).toBe("openai");
       // Note: when `AGENC_PROVIDER` overrides `model_provider` while the
-      // base config still carries the default `model: "grok-4.5"`,
+      // base config still carries the default `model: "grok-4.6"`,
       // `configuredModelForProvider` keeps that explicit model rather
       // than falling back to the openai default. The test focuses on
       // provider + api-key resolution, not model defaulting.

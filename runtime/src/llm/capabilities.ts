@@ -218,7 +218,7 @@ function resolveGrokImageHistory(model: string): boolean {
 
 function resolveGrokReasoningEffort(model: string): boolean {
   // Delegate the xAI model allowlist to the single source of truth so
-  // supported 4.3/4.5 requests retain their depth control while inherited
+  // supported 4.3/4.5/4.6 requests retain their depth control while inherited
   // effort is stripped from unknown or explicitly non-reasoning models.
   return supportsXaiReasoningEffortParam(model);
 }

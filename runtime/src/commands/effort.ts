@@ -14,9 +14,10 @@ import {
   getAvailableEffortLevels,
   getDefaultEffortForModel,
   getDisplayedEffortLevel,
-  isEffortLevel,
+  isAvailableEffortLevel,
   modelSupportsEffort,
-  type EffortLevel,
+  toPersistableEffort,
+  type AvailableEffortLevel,
 } from "../utils/effort.js";
 import { getMainLoopModel } from "../utils/model/model.js";
 import { readSessionSelection } from "./model.js";
@@ -105,15 +106,15 @@ export const effortCommand: SlashCommand = {
         };
       }
 
-      if (!isEffortLevel(arg)) {
-        const levels = getAvailableEffortLevels(model).join(", ");
+      const available = getAvailableEffortLevels(model);
+      if (!isAvailableEffortLevel(arg)) {
+        const levels = available.join(", ");
         return {
           kind: "error",
           message: `Usage: /effort <${levels}> — or /effort default.`,
         };
       }
-      const level: EffortLevel = arg;
-      const available = getAvailableEffortLevels(model);
+      const level: AvailableEffortLevel = arg;
       if (!(available as readonly string[]).includes(level)) {
         return {
           kind: "error",
@@ -121,7 +122,9 @@ export const effortCommand: SlashCommand = {
         };
       }
 
-      updateSettingsForSource("userSettings", { effortLevel: level });
+      updateSettingsForSource("userSettings", {
+        effortLevel: toPersistableEffort(level),
+      });
       ctx.appState?.setAppState?.((prev: unknown) => ({
         ...(prev as Record<string, unknown>),
         effortValue: level,

@@ -343,17 +343,19 @@ Default provider is **`grok`** (xAI). Model defaults are dual-sourced:
 
 | Source                                                          | Grok default        | Evidence                                    |
 | --------------------------------------------------------------- | ------------------- | ------------------------------------------- |
-| Fresh `defaultConfig().model`                                   | **`grok-4.5`**      | `runtime/src/config/schema.ts`              |
-| Provider-map fallback (`BUILT_IN_PROVIDER_DEFAULT_MODELS.grok`) | **`grok-4.5`**      | `runtime/src/llm/registry/provider-info.ts` |
+| Fresh `defaultConfig().model`                                   | **`grok-4.6`**      | `runtime/src/config/schema.ts`              |
+| Provider-map fallback (`BUILT_IN_PROVIDER_DEFAULT_MODELS.grok`) | **`grok-4.6`**      | `runtime/src/llm/registry/provider-info.ts` |
 | Managed OpenRouter paid first model                             | **`x-ai/grok-4.5`** | `subscription-managed-models.ts`            |
 
 Bare interactive startup with an empty/fresh config uses the **config** default
-(`grok-4.5`). Provider-map and paid managed OpenRouter also use **4.5**.
+(`grok-4.6`). The direct Grok provider map also uses **4.6**; paid managed
+OpenRouter intentionally remains on **`x-ai/grok-4.5`**.
 API key resolution for grok: `XAI_API_KEY` → `GROK_API_KEY` →
 `AGENC_XAI_API_KEY`.
 
-`grok-4.5` is also a full catalog entry (500k context, text/image, tools,
-structured output, low/medium/high effort with high default). Model metadata
+`grok-4.6` is a full catalog entry (500k context, text/image, tools, structured
+output, low/medium/high/xhigh effort with high default); `grok-4.5` remains a
+selectable entry. Model metadata
 and cost assumptions: [`reference/providers.md`](reference/providers.md).
 
 There are **16 built-in provider slugs**. Full table, env vars, and base URLs:

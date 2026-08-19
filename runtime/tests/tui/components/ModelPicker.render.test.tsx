@@ -63,6 +63,12 @@ vi.mock("../../utils/fastMode.js", () => ({
 
 vi.mock("../../utils/effort.js", () => ({
   convertEffortValueToLevel: (value: string | undefined) => value,
+  getAvailableEffortLevels: (model: string) =>
+    model.includes("basic")
+      ? []
+      : model.includes("max")
+        ? ["low", "medium", "high", "max"]
+        : ["low", "medium", "high"],
   getDefaultEffortForModel: (model: string) =>
     model.includes("mini") ? undefined : "medium",
   modelSupportsEffort: (model: string) => !model.includes("basic"),

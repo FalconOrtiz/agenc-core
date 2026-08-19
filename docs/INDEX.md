@@ -4,8 +4,9 @@ Canonical map of docs under `docs/`. Product overview and install entry:
 [`../README.md`](../README.md).
 
 Version in tree: **runtime / launcher 0.16.1**; embedding SDK
-**0.3.0**. Default provider **grok**; fresh-config session model **grok-4.5**
-(same as provider-map / managed-OpenRouter paid defaults — see [providers.md](reference/providers.md)).
+**0.3.0**. Default provider **grok**; fresh-config session and direct-provider
+default **grok-4.6**. Managed OpenRouter's paid default remains
+**`x-ai/grok-4.5`** (see [providers.md](reference/providers.md)).
 
 Layout follows a Diataxis-ish split: tutorials (start here), how-to, reference,
 explanation. Superseded planning and audit material remains available in Git
