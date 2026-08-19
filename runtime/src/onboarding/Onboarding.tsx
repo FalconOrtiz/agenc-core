@@ -89,6 +89,7 @@ export type ProviderConnectionStatus =
   | "auth-failed"
   | "provider-unreachable"
   | "local-unchecked"
+  | "local-model-missing"
   | "local-down";
 
 export interface FirstRunOnboardingStep {
@@ -502,13 +503,13 @@ export async function detectRunningLocalProviders(
     candidates.map(async (provider) => {
       const settings = resolveProviderSettings(provider, context.config, context.env);
       const baseURL = settings?.baseURL ?? BUILT_IN_PROVIDER_BASE_URLS[provider];
-      const reachable = await probeLocalProvider({
+      const probe = await probeLocalProvider({
         provider,
         baseURL,
         ...(context.fetchImpl !== undefined ? { fetchImpl: context.fetchImpl } : {}),
         timeoutMs: 600,
-      }).catch(() => false);
-      return reachable ? provider : null;
+      }).catch(() => ({ reachable: false, modelIds: null }));
+      return probe.reachable ? provider : null;
     }),
   );
   return results.filter((p): p is BuiltInProviderSlug => p !== null);
@@ -868,9 +869,12 @@ async function probeLocalProvider(params: {
   readonly baseURL: string;
   readonly fetchImpl?: typeof fetch;
   readonly timeoutMs?: number;
-}): Promise<boolean> {
+}): Promise<{
+  readonly reachable: boolean;
+  readonly modelIds: readonly string[] | null;
+}> {
   const fetchImpl = params.fetchImpl ?? globalThis.fetch?.bind(globalThis);
-  if (fetchImpl === undefined) return false;
+  if (fetchImpl === undefined) return { reachable: false, modelIds: null };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? 750);
   if (typeof (timer as { unref?: () => void }).unref === "function") {
@@ -884,12 +888,96 @@ async function probeLocalProvider(params: {
         signal: controller.signal,
       },
     );
-    return response.ok;
+    if (!response.ok) return { reachable: false, modelIds: null };
+    const payload: unknown = await readLocalProviderCatalog(response).catch(
+      () => null,
+    );
+    return {
+      reachable: true,
+      modelIds: localProviderModelIds(params.provider, payload),
+    };
   } catch {
-    return false;
+    return { reachable: false, modelIds: null };
   } finally {
     clearTimeout(timer);
   }
+}
+
+const LOCAL_PROVIDER_CATALOG_MAX_BYTES = 1024 * 1024;
+
+async function readLocalProviderCatalog(response: Response): Promise<unknown> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) return null;
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > LOCAL_PROVIDER_CATALOG_MAX_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(
+          `Local provider model catalog exceeds ${LOCAL_PROVIDER_CATALOG_MAX_BYTES} bytes`,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The stream may already be closed after cancellation.
+    }
+  }
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+}
+
+function localProviderModelIds(
+  provider: BuiltInProviderSlug,
+  payload: unknown,
+): readonly string[] | null {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  const record = payload as Record<string, unknown>;
+  const entries = provider === "ollama" ? record.models : record.data;
+  if (!Array.isArray(entries)) return null;
+  const ids = entries.flatMap((entry): string[] => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return [];
+    }
+    const model = entry as Record<string, unknown>;
+    const candidates = provider === "ollama"
+      ? [model.name, model.model]
+      : [model.id];
+    return candidates.filter(
+      (candidate): candidate is string =>
+        typeof candidate === "string" && candidate.trim().length > 0,
+    );
+  });
+  return [...new Set(ids)];
+}
+
+function hasLocalProviderModel(
+  provider: BuiltInProviderSlug,
+  modelIds: readonly string[],
+  selectedModel: string,
+): boolean {
+  const selected = selectedModel.trim();
+  if (provider !== "ollama") return modelIds.includes(selected);
+  const withoutLatestTag = (model: string): string =>
+    model.trim().replace(/:latest$/u, "");
+  const normalizedSelected = withoutLatestTag(selected);
+  return modelIds.some(
+    (modelId) => withoutLatestTag(modelId) === normalizedSelected,
+  );
 }
 
 async function probeRemoteProvider(params: {
@@ -958,19 +1046,50 @@ export async function checkOnboardingProviderConnection(
         baseURL,
       };
     }
-    const reachable = await probeLocalProvider({
+    const probe = await probeLocalProvider({
       provider,
       baseURL,
       fetchImpl: context.fetchImpl,
     });
+    if (!probe.reachable) {
+      return {
+        provider,
+        model,
+        status: "local-down",
+        ok: false,
+        detail: "Local provider endpoint did not respond; start it before the first model turn.",
+        baseURL,
+      };
+    }
+    if (probe.modelIds === null) {
+      return {
+        provider,
+        model,
+        status: "local-down",
+        ok: false,
+        detail: "Local provider endpoint did not return a readable model catalog.",
+        baseURL,
+      };
+    }
+    if (!hasLocalProviderModel(provider, probe.modelIds, model)) {
+      return {
+        provider,
+        model,
+        status: "local-model-missing",
+        ok: false,
+        detail:
+          provider === "ollama"
+            ? `Selected model ${model} is not installed in Ollama; run \`ollama pull ${model}\` before the first model turn.`
+            : `Selected model ${model} is not listed by the local provider; load it before the first model turn.`,
+        baseURL,
+      };
+    }
     return {
       provider,
       model,
-      status: reachable ? "ready" : "local-down",
-      ok: reachable,
-      detail: reachable
-        ? "Local provider endpoint is reachable."
-        : "Local provider endpoint did not respond; start it before the first model turn.",
+      status: "ready",
+      ok: true,
+      detail: `Local provider endpoint is reachable and model ${model} is available.`,
       baseURL,
     };
   }
@@ -1135,11 +1254,9 @@ export async function submitFirstRunOnboardingInput(
           completed: false,
         };
       }
-      const selectedModel = providerDefaultModel(
-        provider,
-        context.config,
-        context.env,
-      );
+      const selectedModel = provider === state.selectedProvider
+        ? state.selectedModel
+        : providerDefaultModel(provider, context.config, context.env);
       return {
         state: withCompletedStep(
           {
