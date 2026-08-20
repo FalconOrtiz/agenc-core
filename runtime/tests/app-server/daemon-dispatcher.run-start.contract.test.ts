@@ -191,6 +191,7 @@ class FakeAdmission implements ExecutionAdmissionClient {
 class MemoryLedger implements WorkflowEvidenceLedger {
   readonly payloads = new Map<string, Uint8Array>();
   #eventCount = 1;
+  #payloadBytes = 0;
   #headDigest: Sha256Digest;
   sealed = false;
 
@@ -208,6 +209,7 @@ class MemoryLedger implements WorkflowEvidenceLedger {
     const hex = digest.slice("sha256:".length);
     this.payloads.set(hex, input.bytes);
     this.#eventCount += 1;
+    this.#payloadBytes += input.bytes.byteLength;
     this.#headDigest = sha256Digest(`${this.#headDigest}|${hex}`);
     return {
       step: input.step,
@@ -224,6 +226,7 @@ class MemoryLedger implements WorkflowEvidenceLedger {
       eventCount: this.#eventCount,
       headEventDigest: this.#headDigest,
       sealed: this.sealed,
+      payloadBytes: this.#payloadBytes,
     };
   }
 

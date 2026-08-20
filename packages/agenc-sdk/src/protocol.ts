@@ -48,6 +48,7 @@ export const AGENC_SDK_DAEMON_METHODS = [
   "run.result",
   "run.replay",
   "run.evidence",
+  "run.exportVerified",
   "run.cancel",
   "run.start",
   "csvJob.review.list",
@@ -225,6 +226,14 @@ export interface RunEvidenceParams extends JsonObject {
   readonly limit?: number;
 }
 
+export interface RunExportVerifiedParams extends JsonObject {
+  readonly runId: string;
+  readonly expectedSpecDigest: string;
+  readonly expectedRecordDigest: string;
+  readonly expectedEvidenceDigest: string;
+  readonly maximumBytes?: number;
+}
+
 export interface RunCancelParams extends JsonObject {
   readonly runId: string;
   readonly reason?: string;
@@ -232,6 +241,7 @@ export interface RunCancelParams extends JsonObject {
 
 /** One required verification command for a verified-change workflow run. */
 export interface RunStartVerificationCommand extends JsonObject {
+  readonly id?: string;
   readonly label: string;
   readonly script: string;
 }
@@ -517,6 +527,7 @@ export interface AgencParamsByMethod {
   readonly "run.result": RunResultParams;
   readonly "run.replay": RunReplayParams;
   readonly "run.evidence": RunEvidenceParams;
+  readonly "run.exportVerified": RunExportVerifiedParams;
   readonly "run.cancel": RunCancelParams;
   readonly "run.start": RunStartParams;
   readonly "csvJob.review.list": CsvJobReviewListWireParams;
@@ -722,6 +733,7 @@ export interface RunWorkflowStatus extends JsonObject {
  */
 export interface RunEvidenceBundle extends JsonObject {
   readonly recordDigest?: string;
+  readonly exportRootDigest?: string;
   readonly sealed: boolean;
   readonly ledgerPath: string;
   readonly artifacts: readonly RunWorkflowArtifactPointer[];
@@ -1056,6 +1068,28 @@ export interface RunEvidenceResult extends JsonObject {
   readonly bundle?: RunEvidenceBundle;
 }
 
+export interface RunExportVerifiedArtifact extends JsonObject {
+  readonly pointer: RunWorkflowArtifactPointer;
+  readonly mediaType: string;
+  readonly bytesBase64: string;
+}
+
+export interface RunExportVerifiedOutput extends JsonObject {
+  readonly checkId: string;
+  readonly commandDigest: string;
+  readonly stdoutBase64: string;
+  readonly stderrBase64: string;
+}
+
+export interface RunExportVerifiedResult extends JsonObject {
+  readonly schemaVersion: "agenc.core.verified-export.v1";
+  readonly recordBase64: string;
+  readonly evidenceEnvelopeBase64: string;
+  readonly artifacts: readonly RunExportVerifiedArtifact[];
+  readonly verificationOutputs: readonly RunExportVerifiedOutput[];
+  readonly exportRootDigest: string;
+}
+
 export interface SessionCreateResult extends SessionSummary {}
 
 export interface SessionListResult extends JsonObject {
@@ -1331,6 +1365,7 @@ export interface AgencResultByMethod {
   readonly "run.result": RunResultResult;
   readonly "run.replay": RunReplayResult;
   readonly "run.evidence": RunEvidenceResult;
+  readonly "run.exportVerified": RunExportVerifiedResult;
   readonly "run.cancel": RunCancelResult;
   readonly "run.start": RunStartResult;
   readonly "csvJob.review.list": CsvJobReviewListResult;

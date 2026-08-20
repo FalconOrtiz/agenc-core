@@ -53,6 +53,7 @@ export const AGENC_DAEMON_METHODS = [
   "run.result",
   "run.replay",
   "run.evidence",
+  "run.exportVerified",
   "run.cancel",
   "run.start",
   "csvJob.review.list",
@@ -309,6 +310,14 @@ export const AGENC_DAEMON_METHOD_SPECS = defineMethodSpecs({
     result: "object",
     description:
       "Export a bounded, hashed M3 admission evidence page from existing durable state.",
+  },
+  "run.exportVerified": {
+    method: "run.exportVerified",
+    direction: "client-to-server",
+    params: "required",
+    result: "object",
+    description:
+      "Verify and export exact bytes for a complete sealed verified-change run.",
   },
   "run.cancel": {
     method: "run.cancel",
@@ -1208,6 +1217,15 @@ export interface RunEvidenceParams extends JsonObject {
   readonly limit?: number;
 }
 
+export interface RunExportVerifiedParams extends JsonObject {
+  readonly runId: string;
+  readonly expectedSpecDigest: string;
+  readonly expectedRecordDigest: string;
+  readonly expectedEvidenceDigest: string;
+  /** Optional caller ceiling; the daemon never permits more than 64 MiB. */
+  readonly maximumBytes?: number;
+}
+
 export interface RunCancelParams extends JsonObject {
   /** Root run id (= root agent id, the agent_runs primary key). */
   readonly runId: string;
@@ -1216,6 +1234,7 @@ export interface RunCancelParams extends JsonObject {
 
 /** One required verification command for a verified-change workflow run. */
 export interface RunStartVerificationCommand extends JsonObject {
+  readonly id?: string;
   readonly label: string;
   readonly script: string;
 }
@@ -2148,6 +2167,10 @@ export type AgenCDaemonRequest =
   | AgenCDaemonRequestWithParams<"run.result", RunResultParams>
   | AgenCDaemonRequestWithParams<"run.replay", RunReplayParams>
   | AgenCDaemonRequestWithParams<"run.evidence", RunEvidenceParams>
+  | AgenCDaemonRequestWithParams<
+      "run.exportVerified",
+      RunExportVerifiedParams
+    >
   | AgenCDaemonRequestWithParams<"run.cancel", RunCancelParams>
   | AgenCDaemonRequestWithParams<"run.start", RunStartParams>
   | AgenCDaemonRequestWithParams<"csvJob.review.list", CsvJobReviewListParams>
@@ -2472,6 +2495,8 @@ export interface RunWorkflowStatus extends JsonObject {
 export interface RunEvidenceBundle extends JsonObject {
   /** Digest of the self-validated verified-change record, when persisted. */
   readonly recordDigest?: string;
+  /** Stable digest of the complete sealed verified export, independent of paging. */
+  readonly exportRootDigest?: string;
   readonly sealed: boolean;
   readonly ledgerPath: string;
   readonly artifacts: readonly RunWorkflowArtifactPointer[];
@@ -2755,6 +2780,29 @@ export interface RunEvidenceResult extends JsonObject {
   readonly hashes: RunEvidenceHashes;
   /** M5 evidence-ledger summary; present only when the run has a ledger dir. */
   readonly bundle?: RunEvidenceBundle;
+}
+
+export interface RunExportVerifiedArtifact extends JsonObject {
+  readonly pointer: RunWorkflowArtifactPointer;
+  readonly mediaType: string;
+  readonly bytesBase64: string;
+}
+
+export interface RunExportVerifiedOutput extends JsonObject {
+  readonly checkId: string;
+  readonly commandDigest: string;
+  readonly stdoutBase64: string;
+  readonly stderrBase64: string;
+}
+
+/** JSON-safe wire form; the SDK convenience method decodes exact bytes. */
+export interface RunExportVerifiedResult extends JsonObject {
+  readonly schemaVersion: "agenc.core.verified-export.v1";
+  readonly recordBase64: string;
+  readonly evidenceEnvelopeBase64: string;
+  readonly artifacts: readonly RunExportVerifiedArtifact[];
+  readonly verificationOutputs: readonly RunExportVerifiedOutput[];
+  readonly exportRootDigest: string;
 }
 
 export interface AgentLogSession extends JsonObject {
@@ -3455,6 +3503,7 @@ export interface AgenCDaemonResultByMethod {
   readonly "run.result": RunResultResult;
   readonly "run.replay": RunReplayResult;
   readonly "run.evidence": RunEvidenceResult;
+  readonly "run.exportVerified": RunExportVerifiedResult;
   readonly "run.cancel": RunCancelResult;
   readonly "run.start": RunStartResult;
   readonly "csvJob.review.list": CsvJobReviewListResult;
