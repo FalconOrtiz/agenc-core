@@ -3718,11 +3718,24 @@ export class RolloutStore {
       throw new Error(`cannot resume run ${runId}: lifecycle epoch is missing`);
     }
     const items = this.store.readAll();
-    const pendingReviews =
-      this.runDurabilityRepo.listPendingEffectReviews(runId);
-    if (pendingReviews.length > 0) {
+    // Pending unknown-outcome reviews do NOT refuse the reopen: the operator
+    // review the M4 contract requires happens through the live session's
+    // /resolve (daemon effect-review RPC), so refusing to reopen made a
+    // restarted session permanently unrecoverable (#1750/#1751). Dependent
+    // mutations stay stopped regardless — the durable unknown-outcome gate
+    // at `recordInFlightToolCallStart` and the in-memory live-effect gate
+    // block side-effecting dispatch until each effect is resolved. An intent
+    // with NO settlement record is an evidence gap, not a review queue, and
+    // still refuses the reopen.
+    const pendingReviews = this.runDurabilityRepo.listPendingEffectReviews(
+      runId,
+    );
+    const danglingIntents = this.runDurabilityRepo.listUnsettledEffectIntents(
+      runId,
+    );
+    if (danglingIntents.length > 0) {
       throw new Error(
-        `cannot resume run ${runId}: ${pendingReviews.length} unknown-outcome effect(s) require review`,
+        `cannot resume run ${runId}: ${danglingIntents.length} unknown-outcome effect(s) require review`,
       );
     }
     const terminalEvent = canonicalTerminalEvent(items, runId, current.epoch);
@@ -3735,10 +3748,12 @@ export class RolloutStore {
       result: terminal,
       eventId: canonicalRolloutEventId(terminalEvent),
     });
-    if (
-      terminal.status === "cancelled" ||
-      terminal.status === "unknown_outcome"
-    ) {
+    // A cancelled epoch is a settled terminal outcome (the interrupted turn
+    // durably ended); reopening it under a new epoch is the everyday
+    // Ctrl-C-then-continue workflow (#1750) and un-terminates nothing.
+    // An `unknown_outcome` terminal stays refused until its effect reviews
+    // resolve; the reviews reconcile the unsettled terminal evidence.
+    if (terminal.status === "unknown_outcome" && pendingReviews.length > 0) {
       throw new Error(
         `cannot resume run ${runId}: ${terminal.status} terminal epoch ${current.epoch} cannot be reopened`,
       );
@@ -3972,20 +3987,29 @@ export class RolloutStore {
             `cannot resume run ${this.sessionId}: canonical reopen is out of order`,
           );
         }
+        // Mirrors reopenTerminalEpoch (#1750/#1751): settled terminals
+        // (completed, failed, cancelled) reopen with unknown-outcome effect
+        // reviews still pending — the review happens inside the reopened
+        // session while the mutation gate stays armed. Dangling intents (no
+        // settlement evidence) always refuse, and an unknown-outcome
+        // terminal stays refused until its reviews resolve.
+        const danglingReplayEffects = [...effectBoundaryState].filter(
+          ([, state]) => state === "unresolved",
+        );
+        if (danglingReplayEffects.length > 0) {
+          throw new Error(
+            `cannot resume run ${this.sessionId}: canonical reopen at epoch ${projectionEpoch} precedes required effect review`,
+          );
+        }
+        const reviewPendingReplayEffects = [...effectBoundaryState].filter(
+          ([, state]) => state === "review_required",
+        );
         if (
-          terminalStatus === "cancelled" ||
-          terminalStatus === "unknown_outcome"
+          terminalStatus === "unknown_outcome" &&
+          reviewPendingReplayEffects.length > 0
         ) {
           throw new Error(
             `cannot resume run ${this.sessionId}: ${terminalStatus} terminal epoch ${projectionEpoch} cannot be reopened`,
-          );
-        }
-        const blockedEffects = [...effectBoundaryState].filter(
-          ([, state]) => state !== "retry_safe",
-        );
-        if (blockedEffects.length > 0) {
-          throw new Error(
-            `cannot resume run ${this.sessionId}: canonical reopen at epoch ${projectionEpoch} precedes required effect review`,
           );
         }
         const eventId = canonicalRolloutEventId(event);

@@ -638,10 +638,14 @@ export class AgenCDaemonAgentManager {
           sourceProof: resumeSourceProof!,
           allowLegacyRetainedRoot: retainedAgentPath === "/root",
         });
-        if (
-          resumeProof.terminalStatus === "cancelled" ||
-          resumeProof.terminalStatus === "unknown_outcome"
-        ) {
+        // A cancelled session is a settled terminal outcome: the interrupted
+        // turn is durably over, its rollout is intact, and an explicit
+        // interactive resume reopens it as a fresh epoch exactly like a
+        // completed terminal run. Refusing it made the everyday
+        // Ctrl-C-then-continue workflow permanently unresumable (#1750).
+        // `unknown_outcome` stays refused: its evidence is unsettled and
+        // daemon recovery must reconcile it into a real terminal state first.
+        if (resumeProof.terminalStatus === "unknown_outcome") {
           throw new AgenCDaemonAgentLifecycleError(
             "INVALID_ARGUMENT",
             `canonical session ${resumeSessionId} ended with ${resumeProof.terminalStatus} and cannot be resumed`,
@@ -663,7 +667,10 @@ export class AgenCDaemonAgentManager {
         }
         if (
           retainedAgent?.createdAt !== undefined &&
-          retainedAgent.createdAt !== resumeProof.createdAt
+          !retainedCreatedAtMatchesRollout(
+            retainedAgent.createdAt,
+            resumeProof.createdAt,
+          )
         ) {
           throw new AgenCDaemonAgentLifecycleError(
             "INVALID_ARGUMENT",
@@ -1121,7 +1128,15 @@ export class AgenCDaemonAgentManager {
       metadata: params.metadata,
       explicitColdResume: true,
       restoreAttemptId: params.restoreAttemptId,
-      ...(params.lifecycleState === "terminal"
+      // An explicit cold resume reopens a terminal epoch by intent. The
+      // lifecycle proof reads the JSONL journal while the open-time guard
+      // checks the SQLite epoch, and a crash between the two reopen writes
+      // leaves them disagreeing (journal already reopened, SQLite still
+      // terminal — #1750). Pass the flag for "open" too: the reopen boundary
+      // append is itself conditional on a real terminal event, so a genuinely
+      // open epoch continues in place unchanged.
+      ...(params.lifecycleState === "terminal" ||
+      params.lifecycleState === "open"
         ? { reopenTerminalRun: true }
         : {}),
       ...(params.lifecycleState === "suspended"
@@ -3928,6 +3943,29 @@ const MAX_RESUME_CANONICAL_SCAN_BYTES =
 const MAX_RESUME_CANONICAL_LINE_BYTES = MAX_RECOVERY_CANONICAL_LINE_BYTES;
 const MAX_RESUME_CANONICAL_LINES = 2_048;
 const MAX_RESUME_CANONICAL_VALIDATION_MS = DEFAULT_MAX_STARTUP_RECOVERY_MS;
+
+/**
+ * The retained agent record stamps `createdAt` with the daemon clock at
+ * `agent.create` time, while the rollout header timestamp is stamped
+ * separately by the session writer, so the two legitimately disagree by
+ * milliseconds (a session's own rollout filename and header already differ).
+ * Strict equality made every retained root session unresumable while its
+ * retained record existed (#1750). A genuinely mismatched rollout swapped in
+ * from another session still trips the objective/model/provider identity
+ * checks and this bounded window.
+ */
+const RETAINED_CREATED_AT_TOLERANCE_MS = 5_000;
+
+export function retainedCreatedAtMatchesRollout(
+  retainedCreatedAt: string,
+  rolloutCreatedAt: string,
+): boolean {
+  if (retainedCreatedAt === rolloutCreatedAt) return true;
+  const retained = Date.parse(retainedCreatedAt);
+  const rollout = Date.parse(rolloutCreatedAt);
+  if (!Number.isFinite(retained) || !Number.isFinite(rollout)) return false;
+  return Math.abs(retained - rollout) <= RETAINED_CREATED_AT_TOLERANCE_MS;
+}
 
 function assertAuthoritativeResumeSource(params: {
   readonly sessionId: string;
