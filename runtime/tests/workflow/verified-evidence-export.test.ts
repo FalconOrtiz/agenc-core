@@ -11,12 +11,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AgenCDaemonRunInspectionService } from "../../src/app-server/run-inspection.js";
+import {
+  AgenCDaemonRunInspectionService,
+  MAX_RUN_REPLAY_LIMIT,
+} from "../../src/app-server/run-inspection.js";
 import type {
   RunExportVerifiedParams,
   RunExportVerifiedResult as WireExportResult,
 } from "../../src/app-server/protocol/index.js";
-import { resolveStateDatabasePaths } from "../../src/state/sqlite-driver.js";
+import {
+  openStateDatabasePaths,
+  resolveStateDatabasePaths,
+} from "../../src/state/sqlite-driver.js";
 import {
   canonicalizeJson,
   computeDocumentDigest,
@@ -187,6 +193,154 @@ describe("public verified evidence export", () => {
       "risk_register",
       "test_result",
     ]);
+  });
+
+  it("exports the complete root when the public replay view exceeds one page", async () => {
+    const run = await completedRun("wf-verified-export-beyond-replay-page");
+    const constraints = {
+      coreRunId: "wf-verified-export-beyond-replay-page",
+      expectedSpecDigest: run.specDigest,
+      expectedRecordDigest: run.recordDigest,
+      expectedEvidenceDigest: run.exportRootDigest,
+    } as const;
+    const direct = await exportVerifiedRunFromBundle(
+      run.bundleDir,
+      constraints,
+    );
+    run.harness.close();
+
+    // The public replay surface is intentionally capped at 200 events. Seed a
+    // larger canonical projection after the evidence ledger has been sealed;
+    // the strict export must remain independent from that paged view.
+    const statePaths = resolveStateDatabasePaths({
+      cwd: run.repo,
+      agencHome: run.home,
+    });
+    const replayDriver = openStateDatabasePaths(statePaths);
+    try {
+      const binding = replayDriver
+        .prepareState<
+          [string],
+          { readonly child_run_id: string; readonly source_path: string }
+        >(
+          `SELECT child_run_id, source_path
+           FROM run_journal_bindings
+           WHERE run_id = ?
+           ORDER BY epoch DESC
+           LIMIT 1`,
+        )
+        .get(constraints.coreRunId);
+      const fallbackSourcePath = `/test/${constraints.coreRunId}.jsonl`;
+      replayDriver
+        .prepareState(
+          `INSERT OR IGNORE INTO threads(
+             thread_id, created_at, updated_at, rollout_path
+           ) VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          constraints.coreRunId,
+          "2026-08-20T00:00:00.000Z",
+          "2026-08-20T00:00:00.000Z",
+          fallbackSourcePath,
+        );
+      const thread = replayDriver
+        .prepareState<
+          [string],
+          {
+            readonly thread_id: string;
+            readonly rollout_path: string | null;
+            readonly archived_rollout_path: string | null;
+          }
+        >(
+          `SELECT thread_id, rollout_path, archived_rollout_path
+           FROM threads
+           WHERE thread_id = ?
+           LIMIT 1`,
+        )
+        .get(constraints.coreRunId);
+      expect(thread).toBeDefined();
+      const sourcePath =
+        binding?.source_path ??
+        thread!.rollout_path ??
+        thread!.archived_rollout_path ??
+        fallbackSourcePath;
+      const bounds = replayDriver
+        .prepareState<
+          [string, string],
+          {
+            readonly event_sequence: number;
+            readonly line_number: number;
+            readonly byte_offset: number;
+            readonly item_index: number;
+          }
+        >(
+          `SELECT COALESCE(MAX(event_seq), 0) AS event_sequence,
+                  COALESCE(MAX(line_number), 0) AS line_number,
+                  COALESCE(MAX(byte_offset), 0) AS byte_offset,
+                  COALESCE(MAX(item_index), -1) AS item_index
+           FROM thread_rollout_items
+           WHERE thread_id = ? AND source_path = ?`,
+        )
+        .get(thread!.thread_id, sourcePath)!;
+      const insert = replayDriver.prepareState(
+        `INSERT INTO thread_rollout_items(
+           thread_id, source_path, line_number, byte_offset, item_index,
+           item_type, event_id, event_seq, payload_json, line_hash
+         ) VALUES (?, ?, ?, ?, ?, 'event_msg', ?, ?, ?, ?)`,
+      );
+      for (let index = 0; index <= MAX_RUN_REPLAY_LIMIT; index += 1) {
+        const sequence = bounds.event_sequence + index + 1;
+        const eventId = `page-limit-event-${sequence}`;
+        insert.run(
+          thread!.thread_id,
+          sourcePath,
+          bounds.line_number + index + 1,
+          bounds.byte_offset + index + 1,
+          bounds.item_index + index + 1,
+          eventId,
+          sequence,
+          JSON.stringify({
+            eventId,
+            id: eventId,
+            seq: sequence,
+            msg: {
+              type: "turn_started",
+              payload: { turnId: `page-limit-step-${sequence}` },
+            },
+          }),
+          "0".repeat(64),
+        );
+      }
+    } finally {
+      replayDriver.close();
+    }
+
+    const service = new AgenCDaemonRunInspectionService({
+      agencHome: run.home,
+      stateDatabasePaths: () => [statePaths],
+    });
+    const firstReplayPage = service.evidence({
+      runId: constraints.coreRunId,
+      limit: MAX_RUN_REPLAY_LIMIT,
+    });
+    expect(firstReplayPage.hasMore).toBe(true);
+    expect(firstReplayPage.source.completeness).toBe("partial");
+
+    const wire = await service.exportVerified({
+      runId: constraints.coreRunId,
+      expectedSpecDigest: constraints.expectedSpecDigest,
+      expectedRecordDigest: constraints.expectedRecordDigest,
+      expectedEvidenceDigest: constraints.expectedEvidenceDigest,
+    });
+    const client = new AgencClient({ transport: new ExportTransport(wire) });
+    const exported = await client.exportVerifiedRun(constraints);
+
+    expect(exported.exportRootDigest).toBe(direct.exportRootDigest);
+    expect(exported.recordBytes).toEqual(direct.recordBytes);
+    expect(exported.evidenceEnvelopeBytes).toEqual(
+      direct.evidenceEnvelopeBytes,
+    );
+    expect(exported.verificationOutputs).toHaveLength(1);
   });
 
   it("fails with a typed mismatch and byte-limit error", async () => {
