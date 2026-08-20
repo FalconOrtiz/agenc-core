@@ -826,3 +826,103 @@ describe("runAdmittedModelCall", () => {
     );
   });
 });
+
+import { providerLocalModelSlug } from "../../src/budget/admitted-model-call.js";
+
+describe("providerLocalModelSlug", () => {
+  test("strips only an exact provider prefix and keeps provider-local colons", () => {
+    expect(providerLocalModelSlug("ollama:qwen3-coder:30b", "ollama")).toBe(
+      "qwen3-coder:30b",
+    );
+    expect(providerLocalModelSlug("OLLAMA:qwen3-coder:30b", "ollama")).toBe(
+      "qwen3-coder:30b",
+    );
+    expect(providerLocalModelSlug("qwen3-coder:30b", "ollama")).toBe(
+      "qwen3-coder:30b",
+    );
+    expect(
+      providerLocalModelSlug("amazon.nova-pro-v1:0", "amazon-bedrock"),
+    ).toBe("amazon.nova-pro-v1:0");
+    expect(providerLocalModelSlug("grok-4.5", "grok")).toBe("grok-4.5");
+    expect(providerLocalModelSlug("ollama:", "ollama")).toBe("ollama:");
+  });
+});
+
+describe("runAdmittedModelCall local providers (#1752)", () => {
+  function ollamaCall(
+    state: ReturnType<typeof harness>,
+    invoke: (options: LLMChatOptions) => Promise<LLMResponse>,
+  ) {
+    const provider = {
+      name: "ollama",
+      getExecutionProfile: async () => ({
+        provider: "ollama",
+        model: "qwen3-coder:30b",
+        usageReporting: "authoritative",
+        supportsMaxOutputTokens: true,
+      }),
+    } as unknown as LLMProvider;
+    return runAdmittedModelCall({
+      session: state.session,
+      provider,
+      messages: [{ role: "user", content: "hello" }],
+      options: { maxOutputTokens: 512, contextWindowTokens: 32768 },
+      stepId: "model:ollama:1",
+      // The cross-provider "provider:model" reference form as stored in
+      // config `model =` keys; the wire and admission identity must be the
+      // provider-local slug.
+      model: "ollama:qwen3-coder:30b",
+      providerName: "ollama",
+      invoke,
+    });
+  }
+
+  function ollamaResponse(): LLMResponse {
+    return response({
+      model: "qwen3-coder:30b",
+      usage: {
+        promptTokens: 20,
+        completionTokens: 5,
+        totalTokens: 25,
+        availability: "reported",
+        provenance: "provider",
+      },
+    });
+  }
+
+  test("strips the provider prefix from the wire and admission identity", async () => {
+    const state = harness({});
+    const seen: string[] = [];
+    await ollamaCall(state, async (options) => {
+      seen.push(String(options.model));
+      return ollamaResponse();
+    });
+    expect(seen).toEqual(["qwen3-coder:30b"]);
+    expect(state.admission.markDispatched).toHaveBeenCalledWith(
+      "reservation-1",
+      expect.objectContaining({
+        details: expect.objectContaining({ model: "qwen3-coder:30b" }),
+      }),
+    );
+  });
+
+  test("reconciles a zero-cost local response instead of holding it unknown", async () => {
+    const state = harness({});
+    await ollamaCall(state, async () => ollamaResponse());
+    expect(state.reconcile).toHaveBeenCalledWith(
+      "reservation-1",
+      expect.objectContaining({ costUsd: 0 }),
+    );
+    expect(state.holdUnknown).not.toHaveBeenCalled();
+  });
+
+  test("admits a local model call under a hard USD cap", async () => {
+    const state = harness({ maxCostUsd: 1, hasHardCostCap: true });
+    await ollamaCall(state, async () => ollamaResponse());
+    const acquireInput = state.acquire.mock.calls[0]?.[0] as
+      | AdmissionAcquireInput
+      | undefined;
+    expect(acquireInput?.denialReason).toBeUndefined();
+    expect(state.reconcile).toHaveBeenCalled();
+  });
+});

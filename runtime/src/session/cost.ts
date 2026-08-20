@@ -52,6 +52,13 @@ export interface ModelCostEntry {
   readonly webSearchUsdPerRequest?: number;
   /** Free-form label for display. */
   readonly label?: string;
+  /**
+   * Explicitly declares a zero-rate entry as genuinely free (local runtime,
+   * no metered billing). Budget admission treats such entries as priced at
+   * $0 instead of unknown-cost; zero-rate entries WITHOUT this flag stay
+   * fail-closed under hard USD caps.
+   */
+  readonly localZeroCost?: boolean;
 }
 
 export interface CostSummaryProcessLike {
@@ -380,12 +387,23 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     "amazon.nova-pro-v1:0": DEFAULT_UNKNOWN_MODEL_COST,
     "agenc:agenc": DEFAULT_UNKNOWN_MODEL_COST,
     agenc: DEFAULT_UNKNOWN_MODEL_COST,
-    ollama: { inputUsdPer1K: 0, outputUsdPer1K: 0, label: "local" },
-    lmstudio: { inputUsdPer1K: 0, outputUsdPer1K: 0, label: "local" },
+    ollama: {
+      inputUsdPer1K: 0,
+      outputUsdPer1K: 0,
+      label: "local",
+      localZeroCost: true,
+    },
+    lmstudio: {
+      inputUsdPer1K: 0,
+      outputUsdPer1K: 0,
+      label: "local",
+      localZeroCost: true,
+    },
     "openai-compatible": {
       inputUsdPer1K: 0,
       outputUsdPer1K: 0,
       label: "local",
+      localZeroCost: true,
     },
   });
 

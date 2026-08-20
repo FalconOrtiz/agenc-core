@@ -132,6 +132,26 @@ function providerNativeToolsForAccounting(
   }).map(({ name, toolType, payload }) => ({ name, toolType, payload }));
 }
 
+/**
+ * Strip a cross-provider "provider:model" prefix down to the provider-local
+ * model slug. Only an exact, case-insensitive match of the resolved provider
+ * name is stripped; colons inside provider-local ids are preserved.
+ */
+export function providerLocalModelSlug(
+  model: string,
+  provider: string,
+): string {
+  const prefix = `${provider}:`;
+  if (
+    provider.length > 0 &&
+    model.length > prefix.length &&
+    model.slice(0, prefix.length).toLowerCase() === prefix.toLowerCase()
+  ) {
+    return model.slice(prefix.length);
+  }
+  return model;
+}
+
 function pricedEntry(model: string, provider: string): ModelCostEntry | null {
   const resolved = resolveModelCostEntry(
     { model, provider },
@@ -139,6 +159,12 @@ function pricedEntry(model: string, provider: string): ModelCostEntry | null {
   );
   if (resolved === null) return null;
   const entry = resolved.entry;
+  // Entries explicitly declared localZeroCost are the registry's statement
+  // that this provider bills nothing. Treating them as unpriced held every
+  // successful ollama/lmstudio response in
+  // `held_unknown(unpriced_provider_response)` and denied local model calls
+  // under hard USD caps (#1752).
+  if (entry.localZeroCost === true) return entry;
   const rates = [
     entry.inputUsdPer1K,
     entry.outputUsdPer1K,
@@ -147,8 +173,8 @@ function pricedEntry(model: string, provider: string): ModelCostEntry | null {
     entry.reasoningOutputUsdPer1K ?? 0,
     entry.webSearchUsdPerRequest ?? 0,
   ];
-  // A zero-rate local entry does not prove that an arbitrary provider/model
-  // alias is free. Keep hard USD caps fail-closed for that case.
+  // A zero-rate entry without the explicit local label does not prove that an
+  // arbitrary provider/model alias is free. Keep hard USD caps fail-closed.
   return rates.some((rate) => rate > 0) ? entry : null;
 }
 
@@ -291,12 +317,21 @@ export async function runAdmittedModelCall(
     nonBlankString(params.provider.name) ??
     "unknown";
   const sessionModel = nonBlankString(params.session.modelInfo?.slug);
-  const requestedModel =
+  // Config and recovery surfaces reference models in cross-provider
+  // "provider:model" form. The admitted identity must be the provider-local
+  // slug: it is what reaches the provider wire (ollama rejects a
+  // "ollama:"-prefixed name outright), and it is the key for session
+  // context-window and pricing lookups. Only an exact provider-name prefix is
+  // stripped, so provider-local ids that legitimately contain colons (for
+  // example "amazon.nova-pro-v1:0" or "qwen3-coder:30b") pass through.
+  const requestedModel = providerLocalModelSlug(
     nonBlankString(params.model) ??
-    nonBlankString(params.options.model) ??
-    nonBlankString(providerFactoryOptions.model) ??
-    sessionModel ??
-    "unknown";
+      nonBlankString(params.options.model) ??
+      nonBlankString(providerFactoryOptions.model) ??
+      sessionModel ??
+      "unknown",
+    requestedProvider,
+  );
 
   const stagedFallbackEvent =
     params.fallback === undefined
@@ -344,7 +379,7 @@ export async function runAdmittedModelCall(
     : requestedProvider;
   const effectiveModel =
     usesConcreteExecutionIdentity && profile?.model?.trim()
-      ? profile.model.trim()
+      ? providerLocalModelSlug(profile.model.trim(), effectiveProvider)
       : requestedModel;
   const configuredMaxOutputTokens =
     positiveInteger(params.options.maxOutputTokens) ??
