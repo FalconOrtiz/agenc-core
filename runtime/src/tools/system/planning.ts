@@ -43,7 +43,10 @@ import {
 } from "../../planning/exit-plan-approval.js";
 import type { PlanFileContext } from "../../planning/plan-files.js";
 import type { Tool, ToolResult } from "../types.js";
-import { plainTextErrorToolResult as errorResult } from "../results.js";
+import {
+  plainTextErrorToolResult as errorResult,
+  validationErrorToolResult,
+} from "../results.js";
 import {
   ensureTasksDir,
   getTaskListId,
@@ -345,7 +348,12 @@ export function createPlanningTools(options: PlanningToolOptions = {}): readonly
     },
     async execute(args) {
       const todos = parseTodoList(args.todos);
-      if ("error" in todos) return errorResult(todos.error);
+      if ("error" in todos) {
+        return validationErrorToolResult(
+          "tool:system.todo-write:validation",
+          todos.error,
+        );
+      }
       const allDone = todos.length > 0 &&
         todos.every((todo) => todo.status === "completed");
       const nextTodos = allDone ? [] : todos;
@@ -390,7 +398,12 @@ export function createPlanningTools(options: PlanningToolOptions = {}): readonly
         controller: options.workflowController,
         target: "plan",
       });
-      if ("error" in result) return errorResult(result.error);
+      if ("error" in result) {
+        return validationErrorToolResult(
+          "tool:system.enter-plan-mode:transition-refused",
+          result.error,
+        );
+      }
       return textResult(
         `${result.changed ? "Entered plan mode." : "Already in plan mode."}
 
@@ -445,10 +458,14 @@ Remember: DO NOT write or edit any files except the plan file.`,
     async execute(args) {
       const registry = options.workflowController?.getPermissionModeRegistry?.() ?? null;
       if (!registry) {
-        return errorResult("permission mode registry is not available for workflow tools");
+        return validationErrorToolResult(
+          "tool:system.exit-plan-mode:registry-unavailable",
+          "permission mode registry is not available for workflow tools",
+        );
       }
       if (registry.current().mode !== "plan") {
-        return errorResult(
+        return validationErrorToolResult(
+          "tool:system.exit-plan-mode:not-in-plan-mode",
           "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.",
         );
       }

@@ -592,7 +592,10 @@ describe("RolloutStore thread-spawn edges", () => {
     }
   });
 
-  it("rejects an effect review recorded after its canonical reopen boundary", () => {
+  it("accepts an effect review recorded after its canonical reopen boundary", () => {
+    // #1750/#1751 contract change: a settled terminal reopens with the
+    // unknown-outcome review still pending, because the review itself runs
+    // inside the reopened session. The late review then resolves the effect.
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
     const sessionId = "terminal-resume-reviewed-after-boundary";
     const original = openStore({ cwd, sessionId });
@@ -600,30 +603,32 @@ describe("RolloutStore thread-spawn edges", () => {
       appendReviewedReopenFixture(original, sessionId, false);
       original.close();
 
-      expect(() =>
-        openStore({
-          cwd,
-          sessionId,
-          resume: true,
-          reopenTerminalRun: true,
-        }),
-      ).toThrow(/run reopen follows an unsettled effect/u);
-
-      const driver = openStateDatabases({ cwd });
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
       try {
-        expect(
-          driver
-            .prepareState<[string], { readonly epoch: number }>(
-              `SELECT epoch
-               FROM run_lifecycle_epochs
-               WHERE run_id = ?
-               ORDER BY epoch DESC
-               LIMIT 1`,
+        expect(resumed.runEpoch).toBe(2);
+        const driver = openStateDatabases({ cwd });
+        try {
+          const row = driver
+            .prepareState<
+              [string, string],
+              { readonly review_status: string | null }
+            >(
+              `SELECT review_status
+               FROM run_effects
+               WHERE run_id = ? AND step_id = ?`,
             )
-            .get(sessionId)?.epoch,
-        ).toBe(1);
+            .get(sessionId, "step-reviewed");
+          expect(row?.review_status).toBe("resolved");
+        } finally {
+          driver.close();
+        }
       } finally {
-        driver.close();
+        resumed.close();
       }
     } finally {
       original.close();
@@ -631,7 +636,7 @@ describe("RolloutStore thread-spawn edges", () => {
     }
   });
 
-  it("rejects a cancelled terminal even when no effect review is pending", () => {
+  it("reopens a cancelled terminal under a new epoch", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
     const sessionId = "terminal-resume-cancelled-clean";
     const original = openStore({ cwd, sessionId });
@@ -662,15 +667,21 @@ describe("RolloutStore thread-spawn edges", () => {
       ).toBe(true);
       original.close();
 
-      expect(() =>
-        openStore({
-          cwd,
-          sessionId,
-          resume: true,
-          reopenTerminalRun: true,
-        }),
-      ).toThrow(/cancelled terminal epoch 1 cannot be reopened/);
-      expect(readFileSync(original.rolloutPath, "utf8")).not.toContain(
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
+      // #1750 contract change: a cancelled epoch is a settled terminal
+      // outcome and reopens under a new epoch — the everyday
+      // interrupt-then-continue workflow.
+      try {
+        expect(resumed.runEpoch).toBe(2);
+      } finally {
+        resumed.close();
+      }
+      expect(readFileSync(original.rolloutPath, "utf8")).toContain(
         '"type":"run_reopened"',
       );
     } finally {
@@ -679,7 +690,7 @@ describe("RolloutStore thread-spawn edges", () => {
     }
   });
 
-  it("keeps explicit reopen blocked when a side effect has unknown outcome", () => {
+  it("reopens with a recovered unknown-outcome effect still pending review", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
     const sessionId = "terminal-resume-review-blocked";
     const original = openStore({ cwd, sessionId });
@@ -732,17 +743,40 @@ describe("RolloutStore thread-spawn edges", () => {
       ).toBe(true);
       original.close();
 
-      expect(() =>
-        openStore({
-          cwd,
-          sessionId,
-          resume: true,
-          reopenTerminalRun: true,
-        }),
-      ).toThrow(/unknown-outcome effect\(s\) require review/);
+      // #1750/#1751 contract change: open-time recovery settles the dangling
+      // intent as a review-pending unknown outcome, and a settled terminal
+      // reopens with that review still pending — the review runs inside the
+      // reopened session while the mutation gate stays armed.
+      const resumed = openStore({
+        cwd,
+        sessionId,
+        resume: true,
+        reopenTerminalRun: true,
+      });
+      try {
+        expect(resumed.runEpoch).toBe(2);
+        const driver = openStateDatabases({ cwd });
+        try {
+          const row = driver
+            .prepareState<
+              [string, string],
+              { readonly review_status: string | null }
+            >(
+              `SELECT review_status
+               FROM run_effects
+               WHERE run_id = ? AND step_id = ?`,
+            )
+            .get(sessionId, "step-1");
+          expect(row?.review_status).toBe("pending");
+        } finally {
+          driver.close();
+        }
+      } finally {
+        resumed.close();
+      }
       const content = readFileSync(original.rolloutPath, "utf8");
       expect(content).toContain('"type":"effect_unknown_outcome"');
-      expect(content).not.toContain('"type":"run_reopened"');
+      expect(content).toContain('"type":"run_reopened"');
     } finally {
       original.close();
       rmSync(cwd, { recursive: true, force: true });

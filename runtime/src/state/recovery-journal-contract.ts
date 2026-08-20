@@ -185,6 +185,7 @@ export class StrictCanonicalJournalValidator {
   #legacyPlanActive = false;
   readonly #toolNamesByCallId = new Map<string, string>();
   readonly #unsettledEffectSteps = new Map<string, Set<string>>();
+  readonly #unknownOutcomeEffectSteps = new Map<string, Set<string>>();
   #format: CanonicalJournalFormat = "empty";
   #nextSequence = 1;
   #finished = false;
@@ -1320,14 +1321,20 @@ export class StrictCanonicalJournalValidator {
         facts,
       );
     }
-    this.#assertNoUnsettledEffects(
+    this.#assertNoDanglingEffectIntents(
       payload.runId as string,
       "run reopen follows an unsettled effect",
       facts,
     );
+    // Contract change (#1750): `cancelled` is a settled terminal outcome, so
+    // an explicit reopen may follow it — the everyday interrupt-then-continue
+    // workflow re-enters the run under a new epoch without un-terminating the
+    // cancelled one. An `unknown_outcome` terminal remains unreopenable while
+    // its effect reviews are unresolved; resolved reviews reconcile the
+    // unsettled terminal evidence.
     if (
-      this.#activeTerminalStatus === "cancelled" ||
-      this.#activeTerminalStatus === "unknown_outcome"
+      this.#activeTerminalStatus === "unknown_outcome" &&
+      (this.#unsettledEffectSteps.get(payload.runId as string)?.size ?? 0) > 0
     ) {
       this.#fail(
         "terminal_binding_mismatch",
@@ -1729,6 +1736,13 @@ export class StrictCanonicalJournalValidator {
       const steps = this.#unsettledEffectSteps.get(runId) ?? new Set<string>();
       steps.add(stepId);
       this.#unsettledEffectSteps.set(runId, steps);
+      // An unknown-outcome record is durable settlement evidence awaiting
+      // review; a fresh intent for the same step supersedes that state.
+      const unknown =
+        this.#unknownOutcomeEffectSteps.get(runId) ?? new Set<string>();
+      if (type === "effect_unknown_outcome") unknown.add(stepId);
+      else unknown.delete(stepId);
+      this.#unknownOutcomeEffectSteps.set(runId, unknown);
       return;
     }
     const resolved =
@@ -1740,6 +1754,9 @@ export class StrictCanonicalJournalValidator {
     const steps = this.#unsettledEffectSteps.get(runId);
     steps?.delete(stepId);
     if (steps?.size === 0) this.#unsettledEffectSteps.delete(runId);
+    const unknown = this.#unknownOutcomeEffectSteps.get(runId);
+    unknown?.delete(stepId);
+    if (unknown?.size === 0) this.#unknownOutcomeEffectSteps.delete(runId);
   }
 
   #assertNoUnsettledEffects(
@@ -1749,6 +1766,28 @@ export class StrictCanonicalJournalValidator {
   ): void {
     if ((this.#unsettledEffectSteps.get(runId)?.size ?? 0) === 0) return;
     this.#fail("terminal_binding_mismatch", message, facts);
+  }
+
+  /**
+   * Reopen-time variant of {@link #assertNoUnsettledEffects} (#1750/#1751):
+   * a step whose settlement is durably recorded as `unknown_outcome` is
+   * review-pending, not evidence-dangling — the review happens inside the
+   * reopened session while the mutation gate stays armed. Only an intent
+   * with no settlement record at all still refuses the reopen.
+   */
+  #assertNoDanglingEffectIntents(
+    runId: string,
+    message: string,
+    facts: RecoveryIntegrityFacts,
+  ): void {
+    const unsettled = this.#unsettledEffectSteps.get(runId);
+    if (unsettled === undefined || unsettled.size === 0) return;
+    const unknown = this.#unknownOutcomeEffectSteps.get(runId);
+    for (const stepId of unsettled) {
+      if (!unknown?.has(stepId)) {
+        this.#fail("terminal_binding_mismatch", message, facts);
+      }
+    }
   }
 
   #fail(
