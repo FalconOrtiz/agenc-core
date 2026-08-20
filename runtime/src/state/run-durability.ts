@@ -941,9 +941,11 @@ export class StateRunDurabilityRepository {
           `run ${params.runId} current epoch does not match ${params.fromEpoch}`,
         );
       }
-      if (
-        this.getTerminalResult(params.runId, params.fromEpoch) === undefined
-      ) {
+      const terminalResult = this.getTerminalResult(
+        params.runId,
+        params.fromEpoch,
+      );
+      if (terminalResult === undefined) {
         throw conflict(
           "RUN_EPOCH_NOT_TERMINAL",
           `run ${params.runId} epoch ${params.fromEpoch} is not terminal`,
@@ -955,11 +957,34 @@ export class StateRunDurabilityRepository {
           `run ${params.runId} cannot reopen while suspended`,
         );
       }
-      const pending = this.listPendingEffectReviews(params.runId);
-      if (pending.length > 0) {
+      // Pending unknown-outcome reviews do not block the reopen itself
+      // (#1750/#1751): the operator review the M4 contract requires happens
+      // inside the reopened session (/resolve → effect-review RPC), so
+      // refusing here made restarted sessions permanently unrecoverable.
+      // Dependent mutations remain stopped by
+      // `assertDependentMutationAllowed` and the unknown-outcome mutation
+      // gate until every effect is explicitly resolved. An intent with NO
+      // settlement record at all is an evidence gap, not a review queue —
+      // reopening over it stays refused.
+      const pendingReviews = this.listPendingEffectReviews(params.runId);
+      const dangling = this.listUnsettledEffectIntents(params.runId);
+      if (dangling.length > 0) {
         throw conflict(
           "RUN_REOPEN_REVIEW_REQUIRED",
-          `run ${params.runId} has ${pending.length} unresolved unknown-outcome effect(s)`,
+          `run ${params.runId} has ${dangling.length} unsettled effect intent(s)`,
+        );
+      }
+      // An unknown-outcome TERMINAL is itself unreconciled evidence; its
+      // reviews must resolve before the run re-enters a live epoch. Settled
+      // terminals (completed, failed, cancelled) reopen with reviews still
+      // pending — the reopened session is where /resolve runs.
+      if (
+        terminalResult.status === "unknown_outcome" &&
+        pendingReviews.length > 0
+      ) {
+        throw conflict(
+          "RUN_REOPEN_REVIEW_REQUIRED",
+          `run ${params.runId} has ${pendingReviews.length} unresolved unknown-outcome effect(s)`,
         );
       }
 
@@ -1380,6 +1405,25 @@ export class StateRunDurabilityRepository {
         `SELECT ${EFFECT_COLUMNS}
          FROM run_effects
          WHERE run_id = ?
+         ORDER BY intent_sequence ASC, step_id ASC`,
+      )
+      .all(runId)
+      .map(effectFromRow);
+  }
+
+  /**
+   * Side-effecting/interactive intents with NO settlement record at all
+   * (no result, no unknown-outcome evidence). These are evidence gaps —
+   * distinct from review-pending unknown outcomes — and block epoch reopen.
+   */
+  listUnsettledEffectIntents(runId: RunId): readonly DurableRunEffect[] {
+    return this.driver
+      .prepareState<[string], EffectRow>(
+        `SELECT ${EFFECT_COLUMNS}
+         FROM run_effects
+         WHERE run_id = ?
+           AND recovery_category IN ('side-effecting', 'interactive')
+           AND outcome IS NULL
          ORDER BY intent_sequence ASC, step_id ASC`,
       )
       .all(runId)

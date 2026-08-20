@@ -2813,9 +2813,12 @@ describe("AgenC background agent lifecycle", () => {
             ? "stale projected objective"
             : "retained canonical objective",
         status: "stopped",
+        // Drift beyond RETAINED_CREATED_AT_TOLERANCE_MS (#1750): benign
+        // millisecond skew between the daemon clock and the rollout header is
+        // tolerated, so staleness needs a genuinely different creation time.
         createdAt:
           field === "createdAt"
-            ? "2026-05-01T12:29:59.000Z"
+            ? "2026-05-01T12:29:50.000Z"
             : "2026-05-01T12:30:00.000Z",
         startedAt: "2026-05-01T12:30:00.000Z",
         lastActiveAt: "2026-05-01T12:31:00.000Z",
@@ -2927,34 +2930,64 @@ describe("AgenC background agent lifecycle", () => {
     expect(restoreAgent).not.toHaveBeenCalled();
   });
 
-  it.each(["cancelled", "unknown_outcome"] as const)(
-    "rejects a %s canonical terminal before runner activation",
-    async (terminalStatus) => {
-      const sessionId = `conv-poison-${terminalStatus.replace("_", "-")}`;
-      const fixture = createResumeFixture(sessionId, { terminalStatus });
-      const restoreAgent = vi.fn(async () => true);
-      const agents = new AgenCDaemonAgentManager({
-        runner: {
-          startAgent: vi.fn(async () => ({
-            agentId: "unused",
-            startedAt: "2026-08-19T12:00:00.000Z",
-            status: "running" as const,
-          })),
-          restoreAgent,
-        },
-      });
+  it("rejects an unknown_outcome canonical terminal before runner activation", async () => {
+    const sessionId = "conv-poison-unknown-outcome";
+    const fixture = createResumeFixture(sessionId, {
+      terminalStatus: "unknown_outcome",
+    });
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
 
-      await expect(
-        agents.createAgent({
-          resumeSessionId: sessionId,
-          resumeRolloutPath: fixture.rolloutPath,
-          resumeSourceProof: fixture.sourceProof,
-          cwd: fixture.cwd,
-        }),
-      ).rejects.toThrow(`ended with ${terminalStatus}`);
-      expect(restoreAgent).not.toHaveBeenCalled();
-    },
-  );
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).rejects.toThrow("ended with unknown_outcome");
+    expect(restoreAgent).not.toHaveBeenCalled();
+  });
+
+  it("resumes a cancelled canonical terminal as an explicit reopen (#1750)", async () => {
+    // The everyday interrupt-then-continue workflow: Ctrl-C settles the
+    // session as a cancelled terminal, and an explicit resume reopens it
+    // under a new epoch instead of refusing forever.
+    const sessionId = "conv-poison-cancelled";
+    const fixture = createResumeFixture(sessionId, {
+      terminalStatus: "cancelled",
+    });
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: vi.fn(async () => ({
+          agentId: "unused",
+          startedAt: "2026-08-19T12:00:00.000Z",
+          status: "running" as const,
+        })),
+        restoreAgent,
+      },
+    });
+
+    await expect(
+      agents.createAgent({
+        resumeSessionId: sessionId,
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({ agentId: sessionId });
+    expect(restoreAgent).toHaveBeenCalledOnce();
+  });
 
   it("rejects a canonical cancellation request before runner or session activation", async () => {
     const fixture = createResumeFixture("conv-cancel-request1", {
@@ -7183,5 +7216,52 @@ describe("AgenC background agent lifecycle", () => {
     ).toBeUndefined();
 
     await expect(agents.reapStaleAgents()).resolves.toEqual([]);
+  });
+});
+
+import { retainedCreatedAtMatchesRollout } from "../../src/app-server/agent-lifecycle.js";
+
+describe("retainedCreatedAtMatchesRollout (#1750)", () => {
+  it("tolerates the millisecond drift between the daemon clock and the rollout header", () => {
+    expect(
+      retainedCreatedAtMatchesRollout(
+        "2026-08-20T05:38:17.057Z",
+        "2026-08-20T05:38:17.060Z",
+      ),
+    ).toBe(true);
+    expect(
+      retainedCreatedAtMatchesRollout(
+        "2026-08-20T05:38:17.060Z",
+        "2026-08-20T05:38:17.060Z",
+      ),
+    ).toBe(true);
+    expect(
+      retainedCreatedAtMatchesRollout(
+        "2026-08-20T05:38:12.000Z",
+        "2026-08-20T05:38:17.000Z",
+      ),
+    ).toBe(true);
+  });
+
+  it("still rejects a rollout stamped outside the tolerance window", () => {
+    expect(
+      retainedCreatedAtMatchesRollout(
+        "2026-08-20T05:38:11.999Z",
+        "2026-08-20T05:38:17.060Z",
+      ),
+    ).toBe(false);
+    expect(
+      retainedCreatedAtMatchesRollout(
+        "2026-08-20T06:38:17.060Z",
+        "2026-08-20T05:38:17.060Z",
+      ),
+    ).toBe(false);
+  });
+
+  it("falls back to strict equality for unparseable timestamps", () => {
+    expect(retainedCreatedAtMatchesRollout("garbage", "garbage")).toBe(true);
+    expect(retainedCreatedAtMatchesRollout("garbage", "other-garbage")).toBe(
+      false,
+    );
   });
 });
