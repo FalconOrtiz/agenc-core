@@ -72,6 +72,10 @@ async function runCompletedWorkflow(): Promise<{
     goal: "Fix the arithmetic bug in lib/add.js so the required script passes.",
     repoPath: repo,
     reviewerModel: "scripted-reviewer",
+    // Regression: wrapper spawn steps must not reserve the delegated model
+    // usage a second time. This production-sized finite budget is below the
+    // old 1.2M-token wrapper estimate but ample for the scripted run.
+    budget: { maxTokens: 400_000, maxCostUsd: 8 },
     requiredVerification: [{ label: "unit", script: "bash test.sh" }],
     maxImplementAttempts: 2,
     runId: RUN_ID,

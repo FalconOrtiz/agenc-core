@@ -380,8 +380,6 @@ const ZERO_ESTIMATE = {
   maxOutputTokens: 0,
   maxCostUsd: 0,
 } as const;
-const SPAWN_ESTIMATE_INPUT_TOKENS = 1_000_000;
-const SPAWN_ESTIMATE_OUTPUT_TOKENS = 200_000;
 const EVIDENCE_MESSAGE_LIMIT = 20_000;
 const MAX_VERIFICATION_STREAM_BYTES = 8 * 1024 * 1024;
 const MAX_VERIFIED_EXPORT_CAPTURE_BYTES = 64 * 1024 * 1024;
@@ -1355,11 +1353,11 @@ export class VerifiedChangeWorkflowController {
             canonicalizeJson({ stepId, childRunId, reviewer: ctx.spec.reviewerModel }),
           ),
           childRunId,
-          estimate: {
-            maxInputTokens: SPAWN_ESTIMATE_INPUT_TOKENS,
-            maxOutputTokens: SPAWN_ESTIMATE_OUTPUT_TOKENS,
-            maxCostUsd: ctx.spec.budget.maxCostUsd ?? null,
-          },
+          // The review model call is admitted and reconciled by its isolated
+          // child session against the same run allocation. The workflow
+          // wrapper crosses no provider boundary itself, so reserving the
+          // child's worst case here would double-hold every finite budget.
+          estimate: ZERO_ESTIMATE,
           ...(ctx.spec.reviewerModel !== undefined
             ? { model: ctx.spec.reviewerModel }
             : {}),
@@ -1907,11 +1905,11 @@ export class VerifiedChangeWorkflowController {
         }),
       ),
       childRunId: input.childRunId,
-      estimate: {
-        maxInputTokens: SPAWN_ESTIMATE_INPUT_TOKENS,
-        maxOutputTokens: SPAWN_ESTIMATE_OUTPUT_TOKENS,
-        maxCostUsd: spec.budget.maxCostUsd ?? null,
-      },
+      // Delegate construction is a zero-cost wrapper. Provider calls inside
+      // the child have their own durable admission reservations under this
+      // run's allocation; a second parent hold would make finite token/cost
+      // caps unusable and would double-count capacity while the child runs.
+      estimate: ZERO_ESTIMATE,
       ...(spec.model !== undefined ? { model: spec.model } : {}),
       ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
       beforeCommitFailpoints: input.beforeCommitFailpoints ?? [
