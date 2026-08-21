@@ -2457,6 +2457,7 @@ function validateRunStartParams(params: JsonObject): RunStartParams {
     methodName: "run.start",
     stringFields: [
       "goal",
+      "clientRequestId",
       "cwd",
       "model",
       "provider",
@@ -2469,6 +2470,17 @@ function validateRunStartParams(params: JsonObject): RunStartParams {
     valueFields: ["requiredVerification"],
   });
   validateRequiredString(validated, "run.start", "goal");
+  if (validated.clientRequestId !== undefined) {
+    const clientRequestId = validated.clientRequestId;
+    if (
+      typeof clientRequestId !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/u.test(clientRequestId)
+    ) {
+      throw invalidParams(
+        "run.start param 'clientRequestId' must be 8-200 characters, start with an ASCII letter or digit, and contain only letters, digits, '.', '_', ':', or '-'",
+      );
+    }
+  }
   let cwd: string | undefined;
   if (validated.cwd !== undefined) {
     // Same DAE-02 discipline as agent.create/session.create: an absolute,

@@ -247,10 +247,12 @@ class MemoryLedger implements WorkflowEvidenceLedger {
 }
 
 class FakeWorktrees implements WorkflowWorktreeBroker {
+  captures = 0;
   provisions = 0;
   readonly patchText = "diff --git a/f b/f\n--- a/f\n+++ b/f\n+x\n";
 
   async captureBaseState() {
+    this.captures += 1;
     return {
       baseCommit: BASE_COMMIT,
       dirty: false,
@@ -367,6 +369,8 @@ interface Harness {
   driver: StateSqliteDriver;
   repo: StateRunDurabilityRepository;
   controller: VerifiedChangeWorkflowController;
+  createController(): VerifiedChangeWorkflowController;
+  worktrees: FakeWorktrees;
   spawner: FakeSpawner;
   recorded: WorkflowStartedRunRecord[];
   warnings: string[];
@@ -389,27 +393,29 @@ function makeHarness(): Harness {
   const ledgers = new Map<string, MemoryLedger>();
   const warnings: string[] = [];
   const recorded: WorkflowStartedRunRecord[] = [];
-  const controller = new VerifiedChangeWorkflowController({
-    durability: () => repo,
-    journal: { open: async (runId) => new TestJournal(repo, runId) },
-    admission: ({ runId }) => {
-      admission.scope.runId = runId;
-      return admission;
-    },
-    worktrees,
-    commands,
-    spawner,
-    reviewer,
-    evidenceLedger: async (spec) => {
-      let ledger = ledgers.get(spec.runId);
-      if (ledger === undefined) {
-        ledger = new MemoryLedger(spec.runId);
-        ledgers.set(spec.runId, ledger);
-      }
-      return ledger;
-    },
-    warn: (message) => warnings.push(message),
-  });
+  const createController = () =>
+    new VerifiedChangeWorkflowController({
+      durability: () => repo,
+      journal: { open: async (runId) => new TestJournal(repo, runId) },
+      admission: ({ runId }) => {
+        admission.scope.runId = runId;
+        return admission;
+      },
+      worktrees,
+      commands,
+      spawner,
+      reviewer,
+      evidenceLedger: async (spec) => {
+        let ledger = ledgers.get(spec.runId);
+        if (ledger === undefined) {
+          ledger = new MemoryLedger(spec.runId);
+          ledgers.set(spec.runId, ledger);
+        }
+        return ledger;
+      },
+      warn: (message) => warnings.push(message),
+    });
+  const controller = createController();
   const dispatcher = new AgenCDaemonJsonRpcDispatcher({
     agentManager: new AgenCDaemonAgentManager(),
     workflow: new DaemonWorkflowStartService({
@@ -428,6 +434,8 @@ function makeHarness(): Harness {
     driver,
     repo,
     controller,
+    createController,
+    worktrees,
     spawner,
     recorded,
     warnings,
@@ -441,8 +449,10 @@ function makeHarness(): Harness {
   };
 }
 
-async function initializedConnection() {
-  const connection = harness.dispatcher.createConnection();
+async function initializedConnection(
+  dispatcher = harness.dispatcher,
+) {
+  const connection = dispatcher.createConnection();
   const initialize = await connection.dispatch({
     jsonrpc: JSON_RPC_VERSION,
     id: "init",
@@ -464,8 +474,9 @@ function startParams(overrides: JsonObject = {}): JsonObject {
 
 async function dispatchRunStart(
   params: JsonObject,
+  dispatcher = harness.dispatcher,
 ): Promise<{ result?: RunStartResult; error?: JsonObject }> {
-  const { connection } = await initializedConnection();
+  const { connection } = await initializedConnection(dispatcher);
   const response = (await connection.dispatch({
     jsonrpc: JSON_RPC_VERSION,
     id: "start",
@@ -530,6 +541,7 @@ describe("daemon dispatcher — run.start", () => {
     const { result, error } = await dispatchRunStart(startParams());
     expect(error).toBeUndefined();
     expect(result).toMatchObject({
+      idempotentReplay: false,
       baseCommit: BASE_COMMIT,
       baseDirty: { dirty: false, fileCount: 0 },
     });
@@ -555,6 +567,63 @@ describe("daemon dispatcher — run.start", () => {
       status: "running",
       cwd: harness.repoDir,
     });
+  });
+
+  it("replays one caller-owned start exactly across concurrent requests", async () => {
+    const clientRequestId = "managed-repo-repair-start-0001";
+    const [left, right] = await Promise.all([
+      dispatchRunStart(startParams({ clientRequestId })),
+      dispatchRunStart(startParams({ clientRequestId })),
+    ]);
+    expect(left.error).toBeUndefined();
+    expect(right.error).toBeUndefined();
+    expect(left.result!.runId).toBe(right.result!.runId);
+    expect(left.result!.runId).toMatch(/^wf-client-[a-f0-9]{64}$/u);
+    expect(
+      [left.result!.idempotentReplay, right.result!.idempotentReplay].sort(),
+    ).toEqual([false, true]);
+    expect(left.result!.specDigest).toBe(right.result!.specDigest);
+
+    await harness.controller.awaitRun(left.result!.runId);
+    expect(harness.recorded).toHaveLength(1);
+    expect(harness.worktrees.captures).toBe(1);
+
+    const restartedController = harness.createController();
+    const restartedDispatcher = new AgenCDaemonJsonRpcDispatcher({
+      agentManager: new AgenCDaemonAgentManager(),
+      workflow: new DaemonWorkflowStartService({
+        controller: restartedController,
+        primaryCwd: harness.repoDir,
+        recordAgentRun: (run) => harness.recorded.push(run),
+        warn: (message) => harness.warnings.push(message),
+      }),
+    });
+    const afterRestart = await dispatchRunStart(
+      startParams({ clientRequestId }),
+      restartedDispatcher,
+    );
+    expect(afterRestart.error).toBeUndefined();
+    expect(afterRestart.result).toMatchObject({
+      runId: left.result!.runId,
+      idempotentReplay: true,
+      specDigest: left.result!.specDigest,
+    });
+    expect(harness.recorded).toHaveLength(1);
+    expect(harness.worktrees.captures).toBe(1);
+
+    const conflict = await dispatchRunStart(
+      startParams({
+        clientRequestId,
+        goal: "Bind the same identity to different bytes",
+      }),
+    );
+    expect(conflict.error).toMatchObject({
+      code: -32602,
+      data: { code: "INVALID_ARGUMENT" },
+    });
+    expect(String((conflict.error as { message?: unknown }).message)).toContain(
+      "already bound to different start parameters",
+    );
   });
 
   it("rejects a missing or empty goal with a typed INVALID_ARGUMENT error", async () => {
@@ -629,5 +698,13 @@ describe("daemon dispatcher — run.start", () => {
       startParams({ permissionMode: "yolo" }),
     );
     expect(badMode.error).toMatchObject({ code: -32602 });
+    const shortClientRequest = await dispatchRunStart(
+      startParams({ clientRequestId: "short" }),
+    );
+    expect(shortClientRequest.error).toMatchObject({ code: -32602 });
+    const unsafeClientRequest = await dispatchRunStart(
+      startParams({ clientRequestId: "unsafe/request/identity" }),
+    );
+    expect(unsafeClientRequest.error).toMatchObject({ code: -32602 });
   });
 });

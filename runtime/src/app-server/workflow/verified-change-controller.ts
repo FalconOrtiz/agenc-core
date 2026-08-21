@@ -353,6 +353,7 @@ export interface WorkflowStartParams {
 
 export interface WorkflowStartResult {
   readonly runId: string;
+  readonly idempotentReplay: boolean;
   readonly specDigest: Sha256Digest;
   readonly baseCommit: string;
   readonly baseDirty: WorkflowSpec["baseDirty"];
@@ -509,6 +510,7 @@ export class VerifiedChangeWorkflowController {
   readonly #now: () => Date;
   readonly #newRunId: () => string;
   readonly #active = new Map<string, Promise<void>>();
+  readonly #startQueues = new Map<string, Promise<void>>();
 
   constructor(deps: VerifiedChangeWorkflowControllerDeps) {
     this.#deps = deps;
@@ -546,7 +548,31 @@ export class VerifiedChangeWorkflowController {
       verificationIds.add(id);
     }
     const runId = params.runId ?? this.#newRunId();
+    const previous = this.#startQueues.get(runId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => this.#startWithRunId(params, runId));
+    const tail = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#startQueues.set(runId, tail);
+    try {
+      return await current;
+    } finally {
+      if (this.#startQueues.get(runId) === tail) {
+        this.#startQueues.delete(runId);
+      }
+    }
+  }
+
+  async #startWithRunId(
+    params: WorkflowStartParams,
+    runId: string,
+  ): Promise<WorkflowStartResult> {
     const repo = this.#deps.durability({ runId, repoPath: params.repoPath });
+    const replay = this.#existingStart(params, runId, repo);
+    if (replay !== undefined) return replay;
     const journal = await this.#deps.journal.open(runId, {
       repoPath: params.repoPath,
       policy: {
@@ -607,7 +633,111 @@ export class VerifiedChangeWorkflowController {
     this.#active.set(runId, pipeline);
     return {
       runId,
+      idempotentReplay: false,
       specDigest,
+      baseCommit: spec.baseCommit,
+      baseDirty: spec.baseDirty,
+    };
+  }
+
+  #existingStart(
+    params: WorkflowStartParams,
+    runId: string,
+    repo: StateRunDurabilityRepository,
+  ): WorkflowStartResult | undefined {
+    const intake = repo.getEffect(runId, "workflow.intake");
+    if (intake === undefined) {
+      if (
+        repo.listEffects(runId).length > 0 ||
+        repo.getCurrentTerminalResult(runId) !== undefined
+      ) {
+        throw new WorkflowIntakeError(
+          runId,
+          null,
+          "the deterministic run id is already owned by non-intake durable state",
+        );
+      }
+      return undefined;
+    }
+    if (intake.outcome !== "committed") {
+      throw new WorkflowIntakeError(
+        runId,
+        null,
+        `the deterministic intake is ${intake.outcome ?? "unresolved"}`,
+      );
+    }
+    const evidence = readWorkflowStepEvidence(intake);
+    if (
+      evidence.spec === null ||
+      typeof evidence.spec !== "object" ||
+      Array.isArray(evidence.spec)
+    ) {
+      throw new WorkflowIntakeError(
+        runId,
+        null,
+        "the deterministic intake has no durable workflow spec",
+      );
+    }
+    const candidate = evidence.spec as Partial<WorkflowSpec>;
+    const baseDirty = candidate.baseDirty;
+    if (
+      candidate.runId !== runId ||
+      typeof candidate.repoPath !== "string" ||
+      typeof candidate.baseCommit !== "string" ||
+      !/^[a-f0-9]{40,64}$/u.test(candidate.baseCommit) ||
+      baseDirty === undefined ||
+      typeof baseDirty.dirty !== "boolean" ||
+      !Number.isSafeInteger(baseDirty.fileCount) ||
+      baseDirty.fileCount < 0 ||
+      !/^sha256:[a-f0-9]{64}$/u.test(baseDirty.summaryDigest)
+    ) {
+      throw new WorkflowIntakeError(
+        runId,
+        null,
+        "the deterministic intake identity or base state is corrupt",
+      );
+    }
+    const spec = candidate as WorkflowSpec;
+    let persistedDigest: Sha256Digest;
+    try {
+      persistedDigest = computeSpecDigest(spec);
+    } catch (error) {
+      throw new WorkflowIntakeError(
+        runId,
+        null,
+        `the deterministic intake spec is unreadable: ${errorMessage(error)}`,
+      );
+    }
+    if (
+      evidence.specDigest !== undefined &&
+      evidence.specDigest !== persistedDigest
+    ) {
+      throw new WorkflowIntakeError(
+        runId,
+        null,
+        "the deterministic intake digest is corrupt",
+      );
+    }
+    if (spec.repoPath !== params.repoPath) {
+      throw new TypeError(
+        `workflow ${runId} clientRequestId is already bound to different start parameters`,
+      );
+    }
+    const replaySpec = freezeWorkflowSpec(runId, params, {
+      baseCommit: spec.baseCommit,
+      dirty: spec.baseDirty.dirty,
+      fileCount: spec.baseDirty.fileCount,
+      summaryDigest: spec.baseDirty.summaryDigest as Sha256Digest,
+    });
+    if (computeSpecDigest(replaySpec) !== persistedDigest) {
+      throw new TypeError(
+        `workflow ${runId} clientRequestId is already bound to different start parameters`,
+      );
+    }
+    return {
+      runId,
+      idempotentReplay: true,
+      specDigest: persistedDigest,
       baseCommit: spec.baseCommit,
       baseDirty: spec.baseDirty,
     };

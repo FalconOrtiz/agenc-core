@@ -76,7 +76,12 @@ Key `AgencClient` methods:
 - `listAgents()` / `stopAgent(id)` / `agentLogs(id)`
 - `startRun(params)` → start the M5 verified-change workflow as a durable
   daemon run (`run.start`; resolves after the intake commit with
-  `{ runId, specDigest, baseCommit, baseDirty }`)
+  `{ runId, idempotentReplay, specDigest, baseCommit, baseDirty }`). Supply a
+  stable daemon-wide `clientRequestId` when a caller must safely retry after a
+  disconnect: exact parameters return the committed intake, while any attempt
+  to rebind that identity fails closed. The identifier must be 8-200 ASCII
+  characters, begin with a letter or digit, and otherwise contain only letters,
+  digits, `.`, `_`, `:`, or `-`.
 - `runStatus(id)` / `runResult(id)` / `replayRun(params)` /
   `reattachRun(options)` / `runEvidence(params)` /
   `exportVerifiedRun(constraints)` / `cancelRun(id, reason?)`

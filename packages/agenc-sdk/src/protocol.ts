@@ -249,6 +249,14 @@ export interface RunStartVerificationCommand extends JsonObject {
 export interface RunStartParams extends JsonObject {
   /** The engineering goal / issue text driving the change. */
   readonly goal: string;
+  /**
+   * Stable, caller-owned identity for an idempotent start. Reusing it with
+   * byte-equivalent start parameters returns the original run; rebinding it
+   * to different parameters is rejected. Must be 8-200 characters, start
+   * with an ASCII letter or digit, and contain only letters, digits, `.`,
+   * `_`, `:`, or `-`.
+   */
+  readonly clientRequestId?: string;
   /** Absolute directory inside the target git repository (daemon cwd default). */
   readonly cwd?: string;
   readonly model?: string;
@@ -679,6 +687,8 @@ export interface RunStartBaseDirty extends JsonObject {
 
 export interface RunStartResult extends JsonObject {
   readonly runId: string;
+  /** True only when clientRequestId resolved an already-committed intake. */
+  readonly idempotentReplay: boolean;
   /** Canonical digest of the frozen WorkflowSpec (the spec's durable identity). */
   readonly specDigest: string;
   /** Exact base commit recorded before any work began. */

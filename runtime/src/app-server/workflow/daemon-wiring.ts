@@ -469,6 +469,26 @@ export function createDaemonWorkflowController(options: {
   const durability = (
     context?: WorkflowDurabilityContext,
   ): StateRunDurabilityRepository => {
+    if (context?.runId !== undefined) {
+      const matches: StateRunDurabilityRepository[] = [];
+      for (const paths of candidatePaths()) {
+        const repository = repoForPaths(paths);
+        if (
+          repository.getEffect(context.runId, "workflow.intake") !==
+            undefined ||
+          repository.getCurrentTerminalResult(context.runId) !== undefined ||
+          repository.listEffects(context.runId).length > 0
+        ) {
+          matches.push(repository);
+        }
+      }
+      if (matches.length > 1) {
+        throw new Error(
+          `workflow ${context.runId} has durable state in multiple project databases`,
+        );
+      }
+      if (matches[0] !== undefined) return matches[0];
+    }
     if (context?.repoPath !== undefined) {
       return repoForPaths(
         resolveStateDatabasePaths({
@@ -476,18 +496,6 @@ export function createDaemonWorkflowController(options: {
           agencHome: options.agencHome,
         }),
       );
-    }
-    if (context?.runId !== undefined) {
-      for (const paths of candidatePaths()) {
-        const repository = repoForPaths(paths);
-        if (
-          repository.getEffect(context.runId, "workflow.intake") !==
-            undefined ||
-          repository.getCurrentTerminalResult(context.runId) !== undefined
-        ) {
-          return repository;
-        }
-      }
     }
     return repoForPaths(activeResumePaths ?? primaryPaths);
   };
