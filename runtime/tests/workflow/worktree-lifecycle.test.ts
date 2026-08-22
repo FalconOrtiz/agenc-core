@@ -12,6 +12,7 @@ import {
   exportPatchArtifacts,
   mintSealedEvidenceProof,
   provisionWorkflowWorktree,
+  workflowRunRef,
   workflowWorktreeSlug,
   type EvidenceArtifactSink,
 } from "../../src/workflow/worktree-lifecycle.js";
@@ -240,12 +241,14 @@ describe("M5 worktree lifecycle", () => {
     const before = checkoutFingerprint(repo);
 
     const warnings: string[] = [];
+    const head = git(handle.path, "rev-parse", "HEAD").trim();
     await cleanupAfterEvidence({
       proof: mintSealedEvidenceProof({
         runId: spec.runId,
         sealDigest: `sha256:${"d".repeat(64)}`,
       }),
       handle,
+      headCommit: head,
       broker,
       warn: (message) => warnings.push(message),
     });
@@ -253,5 +256,37 @@ describe("M5 worktree lifecycle", () => {
     expect(checkoutFingerprint(repo)).toBe(before);
     const { existsSync } = await import("node:fs");
     expect(existsSync(handle.path)).toBe(false);
+  });
+
+  it("pins the delivered commit before deleting its only branch", async () => {
+    const repo = join(tempWork(), "repo");
+    const base = initRepo(repo);
+    const spec = { runId: "wf-m5pin0001", repoPath: repo, baseCommit: base };
+    const handle = await provisionWorkflowWorktree(spec, broker);
+    writeFileSync(join(handle.path, "delivered.txt"), "the change\n");
+    git(handle.path, "add", "-A");
+    git(
+      handle.path,
+      "-c", "user.name=t", "-c", "user.email=t@t",
+      "commit", "-m", "snapshot",
+    );
+    const head = git(handle.path, "rev-parse", "HEAD").trim();
+
+    const warnings: string[] = [];
+    await cleanupAfterEvidence({
+      proof: mintSealedEvidenceProof({
+        runId: spec.runId,
+        sealDigest: `sha256:${"e".repeat(64)}`,
+      }),
+      handle,
+      headCommit: head,
+      broker,
+      warn: (message) => warnings.push(message),
+    });
+    expect(warnings).toEqual([]);
+    expect(git(repo, "rev-parse", workflowRunRef(spec.runId)).trim()).toBe(head);
+    expect(git(repo, "show", `${workflowRunRef(spec.runId)}:delivered.txt`)).toContain(
+      "the change",
+    );
   });
 });

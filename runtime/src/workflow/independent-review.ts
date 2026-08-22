@@ -127,8 +127,30 @@ export function buildReviewerMessages(input: ReviewerPromptInput): {
     '"overallExplanation":"...","overallConfidenceScore":0..1}',
     "Priority 0-1 findings are release blockers; reserve them for defects",
     "that make the change wrong, unsafe, or untested.",
+    "",
+    "You are answering in a single message and you have no tools: this",
+    "patch and this summary are everything you get. Reply with the JSON",
+    "object alone — no preamble, no narration of what you will do next,",
+    "no prose around it.",
   ].join("\n");
   return { systemPrompt: REVIEW_SYSTEM_PROMPT, userMessage };
+}
+
+/** The exact fallback shape returned when no structured review was found. */
+export function isUnstructuredReview(review: ReviewOutput): boolean {
+  return review.overallCorrectness === "" && review.findings.length === 0;
+}
+
+export const REVIEW_REPAIR_INSTRUCTION =
+  "Your previous reply contained no ReviewOutput. Do not describe what you " +
+  "will do and do not ask for more context: there is none. Reply now with " +
+  "the ReviewOutput JSON object alone.";
+
+export function reviewerResponseExcerpt(raw: string, limit = 240): string {
+  const flat = raw.replace(/\s+/gu, " ").trim();
+  if (flat.length === 0) return "(empty response)";
+  if (flat.length <= limit) return flat;
+  return `${flat.slice(0, Math.max(0, limit - 1))}…`;
 }
 
 export interface IndependentReviewResult {
@@ -155,20 +177,31 @@ export async function runIndependentReview(opts: {
     verification: opts.verification,
     verificationVerdict: opts.verificationVerdict,
   });
-  const raw = await opts.invoker.invoke({
+  const firstRaw = await opts.invoker.invoke({
     systemPrompt: prompt.systemPrompt,
     userMessage: prompt.userMessage,
     reviewerModel: opts.spec.reviewerModel,
     runId: opts.step.runId,
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   });
-  const review = parseReviewOutput(raw);
+  let raw = firstRaw;
+  let review = parseReviewOutput(raw);
+  if (isUnstructuredReview(review)) {
+    raw = await opts.invoker.invoke({
+      systemPrompt: prompt.systemPrompt,
+      userMessage: `${prompt.userMessage}\n\n${REVIEW_REPAIR_INSTRUCTION}`,
+      reviewerModel: opts.spec.reviewerModel,
+      runId: opts.step.runId,
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    });
+    review = parseReviewOutput(raw);
+  }
   // parseReviewOutput's plain-text fallback has this exact shape; a review
   // that did not produce structured output FAILS the step — it is never
   // treated as an approval.
-  if (review.overallCorrectness === "" && review.findings.length === 0) {
+  if (isUnstructuredReview(review)) {
     throw new ReviewParseError(
-      `no structured ReviewOutput in reviewer response (${raw.length} chars)`,
+      `no structured ReviewOutput in reviewer response: ${reviewerResponseExcerpt(raw)}`,
     );
   }
   const artifact = await opts.sink.recordArtifact({

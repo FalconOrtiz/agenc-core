@@ -29,6 +29,7 @@ import {
   getOrCreateWorktree,
   removeAgentWorktree,
   runGit,
+  runGitMutation,
   type WorktreeHandle,
 } from "../agents/worktree.js";
 
@@ -172,9 +173,15 @@ export async function exportPatchArtifacts(opts: {
     throw new WorkflowGitError("status", status.stderr.trim());
   }
   if (status.stdout.trim().length > 0) {
-    const add = await runGit(["add", "-A"], handle.path, broker);
+    const add = await runGitMutation(
+      ["add", "-A"],
+      handle.path,
+      broker,
+      handle.gitRoot,
+      [handle.path],
+    );
     if (add.code !== 0) throw new WorkflowGitError("add", add.stderr.trim());
-    const commit = await runGit(
+    const commit = await runGitMutation(
       [
         "-c", "user.name=agenc-workflow",
         "-c", "user.email=workflow@agenc.invalid",
@@ -183,6 +190,8 @@ export async function exportPatchArtifacts(opts: {
       ],
       handle.path,
       broker,
+      handle.gitRoot,
+      [handle.path],
     );
     if (commit.code !== 0) {
       throw new WorkflowGitError("commit", commit.stderr.trim());
@@ -330,12 +339,30 @@ export async function checkBaseMovement(opts: {
  * thrown: a leftover worktree is a nuisance, a thrown cleanup after a
  * sealed run would mask success.
  */
+export function workflowRunRef(runId: string): string {
+  return `refs/agenc/runs/${runId}`;
+}
+
 export async function cleanupAfterEvidence(opts: {
   readonly proof: SealedEvidenceProof;
   readonly handle: WorktreeHandle;
+  readonly headCommit: string;
   readonly broker: SandboxExecutionBrokerLike;
   readonly warn: (message: string) => void;
 }): Promise<void> {
+  const pin = await runGitMutation(
+    ["update-ref", workflowRunRef(opts.proof.runId), opts.headCommit],
+    opts.handle.gitRoot,
+    opts.broker,
+    opts.handle.gitRoot,
+  );
+  if (pin.code !== 0) {
+    opts.warn(
+      `workflow ${opts.proof.runId} could not pin its delivered commit ` +
+        `${opts.headCommit} (${pin.stderr.trim()}); leaving the worktree in place`,
+    );
+    return;
+  }
   try {
     await removeAgentWorktree({
       gitRoot: opts.handle.gitRoot,

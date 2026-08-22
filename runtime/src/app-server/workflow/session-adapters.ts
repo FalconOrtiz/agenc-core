@@ -85,6 +85,7 @@ import type {
   WorkflowJournalWriter,
   WorkflowRunJournal,
   WorkflowRunSessionPolicy,
+  WorkflowSpawnKind,
   WorkflowTerminalJournalIntent,
   WorkflowWorktreeBroker,
 } from "./verified-change-controller.js";
@@ -217,6 +218,41 @@ export {
   inspectWorkflowChildTerminal,
   recordWorkflowChildTerminal,
 } from "./child-terminals.js";
+
+/**
+ * Convert the controller's deterministic child-run id into the narrower
+ * lowercase identifier accepted by the agent registry. The logical run id
+ * remains unchanged in the durable workflow journal.
+ */
+export function workflowChildAgentName(childRunId: string): string {
+  return childRunId.toLowerCase().replace(/[^a-z0-9_]+/g, "_");
+}
+
+/** Preserve a pre-message child failure in the durable parent evidence. */
+export function workflowChildFailureMessage(
+  kind: WorkflowSpawnKind,
+  result: {
+    readonly outcome: "completed" | "errored" | "interrupted" | "aborted";
+    readonly error?: unknown;
+  },
+): string | null {
+  if (result.outcome === "completed") return null;
+  const reason =
+    result.error === undefined ? "" : `: ${childErrorText(result.error)}`;
+  return `workflow ${kind} child ${result.outcome}${reason}`;
+}
+
+function childErrorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null) {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return Object.prototype.toString.call(error);
+    }
+  }
+  return String(error);
+}
 
 /**
  * The child usage rollup for a real delegate spawn, resolved from the
@@ -703,6 +739,7 @@ export function createWorkflowSessionSeams(
       return cleanupAfterEvidence({
         proof: input.proof,
         handle: input.handle,
+        headCommit: input.headCommit,
         broker: sessionBroker(entry, input.handle.gitRoot),
         warn: options.warn,
       });
@@ -776,7 +813,7 @@ export function createWorkflowSessionSeams(
           registry,
           taskPrompt: input.prompt,
           ...(input.kind === "verify_agent" ? { role: "verification" } : {}),
-          agentName: input.childRunId.replace(/[^a-zA-Z0-9._-]/g, "-"),
+          agentName: workflowChildAgentName(input.childRunId),
           ...(input.spec.model !== undefined
             ? { model: input.spec.model }
             : {}),
@@ -838,7 +875,9 @@ export function createWorkflowSessionSeams(
         }
         return {
           status,
-          finalMessage: result.finalMessage ?? null,
+          finalMessage:
+            result.finalMessage ??
+            workflowChildFailureMessage(input.kind, result),
           usage,
           ...(heldUnknownCount > 0
             ? { usageHeldUnknownCount: heldUnknownCount }

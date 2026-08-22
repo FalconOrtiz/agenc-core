@@ -279,6 +279,7 @@ export interface WorkflowWorktreeBroker {
   cleanup(input: {
     readonly proof: SealedEvidenceProof;
     readonly handle: WorktreeHandle;
+    readonly headCommit: string;
   }): Promise<void>;
 }
 
@@ -1729,6 +1730,7 @@ export class VerifiedChangeWorkflowController {
       await this.#deps.worktrees.cleanup({
         proof: mintSealedEvidenceProof({ runId: ctx.runId, sealDigest }),
         handle,
+        headCommit: exported.headCommit,
       });
     } catch (error) {
       this.#deps.warn(

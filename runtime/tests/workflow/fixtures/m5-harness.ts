@@ -286,6 +286,7 @@ export function buildM5Harness(options: M5HarnessOptions): M5Harness {
       cleanupAfterEvidence({
         proof: input.proof,
         handle: input.handle,
+        headCommit: input.headCommit,
         broker,
         warn: (message) => warnings.push(message),
       }),

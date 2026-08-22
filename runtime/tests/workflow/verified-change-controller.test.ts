@@ -299,8 +299,11 @@ class FakeWorktrees implements WorkflowWorktreeBroker {
   movement: BaseMovementCheck = { kind: "unmoved" };
   patchText = "diff --git a/f b/f\n--- a/f\n+++ b/f\n+x\n";
   provisions = 0;
-  readonly cleanups: { proof: SealedEvidenceProof; handle: WorktreeHandle }[] =
-    [];
+  readonly cleanups: {
+    proof: SealedEvidenceProof;
+    handle: WorktreeHandle;
+    headCommit: string;
+  }[] = [];
 
   async captureBaseState() {
     return {
@@ -358,6 +361,7 @@ class FakeWorktrees implements WorkflowWorktreeBroker {
   async cleanup(input: {
     proof: SealedEvidenceProof;
     handle: WorktreeHandle;
+    headCommit: string;
   }): Promise<void> {
     this.cleanups.push(input);
   }
@@ -661,6 +665,7 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(harness.worktrees.cleanups[0].proof.sealDigest).toBe(
       ledger.sealDigest,
     );
+    expect(harness.worktrees.cleanups[0].headCommit).toBe(HEAD_COMMIT);
 
     // Status projection: every stage committed, verify verdict PASS.
     const status = harness.controller.status(RUN_ID)!;
@@ -1131,7 +1136,9 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
   });
 
   it("a settled-but-unparseable reviewer adopted after a crash keeps its failed outcome and retries once", async () => {
+    // One unstructured reply earns one repair turn inside the same attempt.
     harness.reviewer.responses.push("no structured output at all");
+    harness.reviewer.responses.push("still no structured output");
     armFailpoint("before_review_commit");
     const started = await harness.controller.start(startParams(harness));
     await expect(harness.controller.awaitRun(started.runId)).rejects.toThrow(
@@ -1157,7 +1164,7 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
       "completed",
     );
-    expect(harness.reviewer.invocations).toHaveLength(2);
+    expect(harness.reviewer.invocations).toHaveLength(3);
   });
 });
 
