@@ -54,6 +54,22 @@ describe("buildOpenAIResponsesRequest", () => {
     expect(request.temperature).toBe(0.3);
   });
 
+  test("omits tool controls when no tools are attached", () => {
+    const request = buildOpenAIResponsesRequest({
+      model: "grok-build-0.1",
+      messages: [{ role: "user", content: "review this change" }],
+      tools: [],
+      options: {
+        toolChoice: "none",
+        parallelToolCalls: false,
+      },
+    });
+
+    expect(request.tools).toBeUndefined();
+    expect(request.tool_choice).toBeUndefined();
+    expect(request.parallel_tool_calls).toBeUndefined();
+  });
+
   test("folds developer messages into instructions before current user input", () => {
     const request = buildOpenAIResponsesRequest({
       model: "gpt-5",

@@ -292,12 +292,14 @@ export function buildOpenAIResponsesRequest(
     body.instructions = instructions;
   }
   const tools = toOpenAIResponsesTools(input.tools);
-  if (tools.length > 0) body.tools = tools;
-  if (input.options?.toolChoice !== undefined) {
-    body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);
-  }
-  if (input.options?.parallelToolCalls !== undefined) {
-    body.parallel_tool_calls = input.options.parallelToolCalls;
+  if (tools.length > 0) {
+    body.tools = tools;
+    if (input.options?.toolChoice !== undefined) {
+      body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);
+    }
+    if (input.options?.parallelToolCalls !== undefined) {
+      body.parallel_tool_calls = input.options.parallelToolCalls;
+    }
   }
   if (input.options?.promptCacheKey) {
     body.prompt_cache_key = input.options.promptCacheKey;

@@ -158,12 +158,14 @@ export function buildChatCompletionsRequest(
   };
 
   const tools = toChatCompletionsTools(input.tools);
-  if (tools.length > 0) body.tools = tools;
-  if (input.options?.toolChoice !== undefined) {
-    body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);
-  }
-  if (input.options?.parallelToolCalls !== undefined) {
-    body.parallel_tool_calls = input.options.parallelToolCalls;
+  if (tools.length > 0) {
+    body.tools = tools;
+    if (input.options?.toolChoice !== undefined) {
+      body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);
+    }
+    if (input.options?.parallelToolCalls !== undefined) {
+      body.parallel_tool_calls = input.options.parallelToolCalls;
+    }
   }
   if (input.options?.temperature !== undefined) {
     body.temperature = input.options.temperature;

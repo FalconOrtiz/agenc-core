@@ -77,6 +77,22 @@ describe("buildChatCompletionsRequest", () => {
     expect(request.max_tokens).toBe(32_000);
   });
 
+  test("omits tool controls when no tools are attached", () => {
+    const request = buildChatCompletionsRequest({
+      model: "grok-build-0.1",
+      messages: [{ role: "user", content: "review this change" }],
+      tools: [],
+      options: {
+        toolChoice: "none",
+        parallelToolCalls: false,
+      },
+    });
+
+    expect(request.tools).toBeUndefined();
+    expect(request.tool_choice).toBeUndefined();
+    expect(request.parallel_tool_calls).toBeUndefined();
+  });
+
   test("serializes request-scoped sampling controls", () => {
     const request = buildChatCompletionsRequest({
       model: "qwen-local",
