@@ -2724,7 +2724,7 @@ function buildVerifyAgentPrompt(
         (record.timedOut ? " (timed out)" : ""),
     ),
     "",
-    "End your final message with exactly one line:",
+    "End your final message with exactly one plain-text line (no Markdown, bold, bullets, or backticks):",
     "VERDICT: PASS | FAIL | PARTIAL",
   ].join("\n");
 }

@@ -163,8 +163,22 @@ export function parseVerificationVerdict(
   text: string,
 ): VerificationVerdict | undefined {
   let verdict: VerificationVerdict | undefined;
-  for (const line of text.split("\n")) {
-    const match = /^\s*VERDICT:\s*(PASS|FAIL|PARTIAL)\b/.exec(line.trim());
+  for (const rawLine of text.split("\n")) {
+    let line = rawLine.trim();
+    // Models commonly emphasize the requested terminal line even when the
+    // prompt asks for it verbatim. Accept only balanced, whole-line Markdown
+    // wrappers so prose that merely mentions a verdict remains rejected.
+    for (const marker of ["**", "__", "`"] as const) {
+      if (
+        line.length > marker.length * 2 &&
+        line.startsWith(marker) &&
+        line.endsWith(marker)
+      ) {
+        line = line.slice(marker.length, -marker.length).trim();
+        break;
+      }
+    }
+    const match = /^VERDICT:\s*(PASS|FAIL|PARTIAL)\b/.exec(line);
     if (match !== null) verdict = match[1] as VerificationVerdict;
   }
   return verdict;

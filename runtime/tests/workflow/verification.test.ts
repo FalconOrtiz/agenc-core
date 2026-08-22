@@ -197,12 +197,19 @@ describe("verification agent verdict parsing", () => {
     expect(parseVerificationVerdict("  VERDICT: PARTIAL (2 checks skipped)")).toBe(
       "PARTIAL",
     );
+    expect(parseVerificationVerdict("checks passed\n**VERDICT: PASS**")).toBe(
+      "PASS",
+    );
+    expect(parseVerificationVerdict("__VERDICT: FAIL__")).toBe("FAIL");
+    expect(parseVerificationVerdict("`VERDICT: PARTIAL`")).toBe("PARTIAL");
   });
 
   it("a missing or malformed verdict is undefined — callers treat it as failure", () => {
     expect(parseVerificationVerdict("all good, ship it")).toBeUndefined();
     expect(parseVerificationVerdict("VERDICT: SHIP")).toBeUndefined();
     expect(parseVerificationVerdict("the VERDICT: PASS came earlier")).toBeUndefined();
+    expect(parseVerificationVerdict("**the VERDICT: PASS came earlier**")).toBeUndefined();
+    expect(parseVerificationVerdict("**VERDICT: PASS")).toBeUndefined();
     expect(parseVerificationVerdict("")).toBeUndefined();
   });
 });
