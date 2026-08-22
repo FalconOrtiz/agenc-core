@@ -2672,9 +2672,11 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
   const lines = [
     "You are the implementation stage of a verified-change workflow.",
     "Implement the goal below inside the current worktree.",
-    "Use the fewest tool calls needed for the bounded change.",
+    "Use at most 16 tool calls and the fewest needed for the bounded change.",
+    "Inspect the relevant files once, make the smallest correct edit, and run each required verification command at most once after the latest edit.",
     "Do not repeat an unchanged failing command; diagnose it or change the code first.",
-    "As soon as the required verification passes, stop and report the result.",
+    "An exec_command result's exit_code is authoritative even when the command writes no stdout; do not rerun it only to print the exit code.",
+    "As soon as the required verification passes, immediately stop using tools and report the result.",
     "",
     "## Goal",
     ctx.spec.goal,
