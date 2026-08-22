@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
   __INTERNAL,
   __resetRipgrepProbeForTests,
+  __setRipgrepModifiedSortAvailabilityForTests,
   __setRipgrepAvailabilityForTests,
   createGrepTool as createUnboundGrepTool,
   GREP_TOOL_NAME,
@@ -1354,6 +1355,35 @@ describe("Grep tool", () => {
       "Found 2 files (results truncated at 2; refine query)",
       "new.txt",
       "mid.txt",
+    ]);
+  });
+
+  test("keeps newest files when the sandbox requires portable mtime sorting", async () => {
+    const oldFile = join(root, "a-old.txt");
+    const midFile = join(root, "b-mid.txt");
+    const newFile = join(root, "z-new.txt");
+    await writeFile(oldFile, "needle\n", "utf8");
+    await writeFile(midFile, "needle\n", "utf8");
+    await writeFile(newFile, "needle\n", "utf8");
+    const now = Date.now() / 1000;
+    await utimes(oldFile, now - 300, now - 300);
+    await utimes(midFile, now - 150, now - 150);
+    await utimes(newFile, now, now);
+    __setRipgrepModifiedSortAvailabilityForTests(false);
+    const tool = createGrepTool({ allowedPaths: [root] });
+
+    const result = await tool.execute({
+      pattern: "needle",
+      path: root,
+      output_mode: "files_with_matches",
+      head_limit: 2,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(lines(result.content)).toEqual([
+      "Found 2 files (results truncated at 2; refine query)",
+      "z-new.txt",
+      "b-mid.txt",
     ]);
   });
 

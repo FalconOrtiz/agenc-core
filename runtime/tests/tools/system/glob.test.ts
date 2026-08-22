@@ -649,6 +649,48 @@ await rename(displaced, nested);
     expect(oldIdx).toBeGreaterThan(midIdx);
   });
 
+  test("falls back to authenticated portable mtime sorting without procfs", async () => {
+    const oldFile = join(root, "a-old.log");
+    const midFile = join(root, "b-mid.log");
+    const newFile = join(root, "z-new.log");
+    await writeFile(oldFile, "old\n", "utf8");
+    await writeFile(midFile, "mid\n", "utf8");
+    await writeFile(newFile, "new\n", "utf8");
+    const now = Date.now() / 1000;
+    await utimes(oldFile, now - 300, now - 300);
+    await utimes(midFile, now - 150, now - 150);
+    await utimes(newFile, now, now);
+
+    const fakeRipgrep = join(root, "no-proc-rg.mjs");
+    await writeFile(
+      fakeRipgrep,
+      `#!/usr/bin/env node
+if (process.argv.includes("modified")) {
+  process.stderr.write("rg: sorting by last modified isn't supported: no /proc/self/exe available. Is /proc mounted?\\n");
+  process.exitCode = 2;
+} else {
+  process.stdout.write("a-old.log\\0b-mid.log\\0z-new.log\\0");
+}
+`,
+      "utf8",
+    );
+    await chmod(fakeRipgrep, 0o755);
+    const tool = createGlobTool({
+      allowedPaths: [root],
+      maxResults: 2,
+      ripgrepCommand: fakeRipgrep,
+    });
+
+    const result = await tool.execute({ pattern: "*.log", path: root });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content.split("\n")).toEqual([
+      "z-new.log",
+      "b-mid.log",
+      "(Results are truncated. Consider using a more specific path or pattern.)",
+    ]);
+  });
+
   test("truncates at `maxResults` with a polite note", async () => {
     for (let i = 0; i < 8; i += 1) {
       await writeFile(join(root, `f${i}.txt`), `${i}\n`, "utf8");

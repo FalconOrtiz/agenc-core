@@ -407,6 +407,7 @@ export interface RunRipgrepFilesParams {
   readonly readCapability?: WorkspaceBoundReadCapability;
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
+  readonly sortMode?: "modified" | "path";
 }
 
 type RunRipgrepFilesWithIgnorePathsParams = Omit<
@@ -421,6 +422,7 @@ interface BuildRipgrepFilesArgsParams {
   readonly searchPath?: string;
   readonly includeIgnored: boolean;
   readonly rootIgnoreFilePaths: readonly string[];
+  readonly sortMode?: "modified" | "path";
 }
 
 function buildRipgrepFilesArgs(params: BuildRipgrepFilesArgsParams): string[] {
@@ -438,8 +440,8 @@ function buildRipgrepFilesArgs(params: BuildRipgrepFilesArgsParams): string[] {
     `${RIPGREP_FILE_TYPE_NAME}:${params.pattern}`,
     "--type",
     RIPGREP_FILE_TYPE_NAME,
-    "--sortr",
-    "modified",
+    params.sortMode === "path" ? "--sort" : "--sortr",
+    params.sortMode === "path" ? "path" : "modified",
     "--hidden",
   ];
   if (!params.includeIgnored) {
@@ -521,7 +523,10 @@ async function runRipgrepFilesWithIgnorePaths(
   const timeoutMs = params.timeoutMs ?? RIPGREP_FILES_TIMEOUT_MS;
   const maxOutputBytes =
     params.maxOutputBytes ?? RIPGREP_FILES_MAX_OUTPUT_BYTES;
-  const args = buildRipgrepFilesArgs(params);
+  const args = buildRipgrepFilesArgs({
+    ...params,
+    ...(params.sortMode !== undefined ? { sortMode: params.sortMode } : {}),
+  });
   try {
     assertRipgrepFilesArgvWithinLimits(params.command, args);
   } catch (error) {
@@ -749,12 +754,18 @@ function isSafeRelativeRipgrepPathBytes(path: Buffer): boolean {
   return true;
 }
 
+interface NormalizedGlobMatch {
+  readonly renderedPath: string;
+  readonly pathBytes: Buffer;
+  readonly mtimeMs: number;
+}
+
 async function normalizeAndFilterMatches(params: {
   readonly matches: readonly Buffer[];
   readonly target: ResolvedGlobTarget;
   readonly readCapability?: WorkspaceBoundReadCapability;
-}): Promise<readonly string[]> {
-  const safeMatches: string[] = [];
+}): Promise<readonly NormalizedGlobMatch[]> {
+  const safeMatches: NormalizedGlobMatch[] = [];
   for (const match of params.matches) {
     const normalizedBytes = normalizeRelativeRipgrepPathBytes(match);
     if (!isSafeRelativeRipgrepPathBytes(normalizedBytes)) continue;
@@ -772,15 +783,27 @@ async function normalizeAndFilterMatches(params: {
         continue;
       }
       try {
-        await params.readCapability.validateRelativeFile(relativeToSearchRoot);
+        const file = await params.readCapability.readRelativeFile(
+          relativeToSearchRoot,
+          0,
+          { truncate: true },
+        );
+        safeMatches.push({
+          renderedPath: renderRipgrepPathBytes(normalizedBytes),
+          pathBytes: normalizedBytes,
+          mtimeMs: file.stats.mtimeMs,
+        });
       } catch {
         continue;
       }
-      safeMatches.push(renderRipgrepPathBytes(normalizedBytes));
       continue;
     }
     if (decoded === undefined) {
-      safeMatches.push(renderRipgrepPathBytes(normalizedBytes));
+      safeMatches.push({
+        renderedPath: renderRipgrepPathBytes(normalizedBytes),
+        pathBytes: normalizedBytes,
+        mtimeMs: Number.NEGATIVE_INFINITY,
+      });
       continue;
     }
     const absolute = resolve(params.target.displayRoot, decoded);
@@ -788,9 +811,31 @@ async function normalizeAndFilterMatches(params: {
     if (!check.safe) continue;
     const st = await fs.stat(check.resolved).catch(() => undefined);
     if (!st || st.isDirectory()) continue;
-    safeMatches.push(renderRipgrepPathBytes(normalizedBytes));
+    safeMatches.push({
+      renderedPath: renderRipgrepPathBytes(normalizedBytes),
+      pathBytes: normalizedBytes,
+      mtimeMs: st.mtimeMs,
+    });
   }
   return safeMatches;
+}
+
+function sortNormalizedGlobMatchesNewestFirst(
+  matches: readonly NormalizedGlobMatch[],
+): readonly NormalizedGlobMatch[] {
+  return matches.toSorted((left, right) => {
+    if (left.mtimeMs !== right.mtimeMs) {
+      return left.mtimeMs > right.mtimeMs ? -1 : 1;
+    }
+    return Buffer.compare(left.pathBytes, right.pathBytes);
+  });
+}
+
+function isRipgrepModifiedSortUnavailable(stderr: string): boolean {
+  return (
+    stderr.includes("sorting by last modified isn't supported") &&
+    stderr.includes("no /proc/self/exe available")
+  );
 }
 
 export async function discoverRipgrepRootIgnoreFiles(params: {
@@ -985,7 +1030,8 @@ export function createGlobTool(
         await afterRootIgnoreSnapshot?.();
         let rawMatches: readonly Buffer[];
         let truncated = false;
-        const rg = await runRipgrepFiles({
+        let portableMtimeSort = false;
+        let rg = await runRipgrepFiles({
           command: ripgrepCommand,
           pattern: target.pattern,
           cwd: target.displayRoot,
@@ -999,6 +1045,28 @@ export function createGlobTool(
             ? { readCapability: enumerationCapability }
             : {}),
         });
+        if (
+          rg.exitCode !== 0 &&
+          !rg.killedAfterLimit &&
+          isRipgrepModifiedSortUnavailable(rg.stderr)
+        ) {
+          portableMtimeSort = true;
+          rg = await runRipgrepFiles({
+            command: ripgrepCommand,
+            pattern: target.pattern,
+            cwd: target.displayRoot,
+            searchPath: relative(target.displayRoot, target.searchRoot) || ".",
+            toolArgs: rawArgs,
+            limit: MAX_GREP_RESULTS,
+            includeIgnored,
+            rootIgnoreFiles,
+            sortMode: "path",
+            signal,
+            ...(enumerationCapability !== undefined
+              ? { readCapability: enumerationCapability }
+              : {}),
+          });
+        }
         if (signal?.aborted || rg.aborted) {
           return errorResult("Glob aborted");
         }
@@ -1008,6 +1076,11 @@ export function createGlobTool(
         if (rg.stopReason === "output_limit") {
           return errorResult(
             "Glob error: ripgrep exceeded the output safety limit.",
+          );
+        }
+        if (portableMtimeSort && rg.killedAfterLimit) {
+          return errorResult(
+            `Glob error [RESULT_LIMIT]: portable modification-time sorting exceeded ${MAX_GREP_RESULTS} files. Refine the pattern or path.`,
           );
         }
         if (rg.spawnError) {
@@ -1030,11 +1103,16 @@ export function createGlobTool(
           truncated = rg.killedAfterLimit || rg.pathRecords.length > limit;
         }
 
-        const normalized = await normalizeAndFilterMatches({
+        const normalizedMatches = await normalizeAndFilterMatches({
           matches: rawMatches,
           target,
           ...(readCapability !== undefined ? { readCapability } : {}),
         });
+        const normalized = (
+          portableMtimeSort
+            ? sortNormalizedGlobMatchesNewestFirst(normalizedMatches)
+            : normalizedMatches
+        ).map((match) => match.renderedPath);
         const kept = normalized.slice(0, limit);
         const elapsedMs = Date.now() - startedAt;
         const metadata = {

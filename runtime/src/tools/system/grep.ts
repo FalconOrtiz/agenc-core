@@ -481,6 +481,14 @@ function helperBoundaryError(
 }
 
 let ripgrepAvailability: boolean | undefined;
+let ripgrepModifiedSortAvailabilityOverrideForTests: boolean | undefined;
+
+function isRipgrepModifiedSortUnavailable(stderr: string): boolean {
+  return (
+    stderr.includes("sorting by last modified isn't supported") &&
+    stderr.includes("no /proc/self/exe available")
+  );
+}
 
 function isExecutableUnavailable(error: unknown): boolean {
   let current = error;
@@ -619,12 +627,101 @@ async function probeRipgrepCommand(
   );
 }
 
+async function isRipgrepModifiedSortAvailable(
+  cwd: string,
+  toolArgs: Record<string, unknown>,
+  signal?: AbortSignal,
+  readCapability?: WorkspaceBoundReadCapability,
+  deadline?: GrepOperationDeadline,
+): Promise<boolean> {
+  if (ripgrepModifiedSortAvailabilityOverrideForTests !== undefined) {
+    return ripgrepModifiedSortAvailabilityOverrideForTests;
+  }
+  const ripgrepPath = selectPinnedRipgrepPath();
+  if (ripgrepPath === undefined) return false;
+  const probeArgs = [
+    "--no-config",
+    "--no-follow",
+    "--files",
+    "-0",
+    "--sortr",
+    "modified",
+    "--glob",
+    "!**",
+    "--",
+    ".",
+  ];
+  const remaining =
+    deadline === undefined
+      ? RIPGREP_PROBE_TIMEOUT_MS
+      : Math.min(RIPGREP_PROBE_TIMEOUT_MS, remainingGrepOperationMs(deadline));
+  if (remaining < 1) return true;
+
+  let exitCode: number | null;
+  let stderr: string;
+  let failed = false;
+  if (readCapability !== undefined) {
+    const command = prepareBoundRipgrepCommand({
+      toolArgs,
+      fallbackCwd: cwd,
+      program: ripgrepPath,
+      args: probeArgs,
+      env: scrubEnvForChildProcess(process.env),
+    });
+    try {
+      const result = await readCapability.runRipgrep({
+        program: command.program,
+        args: command.args,
+        env: command.env,
+        ...(command.argv0 !== undefined ? { argv0: command.argv0 } : {}),
+        timeoutMs: remaining,
+        maxOutputBytes: RIPGREP_PROBE_MAX_OUTPUT_BYTES,
+        ...(signal !== undefined ? { signal } : {}),
+      });
+      exitCode = result.exitCode;
+      stderr = result.stderr.toString("utf8");
+      failed =
+        result.spawnError !== undefined || result.stopReason !== undefined;
+    } catch {
+      return true;
+    }
+  } else {
+    const command = applyReadOnlyRuntimeSandboxToSpawn({
+      toolArgs,
+      fallbackCwd: cwd,
+      program: ripgrepPath,
+      args: probeArgs,
+      cwd,
+      env: scrubEnvForChildProcess(process.env),
+    });
+    const result = await runSupervisedProcess(command, {
+      timeoutMs: remaining,
+      maxOutputBytes: RIPGREP_PROBE_MAX_OUTPUT_BYTES,
+      signal,
+    });
+    exitCode = result.exitCode;
+    stderr = result.stderr.toString("utf8");
+    failed = result.error !== undefined || result.stopReason !== undefined;
+  }
+  if (!failed && (exitCode === 0 || exitCode === 1)) {
+    return true;
+  }
+  if (isRipgrepModifiedSortUnavailable(stderr)) {
+    return false;
+  }
+  // Preserve the normal execution path for unknown probe failures so the
+  // real invocation reports its full diagnostic instead of silently changing
+  // ordering semantics.
+  return true;
+}
+
 /**
  * Test hook — reset the cached `rg` probe between unit tests.
  * Not exported via index.ts; only the test file imports it.
  */
 export function __resetRipgrepProbeForTests(): void {
   ripgrepAvailability = undefined;
+  ripgrepModifiedSortAvailabilityOverrideForTests = undefined;
 }
 
 /**
@@ -635,6 +732,13 @@ export function __setRipgrepAvailabilityForTests(
   available: boolean | undefined,
 ): void {
   ripgrepAvailability = available;
+}
+
+/** Test-only seam for the no-proc portable mtime-sort path. */
+export function __setRipgrepModifiedSortAvailabilityForTests(
+  available: boolean | undefined,
+): void {
+  ripgrepModifiedSortAvailabilityOverrideForTests = available;
 }
 
 function splitGlobs(rawGlob: string): string[] {
@@ -1024,6 +1128,7 @@ interface RipgrepOptions {
   readonly globs: readonly string[];
   readonly respectVcsIgnores?: boolean;
   readonly rootIgnoreFiles?: readonly string[];
+  readonly fileSort?: "modified" | "path";
 }
 
 function buildRipgrepArgs(opts: RipgrepOptions): string[] {
@@ -1064,7 +1169,12 @@ function buildRipgrepArgs(opts: RipgrepOptions): string[] {
     args.push("-i");
   }
   if (opts.outputMode === "files_with_matches") {
-    args.push("-0", "-l", "--sortr", "modified");
+    args.push(
+      "-0",
+      "-l",
+      opts.fileSort === "path" ? "--sort" : "--sortr",
+      opts.fileSort === "path" ? "path" : "modified",
+    );
   } else if (opts.outputMode === "count") {
     args.push("-0", "-c", "--with-filename", "--sort", "path");
   } else {
@@ -2276,6 +2386,73 @@ function filterDirtyDiskRecords(
   );
 }
 
+async function sortFileRecordsNewestFirstPortable(params: {
+  readonly records: readonly RipgrepOutputRecord[];
+  readonly target: ResolvedTarget;
+  readonly readCapability: WorkspaceBoundReadCapability;
+  readonly deadline: GrepOperationDeadline;
+}): Promise<
+  | { readonly records: readonly RipgrepOutputRecord[] }
+  | { readonly error: string }
+> {
+  const timed: Array<{
+    readonly record: RipgrepOutputRecord;
+    readonly mtimeMs: number;
+  }> = [];
+  for (const record of params.records) {
+    if (remainingGrepOperationMs(params.deadline) < 1) {
+      return {
+        error: `Grep error [WALL_TIMEOUT]: portable modification-time sorting exceeded ${MAX_GREP_WALL_MS}ms.`,
+      };
+    }
+    if (record.kind !== "file") continue;
+    const decoded = decodeRipgrepPathBytes(record.path);
+    if (decoded === undefined) {
+      return {
+        error:
+          "Grep error [INVALID_WIRE_TEXT]: portable modification-time sorting requires UTF-8 file paths.",
+      };
+    }
+    const absolute = normalizedResultPath(decoded, params.target.displayRoot);
+    const relativeToCapability = relative(
+      params.readCapability.rootPath,
+      absolute,
+    );
+    if (
+      relativeToCapability.length === 0 ||
+      isRelativePathOutside(relativeToCapability, sep, isAbsolute)
+    ) {
+      return {
+        error:
+          "Grep error: a portable modification-time sort result escaped its authenticated read capability.",
+      };
+    }
+    try {
+      const file = await params.readCapability.readRelativeFile(
+        relativeToCapability,
+        0,
+        { truncate: true },
+      );
+      timed.push({ record, mtimeMs: file.stats.mtimeMs });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") continue;
+      return {
+        error: `Grep error: authoritative file metadata is unavailable during portable modification-time sorting: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      };
+    }
+  }
+  timed.sort((left, right) => {
+    if (left.mtimeMs !== right.mtimeMs) {
+      return left.mtimeMs > right.mtimeMs ? -1 : 1;
+    }
+    return Buffer.compare(left.record.path, right.record.path);
+  });
+  return { records: timed.map((entry) => entry.record) };
+}
+
 export function searchPathUsesDefaultExcludedDirectory(
   relativePath: string,
   includeIgnored: boolean,
@@ -2811,15 +2988,27 @@ async function runRipgrepGrep(params: {
   readonly deadline: GrepOperationDeadline;
   readonly observer?: GrepToolConfig["__testProtectedTaskObserver"];
   readonly operationBudgetLimits?: Partial<GrepOperationBudgetLimits>;
+  readonly portableFileMtimeSort?: boolean;
 }): Promise<ToolResult> {
   const { opts, headLimit, offset, target, authoritativeSnapshots, signal } =
     params;
   const pageLines = headLimit === 0 ? undefined : headLimit + 1;
   const countMode = opts.outputMode === "count";
+  const portableFileMtimeSort =
+    params.portableFileMtimeSort === true &&
+    opts.outputMode === "files_with_matches";
+  const portableCollectionLines =
+    headLimit === 0
+      ? MAX_GREP_RESULTS
+      : Math.min(MAX_GREP_RESULTS, offset + headLimit + 1);
   const operationBudget = new GrepOperationBudget({
     maxRecords:
       params.operationBudgetLimits?.maxRecords ??
-      (pageLines === undefined ? MAX_GREP_RESULTS : MAX_GREP_RESULTS + 1),
+      (portableFileMtimeSort
+        ? MAX_GREP_RESULTS
+        : pageLines === undefined
+          ? MAX_GREP_RESULTS
+          : MAX_GREP_RESULTS + 1),
     maxDecodedBytes:
       params.operationBudgetLimits?.maxDecodedBytes ?? MAX_GREP_DECODED_BYTES,
     maxWorkUnits:
@@ -2833,10 +3022,16 @@ async function runRipgrepGrep(params: {
     const authoritative = await collectAuthoritativeSnapshotRecords({
       snapshots: authoritativeSnapshots,
       opts,
-      ...(!countMode && pageLines !== undefined
-        ? { maximumLines: pageLines }
+      ...(!countMode && (portableFileMtimeSort || pageLines !== undefined)
+        ? {
+            maximumLines: portableFileMtimeSort
+              ? portableCollectionLines
+              : pageLines!,
+          }
         : {}),
-      ...(!countMode && offset > 0 ? { skipLines: offset } : {}),
+      ...(!countMode && offset > 0 && !portableFileMtimeSort
+        ? { skipLines: offset }
+        : {}),
       target,
       toolArgs: params.toolArgs,
       signal,
@@ -2861,9 +3056,13 @@ async function runRipgrepGrep(params: {
   const authoritativeCount = countMode ? authoritativeRecords.length : 0;
   const sourceSkipLines = countMode
     ? Math.max(0, offset - authoritativeCount)
-    : Math.max(0, offset - authoritativeProcessedLines);
+    : portableFileMtimeSort
+      ? 0
+      : Math.max(0, offset - authoritativeProcessedLines);
   const diskMaximumLines =
-    pageLines === undefined
+    portableFileMtimeSort
+      ? MAX_GREP_RESULTS
+      : pageLines === undefined
       ? undefined
       : countMode
         ? pageLines + authoritativeCount
@@ -2960,12 +3159,32 @@ async function runRipgrepGrep(params: {
     const detail = result.stderr.trim() || "ripgrep failed";
     return errorResult(`Grep error: ${detail}`);
   }
+  if (portableFileMtimeSort && result.killedAfterLimit) {
+    return errorResult(
+      `Grep error [RESULT_LIMIT]: portable modification-time sorting exceeded ${MAX_GREP_RESULTS} matching files. Refine the query or path.`,
+    );
+  }
 
-  const diskRecords = filterDirtyDiskRecords(
+  let diskRecords: readonly RipgrepOutputRecord[] = filterDirtyDiskRecords(
     result.records,
     target,
     authoritativeSnapshots,
   );
+  if (portableFileMtimeSort) {
+    if (params.readCapability === undefined) {
+      return errorResult(
+        "Grep error: portable modification-time sorting requires an authenticated read capability.",
+      );
+    }
+    const sorted = await sortFileRecordsNewestFirstPortable({
+      records: diskRecords,
+      target,
+      readCapability: params.readCapability,
+      deadline: params.deadline,
+    });
+    if ("error" in sorted) return errorResult(sorted.error);
+    diskRecords = sorted.records;
+  }
   const merged =
     opts.outputMode === "count"
       ? mergeCountRecordsByPath({
@@ -2981,7 +3200,7 @@ async function runRipgrepGrep(params: {
       : appendRecordsWithinLineLimit(
           authoritativeRecords,
           diskRecords,
-          pageLines,
+          portableFileMtimeSort ? undefined : pageLines,
         );
   const rawRecords = merged.records;
   const mergeTruncated = merged.truncated;
@@ -2991,7 +3210,11 @@ async function runRipgrepGrep(params: {
   }
 
   const displayRoot = displayRootForTarget(target);
-  const retainedOffset = countMode ? offset - sourceSkipLines : 0;
+  const retainedOffset = countMode
+    ? offset - sourceSkipLines
+    : portableFileMtimeSort
+      ? offset
+      : 0;
 
   try {
     if (
@@ -4127,7 +4350,7 @@ export function createGrepTool(config?: GrepToolConfig): Tool {
         } catch (error) {
           return finalizeAuthoritativeResult(editorCoherenceError(error));
         }
-        const ripgrepOptions: RipgrepOptions = {
+        let ripgrepOptions: RipgrepOptions = {
           ...prospectiveOptions,
           absolutePath: ripgrepSearchPathForTarget(target),
           respectVcsIgnores: target.respectVcsIgnores,
@@ -4172,6 +4395,31 @@ export function createGrepTool(config?: GrepToolConfig): Tool {
           );
         }
 
+        const portableFileMtimeSort =
+          normalized.outputMode === "files_with_matches" &&
+          !(await isRipgrepModifiedSortAvailable(
+            cwdForProbe,
+            rawArgs,
+            signal,
+            readCapability,
+            deadline,
+          ));
+        if (portableFileMtimeSort) {
+          ripgrepOptions = { ...ripgrepOptions, fileSort: "path" };
+        }
+
+        if (signal?.aborted) {
+          return finalizeAuthoritativeResult(errorResult("Search aborted"));
+        }
+
+        if (remainingGrepOperationMs(deadline) < 1) {
+          return finalizeAuthoritativeResult(
+            errorResult(
+              `Grep error [WALL_TIMEOUT]: pinned ripgrep exceeded ${MAX_GREP_WALL_MS}ms.`,
+            ),
+          );
+        }
+
         const discoveryReadCapability =
           readCapability !== undefined && target.isDirectory
             ? ignoreReadCapability
@@ -4187,6 +4435,7 @@ export function createGrepTool(config?: GrepToolConfig): Tool {
             requiresStrictCandidateReads,
             signal,
             deadline,
+            portableFileMtimeSort,
             ...(protectedTaskObserver !== undefined
               ? { observer: protectedTaskObserver }
               : {}),
