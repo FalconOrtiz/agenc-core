@@ -239,11 +239,10 @@ describe("cost helpers", () => {
   });
 
   test("default + catalog grok models price as known and non-reasoning ones are not charged the reasoning surcharge", () => {
-    // grok-4.3 is the grok provider default (provider-info.ts). Both it and
-    // grok-build-0.1 used to mis-resolve: grok-4.3 collapsed onto the
-    // reasoning entry (wrong reasoning surcharge) and grok-build-0.1 fell to
+    // grok-4.3 is the grok provider default (provider-info.ts). It used to
+    // collapse onto the reasoning entry, while grok-build-0.1 fell to
     // DEFAULT_UNKNOWN_MODEL_COST. Since DEFAULT_MODEL_COSTS feeds dollar_cap
-    // enforcement, mispricing here enforces budgets at the wrong threshold.
+    // enforcement, either failure enforces budgets at the wrong threshold.
     const nonReasoningModels = [
       "grok-4.6",
       "grok-4.5",
@@ -325,6 +324,32 @@ describe("cost helpers", () => {
       },
     });
     expect(match?.entry.reasoningOutputUsdPer1K).toBeUndefined();
+  });
+
+  test("Grok Build and its retired code-fast alias use current official pricing", () => {
+    for (const model of [
+      "xai/grok-build-0.1",
+      "xai/grok-code-fast-1",
+      "xai/grok-code-fast",
+    ]) {
+      const match = resolveModelCostEntry(
+        { model, provider: "openai" },
+        DEFAULT_MODEL_COSTS,
+      );
+
+      expect(
+        match,
+        `${model} should resolve through the gateway alias`,
+      ).toMatchObject({
+        key: "grok-build-0.1",
+        entry: {
+          inputUsdPer1K: 0.001,
+          cachedInputUsdPer1K: 0.0002,
+          outputUsdPer1K: 0.002,
+        },
+      });
+      expect(match?.entry.reasoningOutputUsdPer1K).toBeUndefined();
+    }
   });
 
   test("computeUsdCost prices cache writes and web search requests", () => {

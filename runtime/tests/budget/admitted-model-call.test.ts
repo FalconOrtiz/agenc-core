@@ -554,6 +554,41 @@ describe("runAdmittedModelCall", () => {
     );
   });
 
+  test("admits the Grok Build gateway path and legacy alias under a hard USD cap", async () => {
+    for (const model of ["xai/grok-build-0.1", "xai/grok-code-fast-1"]) {
+      const state = harness({ maxCostUsd: 8 });
+      const invoke = vi.fn(async () => response({ model }));
+
+      await runAdmittedModelCall({
+        session: state.session,
+        provider: state.provider,
+        messages: [{ role: "user", content: "hello" }],
+        options: { model, maxOutputTokens: 200 },
+        stepId: `model:${model}`,
+        model,
+        providerName: "openai",
+        invoke,
+      });
+
+      expect(state.acquire).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model,
+          provider: "openai",
+          maxCostUsd: expect.any(Number),
+        }),
+        undefined,
+      );
+      expect(state.acquire.mock.calls[0]?.[0].maxCostUsd).toBeGreaterThan(0);
+      expect(state.acquire.mock.calls[0]?.[0].denialReason).toBeUndefined();
+      expect(invoke).toHaveBeenCalledOnce();
+      expect(state.reconcile).toHaveBeenCalledWith("reservation-1", {
+        inputTokens: 100,
+        outputTokens: 50,
+        costUsd: 0.000204,
+      });
+    }
+  });
+
   test("denies an uncapped call when the provider cannot enforce its output bound", async () => {
     const state = harness({ supportsMaxOutputTokens: false });
     const invoke = vi.fn(async () => response());

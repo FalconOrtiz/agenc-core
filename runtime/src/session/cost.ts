@@ -180,12 +180,19 @@ const COST_TIER_OPUS_5_25: Readonly<ModelCostEntry> = Object.freeze({
  * pricing) but WITHOUT `reasoningOutputUsdPer1K`: these models do not bill a
  * separate reasoning-token rate, so charging the reasoning surcharge here
  * would over-count cost and trip `dollar_cap` budgets at the wrong threshold.
- * grok-4.3 (the grok provider default) and grok-build-0.1 both belong here.
+ * grok-4.3 (the grok provider default) belongs here.
  */
 const COST_TIER_GROK_4X_NON_REASONING: Readonly<ModelCostEntry> = Object.freeze({
   inputUsdPer1K: 0.003,
   outputUsdPer1K: 0.012,
   webSearchUsdPerRequest: 0.01,
+});
+
+/** Official Grok Build 0.1 token pricing, including prompt-cache reads. */
+const COST_TIER_GROK_BUILD_01: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.001,
+  outputUsdPer1K: 0.002,
+  cachedInputUsdPer1K: 0.0002,
 });
 
 /** Official Grok 4.5 token pricing, including prompt-cache reads. */
@@ -260,7 +267,7 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     ...grokCostAliases("grok-4.6", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.5", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.3", COST_TIER_GROK_4X_NON_REASONING),
-    ...grokCostAliases("grok-build-0.1", COST_TIER_GROK_4X_NON_REASONING),
+    ...grokCostAliases("grok-build-0.1", COST_TIER_GROK_BUILD_01),
     ...grokCostAliases(
       "grok-4.20-0309-non-reasoning",
       COST_TIER_GROK_4X_NON_REASONING,
@@ -569,6 +576,17 @@ function canonicalModel(model: string): string {
     ? pathUnqualified.slice(pathUnqualified.lastIndexOf(":") + 1)
     : pathUnqualified;
   if (unqualified.startsWith("grok-4-fast")) return "grok-4-fast";
+  // grok-code-fast-1 was retired in favour of grok-build-0.1, but gateways
+  // may continue to report the legacy alias. Price both identities against
+  // the current canonical model even when the configured provider is an
+  // OpenAI-compatible router and the model arrives as an `xai/...` path.
+  if (
+    unqualified.startsWith("grok-build-0.1") ||
+    unqualified.startsWith("grok-code-fast-1") ||
+    unqualified === "grok-code-fast"
+  ) {
+    return "grok-build-0.1";
+  }
   // Non-reasoning grok-4.x variants are priced explicitly below; route them to
   // their own keys so they are NOT collapsed onto the reasoning entry (which
   // would wrongly add the reasoning surcharge and skew dollar_cap budgets).
