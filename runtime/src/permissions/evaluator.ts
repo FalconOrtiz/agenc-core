@@ -565,11 +565,16 @@ async function checkUnattendedPolicy(
     return unattendedDenyDecision(unattended.toolName);
   }
 
-  // The allowlist / pause behaviors are the additive subset semantics that
-  // `preserveMode` intentionally keeps off under bypassPermissions/plan/
-  // acceptEdits — only the deny floor above is bypass-immune. Outside
-  // unattended mode the mode gate owns the allow/ask decision from here.
-  if (permissionContext.mode !== "unattended") return null;
+  // The allowlist is also an explicit additive grant in acceptEdits mode.
+  // Managed workflows pin acceptEdits so ordinary edits retain their native
+  // semantics, while the operator-supplied list grants the small additional
+  // tool surface needed by an unattended run (for example exec_command).
+  // Deny still wins above, and every tool-level ask remains a pause below.
+  // Other explicit modes keep their native mode-gate semantics.
+  const appliesAllowlist =
+    permissionContext.mode === "unattended" ||
+    permissionContext.mode === "acceptEdits";
+  if (!appliesAllowlist) return null;
 
   if (ruleBased?.behavior === "ask") {
     return unattendedPauseDecision(unattended.toolName, ruleBased);
@@ -595,7 +600,12 @@ async function checkUnattendedPolicy(
         : undefined,
     );
   }
-  return unattendedPauseDecision(unattended.toolName, null);
+  // In fully unattended mode, absence from the allowlist is a pause. In
+  // acceptEdits mode the list is additive, so non-members fall through to the
+  // normal acceptEdits evaluator behavior.
+  return permissionContext.mode === "unattended"
+    ? unattendedPauseDecision(unattended.toolName, null)
+    : null;
 }
 
 /**
