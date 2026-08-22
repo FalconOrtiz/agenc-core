@@ -214,6 +214,13 @@ describe("transactional compaction production path", () => {
       const result = await runRealTransaction(store, source, provider);
 
       expect(provider.chat).toHaveBeenCalledOnce();
+      expect(provider.chat).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({
+          tools: [],
+          toolRouting: { allowedToolNames: [] },
+        }),
+      );
       expect(result.transaction).toBeDefined();
       const lifecycle = store.readAll().filter((item) =>
         isCompactionLifecycleItem(item),
