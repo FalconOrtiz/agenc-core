@@ -680,6 +680,16 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(harness.reviewer.invocations[0].userMessage).toContain(
       harness.worktrees.patchText.trim(),
     );
+
+    const verifierPrompt = harness.spawner.spawns.find(
+      (spawn) => spawn.kind === "verify_agent",
+    )?.prompt;
+    expect(verifierPrompt).toContain("Use at most 8 tool calls");
+    expect(verifierPrompt).toContain(
+      "Never repeat a command or an equivalent check",
+    );
+    expect(verifierPrompt).toContain("exit_code is authoritative");
+    expect(verifierPrompt).toContain("immediately write the final report");
   });
 
   it("resumeOpenWorkflows skips runs that are already terminal", async () => {

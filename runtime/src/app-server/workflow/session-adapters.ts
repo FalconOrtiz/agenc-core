@@ -244,7 +244,7 @@ export function workflowDelegateBounds(
     case "implement":
       return { maxTurns: 12 };
     case "verify_agent":
-      return { role: "verification", maxTurns: 16 };
+      return { role: "verification", maxTurns: 24 };
     case "review":
       return { maxTurns: 4 };
   }
