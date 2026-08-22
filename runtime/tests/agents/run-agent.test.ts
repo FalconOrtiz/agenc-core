@@ -115,6 +115,8 @@ import {
 import { signSessionId } from "../agents/_deps/filesystem-args.js";
 import { explicitDangerBroker } from "../helpers/explicit-danger-boundary.js";
 import { createApplyPatchTool } from "../tools/apply-patch/tool.js";
+import { createFileEditTool } from "../tools/system/file-edit.js";
+import { createFileReadTool } from "../tools/system/file-read.js";
 import { cloneFileStateCache } from "../utils/fileStateCache.js";
 import { normalizeLspServerConfig } from "../services/lsp/config.js";
 import type { LSPServerInstance } from "../services/lsp/LSPServerInstance.js";
@@ -3654,6 +3656,129 @@ describe("runAgent", () => {
       rmSync(parentRoot, { recursive: true, force: true });
       rmSync(worktreeRoot, { recursive: true, force: true });
     }
+  });
+
+  it("runs relative child Edit calls against the child worktree, not the parent checkout", async () => {
+    const parentRoot = mkdtempSync(join(tmpdir(), "agenc-parent-edit-"));
+    const worktreeRoot = mkdtempSync(join(tmpdir(), "agenc-child-edit-"));
+    const relativePath = "src/value.mjs";
+    mkdirSync(join(parentRoot, "src"), { recursive: true });
+    mkdirSync(join(worktreeRoot, "src"), { recursive: true });
+    writeFileSync(join(parentRoot, relativePath), "export const value = 1;\n");
+    writeFileSync(join(worktreeRoot, relativePath), "export const value = 1;\n");
+    const readTool = createFileReadTool({ allowedPaths: [parentRoot] });
+    const editTool = createFileEditTool({ allowedPaths: [parentRoot] });
+    const registry = buildFilteredRegistry(
+      {
+        tools: [readTool, editTool],
+        toLLMTools: () =>
+          [readTool, editTool].map((tool) => ({
+            type: "function",
+            function: {
+              name: tool.name,
+              description: tool.description,
+              parameters: tool.inputSchema,
+            },
+          })),
+        dispatch: async () => ({ content: "{}" }),
+      },
+      {
+        childConversationId: "child-edit",
+        unadmittedDispatchOverride:
+          TEST_ONLY_ALLOW_UNADMITTED_CHILD_REGISTRY_DISPATCH,
+        worktree: {
+          path: worktreeRoot,
+          branch: "worktree-child",
+          gitRoot: parentRoot,
+          created: false,
+        },
+      },
+    );
+
+    try {
+      const read = await registry.dispatch({
+        id: "read-1",
+        name: "FileRead",
+        arguments: JSON.stringify({ file_path: relativePath }),
+      });
+      expect(read.isError).toBeUndefined();
+      const result = await registry.dispatch({
+        id: "edit-1",
+        name: "Edit",
+        arguments: JSON.stringify({
+          file_path: relativePath,
+          old_string: "value = 1",
+          new_string: "value = 2",
+        }),
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(readFileSync(join(worktreeRoot, relativePath), "utf8")).toBe(
+        "export const value = 2;\n",
+      );
+      expect(readFileSync(join(parentRoot, relativePath), "utf8")).toBe(
+        "export const value = 1;\n",
+      );
+    } finally {
+      rmSync(parentRoot, { recursive: true, force: true });
+      rmSync(worktreeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves child exec workdir and search paths from the child worktree", async () => {
+    const execute = vi.fn(async () => ({ content: "ok" }));
+    const tools = ["exec_command", "Glob"].map((name) => ({
+      name,
+      description: name,
+      inputSchema: { type: "object" } as const,
+      execute,
+    }));
+    const registry = buildFilteredRegistry(
+      {
+        tools,
+        toLLMTools: () =>
+          tools.map((tool) => ({
+            type: "function" as const,
+            function: {
+              name: tool.name,
+              description: tool.description,
+              parameters: tool.inputSchema,
+            },
+          })),
+        dispatch: async () => ({ content: "{}" }),
+      },
+      {
+        childConversationId: "child-paths",
+        unadmittedDispatchOverride:
+          TEST_ONLY_ALLOW_UNADMITTED_CHILD_REGISTRY_DISPATCH,
+        worktree: {
+          path: "/tmp/subagent-wt",
+          branch: "worktree-child",
+          gitRoot: "/tmp/parent",
+          created: false,
+        },
+      },
+    );
+
+    await registry.dispatch({
+      id: "exec-1",
+      name: "exec_command",
+      arguments: JSON.stringify({ cmd: "pwd", workdir: "." }),
+    });
+    await registry.dispatch({
+      id: "glob-1",
+      name: "Glob",
+      arguments: JSON.stringify({ pattern: "**/*", path: "src" }),
+    });
+
+    expect(execute.mock.calls[0]![0]).toMatchObject({
+      cwd: "/tmp/subagent-wt",
+      workdir: "/tmp/subagent-wt",
+    });
+    expect(execute.mock.calls[1]![0]).toMatchObject({
+      cwd: "/tmp/subagent-wt",
+      path: "/tmp/subagent-wt/src",
+    });
   });
 
   it("keeps V2 agent tools available to child agents at the configured depth cap", async () => {

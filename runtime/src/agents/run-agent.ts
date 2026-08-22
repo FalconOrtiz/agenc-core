@@ -17,7 +17,7 @@
  * @module
  */
 
-import { normalize } from "node:path";
+import { isAbsolute, normalize, resolve } from "node:path";
 import { LRUCache } from "lru-cache";
 import type {
   LLMChatOptions,
@@ -2607,16 +2607,55 @@ function injectChildToolArgs(
   if (opts.worktree?.path) {
     injectedArgs = withSignedAllowedRoots(injectedArgs, [opts.worktree.path]);
   }
-  if (
-    opts.worktree?.path &&
-    (toolName === "system.bash" ||
-      toolName === "exec_command" ||
-      toolName === "apply_patch") &&
-    (typeof injectedArgs.cwd !== "string" || injectedArgs.cwd.length === 0)
-  ) {
-    injectedArgs.cwd = opts.worktree.path;
+  if (opts.worktree?.path && CHILD_WORKTREE_BOUND_TOOL_NAMES.has(toolName)) {
+    const worktreePath = opts.worktree.path;
+    const requestedCwd = injectedArgs.cwd;
+    injectedArgs.cwd =
+      typeof requestedCwd === "string" && requestedCwd.trim().length > 0
+        ? resolveChildWorktreePath(worktreePath, requestedCwd)
+        : worktreePath;
+
+    for (const key of CHILD_WORKTREE_PATH_KEYS_BY_TOOL.get(toolName) ?? []) {
+      const value = injectedArgs[key];
+      if (typeof value !== "string" || value.trim().length === 0) continue;
+      injectedArgs[key] = resolveChildWorktreePath(worktreePath, value);
+    }
   }
   return injectedArgs;
+}
+
+const CHILD_WORKTREE_PATH_KEYS_BY_TOOL = new Map<
+  string,
+  readonly string[]
+>([
+  ["exec_command", ["workdir"]],
+  ["FileRead", ["file_path"]],
+  ["Read", ["file_path"]],
+  ["Edit", ["file_path"]],
+  ["FileEdit", ["file_path"]],
+  ["MultiEdit", ["file_path"]],
+  ["Write", ["file_path"]],
+  ["FileWrite", ["file_path"]],
+  ["Glob", ["path"]],
+  ["system.glob", ["path"]],
+  ["Grep", ["path"]],
+  ["system.grep", ["path"]],
+  ["Orient", ["path"]],
+  ["NotebookEdit", ["notebook_path"]],
+]);
+
+const CHILD_WORKTREE_BOUND_TOOL_NAMES = new Set([
+  ...CHILD_WORKTREE_PATH_KEYS_BY_TOOL.keys(),
+  "system.bash",
+  "Bash",
+  "apply_patch",
+]);
+
+function resolveChildWorktreePath(
+  worktreePath: string,
+  candidate: string,
+): string {
+  return isAbsolute(candidate) ? candidate : resolve(worktreePath, candidate);
 }
 
 async function applyChildToolPolicy(

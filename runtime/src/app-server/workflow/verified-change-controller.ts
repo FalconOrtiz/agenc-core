@@ -2655,6 +2655,8 @@ function buildPlanPrompt(spec: WorkflowSpec): string {
     "You are the planning stage of a verified-change workflow.",
     "Produce a concrete, minimal implementation plan for the goal below.",
     "Do NOT modify any files — respond with the plan only.",
+    "Do not inspect the repository in this stage; the implementer will re-read it.",
+    "Keep the plan to at most 8 concise steps and 600 words.",
     "",
     "## Goal",
     spec.goal,
@@ -2670,6 +2672,9 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
   const lines = [
     "You are the implementation stage of a verified-change workflow.",
     "Implement the goal below inside the current worktree.",
+    "Use the fewest tool calls needed for the bounded change.",
+    "Do not repeat an unchanged failing command; diagnose it or change the code first.",
+    "As soon as the required verification passes, stop and report the result.",
     "",
     "## Goal",
     ctx.spec.goal,

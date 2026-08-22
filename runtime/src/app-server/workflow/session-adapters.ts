@@ -228,6 +228,28 @@ export function workflowChildAgentName(childRunId: string): string {
   return childRunId.toLowerCase().replace(/[^a-z0-9_]+/g, "_");
 }
 
+export interface WorkflowDelegateBounds {
+  readonly role?: string;
+  readonly toolAllowlist?: readonly string[];
+  readonly maxTurns: number;
+}
+
+/** Keep each workflow child bounded so one stage cannot consume the run. */
+export function workflowDelegateBounds(
+  kind: WorkflowSpawnKind,
+): WorkflowDelegateBounds {
+  switch (kind) {
+    case "plan":
+      return { role: "Plan", toolAllowlist: [], maxTurns: 1 };
+    case "implement":
+      return { maxTurns: 12 };
+    case "verify_agent":
+      return { role: "verification", maxTurns: 8 };
+    case "review":
+      return { maxTurns: 4 };
+  }
+}
+
 /** Preserve a pre-message child failure in the durable parent evidence. */
 export function workflowChildFailureMessage(
   kind: WorkflowSpawnKind,
@@ -805,6 +827,7 @@ export function createWorkflowSessionSeams(
       const entry = await requireEntry(input.spec.runId, "spawner.spawn");
       const session = entry.bootstrap.session;
       const { control, registry } = ensureAgentControl(session);
+      const bounds = workflowDelegateBounds(input.kind);
       const pending = (async (): Promise<WorkflowChildOutcome> => {
         const outcome = await delegate({
           parent: session,
@@ -812,7 +835,11 @@ export function createWorkflowSessionSeams(
           control,
           registry,
           taskPrompt: input.prompt,
-          ...(input.kind === "verify_agent" ? { role: "verification" } : {}),
+          ...(bounds.role !== undefined ? { role: bounds.role } : {}),
+          ...(bounds.toolAllowlist !== undefined
+            ? { toolAllowlist: bounds.toolAllowlist }
+            : {}),
+          maxTurns: bounds.maxTurns,
           agentName: workflowChildAgentName(input.childRunId),
           ...(input.spec.model !== undefined
             ? { model: input.spec.model }

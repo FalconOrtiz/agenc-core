@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { assertValidAgentName } from "../../src/agents/registry.js";
-import { workflowChildAgentName } from "../../src/app-server/workflow/session-adapters.js";
+import {
+  workflowChildAgentName,
+  workflowDelegateBounds,
+} from "../../src/app-server/workflow/session-adapters.js";
 
 const CHILD_RUN_IDS = [
   "wf-3f78249a-c5e4-42b4-90ac-c89cf87618f5:plan#1",
@@ -27,5 +30,23 @@ describe("workflowChildAgentName", () => {
     expect(new Set(CHILD_RUN_IDS.map(workflowChildAgentName)).size).toBe(
       CHILD_RUN_IDS.length,
     );
+  });
+});
+
+describe("workflowDelegateBounds", () => {
+  it("makes planning a single tool-free read-only turn", () => {
+    expect(workflowDelegateBounds("plan")).toEqual({
+      role: "Plan",
+      toolAllowlist: [],
+      maxTurns: 1,
+    });
+  });
+
+  it("bounds implementation and adversarial verification independently", () => {
+    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 12 });
+    expect(workflowDelegateBounds("verify_agent")).toEqual({
+      role: "verification",
+      maxTurns: 8,
+    });
   });
 });
