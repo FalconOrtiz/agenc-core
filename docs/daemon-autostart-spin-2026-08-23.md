@@ -69,6 +69,19 @@ Select tools: mcp.agenc-goal.goal_create, mcp.agenc-goal.goal_update, mcp.agenc-
 
 So the model can never call any plugin MCP tool, and it burns tokens searching, reading plugin source, and trying shell fallbacks (one grok-4.5 session spent >$7 flailing on this). Likely related to the known "live-agent MCP refresh no-op" backlog item: the server connects, but tool registration/refresh into the live catalog never happens for plugin-sourced MCP servers. Plugin slash commands and agents from the same plugin DO register (`/agenc-goal:goal` and the goal-planner agent both worked).
 
+## Platform gap: MCP stdio on Landlock-fallback machines — ADDRESSED (same day, follow-up PR)
+
+Follow-up fixes landed after this report's first version:
+
+- The broker pre-flights the Landlock plan when readiness came through the fallback: unexpressible policies now fail at spawn-preparation with `[sandbox_policy_unexpressible] ... <reason> ... <cause-correct bubblewrap remediation>` instead of spawn-and-die (skipped for inherited-readonly-cwd spawns, which plan cleanly; best-effort with the stderr capture below as backstop).
+- The stdio transport retains a bounded ring of child stderr and attaches the tail to pre-handshake connect failures, so any server death shows its actual reason in /mcp instead of "MCP error -32000: Connection closed".
+- Plugin-declared MCP servers finally consume their `pluginSandbox` metadata: they spawn under a tight profile (root read, writes confined to the plugin data dir + its tmp, TMPDIR pointed there) that is stricter under bubblewrap AND Landlock-expressible — plugin MCP works on fallback machines.
+- `agenc doctor` emits `[sandbox_landlock_fallback]` with the cause-correct remedy (and exits 1) whenever the fallback is active.
+- docs/install.md now states plainly that there is no safe partial waiver under the fallback, and that `[sandbox_policy]` `writable_roots` is a dead config key nothing consumes.
+- A FIFTH root cause surfaced only during live verification: the restricted-network seccomp filter denied `getsockname`/`getpeername`/`getsockopt`, and Node's `child_process` "pipe" stdio are AF_UNIX socketpairs — libuv classifies inherited stdio with `getsockname`, so every node-spawned confined child saw `getsockname(0) => EPERM` and instant EOF on stdin (proved with strace and an in-server fd probe; a shell-driven pipeline worked because shell pipes are real pipes). Read-only socket introspection is now allowed in restricted mode; socket creation stays AF_UNIX-only and connect/bind/listen/accept/send*/setsockopt stay denied. With this, the FULL chain was verified live on this bubblewrap-less machine: plugin server `connected` in /mcp with its tools, tool catalog grew 88 → 97, and a model Tool search returned `mcp.plugin:agenc-goal:agenc-goal.goal_create`.
+
+Original analysis below for the record.
+
 ## Remaining platform gap: MCP stdio is fully broken on Landlock-fallback machines
 
 With the four integration fixes in place, the plugin MCP server is resolved, handed to the live manager, and spawned through `agenc-linux-sandbox`, but on this machine every connect still fails with `MCP error -32000: Connection closed` because the sandbox launcher exits before exec:
