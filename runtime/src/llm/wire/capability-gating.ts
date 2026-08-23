@@ -44,6 +44,32 @@ export interface ChatCompletionsCapabilityHints {
    * field and tear down the stream on encounter.
    */
   readonly acceptsStreamUsage?: boolean;
+  /**
+   * If `true`, tool JSON schemas are rewritten to the subset
+   * llama.cpp's json-schema-to-grammar compiles. Grammar-constrained
+   * servers (LM Studio, llama.cpp server, some custom proxies) build
+   * a GBNF grammar from the request's tool schemas and answer 400
+   * "failed to parse grammar" on anything richer — the turn dies
+   * before the model ever runs.
+   */
+  readonly requiresGrammarSafeToolSchemas?: boolean;
+  /**
+   * Upper bound for the request's max-output-tokens field. Local
+   * llama.cpp-family servers run reasoning models (qwen3 and kin)
+   * whose thinking freely eats whatever budget the caller sends; the
+   * runtime's frontier default (tens of thousands) turns one turn
+   * into minutes of silent generation on consumer hardware. Undefined
+   * = caller-controlled.
+   */
+  readonly outputTokensCeiling?: number;
+  /**
+   * Soft switch appended to the system prompt to suppress the model's
+   * think-trace. Qwen3-family models honor a literal /no_think line;
+   * without it a local reasoning model spends its whole (already
+   * capped) output budget thinking. Empirically: 16-24s turns drop to
+   * 1-3s on the same hardware. Undefined = no suffix.
+   */
+  readonly reasoningSoftSwitchSuffix?: string;
 }
 
 // Providers that document `service_tier` on chat-completions.
@@ -59,6 +85,17 @@ const SERVICE_TIER_PROVIDERS = new Set(["openai", "azure-openai"]);
 // servers that misbehave.
 const STREAM_USAGE_INCOMPATIBLE_PROVIDERS = new Set<string>();
 
+// Providers whose tool calling is grammar-constrained (llama.cpp
+// based): tool schemas must stay within the subset its
+// json-schema-to-grammar converter accepts, or the request 400s with
+// "failed to parse grammar". The generic compatible slot is included
+// because llama.cpp-family servers are its most common target; richer
+// servers only lose optional constraint keywords, never validity.
+const GRAMMAR_CONSTRAINED_TOOL_PROVIDERS = new Set([
+  "lmstudio",
+  "openai-compatible",
+]);
+
 /**
  * Lightweight test for the upstream-provider reasoning model family.
  * Mirrors the regex in `capabilities.ts:isOpenAIReasoningModel` so we
@@ -69,6 +106,56 @@ function isUpstreamReasoningModel(model: string | undefined): boolean {
   // branding-scan: allow real model-family identifiers in regex
   return /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/i.test(
     model.trim(),
+  );
+}
+
+/**
+ * Tools a small local model can actually drive. The frontier catalog
+ * (~20 tools with team/task orchestration) overwhelms 7-32B models —
+ * observed as zero tool calls emitted across whole sessions. The
+ * subset keeps the core loop: shell, files, search, planning, user
+ * interaction and progress messages. Names must match the registry's
+ * advertised tool names.
+ */
+const LOCAL_PROFILE_TOOL_NAMES = new Set([
+  "exec_command",
+  "write_stdin",
+  "kill_process",
+  "FileRead",
+  "Edit",
+  "MultiEdit",
+  "Write",
+  "Glob",
+  "Grep",
+  "Orient",
+  "AskUserQuestion",
+  "TodoWrite",
+  "EnterPlanMode",
+  "ExitPlanMode",
+  "system.searchTools",
+  "Brief",
+  "StructuredOutput",
+]);
+
+/**
+ * Whether the provider gets the reduced local tool catalog. Keyed on
+ * the same set as the grammar constraints: these are the providers
+ * that serve small local models.
+ */
+export function usesLocalToolProfile(
+  providerName: string | undefined,
+): boolean {
+  return GRAMMAR_CONSTRAINED_TOOL_PROVIDERS.has(
+    normalizeProviderSlug(providerName),
+  );
+}
+
+/** Filter an advertised tool list down to the local profile. */
+export function filterToolsForLocalProfile<
+  T extends { readonly function: { readonly name: string } },
+>(tools: readonly T[]): readonly T[] {
+  return tools.filter((tool) =>
+    LOCAL_PROFILE_TOOL_NAMES.has(tool.function.name),
   );
 }
 
@@ -108,9 +195,38 @@ export function chatCompletionsCapabilityHintsForProvider(
   // that DO support it — keep the default permissive.
   const acceptsStreamUsage = !STREAM_USAGE_INCOMPATIBLE_PROVIDERS.has(slug);
 
+  const requiresGrammarSafeToolSchemas =
+    GRAMMAR_CONSTRAINED_TOOL_PROVIDERS.has(slug);
+
+  // Qwen3's hybrid thinking honors a soft /no_think switch in the
+  // prompt. LM Studio ignores chat_template_kwargs.enable_thinking
+  // (verified empirically), so the prompt-level switch is the only
+  // wire-side control that works everywhere llama.cpp serves qwen.
+  const reasoningSoftSwitchSuffix =
+    requiresGrammarSafeToolSchemas &&
+      /(^|[/:])qwen-?3/i.test((model ?? "").trim())
+      ? "/no_think"
+      : undefined;
+
+  // Local servers get a sane output ceiling: enough for a long answer
+  // or a batch of tool calls, small enough that a runaway think-trace
+  // cannot burn minutes per turn on consumer hardware.
+  // 8192, not lower: 4096 clipped legitimate long generations (code,
+  // multi-file answers) and the executor discarded the withheld output
+  // as max_output_tokens — the user saw an empty turn. This still caps
+  // the minutes-long runaway think-traces the ceiling exists for.
+  const outputTokensCeiling = requiresGrammarSafeToolSchemas
+    ? 8192
+    : undefined;
+
   return {
     acceptsReasoningEffort,
     acceptsServiceTier,
     acceptsStreamUsage,
+    requiresGrammarSafeToolSchemas,
+    ...(outputTokensCeiling !== undefined ? { outputTokensCeiling } : {}),
+    ...(reasoningSoftSwitchSuffix !== undefined
+      ? { reasoningSoftSwitchSuffix }
+      : {}),
   };
 }

@@ -16,6 +16,10 @@ import type {
   ProviderFallbackTargetConfig,
 } from "./schema.js";
 import { resolveGrokProviderApiKey } from "../llm/xai-capability-config.js";
+import {
+  readOpenAiOauthApiKey,
+  readOpenAiSubscriptionAuth,
+} from "../utils/openAiOauthCredentials.js";
 
 export {
   BUILT_IN_PROVIDER_BASE_URLS,
@@ -115,8 +119,16 @@ export function resolveProviderSettings(
             resolveEnvProviderApiKey(slug, env),
           env,
         )
-      : ((apiKeyEnvVar ? env[apiKeyEnvVar] : undefined) ??
-        resolveEnvProviderApiKey(slug, env));
+      : slug === "openai"
+        ? // A subscription sign-in has no platform API key; its access
+          // token is the credential (the factory pairs it with the
+          // ChatGPT backend URL and account header).
+          (readOpenAiOauthApiKey() ??
+          readOpenAiSubscriptionAuth()?.accessToken ??
+          (apiKeyEnvVar ? env[apiKeyEnvVar] : undefined) ??
+          resolveEnvProviderApiKey(slug, env))
+        : ((apiKeyEnvVar ? env[apiKeyEnvVar] : undefined) ??
+          resolveEnvProviderApiKey(slug, env));
   const envBaseURL = resolveEnvProviderBaseURL(slug, env);
   const configuredBaseURL = providerConfig?.base_url?.trim();
   const baseURL = envBaseURL ?? configuredBaseURL;

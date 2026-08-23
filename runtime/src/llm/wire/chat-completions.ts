@@ -98,9 +98,14 @@ function systemPromptParts(
 function toChatCompletionsMessages(
   messages: readonly LLMMessage[],
   options: LLMChatOptions | undefined,
+  systemSuffix?: string,
 ): Array<Record<string, unknown>> {
   const prepared = prepareMessagesForWire(messages);
-  const systemPrompt = systemPromptParts(prepared, options).join("\n\n");
+  let systemPrompt = systemPromptParts(prepared, options).join("\n\n");
+  if (systemSuffix !== undefined && systemSuffix.length > 0) {
+    systemPrompt =
+      systemPrompt.length > 0 ? `${systemPrompt}\n${systemSuffix}` : systemSuffix;
+  }
   const wireMessages: Array<Record<string, unknown>> = [];
   if (systemPrompt.length > 0) {
     wireMessages.push({ role: "system", content: systemPrompt });
@@ -146,18 +151,30 @@ export function buildChatCompletionsRequest(
   input: ChatCompletionsRequestOptions,
 ): Record<string, unknown> {
   const maxTokenField = input.maxTokenField ?? "max_tokens";
-  const maxTokens =
+  const requestedMaxTokens =
     positiveInteger(input.maxTokens) ??
     positiveInteger(input.options?.maxOutputTokens) ??
     DEFAULT_CHAT_COMPLETIONS_MAX_TOKENS;
+  const ceiling = positiveInteger(
+    input.providerCapabilityHints?.outputTokensCeiling,
+  );
+  const maxTokens =
+    ceiling !== undefined ? Math.min(requestedMaxTokens, ceiling) : requestedMaxTokens;
   const body: Record<string, unknown> = {
     model: input.model,
     stream: false,
-    messages: toChatCompletionsMessages(input.messages, input.options),
+    messages: toChatCompletionsMessages(
+      input.messages,
+      input.options,
+      input.providerCapabilityHints?.reasoningSoftSwitchSuffix,
+    ),
     [maxTokenField]: maxTokens,
   };
 
-  const tools = toChatCompletionsTools(input.tools);
+  const tools = toChatCompletionsTools(input.tools, {
+    grammarSafe:
+      input.providerCapabilityHints?.requiresGrammarSafeToolSchemas === true,
+  });
   if (tools.length > 0) body.tools = tools;
   if (input.options?.toolChoice !== undefined) {
     body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);

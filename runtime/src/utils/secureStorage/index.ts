@@ -47,6 +47,26 @@ export interface SecureStorageData {
   mcpXaaIdpConfig?: Record<string, { clientSecret: string }>
   trustedDeviceToken?: string
   pluginSecrets?: Record<string, Record<string, string>>
+  /** OpenAI OAuth (Sign in with ChatGPT): the exchanged platform API
+   * key plus the login tokens that produced it. */
+  openAiOauth?: {
+    /**
+     * Exchanged platform API key. Only accounts belonging to an OpenAI
+     * platform organization can mint one, so it is optional: a plain
+     * ChatGPT subscription authenticates with `accessToken` +
+     * `accountId` against the ChatGPT backend instead.
+     */
+    apiKey?: string
+    /** 'apiKey' = platform key; 'chatgpt' = subscription tokens. */
+    authMode?: 'apiKey' | 'chatgpt'
+    accessToken?: string
+    /** chatgpt_account_id, required alongside accessToken. */
+    accountId?: string
+    accountLabel?: string
+    idToken?: string
+    refreshToken?: string
+    obtainedAt?: number
+  }
   /** xAI OAuth (Sign in with X / Grok subscription) tokens. */
   xaiOauth?: {
     accessToken: string
