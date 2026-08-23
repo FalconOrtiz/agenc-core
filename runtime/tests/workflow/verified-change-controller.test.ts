@@ -684,8 +684,8 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const verifierPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "verify_agent",
     )?.prompt;
-    expect(verifierPrompt).toContain("hard-stops this stage after 6 model turns");
-    expect(verifierPrompt).toContain("Use at most 5 tool calls");
+    expect(verifierPrompt).toContain("hard-stops this stage after 3 model turns");
+    expect(verifierPrompt).toContain("Use at most 2 tool calls");
     expect(verifierPrompt).toContain("final response consumes the last turn");
     expect(verifierPrompt).toContain(
       "Never repeat a command or an equivalent check",
@@ -696,8 +696,8 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const implementPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "implement",
     )?.prompt;
-    expect(implementPrompt).toContain("hard-stops this stage after 12 model turns");
-    expect(implementPrompt).toContain("Use at most 11 tool calls");
+    expect(implementPrompt).toContain("hard-stops this stage after 8 model turns");
+    expect(implementPrompt).toContain("Use at most 7 tool calls");
     expect(implementPrompt).toContain("final response consumes the last turn");
     expect(implementPrompt).toContain("deterministic repository context seed");
     expect(implementPrompt).toContain("Do not enumerate the repository");
@@ -737,7 +737,7 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     expect(stepIds).toContain("workflow.implement#2");
     expect(stepIds).toContain("workflow.verify.cmd.1");
     expect(stepIds).toContain("workflow.verify.cmd.1#2");
-    expect(stepIds).toContain("workflow.verify.agent#2");
+    expect(stepIds).not.toContain("workflow.verify.agent#2");
     expect(stepIds).not.toContain("workflow.review");
     // The re-implement prompt carried the failure evidence forward.
     const implementSpawns = harness.spawner.spawns.filter(
@@ -745,6 +745,9 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     );
     expect(implementSpawns).toHaveLength(2);
     expect(implementSpawns[1].prompt).toContain("Previous verification failure");
+    expect(
+      harness.spawner.spawns.filter((spawn) => spawn.kind === "verify_agent"),
+    ).toHaveLength(0);
   });
 
   it("review_rejected on blocking findings, with the review durably committed", async () => {

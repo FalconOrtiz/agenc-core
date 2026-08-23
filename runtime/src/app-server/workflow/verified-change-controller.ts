@@ -1148,6 +1148,10 @@ export class VerifiedChangeWorkflowController {
       sink: ledger,
     });
     ctx.export = exported;
+    const hasChangedFiles =
+      new TextDecoder()
+        .decode(await ledger.readArtifact(exported.changedFiles))
+        .trim().length > 0;
 
     const records: VerifiedChangeCommandRecord[] = [];
     for (const [index, command] of spec.requiredVerification.entries()) {
@@ -1190,16 +1194,27 @@ export class VerifiedChangeWorkflowController {
         });
       }
     }
-    const allPassed = records.every(
-      (record) =>
-        record.exitCode === 0 && !record.timedOut && !record.truncated,
-    );
+    const allPassed =
+      hasChangedFiles &&
+      records.every(
+        (record) =>
+          record.exitCode === 0 && !record.timedOut && !record.truncated,
+      );
     const testResult = await ledger.recordArtifact({
       step: { runId: ctx.runId, stepId: verifyAgentStepId(attempt) },
       role: "test_result",
       bytes: new TextEncoder().encode(canonicalizeJson({ commands: records })),
       mediaType: WORKFLOW_ARTIFACT_MEDIA_TYPES.test_result,
     });
+
+    // A failing mechanical command (or an empty patch) is already an exact
+    // FAIL. Preserve the command evidence for the next implement attempt and
+    // do not spend the signed token budget asking an LLM to restate it.
+    if (!allPassed) {
+      ctx.verification = { records, allPassed, testResult };
+      ctx.verifyVerdict = "FAIL";
+      return false;
+    }
 
     const agent = await this.#driveEffect(
       ctx,
@@ -2690,7 +2705,7 @@ function buildImplementPrompt(
   const lines = [
     "You are the implementation stage of a verified-change workflow.",
     "Implement the goal below inside the current worktree.",
-    "The runtime hard-stops this stage after 12 model turns. Use at most 11 tool calls and the fewest needed for the bounded change; the final response consumes the last turn.",
+    "The runtime hard-stops this stage after 8 model turns. Use at most 7 tool calls and the fewest needed for the bounded change; the final response consumes the last turn.",
     "The controller may provide a deterministic repository context seed below. Treat it as the initial inspection and use its paths instead of rediscovering the repository.",
     "Use only repository-relative paths. Never copy an absolute parent-checkout path into a tool call; every read and edit must stay in the current workflow worktree.",
     "When the context names a preferred source target, your first tool call must read that relative path and your first edit must follow immediately after at most two other targeted calls.",
@@ -2743,7 +2758,7 @@ function buildVerifyAgentPrompt(
     "You are an ADVERSARIAL verification agent for a proposed code change.",
     "Independently verify the change in the current worktree against the goal.",
     "Re-run spot checks; do not trust the implementer's claims.",
-    "The runtime hard-stops this stage after 6 model turns. Use at most 5 tool calls: inspect the relevant diff, re-run at most one relevant command, and run at most one focused adversarial probe; the final response consumes the last turn.",
+    "The runtime hard-stops this stage after 3 model turns. Use at most 2 tool calls: inspect the relevant diff and run at most one focused adversarial probe; the final response consumes the last turn.",
     "Never repeat a command or an equivalent check while the worktree is unchanged.",
     "An exec_command result's exit_code is authoritative even when the command writes no stdout; do not rerun it only to print the exit code.",
     "After the bounded checks, immediately write the final report and VERDICT line instead of using the remaining turn allowance.",

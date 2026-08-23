@@ -308,6 +308,7 @@ function boundedImplementInput(
 export function workflowDelegateToolPolicy(
   kind: WorkflowSpawnKind,
   prompt?: string,
+  onMutationDispatch?: () => void,
 ): ChildToolPolicy | undefined {
   if (kind !== "implement") return undefined;
   let preMutationCalls = 0;
@@ -326,6 +327,7 @@ export function workflowDelegateToolPolicy(
     if (isFileRead) sourceReadDispatched = true;
     if (IMPLEMENT_MUTATION_TOOLS.has(tool.name)) {
       mutationDispatches += 1;
+      onMutationDispatch?.();
       postMutationInspections = 0;
       return { behavior: "allow", updatedInput };
     }
@@ -374,9 +376,9 @@ export function workflowDelegateBounds(
     case "plan":
       return { role: "Plan", toolAllowlist: [], maxTurns: 1 };
     case "implement":
-      return { maxTurns: 12 };
+      return { maxTurns: 8 };
     case "verify_agent":
-      return { role: "verification", maxTurns: 6 };
+      return { role: "verification", maxTurns: 3 };
     case "review":
       return { maxTurns: 4 };
   }
@@ -394,6 +396,31 @@ export function workflowChildFailureMessage(
   const reason =
     result.error === undefined ? "" : `: ${childErrorText(result.error)}`;
   return `workflow ${kind} child ${result.outcome}${reason}`;
+}
+
+/**
+ * A bounded implementer can exhaust its conversation after it has already
+ * mutated the deterministic worktree. Treat that exact condition as a
+ * handoff to controller-owned verification, not as a reason to spend the
+ * next implementation attempt before any command has examined the patch.
+ * The verifier still rejects an empty/invalid tree mechanically.
+ */
+export function workflowImplementReachedBoundWithProgress(
+  kind: WorkflowSpawnKind,
+  result: {
+    readonly outcome: "completed" | "errored" | "interrupted" | "aborted";
+    readonly error?: unknown;
+  },
+  mutationDispatches: number,
+): boolean {
+  return (
+    kind === "implement" &&
+    result.outcome === "errored" &&
+    mutationDispatches > 0 &&
+    /^subagent exceeded maxTurns(?: \([1-9][0-9]*\))?$/u.test(
+      childErrorText(result.error),
+    )
+  );
 }
 
 function childErrorText(error: unknown): string {
@@ -960,9 +987,13 @@ export function createWorkflowSessionSeams(
       const session = entry.bootstrap.session;
       const { control, registry } = ensureAgentControl(session);
       const bounds = workflowDelegateBounds(input.kind);
+      let mutationDispatches = 0;
       const childToolPolicy = workflowDelegateToolPolicy(
         input.kind,
         input.prompt,
+        () => {
+          mutationDispatches += 1;
+        },
       );
       const pending = (async (): Promise<WorkflowChildOutcome> => {
         const outcome = await delegate({
@@ -1005,8 +1036,13 @@ export function createWorkflowSessionSeams(
           );
         }
         const result = outcome.result;
+        const boundedProgress = workflowImplementReachedBoundWithProgress(
+          input.kind,
+          result,
+          mutationDispatches,
+        );
         const status: WorkflowChildOutcome["status"] =
-          result.outcome === "completed"
+          result.outcome === "completed" || boundedProgress
             ? "completed"
             : result.outcome === "interrupted" || result.outcome === "aborted"
               ? "cancelled"
@@ -1040,8 +1076,10 @@ export function createWorkflowSessionSeams(
         return {
           status,
           finalMessage:
-            result.finalMessage ??
-            workflowChildFailureMessage(input.kind, result),
+            (boundedProgress
+              ? `implementation turn bound reached after ${mutationDispatches} mutation dispatch(es); controller verification owns the next decision`
+              : result.finalMessage ??
+                workflowChildFailureMessage(input.kind, result)),
           usage,
           ...(heldUnknownCount > 0
             ? { usageHeldUnknownCount: heldUnknownCount }

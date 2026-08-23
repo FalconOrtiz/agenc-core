@@ -5,6 +5,7 @@ import {
   workflowChildAgentName,
   workflowDelegateBounds,
   workflowDelegateToolPolicy,
+  workflowImplementReachedBoundWithProgress,
 } from "../../src/app-server/workflow/session-adapters.js";
 
 const CHILD_RUN_IDS = [
@@ -44,11 +45,47 @@ describe("workflowDelegateBounds", () => {
   });
 
   it("bounds implementation and adversarial verification independently", () => {
-    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 12 });
+    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 8 });
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
-      maxTurns: 6,
+      maxTurns: 3,
     });
+  });
+});
+
+describe("workflowImplementReachedBoundWithProgress", () => {
+  it("hands a mutated max-turn implementer to controller verification", () => {
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        { outcome: "errored", error: new Error("subagent exceeded maxTurns (8)") },
+        2,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not mask an empty, non-implement, or unrelated child failure", () => {
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        { outcome: "errored", error: new Error("subagent exceeded maxTurns (8)") },
+        0,
+      ),
+    ).toBe(false);
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "verify_agent",
+        { outcome: "errored", error: new Error("subagent exceeded maxTurns (3)") },
+        2,
+      ),
+    ).toBe(false);
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        { outcome: "errored", error: new Error("provider unavailable") },
+        2,
+      ),
+    ).toBe(false);
   });
 });
 
