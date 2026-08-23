@@ -235,7 +235,9 @@ export interface WorkflowDelegateBounds {
   readonly maxTurns: number;
 }
 
-const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 5;
+const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 3;
+const IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT = 1;
+const IMPLEMENT_FILE_READ_LINE_LIMIT = 320;
 const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Edit",
   "FileEdit",
@@ -245,35 +247,117 @@ const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Write",
   "apply_patch",
 ]);
+const IMPLEMENT_READ_TOOLS = new Set([
+  "FileRead",
+  "Grep",
+  "Glob",
+  "Read",
+  "Search",
+]);
+
+function preferredSourcePath(prompt: string | undefined): string | undefined {
+  const match = prompt?.match(/^Preferred source target: (.+)$/mu);
+  const candidate = match?.[1]?.trim();
+  return candidate && !candidate.startsWith("(") ? candidate : undefined;
+}
+
+function workflowRelativePath(value: string): string {
+  if (!value.startsWith("/")) return value;
+  const worktree = value.match(/\/\.agenc-worktrees\/[^/]+\/(.+)$/u)?.[1];
+  if (worktree) return worktree;
+  const checkout = value.match(/\/repo\/(.+)$/u)?.[1];
+  return checkout ?? value;
+}
+
+function boundedImplementInput(
+  toolName: string,
+  input: Record<string, unknown>,
+  preferredSource: string | undefined,
+  firstInspection: boolean,
+): Record<string, unknown> {
+  const updated = { ...input };
+  for (const key of ["file_path", "path"] as const) {
+    if (typeof updated[key] === "string") {
+      updated[key] = workflowRelativePath(updated[key]);
+    }
+  }
+  if (toolName === "FileRead" || toolName === "Read") {
+    if (firstInspection && preferredSource !== undefined) {
+      updated.file_path = preferredSource;
+      updated.offset = 1;
+    }
+    const requested = Number(updated.limit);
+    updated.limit =
+      Number.isSafeInteger(requested) && requested > 0
+        ? Math.min(requested, IMPLEMENT_FILE_READ_LINE_LIMIT)
+        : IMPLEMENT_FILE_READ_LINE_LIMIT;
+  }
+  return updated;
+}
 
 /**
  * Enforce the implementation-stage inspection budget at dispatch time.
  * Prompt guidance alone is not a budget boundary: a model can keep issuing
- * reads until maxTurns consumes the signed run allowance. Once five
- * pre-mutation calls have completed, only an explicit mutation tool can
- * advance the child; a dispatched mutation attempt then restores the normal
- * catalog.
+ * reads until maxTurns consumes the signed run allowance. The context pack
+ * already did the repo-wide discovery, so the first file read is redirected
+ * to its preferred source target and every read is size-bounded. After three
+ * pre-mutation calls, only an explicit mutation can advance the child. After
+ * each mutation attempt, at most one additional inspection is allowed before
+ * the child must mutate again, run a check, or finish.
  */
 export function workflowDelegateToolPolicy(
   kind: WorkflowSpawnKind,
+  prompt?: string,
 ): ChildToolPolicy | undefined {
   if (kind !== "implement") return undefined;
   let preMutationCalls = 0;
-  let mutationDispatched = false;
+  let mutationDispatches = 0;
+  let postMutationInspections = 0;
+  let sourceReadDispatched = false;
+  const preferredSource = preferredSourcePath(prompt);
   return (tool, input) => {
-    if (mutationDispatched) return { behavior: "allow", updatedInput: input };
+    const isFileRead = tool.name === "FileRead" || tool.name === "Read";
+    const updatedInput = boundedImplementInput(
+      tool.name,
+      input,
+      preferredSource,
+      isFileRead && !sourceReadDispatched,
+    );
+    if (isFileRead) sourceReadDispatched = true;
     if (IMPLEMENT_MUTATION_TOOLS.has(tool.name)) {
-      mutationDispatched = true;
-      return { behavior: "allow", updatedInput: input };
+      mutationDispatches += 1;
+      postMutationInspections = 0;
+      return { behavior: "allow", updatedInput };
+    }
+    if (mutationDispatches > 0) {
+      if (!IMPLEMENT_READ_TOOLS.has(tool.name)) {
+        return { behavior: "allow", updatedInput };
+      }
+      postMutationInspections += 1;
+      if (
+        postMutationInspections <= IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT
+      ) {
+        return { behavior: "allow", updatedInput };
+      }
+      return {
+        behavior: "deny",
+        message:
+          "Post-mutation inspection budget exhausted. Use the context and last result to make the next focused source/test edit now, run one relevant verification command, or finish. Another read or search is not allowed; denied calls consume a turn.",
+        metadata: {
+          workflowPolicy: "implement_post_mutation_inspection_limit",
+          limit: IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT,
+          mutationDispatches,
+        },
+      };
     }
     preMutationCalls += 1;
     if (preMutationCalls <= IMPLEMENT_PRE_MUTATION_TOOL_LIMIT) {
-      return { behavior: "allow", updatedInput: input };
+      return { behavior: "allow", updatedInput };
     }
     return {
       behavior: "deny",
       message:
-        "Implementation inspection budget exhausted. Use the repository context and prior tool results to edit an identified source or test file now. Another read, search, plan, or command is not allowed before the first mutation; denied calls still consume a turn.",
+        "Implementation inspection budget exhausted. Use the repository context and prior tool results to edit the preferred source or test file now. Another read, search, plan, or command is not allowed before the first mutation; denied calls still consume a turn.",
       metadata: {
         workflowPolicy: "implement_pre_mutation_tool_limit",
         limit: IMPLEMENT_PRE_MUTATION_TOOL_LIMIT,
@@ -876,7 +960,10 @@ export function createWorkflowSessionSeams(
       const session = entry.bootstrap.session;
       const { control, registry } = ensureAgentControl(session);
       const bounds = workflowDelegateBounds(input.kind);
-      const childToolPolicy = workflowDelegateToolPolicy(input.kind);
+      const childToolPolicy = workflowDelegateToolPolicy(
+        input.kind,
+        input.prompt,
+      );
       const pending = (async (): Promise<WorkflowChildOutcome> => {
         const outcome = await delegate({
           parent: session,

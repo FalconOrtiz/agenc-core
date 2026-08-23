@@ -2692,10 +2692,13 @@ function buildImplementPrompt(
     "Implement the goal below inside the current worktree.",
     "The runtime hard-stops this stage after 12 model turns. Use at most 11 tool calls and the fewest needed for the bounded change; the final response consumes the last turn.",
     "The controller may provide a deterministic repository context seed below. Treat it as the initial inspection and use its paths instead of rediscovering the repository.",
+    "Use only repository-relative paths. Never copy an absolute parent-checkout path into a tool call; every read and edit must stay in the current workflow worktree.",
+    "When the context names a preferred source target, your first tool call must read that relative path and your first edit must follow immediately after at most two other targeted calls.",
     "Do not enumerate the repository or start with a repo-wide glob. If the context seed is insufficient, use one targeted search combining identifiers from the goal and never repeat the same search.",
-    "Use no more than 5 tool calls before the first edit. A runtime policy denies every non-mutation call after that boundary until you edit; denied calls still consume turns. The first source mutation must be tool call 6 at the latest.",
-    "Do not page sequentially through a source file. Read a targeted file of up to 1,200 lines in one call, or request all needed matched ranges together.",
-    "Inspect the relevant files once, make the smallest correct edit, and run each required verification command at most once after the latest edit.",
+    "Use no more than 3 tool calls before the first edit. A runtime policy denies every non-mutation call after that boundary until you edit; denied calls still consume turns. The first source mutation must be tool call 4 at the latest.",
+    "Do not page sequentially through a source file. Read only the targeted range needed; the runtime caps a file read at 320 lines.",
+    "After each mutation, use at most one further read/search before the next edit. If the acceptance contract asks for automated coverage, a source-only change is incomplete: immediately add or update a focused test using the preferred test target.",
+    "The controller runs every required verification command after you finish. Run at most one focused check yourself only when it is necessary to shape the edit; otherwise finish after source and test changes are complete.",
     "Do not repeat an unchanged failing command; diagnose it or change the code first.",
     "An exec_command result's exit_code is authoritative even when the command writes no stdout; do not rerun it only to print the exit code.",
     "Reserve the final turn for a concise result report. As soon as the required verification passes, immediately stop using tools and report the result.",
@@ -2721,6 +2724,12 @@ function buildImplementPrompt(
       ),
       "",
       "Fix the failures above, then stop.",
+    );
+  } else if (attempt > 1) {
+    lines.push(
+      "",
+      `## Continuation from implementation attempt ${attempt - 1}`,
+      "The deterministic workflow worktree may already contain a partial source edit. Preserve it, use only relative paths, complete any missing automated test, and stop without restarting discovery.",
     );
   }
   return lines.join("\n");

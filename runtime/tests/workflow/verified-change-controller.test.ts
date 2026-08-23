@@ -705,10 +705,12 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(implementPrompt).toContain(
       "runtime policy denies every non-mutation call",
     );
-    expect(implementPrompt).toContain("first source mutation must be tool call 6");
+    expect(implementPrompt).toContain("first source mutation must be tool call 4");
+    expect(implementPrompt).toContain("Use only repository-relative paths");
+    expect(implementPrompt).toContain("a source-only change is incomplete");
     expect(implementPrompt).toContain("Reserve the final turn");
     expect(implementPrompt).toContain(
-      "run each required verification command at most once",
+      "controller runs every required verification command",
     );
     expect(implementPrompt).toContain("exit_code is authoritative");
     expect(implementPrompt).toContain("immediately stop using tools");

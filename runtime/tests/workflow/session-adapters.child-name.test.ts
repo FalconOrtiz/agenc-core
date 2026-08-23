@@ -53,16 +53,28 @@ describe("workflowDelegateBounds", () => {
 });
 
 describe("workflowDelegateToolPolicy", () => {
-  it("technically blocks inspection loops until the first mutation", async () => {
-    const policy = workflowDelegateToolPolicy("implement");
+  it("bounds pre- and post-mutation inspection while pinning relative paths", async () => {
+    const policy = workflowDelegateToolPolicy(
+      "implement",
+      "Preferred source target: src/a.ts\nPreferred test target: tests/a.test.ts",
+    );
     expect(policy).toBeDefined();
-    for (let index = 0; index < 5; index += 1) {
-      expect(await policy!({ name: "Grep" }, { pattern: `term-${index}` })).toEqual(
-        {
-          behavior: "allow",
-          updatedInput: { pattern: `term-${index}` },
-        },
-      );
+    expect(
+      await policy!(
+        { name: "FileRead" },
+        { file_path: "/checkout/repo/tests/a.test.ts", offset: 800, limit: 1_200 },
+      ),
+    ).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "src/a.ts", offset: 1, limit: 320 },
+    });
+    for (let index = 1; index < 3; index += 1) {
+      expect(
+        await policy!({ name: "Grep" }, { pattern: `term-${index}` }),
+      ).toEqual({
+        behavior: "allow",
+        updatedInput: { pattern: `term-${index}` },
+      });
     }
     expect(
       await policy!({ name: "FileRead" }, { file_path: "src/a.ts" }),
@@ -70,16 +82,43 @@ describe("workflowDelegateToolPolicy", () => {
       behavior: "deny",
       metadata: {
         workflowPolicy: "implement_pre_mutation_tool_limit",
-        limit: 5,
+        limit: 3,
       },
     });
-    expect(await policy!({ name: "Edit" }, { file_path: "src/a.ts" })).toEqual({
+    expect(
+      await policy!(
+        { name: "Edit" },
+        { file_path: "/checkout/repo/.agenc-worktrees/run/src/a.ts" },
+      ),
+    ).toEqual({
       behavior: "allow",
       updatedInput: { file_path: "src/a.ts" },
     });
-    expect(await policy!({ name: "FileRead" }, { file_path: "src/b.ts" })).toEqual({
+    expect(
+      await policy!({ name: "FileRead" }, { file_path: "tests/a.test.ts", limit: 900 }),
+    ).toEqual({
       behavior: "allow",
-      updatedInput: { file_path: "src/b.ts" },
+      updatedInput: { file_path: "tests/a.test.ts", limit: 320 },
+    });
+    expect(
+      await policy!({ name: "Grep" }, { pattern: "another" }),
+    ).toMatchObject({
+      behavior: "deny",
+      metadata: {
+        workflowPolicy: "implement_post_mutation_inspection_limit",
+        limit: 1,
+        mutationDispatches: 1,
+      },
+    });
+    expect(
+      await policy!({ name: "Edit" }, { file_path: "tests/a.test.ts" }),
+    ).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "tests/a.test.ts" },
+    });
+    expect(await policy!({ name: "Bash" }, { command: "npm test" })).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "npm test" },
     });
   });
 

@@ -114,6 +114,12 @@ describe("buildRepositoryContextPack", () => {
     expect(pack!.text).toContain(
       "Ranked candidate paths: tests/amd-gpu-detection.test.js, src/hardware/unified-detector.js, src/hardware/detector.js",
     );
+    expect(pack!.text).toContain(
+      "Preferred source target: src/hardware/unified-detector.js",
+    );
+    expect(pack!.text).toContain(
+      "Preferred test target: tests/amd-gpu-detection.test.js",
+    );
   });
 
   it("skips ignored directories and symbolic links", async () => {
