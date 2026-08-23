@@ -43,10 +43,10 @@ describe("workflowDelegateBounds", () => {
   });
 
   it("bounds implementation and adversarial verification independently", () => {
-    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 8 });
+    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 16 });
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
-      maxTurns: 4,
+      maxTurns: 6,
     });
   });
 });
