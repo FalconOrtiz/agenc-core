@@ -5445,12 +5445,28 @@ async function runDefaultAgenCCliRoute(
     (await resolveAgenCDaemonAutostartEnabled(process.env))
   ) {
     try {
-      await ensureAgenCDaemonAutostart();
+      // Surface respawn reasons on stderr instead of the historical
+      // silentIo(): a failing autostart used to look like a frozen blank
+      // terminal. Keep stdout quiet so the daemon CLI banner stays out of
+      // interactive TUI rendering (mirrors defaultEnsureDaemonReady).
+      const silentStdout = { write: () => true } as Pick<
+        NodeJS.WriteStream,
+        "write"
+      >;
+      await ensureAgenCDaemonAutostart({
+        io: { stdout: silentStdout, stderr: process.stderr },
+      });
     } catch (error) {
-      process.stderr.write(
-        `agenc: daemon autostart failed: ${error instanceof Error ? error.message : String(error)}\n`,
-      );
-      return 1;
+      const message =
+        error instanceof Error ? error.message : String(error);
+      process.stderr.write(`agenc: daemon autostart failed: ${message}\n`);
+      if (!process.stdout.isTTY) {
+        return 1;
+      }
+      // Interactive sessions still get a working (daemon-less) TUI with a
+      // visible error notice rather than an exit back to the shell. The
+      // notice reads this env var at render time (StatusNotices).
+      process.env.AGENC_DAEMON_AUTOSTART_FAILURE = message;
     }
   }
   return routeCLI({
