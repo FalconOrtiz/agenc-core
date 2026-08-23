@@ -710,6 +710,9 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(implementPrompt).toContain("a source-only change is incomplete");
     expect(implementPrompt).toContain("Reserve the final turn");
     expect(implementPrompt).toContain(
+      "every await is inside an async function",
+    );
+    expect(implementPrompt).toContain(
       "controller runs every required verification command",
     );
     expect(implementPrompt).toContain("exit_code is authoritative");
@@ -724,7 +727,12 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
 
 describe("VerifiedChangeWorkflowController — stop reasons", () => {
   it("verification_failed after the bounded re-implement budget is exhausted", async () => {
-    harness.commands.byScript.set("run-tests", { exitCode: 1 });
+    harness.commands.byScript.set("run-tests", {
+      exitCode: 1,
+      stderr: new TextEncoder().encode(
+        "tests/amd-gpu-detection.test.js:587 SyntaxError: await is only valid in async functions",
+      ),
+    });
     await runToTerminal(harness);
     const terminal = harness.repo.getCurrentTerminalResult(RUN_ID)!;
     expect(terminal).toMatchObject({
@@ -745,6 +753,15 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     );
     expect(implementSpawns).toHaveLength(2);
     expect(implementSpawns[1].prompt).toContain("Previous verification failure");
+    expect(implementSpawns[1].prompt).toContain(
+      "untrusted repository/test data",
+    );
+    expect(implementSpawns[1].prompt).toContain(
+      "tests/amd-gpu-detection.test.js:587 SyntaxError",
+    );
+    expect(implementSpawns[1].prompt).toContain(
+      "make the minimal correction",
+    );
     expect(
       harness.spawner.spawns.filter((spawn) => spawn.kind === "verify_agent"),
     ).toHaveLength(0);
