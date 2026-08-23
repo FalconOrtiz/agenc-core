@@ -118,6 +118,7 @@ import {
   worktreeIdempotencyKey,
   type WorkflowStepEvidence,
 } from "./steps.js";
+import { buildRepositoryContextPack } from "./repository-context.js";
 
 // ---------------------------------------------------------------------------
 // Injected seams
@@ -1068,6 +1069,19 @@ export class VerifiedChangeWorkflowController {
       ).attempts,
     );
     for (;;) {
+      let repositoryContext: string | undefined;
+      try {
+        repositoryContext = (
+          await buildRepositoryContextPack(
+            this.#requireHandle(ctx).path,
+            spec.goal,
+          )
+        )?.text;
+      } catch (error) {
+        this.#deps.warn(
+          `workflow ${ctx.runId} repository context seed failed: ${errorMessage(error)}`,
+        );
+      }
       const implement = await this.#driveEffect(
         ctx,
         this.#spawnPlan(ctx, {
@@ -1076,7 +1090,7 @@ export class VerifiedChangeWorkflowController {
           attempt,
           spawnKind: "implement",
           childRunId: `${ctx.runId}:implement#${attempt}`,
-          prompt: buildImplementPrompt(ctx, attempt),
+          prompt: buildImplementPrompt(ctx, attempt, repositoryContext),
         }),
       );
       if (implement.outcome === "cancelled") {
@@ -2668,14 +2682,19 @@ function buildPlanPrompt(spec: WorkflowSpec): string {
   ].join("\n");
 }
 
-function buildImplementPrompt(ctx: RunContext, attempt: number): string {
+function buildImplementPrompt(
+  ctx: RunContext,
+  attempt: number,
+  repositoryContext?: string,
+): string {
   const lines = [
     "You are the implementation stage of a verified-change workflow.",
     "Implement the goal below inside the current worktree.",
     "The runtime hard-stops this stage after 16 model turns. Use at most 15 tool calls and the fewest needed for the bounded change; the final response consumes the last turn.",
-    "Do not enumerate the repository or start with a repo-wide glob. Begin with one targeted search using identifiers from the goal.",
-    "Do not page sequentially through a long source file; search for exact symbols and read only the matched ranges.",
-    "Make the first source edit by tool call 10 at the latest; edit sooner when the targeted files are already clear.",
+    "The controller may provide a deterministic repository context seed below. Treat it as the initial inspection and use its paths instead of rediscovering the repository.",
+    "Do not enumerate the repository or start with a repo-wide glob. If the context seed is insufficient, use one targeted search combining identifiers from the goal and never repeat the same search.",
+    "Use no more than 5 additional read-only tool calls before the first edit. The first source mutation must be tool call 6 at the latest when a context seed is present, or tool call 9 without one.",
+    "Do not page sequentially through a source file. Read a targeted file of up to 1,200 lines in one call, or request all needed matched ranges together.",
     "Inspect the relevant files once, make the smallest correct edit, and run each required verification command at most once after the latest edit.",
     "Do not repeat an unchanged failing command; diagnose it or change the code first.",
     "An exec_command result's exit_code is authoritative even when the command writes no stdout; do not rerun it only to print the exit code.",
@@ -2687,6 +2706,9 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
     "## Plan",
     ctx.planText ?? "(no plan text recorded)",
   ];
+  if (repositoryContext !== undefined) {
+    lines.push("", repositoryContext);
+  }
   if (attempt > 1 && ctx.verification !== undefined) {
     lines.push(
       "",
