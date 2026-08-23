@@ -59,6 +59,63 @@ describe("buildRepositoryContextPack", () => {
     expect(pack!.text.length).toBeLessThanOrEqual(18_000);
   });
 
+  it("ranks implementation files ahead of repetitive documentation", async () => {
+    const root = await fixtureRoot();
+    await mkdir(path.join(root, "src/hardware"), { recursive: true });
+    await mkdir(path.join(root, "tests"), { recursive: true });
+    await mkdir(path.join(root, "docs"), { recursive: true });
+    await writeFile(
+      path.join(root, "src/hardware/detector.js"),
+      [
+        "function getGPUModelFromDeviceId(deviceId) {",
+        "  const amdDeviceMap = { '1586': 'AMD Radeon 8060S' };",
+        "  return amdDeviceMap[deviceId];",
+        "}",
+        "function isIntegratedGPU(model) {",
+        "  return model.includes('Radeon 8060S');",
+        "}",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(root, "src/hardware/unified-detector.js"),
+      [
+        "const UNIFIED_MEMORY_GPUS = {",
+        "  '1586': { family: 'AMD Strix Halo', type: 'integrated' },",
+        "};",
+        "export function effectiveMemory(deviceId) {",
+        "  return UNIFIED_MEMORY_GPUS[deviceId]?.type === 'integrated';",
+        "}",
+      ].join("\n"),
+    );
+    await writeFile(
+      path.join(root, "tests/amd-gpu-detection.test.js"),
+      "test('Radeon 8060S device ID 1586 uses Strix Halo unified memory', () => {});\n",
+    );
+    for (let index = 0; index < 8; index += 1) {
+      await writeFile(
+        path.join(root, "docs", `strix-halo-${index}.md`),
+        "AMD Strix Halo Radeon 8060S device ID 1586 integrated unified memory hw-detect\n".repeat(
+          12,
+        ),
+      );
+    }
+
+    const pack = await buildRepositoryContextPack(
+      root,
+      "Fix AMD Strix Halo unified-memory hardware detection for Radeon 8060S device ID 1586; hw-detect must report integrated memory.",
+    );
+
+    expect(pack).toBeDefined();
+    expect(pack!.matchedFiles.slice(0, 3)).toEqual([
+      "tests/amd-gpu-detection.test.js",
+      "src/hardware/unified-detector.js",
+      "src/hardware/detector.js",
+    ]);
+    expect(pack!.text).toContain(
+      "Ranked candidate paths: tests/amd-gpu-detection.test.js, src/hardware/unified-detector.js, src/hardware/detector.js",
+    );
+  });
+
   it("skips ignored directories and symbolic links", async () => {
     const root = await fixtureRoot();
     await mkdir(path.join(root, "node_modules/decoy"), { recursive: true });

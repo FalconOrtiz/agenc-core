@@ -696,12 +696,15 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const implementPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "implement",
     )?.prompt;
-    expect(implementPrompt).toContain("hard-stops this stage after 16 model turns");
-    expect(implementPrompt).toContain("Use at most 15 tool calls");
+    expect(implementPrompt).toContain("hard-stops this stage after 12 model turns");
+    expect(implementPrompt).toContain("Use at most 11 tool calls");
     expect(implementPrompt).toContain("final response consumes the last turn");
     expect(implementPrompt).toContain("deterministic repository context seed");
     expect(implementPrompt).toContain("Do not enumerate the repository");
     expect(implementPrompt).toContain("Do not page sequentially");
+    expect(implementPrompt).toContain(
+      "runtime policy denies every non-mutation call",
+    );
     expect(implementPrompt).toContain("first source mutation must be tool call 6");
     expect(implementPrompt).toContain("Reserve the final turn");
     expect(implementPrompt).toContain(

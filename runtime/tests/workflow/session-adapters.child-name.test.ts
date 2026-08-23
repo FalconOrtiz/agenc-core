@@ -4,6 +4,7 @@ import { assertValidAgentName } from "../../src/agents/registry.js";
 import {
   workflowChildAgentName,
   workflowDelegateBounds,
+  workflowDelegateToolPolicy,
 } from "../../src/app-server/workflow/session-adapters.js";
 
 const CHILD_RUN_IDS = [
@@ -43,10 +44,48 @@ describe("workflowDelegateBounds", () => {
   });
 
   it("bounds implementation and adversarial verification independently", () => {
-    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 16 });
+    expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 12 });
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
       maxTurns: 6,
     });
+  });
+});
+
+describe("workflowDelegateToolPolicy", () => {
+  it("technically blocks inspection loops until the first mutation", async () => {
+    const policy = workflowDelegateToolPolicy("implement");
+    expect(policy).toBeDefined();
+    for (let index = 0; index < 5; index += 1) {
+      expect(await policy!({ name: "Grep" }, { pattern: `term-${index}` })).toEqual(
+        {
+          behavior: "allow",
+          updatedInput: { pattern: `term-${index}` },
+        },
+      );
+    }
+    expect(
+      await policy!({ name: "FileRead" }, { file_path: "src/a.ts" }),
+    ).toMatchObject({
+      behavior: "deny",
+      metadata: {
+        workflowPolicy: "implement_pre_mutation_tool_limit",
+        limit: 5,
+      },
+    });
+    expect(await policy!({ name: "Edit" }, { file_path: "src/a.ts" })).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "src/a.ts" },
+    });
+    expect(await policy!({ name: "FileRead" }, { file_path: "src/b.ts" })).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "src/b.ts" },
+    });
+  });
+
+  it("does not constrain non-implementation workflow children", () => {
+    expect(workflowDelegateToolPolicy("plan")).toBeUndefined();
+    expect(workflowDelegateToolPolicy("verify_agent")).toBeUndefined();
+    expect(workflowDelegateToolPolicy("review")).toBeUndefined();
   });
 });

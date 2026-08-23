@@ -40,6 +40,7 @@ import {
 } from "../../bin/cli-option-region.js";
 import { ensureAgentControl } from "../../bin/delegate-tool.js";
 import { delegate } from "../../agents/delegate.js";
+import type { ChildToolPolicy } from "../../agents/run-agent.js";
 import type { AgentPath } from "../../agents/registry.js";
 import type { ExecutionAdmissionKernel } from "../../budget/execution-admission-kernel.js";
 import type { AuthBackend } from "../../auth/backend.js";
@@ -234,6 +235,53 @@ export interface WorkflowDelegateBounds {
   readonly maxTurns: number;
 }
 
+const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 5;
+const IMPLEMENT_MUTATION_TOOLS = new Set([
+  "Edit",
+  "FileEdit",
+  "FileWrite",
+  "MultiEdit",
+  "NotebookEdit",
+  "Write",
+  "apply_patch",
+]);
+
+/**
+ * Enforce the implementation-stage inspection budget at dispatch time.
+ * Prompt guidance alone is not a budget boundary: a model can keep issuing
+ * reads until maxTurns consumes the signed run allowance. Once five
+ * pre-mutation calls have completed, only an explicit mutation tool can
+ * advance the child; a dispatched mutation attempt then restores the normal
+ * catalog.
+ */
+export function workflowDelegateToolPolicy(
+  kind: WorkflowSpawnKind,
+): ChildToolPolicy | undefined {
+  if (kind !== "implement") return undefined;
+  let preMutationCalls = 0;
+  let mutationDispatched = false;
+  return (tool, input) => {
+    if (mutationDispatched) return { behavior: "allow", updatedInput: input };
+    if (IMPLEMENT_MUTATION_TOOLS.has(tool.name)) {
+      mutationDispatched = true;
+      return { behavior: "allow", updatedInput: input };
+    }
+    preMutationCalls += 1;
+    if (preMutationCalls <= IMPLEMENT_PRE_MUTATION_TOOL_LIMIT) {
+      return { behavior: "allow", updatedInput: input };
+    }
+    return {
+      behavior: "deny",
+      message:
+        "Implementation inspection budget exhausted. Use the repository context and prior tool results to edit an identified source or test file now. Another read, search, plan, or command is not allowed before the first mutation; denied calls still consume a turn.",
+      metadata: {
+        workflowPolicy: "implement_pre_mutation_tool_limit",
+        limit: IMPLEMENT_PRE_MUTATION_TOOL_LIMIT,
+      },
+    };
+  };
+}
+
 /** Keep each workflow child bounded so one stage cannot consume the run. */
 export function workflowDelegateBounds(
   kind: WorkflowSpawnKind,
@@ -242,7 +290,7 @@ export function workflowDelegateBounds(
     case "plan":
       return { role: "Plan", toolAllowlist: [], maxTurns: 1 };
     case "implement":
-      return { maxTurns: 16 };
+      return { maxTurns: 12 };
     case "verify_agent":
       return { role: "verification", maxTurns: 6 };
     case "review":
@@ -828,6 +876,7 @@ export function createWorkflowSessionSeams(
       const session = entry.bootstrap.session;
       const { control, registry } = ensureAgentControl(session);
       const bounds = workflowDelegateBounds(input.kind);
+      const childToolPolicy = workflowDelegateToolPolicy(input.kind);
       const pending = (async (): Promise<WorkflowChildOutcome> => {
         const outcome = await delegate({
           parent: session,
@@ -839,6 +888,7 @@ export function createWorkflowSessionSeams(
           ...(bounds.toolAllowlist !== undefined
             ? { toolAllowlist: bounds.toolAllowlist }
             : {}),
+          ...(childToolPolicy !== undefined ? { childToolPolicy } : {}),
           maxTurns: bounds.maxTurns,
           agentName: workflowChildAgentName(input.childRunId),
           ...(input.spec.model !== undefined
