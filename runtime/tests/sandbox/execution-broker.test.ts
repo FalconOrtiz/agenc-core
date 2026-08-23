@@ -223,6 +223,201 @@ describe("SandboxExecutionBroker", () => {
     expect(transform).toHaveBeenCalledOnce();
   });
 
+  describe("Landlock-fallback pre-flight", () => {
+    function fallbackStatus(): SandboxExecutionStatus {
+      return {
+        ...readyStatus("workspace_write"),
+        platform: "linux",
+        landlock: "full",
+        landlockFallback: {
+          reason: "probe: bubblewrap could not create the required namespaces",
+          remediation:
+            "Install AgenC's narrow per-command profile with: agenc doctor --apparmor-profile | sudo tee ...",
+        },
+      };
+    }
+    const fakeManager = {
+      selectInitial: vi.fn(() => "linux_seccomp" as const),
+      transform: vi.fn(() => ({
+        command: ["/sandbox/helper", "/bin/echo", "ok"],
+        cwd: "/",
+        env: {},
+        arg0: "sandbox-helper",
+      })),
+    } as never;
+
+    it("refuses an unexpressible policy with the precise reason and the probe-time remediation", () => {
+      const root = tempRoot("agenc-broker-preflight-");
+      mkdirSync(join(root, ".agenc"));
+      const broker = new SandboxExecutionBroker({
+        mode: "workspace_write",
+        cwd: root,
+        platform: "linux",
+        sandboxManager: fakeManager,
+        probe: fallbackStatus,
+      });
+
+      expect(() =>
+        broker.prepareSpawn("mcp_stdio", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "sandbox_policy_unexpressible",
+          surface: "mcp_stdio",
+          message: expect.stringMatching(
+            /read-only subpath.*\.agenc.*agenc doctor --apparmor-profile/s,
+          ),
+        }),
+      );
+    });
+
+    it("rechecks carve-out existence on every spawn instead of memoizing", () => {
+      const root = tempRoot("agenc-broker-preflight-recheck-");
+      const broker = new SandboxExecutionBroker({
+        mode: "workspace_write",
+        cwd: root,
+        platform: "linux",
+        sandboxManager: fakeManager,
+        probe: fallbackStatus,
+      });
+      const command = {
+        program: "/bin/echo",
+        args: ["ok"],
+        cwd: root,
+        env: {},
+      };
+
+      expect(() => broker.prepareSpawn("tool", command)).not.toThrow();
+      mkdirSync(join(root, ".agenc"));
+      expect(() => broker.prepareSpawn("tool", command)).toThrowError(
+        expect.objectContaining({ code: "sandbox_policy_unexpressible" }),
+      );
+    });
+
+    it("skips the pre-flight for inherited read-only cwd spawns", () => {
+      const root = tempRoot("agenc-broker-preflight-inherited-");
+      mkdirSync(join(root, ".agenc"));
+      const broker = new SandboxExecutionBroker({
+        mode: "workspace_write",
+        cwd: root,
+        platform: "linux",
+        sandboxManager: fakeManager,
+        probe: fallbackStatus,
+      });
+
+      expect(() =>
+        broker.prepareSpawn("tool", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+          cwdBinding: "inherited_readonly",
+        }),
+      ).not.toThrow();
+    });
+
+    it("never invokes the planner on a healthy bubblewrap host", () => {
+      const root = tempRoot("agenc-broker-preflight-healthy-");
+      mkdirSync(join(root, ".agenc"));
+      const planSpy = vi.fn(() => ({
+        kind: "refused" as const,
+        reason: "should never be consulted",
+      }));
+      const broker = new SandboxExecutionBroker({
+        mode: "workspace_write",
+        cwd: root,
+        platform: "linux",
+        sandboxManager: fakeManager,
+        probe: () => ({ ...readyStatus("workspace_write"), platform: "linux" }),
+        planLandlockPolicy: planSpy,
+      });
+
+      expect(() =>
+        broker.prepareSpawn("tool", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+        }),
+      ).not.toThrow();
+      expect(planSpy).not.toHaveBeenCalled();
+    });
+
+    it("a tight profile override makes the same spawn expressible, and additionalPermissions still merge", () => {
+      const root = tempRoot("agenc-broker-preflight-override-");
+      mkdirSync(join(root, ".agenc"));
+      const dataDir = join(root, "plugin-data");
+      mkdirSync(dataDir);
+      const broker = new SandboxExecutionBroker({
+        mode: "workspace_write",
+        cwd: root,
+        platform: "linux",
+        sandboxManager: fakeManager,
+        probe: fallbackStatus,
+      });
+      const override = {
+        fileSystem: {
+          kind: "restricted",
+          entries: [
+            {
+              path: { kind: "special", value: { kind: "root" } },
+              access: "read",
+            },
+            { path: { kind: "path", path: dataDir }, access: "write" },
+          ],
+          includePlatformDefaults: true,
+        },
+        network: "disabled",
+      } as never;
+
+      // Default workspace profile refuses (existing .agenc carve-out) …
+      expect(() =>
+        broker.prepareSpawn("mcp_stdio", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "sandbox_policy_unexpressible" }),
+      );
+      // … the tight override plans cleanly …
+      expect(() =>
+        broker.prepareSpawn("mcp_stdio", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+          permissionProfileOverride: override,
+        }),
+      ).not.toThrow();
+      // … and additive surface grants still merge on top of the override:
+      // granting the project root back re-introduces the carve-out refusal.
+      expect(() =>
+        broker.prepareSpawn("mcp_stdio", {
+          program: "/bin/echo",
+          args: ["ok"],
+          cwd: root,
+          env: {},
+          permissionProfileOverride: override,
+          additionalPermissions: {
+            fileSystem: {
+              entries: [
+                { path: { kind: "path", path: root }, access: "write" },
+              ],
+            },
+          } as never,
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "sandbox_policy_unexpressible" }),
+      );
+    });
+  });
+
   it("rebases captured boundaries and forks independent child roots", async () => {
     const root = tempRoot("agenc-sandbox-broker-root-");
     const child = tempRoot("agenc-sandbox-broker-child-");
