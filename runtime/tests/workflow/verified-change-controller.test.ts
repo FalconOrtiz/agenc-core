@@ -684,7 +684,8 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const verifierPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "verify_agent",
     )?.prompt;
-    expect(verifierPrompt).toContain("Use at most 8 tool calls");
+    expect(verifierPrompt).toContain("hard-stops this stage after 4 model turns");
+    expect(verifierPrompt).toContain("Use at most 4 tool calls");
     expect(verifierPrompt).toContain(
       "Never repeat a command or an equivalent check",
     );
@@ -694,7 +695,11 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const implementPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "implement",
     )?.prompt;
-    expect(implementPrompt).toContain("Use at most 16 tool calls");
+    expect(implementPrompt).toContain("hard-stops this stage after 8 model turns");
+    expect(implementPrompt).toContain("Use at most 8 tool calls");
+    expect(implementPrompt).toContain("Do not enumerate the repository");
+    expect(implementPrompt).toContain("first source edit by tool call 5");
+    expect(implementPrompt).toContain("Reserve the final turn");
     expect(implementPrompt).toContain(
       "run each required verification command at most once",
     );
