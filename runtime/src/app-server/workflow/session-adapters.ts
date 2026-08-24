@@ -374,8 +374,8 @@ export interface WorkflowDelegateBounds {
 const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 3;
 const IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT = 1;
 const IMPLEMENT_FILE_READ_LINE_LIMIT = 320;
-const VERIFY_AGENT_TOOL_LIMIT = 2;
-const WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS = 8_192;
+const VERIFY_AGENT_TOOL_LIMIT = 0;
+const WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS = 4_096;
 const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Edit",
   "FileEdit",
@@ -458,7 +458,7 @@ export function workflowDelegateToolPolicy(
       return {
         behavior: "deny",
         message:
-          "Adversarial verification tool budget exhausted. Do not request another tool. Use the diff and probe results already returned, write the final verification report now, and end with exactly one VERDICT line. A denied call consumes the recovery turn.",
+          "This verifier is a one-response, no-tools stage. Use the exact diff and authenticated command evidence already supplied in the prompt, write the final verification report now, and end with exactly one VERDICT line.",
         metadata: {
           workflowPolicy: "verify_agent_tool_limit",
           limit: VERIFY_AGENT_TOOL_LIMIT,
@@ -533,12 +533,13 @@ export function workflowDelegateBounds(
     case "implement":
       return { maxTurns: 8 };
     case "verify_agent":
-      // Two independent checks, one normal final-response turn, and one
-      // recovery turn if the model ignores the tool cap and policy denies a
-      // third call. The denied call never reaches a tool or changes state.
+      // The controller supplies the exact exported patch and authenticated
+      // command evidence. One fresh-context model response judges both; no
+      // additional model turn can strand the verdict behind a budget hold.
       return {
         role: "verification",
-        maxTurns: 4,
+        toolAllowlist: [],
+        maxTurns: 1,
         maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
       };
     case "review":

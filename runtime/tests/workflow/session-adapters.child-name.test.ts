@@ -48,12 +48,13 @@ describe("workflowDelegateBounds", () => {
     expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 8 });
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
-      maxTurns: 4,
-      maxOutputTokens: 8_192,
+      toolAllowlist: [],
+      maxTurns: 1,
+      maxOutputTokens: 4_096,
     });
     expect(workflowDelegateBounds("review")).toEqual({
       maxTurns: 4,
-      maxOutputTokens: 8_192,
+      maxOutputTokens: 4_096,
     });
   });
 });
@@ -213,29 +214,17 @@ describe("workflowDelegateToolPolicy", () => {
     });
   });
 
-  it("caps adversarial verification tools and preserves a final-response recovery turn", async () => {
+  it("denies every adversarial verification tool in the one-response stage", async () => {
     const policy = workflowDelegateToolPolicy("verify_agent");
     expect(policy).toBeDefined();
     expect(
       await policy!({ name: "FileRead" }, { file_path: "src/a.ts" }),
-    ).toEqual({
-      behavior: "allow",
-      updatedInput: { file_path: "src/a.ts" },
-    });
-    expect(
-      await policy!({ name: "Bash" }, { command: "npm test -- --focused" }),
-    ).toEqual({
-      behavior: "allow",
-      updatedInput: { command: "npm test -- --focused" },
-    });
-    expect(
-      await policy!({ name: "Grep" }, { pattern: "another-check" }),
     ).toMatchObject({
       behavior: "deny",
       metadata: {
         workflowPolicy: "verify_agent_tool_limit",
-        limit: 2,
-        attemptedTool: "Grep",
+        limit: 0,
+        attemptedTool: "FileRead",
       },
     });
   });
