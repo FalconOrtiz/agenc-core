@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  approvedPreExportVerificationCommand,
   VerifiedChangeWorkflowController,
   WorkflowIntakeError,
   type WorkflowAgentSpawner,
@@ -295,6 +296,7 @@ const BASE_COMMIT = "c".repeat(40);
 const HEAD_COMMIT = "d".repeat(40);
 
 class FakeWorktrees implements WorkflowWorktreeBroker {
+  baseCommit = BASE_COMMIT;
   dirty = false;
   movement: BaseMovementCheck = { kind: "unmoved" };
   patchText = "diff --git a/f b/f\n--- a/f\n+++ b/f\n+x\n";
@@ -307,7 +309,7 @@ class FakeWorktrees implements WorkflowWorktreeBroker {
 
   async captureBaseState() {
     return {
-      baseCommit: BASE_COMMIT,
+      baseCommit: this.baseCommit,
       dirty: this.dirty,
       fileCount: this.dirty ? 3 : 0,
       summaryDigest: sha256Digest("status") as `sha256:${string}`,
@@ -594,6 +596,51 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("VerifiedChangeWorkflowController — happy path", () => {
+  it("scopes the funded Strix pre-export verifier to the exact base and command", () => {
+    const script =
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
+      "npm-test";
+    expect(
+      approvedPreExportVerificationCommand({
+        baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
+        requiredVerification: [{ id: "npm-test", label: "npm test", script }],
+      }),
+    ).toBe(script);
+    expect(
+      approvedPreExportVerificationCommand({
+        baseCommit: "a".repeat(40),
+        requiredVerification: [{ id: "npm-test", label: "npm test", script }],
+      }),
+    ).toBeUndefined();
+    expect(
+      approvedPreExportVerificationCommand({
+        baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
+        requiredVerification: [
+          { id: "npm-test", label: "npm test", script: `${script} extra` },
+        ],
+      }),
+    ).toBeUndefined();
+  });
+
+  it("runs the exact Strix preparation before the evidence-bearing verification", async () => {
+    const script =
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
+      "npm-test";
+    harness.worktrees.baseCommit =
+      "8935c9e77e5104d0fa4c50a560123b88b92155f0";
+    await runToTerminal(harness, {
+      requiredVerification: [
+        { id: "npm-test", label: "npm test", script },
+      ],
+    });
+    expect(harness.commands.executed).toEqual([script, script]);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+  });
+
   it("drives the full pipeline to a completed terminal with sealed evidence", async () => {
     // One non-blocking finding: it must land in the risk register and the
     // final message, never block completion (D6).
