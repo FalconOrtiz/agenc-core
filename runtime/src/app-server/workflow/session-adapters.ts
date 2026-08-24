@@ -537,13 +537,42 @@ export function workflowChildFailureMessage(
   return `workflow ${kind} child ${result.outcome}${reason}`;
 }
 
+type WorkflowImplementProgressHandoff =
+  | "turn_bound"
+  | "token_budget_exhausted";
+
 /**
- * A bounded implementer can exhaust its conversation after it has already
- * mutated the deterministic worktree. Treat that exact condition as a
- * handoff to controller-owned verification, not as a reason to spend the
- * next implementation attempt before any command has examined the patch.
- * The verifier still rejects an empty/invalid tree mechanically.
+ * A bounded implementer can exhaust either its conversation or the signed
+ * token allowance after it has already mutated the deterministic worktree.
+ * Treat only those exact post-mutation conditions as a handoff to
+ * controller-owned verification, not as a reason to discard an unexamined
+ * patch. The verifier still rejects an empty or invalid tree mechanically.
  */
+function workflowImplementProgressHandoff(
+  kind: WorkflowSpawnKind,
+  result: {
+    readonly outcome: "completed" | "errored" | "interrupted" | "aborted";
+    readonly error?: unknown;
+  },
+  mutationDispatches: number,
+): WorkflowImplementProgressHandoff | null {
+  if (
+    kind !== "implement" ||
+    result.outcome !== "errored" ||
+    mutationDispatches <= 0
+  ) {
+    return null;
+  }
+  const error = childErrorText(result.error);
+  if (/^subagent exceeded maxTurns(?: \([1-9][0-9]*\))?$/u.test(error)) {
+    return "turn_bound";
+  }
+  if (error === "execution admission deny: budget_exceeded") {
+    return "token_budget_exhausted";
+  }
+  return null;
+}
+
 export function workflowImplementReachedBoundWithProgress(
   kind: WorkflowSpawnKind,
   result: {
@@ -553,12 +582,7 @@ export function workflowImplementReachedBoundWithProgress(
   mutationDispatches: number,
 ): boolean {
   return (
-    kind === "implement" &&
-    result.outcome === "errored" &&
-    mutationDispatches > 0 &&
-    /^subagent exceeded maxTurns(?: \([1-9][0-9]*\))?$/u.test(
-      childErrorText(result.error),
-    )
+    workflowImplementProgressHandoff(kind, result, mutationDispatches) !== null
   );
 }
 
@@ -1184,11 +1208,12 @@ export function createWorkflowSessionSeams(
           );
         }
         const result = outcome.result;
-        const boundedProgress = workflowImplementReachedBoundWithProgress(
+        const progressHandoff = workflowImplementProgressHandoff(
           input.kind,
           result,
           mutationDispatches,
         );
+        const boundedProgress = progressHandoff !== null;
         const status: WorkflowChildOutcome["status"] =
           result.outcome === "completed" || boundedProgress
             ? "completed"
@@ -1224,8 +1249,10 @@ export function createWorkflowSessionSeams(
         return {
           status,
           finalMessage:
-            (boundedProgress
+            (progressHandoff === "turn_bound"
               ? `implementation turn bound reached after ${mutationDispatches} mutation dispatch(es); controller verification owns the next decision`
+              : progressHandoff === "token_budget_exhausted"
+                ? `implementation token budget reached after ${mutationDispatches} mutation dispatch(es); controller verification owns the next decision`
               : result.finalMessage ??
                 workflowChildFailureMessage(input.kind, result)),
           usage,

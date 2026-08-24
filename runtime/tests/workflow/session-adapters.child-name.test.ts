@@ -64,6 +64,19 @@ describe("workflowImplementReachedBoundWithProgress", () => {
     ).toBe(true);
   });
 
+  it("hands a mutated token-budget denial to controller verification", () => {
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        {
+          outcome: "errored",
+          error: new Error("execution admission deny: budget_exceeded"),
+        },
+        1,
+      ),
+    ).toBe(true);
+  });
+
   it("does not mask an empty, non-implement, or unrelated child failure", () => {
     expect(
       workflowImplementReachedBoundWithProgress(
@@ -83,6 +96,26 @@ describe("workflowImplementReachedBoundWithProgress", () => {
       workflowImplementReachedBoundWithProgress(
         "implement",
         { outcome: "errored", error: new Error("provider unavailable") },
+        2,
+      ),
+    ).toBe(false);
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        {
+          outcome: "errored",
+          error: new Error("execution admission deny: budget_exceeded"),
+        },
+        0,
+      ),
+    ).toBe(false);
+    expect(
+      workflowImplementReachedBoundWithProgress(
+        "implement",
+        {
+          outcome: "errored",
+          error: new Error("execution admission deny: cost_exceeded"),
+        },
         2,
       ),
     ).toBe(false);
