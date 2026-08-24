@@ -100,14 +100,23 @@ export function capTurnContextMaxOutputTokens(
   if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
     throw new TypeError("maxOutputTokens must be a positive safe integer");
   }
-  const effectiveMaxOutputTokens = Math.min(
-    ctx.modelInfo.maxOutputTokens ?? maxOutputTokens,
-    maxOutputTokens,
-  );
   const effectiveUpperLimit = Math.min(
     ctx.modelInfo.maxOutputTokensUpperLimit ?? maxOutputTokens,
     maxOutputTokens,
   );
+  // A capped default is deliberately lower than the model's hard upper
+  // limit and exists only as the ordinary-turn starting point. A caller that
+  // supplies an explicit, stage-owned ceiling (for example the one-shot
+  // workflow reviewer) may widen that default, but must still remain inside
+  // both the requested ceiling and the model's advertised upper limit.
+  // Treat an uncapped lower value as a hard model limit and never widen it.
+  const effectiveMaxOutputTokens =
+    ctx.modelInfo.maxOutputTokensCappedDefault === true
+      ? effectiveUpperLimit
+      : Math.min(
+          ctx.modelInfo.maxOutputTokens ?? effectiveUpperLimit,
+          effectiveUpperLimit,
+        );
   return {
     ...ctx,
     modelInfo: {

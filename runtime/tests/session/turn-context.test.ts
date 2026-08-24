@@ -135,7 +135,7 @@ function mkNetworkProxy(): NetworkProxy {
 }
 
 describe("capTurnContextMaxOutputTokens", () => {
-  test("applies a persistent explicit ceiling without widening a lower model limit", () => {
+  test("applies a persistent explicit ceiling and only widens a capped default", () => {
     const ctx = buildTurnContext({
       conversationId: "cap-test",
       subId: "turn-1",
@@ -162,11 +162,50 @@ describe("capTurnContextMaxOutputTokens", () => {
       capTurnContextMaxOutputTokens(
         {
           ...ctx,
-          modelInfo: { ...ctx.modelInfo, maxOutputTokens: 4_096 },
+          modelInfo: {
+            ...ctx.modelInfo,
+            maxOutputTokens: 8_000,
+            maxOutputTokensUpperLimit: 64_000,
+            maxOutputTokensCappedDefault: true,
+          },
+        },
+        32_768,
+      ).modelInfo,
+    ).toMatchObject({
+      maxOutputTokens: 32_768,
+      maxOutputTokensUpperLimit: 32_768,
+      maxOutputTokensExplicit: true,
+      maxOutputTokensCappedDefault: false,
+    });
+
+    expect(
+      capTurnContextMaxOutputTokens(
+        {
+          ...ctx,
+          modelInfo: {
+            ...ctx.modelInfo,
+            maxOutputTokens: 4_096,
+            maxOutputTokensCappedDefault: false,
+          },
         },
         8_192,
       ).modelInfo.maxOutputTokens,
     ).toBe(4_096);
+
+    expect(
+      capTurnContextMaxOutputTokens(
+        {
+          ...ctx,
+          modelInfo: {
+            ...ctx.modelInfo,
+            maxOutputTokens: 2_048,
+            maxOutputTokensUpperLimit: 2_048,
+            maxOutputTokensCappedDefault: true,
+          },
+        },
+        32_768,
+      ).modelInfo.maxOutputTokens,
+    ).toBe(2_048);
   });
 
   test("rejects an invalid ceiling", () => {

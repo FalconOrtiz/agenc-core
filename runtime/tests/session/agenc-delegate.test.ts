@@ -1355,6 +1355,34 @@ describe("runAgenCReviewOneShot happy-path review", () => {
     expect(observedOptions?.maxOutputTokens).toBe(8_192);
   });
 
+  it("widens a capped default for an explicit review ceiling", async () => {
+    let observedOptions: LLMChatOptions | undefined;
+    const session = mkSession(
+      mkScriptedProvider({
+        content: "bounded reasoning review",
+        onChat: (_messages, options) => {
+          observedOptions = options;
+        },
+      }),
+    );
+    const reviewerModelInfo: ModelInfo = {
+      ...mkModelInfo("reasoning-reviewer"),
+      maxOutputTokens: 8_000,
+      maxOutputTokensUpperLimit: 64_000,
+      maxOutputTokensCappedDefault: true,
+    };
+
+    const outcome = await runAgenCReviewOneShot(session, {
+      ...mkOneShotRequest(session),
+      reviewerModel: "reasoning-reviewer",
+      reviewerModelInfo,
+      maxOutputTokens: 32_768,
+    });
+
+    expect(outcome.rawText).toBe("bounded reasoning review");
+    expect(observedOptions?.maxOutputTokens).toBe(32_768);
+  });
+
   it("forwards child approval and permission events to the parent event log", async () => {
     const session = mkSession(mkScriptedProvider({ content: "ok" }));
     const parentEvents: EventMsg[] = [];
