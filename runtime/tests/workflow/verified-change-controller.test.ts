@@ -743,6 +743,10 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     );
     expect(verifierPrompt).toContain("Use at most 2 tool calls");
     expect(verifierPrompt).toContain(
+      `git diff --stat ${BASE_COMMIT}...HEAD && git diff ${BASE_COMMIT}...HEAD -- .`,
+    );
+    expect(verifierPrompt).toContain("Never use `git diff HEAD`");
+    expect(verifierPrompt).toContain(
       "normally the final response is the third turn",
     );
     expect(verifierPrompt).toContain(
@@ -751,7 +755,10 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(verifierPrompt).toContain(
       "Never repeat a command or an equivalent check",
     );
-    expect(verifierPrompt).toContain("exit_code is authoritative");
+    expect(verifierPrompt).toContain("authenticated workflow evidence");
+    expect(verifierPrompt).toContain(
+      "Pull-request publication is a downstream step",
+    );
     expect(verifierPrompt).toContain("immediately write the final report");
 
     const implementPrompt = harness.spawner.spawns.find(

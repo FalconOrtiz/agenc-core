@@ -49,6 +49,11 @@ describe("workflowDelegateBounds", () => {
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
       maxTurns: 4,
+      maxOutputTokens: 8_192,
+    });
+    expect(workflowDelegateBounds("review")).toEqual({
+      maxTurns: 4,
+      maxOutputTokens: 8_192,
     });
   });
 });

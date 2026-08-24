@@ -67,6 +67,7 @@ import {
 } from "../session/child-run-journal.js";
 import { TerminalRunEpochOpenError } from "../session/rollout-store.js";
 import {
+  capTurnContextMaxOutputTokens,
   threadConfigSnapshot,
   type ReasoningEffort,
   type TurnContext,
@@ -148,6 +149,8 @@ export interface RunAgentParams {
   readonly querySource?: string;
   /** Optional per-child turn cap. */
   readonly maxTurns?: number;
+  /** Durable per-sampling output ceiling for this child. */
+  readonly maxOutputTokens?: number;
   /**
    * Suppress parent mailbox/progress relays. Canonical child recording remains
    * enabled because silent internal agents can still perform admitted work.
@@ -3766,7 +3769,7 @@ export async function* runAgent(
 
       const iter = childSession.runTurn(nextUserMessage, {
         ctx: (() => {
-          activeTurnContext =
+          const baseTurnContext =
             params.maxTurns !== undefined
               ? childSession.newTurnWithSubId(
                   childSession.nextInternalSubId(),
@@ -3774,6 +3777,13 @@ export async function* runAgent(
                 )
               : childSession.newDefaultTurnWithSubId(
                   childSession.nextInternalSubId(),
+                );
+          activeTurnContext =
+            params.maxOutputTokens === undefined
+              ? baseTurnContext
+              : capTurnContextMaxOutputTokens(
+                  baseTurnContext,
+                  params.maxOutputTokens,
                 );
           return activeTurnContext;
         })(),

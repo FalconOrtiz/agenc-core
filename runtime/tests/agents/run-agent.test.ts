@@ -291,6 +291,7 @@ function makeProvider(
       async (
         _messages: LLMMessage[],
         _onChunk: StreamProgressCallback,
+        _options?: LLMChatOptions,
       ): Promise<LLMResponse> => ({
         content: "",
         toolCalls: [],
@@ -1894,6 +1895,36 @@ describe("runAgent", () => {
       taskId: "max-turns-task",
     });
     expect(receipt?.content).toContain('"outcome":"errored"');
+  });
+
+  it("passes the durable child output ceiling to every provider sample", async () => {
+    const provider = makeProvider([{ content: "bounded result" }]);
+    const session = makeStubSession({
+      services: { provider },
+      modelInfo: {
+        ...mkModelInfo(),
+        maxOutputTokens: 131_072,
+        maxOutputTokensUpperLimit: 131_072,
+        maxOutputTokensCappedDefault: true,
+      },
+    });
+    const { live } = await spawnLive(session);
+
+    const { result } = await collectRun(
+      runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "go" }],
+        taskPrompt: "go",
+        maxOutputTokens: 8_192,
+      }),
+    );
+
+    expect(result.outcome).toBe("completed");
+    expect(provider.chatStream).toHaveBeenCalledOnce();
+    expect(
+      (provider.chatStream as ReturnType<typeof vi.fn>).mock.calls[0]?.[2],
+    ).toMatchObject({ maxOutputTokens: 8_192 });
   });
 
   it("does not reuse a non-keep-alive worker for queued follow-up input", async () => {

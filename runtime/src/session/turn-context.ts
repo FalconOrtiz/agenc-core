@@ -88,6 +88,38 @@ export interface ModelInfo {
   readonly usedFallbackModelMetadata: boolean;
 }
 
+/**
+ * Apply a durable per-stage output ceiling to a turn. Marking the ceiling as
+ * explicit prevents max-output recovery from silently expanding it on a
+ * later sampling iteration, which would defeat admission-budget planning.
+ */
+export function capTurnContextMaxOutputTokens(
+  ctx: TurnContext,
+  maxOutputTokens: number,
+): TurnContext {
+  if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
+    throw new TypeError("maxOutputTokens must be a positive safe integer");
+  }
+  const effectiveMaxOutputTokens = Math.min(
+    ctx.modelInfo.maxOutputTokens ?? maxOutputTokens,
+    maxOutputTokens,
+  );
+  const effectiveUpperLimit = Math.min(
+    ctx.modelInfo.maxOutputTokensUpperLimit ?? maxOutputTokens,
+    maxOutputTokens,
+  );
+  return {
+    ...ctx,
+    modelInfo: {
+      ...ctx.modelInfo,
+      maxOutputTokens: effectiveMaxOutputTokens,
+      maxOutputTokensUpperLimit: effectiveUpperLimit,
+      maxOutputTokensExplicit: true,
+      maxOutputTokensCappedDefault: false,
+    },
+  };
+}
+
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "none";
 export type ReasoningSummary = "auto" | "concise" | "detailed" | "none";
 export type TruncationPolicy = "head" | "middle" | "off";

@@ -91,6 +91,7 @@ export interface DelegateOpts {
   readonly childToolPolicy?: ChildToolPolicy;
   readonly depthCap?: number;
   readonly maxTurns?: number;
+  readonly maxOutputTokens?: number;
   readonly externalSignal?: AbortSignal;
   readonly capacityPermit?: AgentCapacityPermit;
   readonly capacityOwnerId?: string;
@@ -373,6 +374,9 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         ? { childToolPolicy: opts.childToolPolicy }
         : {}),
       ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
+      ...(opts.maxOutputTokens !== undefined
+        ? { maxOutputTokens: opts.maxOutputTokens }
+        : {}),
       ...(opts.externalSignal !== undefined
         ? { externalSignal: opts.externalSignal }
         : {}),
@@ -531,6 +535,7 @@ async function runDelegateAgentLoop(opts: {
   readonly toolAllowlist?: ReadonlyArray<string>;
   readonly childToolPolicy?: ChildToolPolicy;
   readonly maxTurns?: number;
+  readonly maxOutputTokens?: number;
   readonly externalSignal?: AbortSignal;
   readonly silent?: boolean;
   readonly model?: string;
@@ -565,6 +570,9 @@ async function runDelegateAgentLoop(opts: {
           ? { childToolPolicy: opts.childToolPolicy }
           : {}),
         ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
+        ...(opts.maxOutputTokens !== undefined
+          ? { maxOutputTokens: opts.maxOutputTokens }
+          : {}),
         ...(opts.externalSignal !== undefined
           ? { externalSignal: opts.externalSignal }
           : {}),

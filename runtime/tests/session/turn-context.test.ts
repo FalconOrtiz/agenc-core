@@ -15,6 +15,7 @@ import {
   applySessionConfiguration,
   buildPerTurnConfig,
   buildTurnContext,
+  capTurnContextMaxOutputTokens,
   agencHome,
   deepFreeze,
   deriveFileSystemSandboxPolicyForMode,
@@ -132,6 +133,56 @@ function mkNetworkProxy(): NetworkProxy {
     },
   };
 }
+
+describe("capTurnContextMaxOutputTokens", () => {
+  test("applies a persistent explicit ceiling without widening a lower model limit", () => {
+    const ctx = buildTurnContext({
+      conversationId: "cap-test",
+      subId: "turn-1",
+      config: mkConfig(),
+      modelInfo: {
+        ...mkModelInfo(),
+        maxOutputTokens: 131_072,
+        maxOutputTokensUpperLimit: 131_072,
+        maxOutputTokensCappedDefault: true,
+      },
+      provider: mkProvider(),
+      sessionConfiguration: mkSessionConfiguration(),
+    });
+    const capped = capTurnContextMaxOutputTokens(ctx, 8_192);
+    expect(capped.modelInfo).toMatchObject({
+      maxOutputTokens: 8_192,
+      maxOutputTokensUpperLimit: 8_192,
+      maxOutputTokensExplicit: true,
+      maxOutputTokensCappedDefault: false,
+    });
+    expect(ctx.modelInfo.maxOutputTokens).toBe(131_072);
+
+    expect(
+      capTurnContextMaxOutputTokens(
+        {
+          ...ctx,
+          modelInfo: { ...ctx.modelInfo, maxOutputTokens: 4_096 },
+        },
+        8_192,
+      ).modelInfo.maxOutputTokens,
+    ).toBe(4_096);
+  });
+
+  test("rejects an invalid ceiling", () => {
+    const ctx = buildTurnContext({
+      conversationId: "cap-test",
+      subId: "turn-2",
+      config: mkConfig(),
+      modelInfo: mkModelInfo(),
+      provider: mkProvider(),
+      sessionConfiguration: mkSessionConfiguration(),
+    });
+    expect(() => capTurnContextMaxOutputTokens(ctx, 0)).toThrow(
+      "maxOutputTokens must be a positive safe integer",
+    );
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────
 // A2 — image-generation OAuth gate parity

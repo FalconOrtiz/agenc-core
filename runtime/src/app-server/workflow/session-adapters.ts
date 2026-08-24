@@ -368,12 +368,14 @@ export interface WorkflowDelegateBounds {
   readonly role?: string;
   readonly toolAllowlist?: readonly string[];
   readonly maxTurns: number;
+  readonly maxOutputTokens?: number;
 }
 
 const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 3;
 const IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT = 1;
 const IMPLEMENT_FILE_READ_LINE_LIMIT = 320;
 const VERIFY_AGENT_TOOL_LIMIT = 2;
+const WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS = 8_192;
 const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Edit",
   "FileEdit",
@@ -534,9 +536,16 @@ export function workflowDelegateBounds(
       // Two independent checks, one normal final-response turn, and one
       // recovery turn if the model ignores the tool cap and policy denies a
       // third call. The denied call never reaches a tool or changes state.
-      return { role: "verification", maxTurns: 4 };
+      return {
+        role: "verification",
+        maxTurns: 4,
+        maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
+      };
     case "review":
-      return { maxTurns: 4 };
+      return {
+        maxTurns: 4,
+        maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
+      };
   }
 }
 
@@ -1195,6 +1204,9 @@ export function createWorkflowSessionSeams(
             : {}),
           ...(childToolPolicy !== undefined ? { childToolPolicy } : {}),
           maxTurns: bounds.maxTurns,
+          ...(bounds.maxOutputTokens !== undefined
+            ? { maxOutputTokens: bounds.maxOutputTokens }
+            : {}),
           agentName: workflowChildAgentName(input.childRunId),
           ...(input.spec.model !== undefined
             ? { model: input.spec.model }
@@ -1356,6 +1368,7 @@ export function createWorkflowSessionSeams(
           reviewerModel: input.reviewerModel,
           systemPrompt: input.systemPrompt,
           timeoutMs: input.timeoutMs,
+          maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
           reuseKey: false,
         },
       );

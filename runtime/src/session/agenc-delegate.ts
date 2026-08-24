@@ -28,7 +28,10 @@ import type {
   SessionConfiguration,
   TurnContext,
 } from "./turn-context.js";
-import { buildTurnContext } from "./turn-context.js";
+import {
+  buildTurnContext,
+  capTurnContextMaxOutputTokens,
+} from "./turn-context.js";
 import { Session, type AgentStatus, type SessionServices } from "./session.js";
 import { emitWarning, type Event, type EventMsg } from "./event-log.js";
 import type { ReviewOutput, ReviewRequest } from "./review.js";
@@ -174,6 +177,8 @@ export interface AgenCReviewOneShotRequest {
    *  Omitted means unbounded; callers that need a finite operational
    *  budget can opt in explicitly. */
   readonly timeoutMs?: number;
+  /** Durable output ceiling for the review model call. */
+  readonly maxOutputTokens?: number;
   /**
    * Optional reviewer system prompt override. Generic `/review` uses
    * `REVIEW_SYSTEM_PROMPT`; guardian approval review supplies the
@@ -1080,13 +1085,20 @@ export async function spawnAgenCDelegateThread(
           input: op.input,
         });
         delegateInputStarted = true;
-        const reviewCtx = buildReviewTurnContext(
+        const baseReviewCtx = buildReviewTurnContext(
           req.parentContext,
           reviewerModel,
           reviewerModelInfo,
           req.subId,
           provider,
         );
+        const reviewCtx =
+          req.maxOutputTokens === undefined
+            ? baseReviewCtx
+            : capTurnContextMaxOutputTokens(
+                baseReviewCtx,
+                req.maxOutputTokens,
+              );
         for await (const phase of activeChildSession.runTurn(userMessage, {
           ctx: reviewCtx,
           systemPrompt: req.systemPrompt ?? REVIEW_SYSTEM_PROMPT,
