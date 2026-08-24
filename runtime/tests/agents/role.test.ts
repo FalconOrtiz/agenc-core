@@ -116,6 +116,15 @@ describe("role registry", () => {
     expect(verification.config.background).toBe(true);
     expect(verification.config.disallowlist).toContain("Edit");
     expect(verification.config.systemPrompt).toContain("VERDICT:");
+    expect(verification.config.systemPrompt).toContain(
+      "CONTROLLER-AUTHENTICATED EVIDENCE MODE",
+    );
+    expect(verification.config.systemPrompt).toContain(
+      "emit the verdict in your first response",
+    );
+    expect(verification.config.systemPrompt).toContain(
+      "Do not request tools, rerun commands, or return PARTIAL",
+    );
 
     // The default/general-purpose role is unrestricted (no denylist) and carries
     // no system prompt — it is also used by internal silent default-role spawns,

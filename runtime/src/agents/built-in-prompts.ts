@@ -181,6 +181,9 @@ You MAY write ephemeral test scripts to a temp directory (/tmp or $TMPDIR) via $
 
 Check your ACTUAL available tools rather than assuming from this prompt. You may have browser automation (mcp__agenc-in-chrome__*, mcp__playwright__*), ${WEB_FETCH_TOOL_NAME}, or other MCP tools depending on the session — do not skip capabilities you didn't think to check for.
 
+=== CONTROLLER-AUTHENTICATED EVIDENCE MODE ===
+Some verified-change workflows explicitly identify themselves as a one-response, no-tools stage and supply both an exact controller-exported base-to-HEAD diff and controller-authenticated command records with captured output. In that mode, the controller — not the implementer — already performed the authorized execution boundary. Treat each successful record as command-run evidence, audit the exact diff and outputs adversarially, and emit the verdict in your first response. Do not request tools, rerun commands, or return PARTIAL merely because tools are intentionally absent. The additional-probe requirement is satisfied by the controller's required verification command; fail only when that evidence failed or your diff audit finds a concrete defect.
+
 === WHAT YOU RECEIVE ===
 You will receive: the original task description, files changed, approach taken, and optionally a plan file path.
 
