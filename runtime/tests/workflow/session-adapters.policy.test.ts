@@ -14,7 +14,14 @@
  * gone — while a child with no durable terminal stays honestly "unknown".
  */
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,6 +30,7 @@ import type { AgenCBootstrapFunction } from "../../src/app-server/background-age
 import {
   createWorkflowSessionSeams,
   inspectWorkflowChildTerminal,
+  prepareManagedVerificationCommand,
   recordWorkflowChildTerminal,
   workflowChildAdmissionUsage,
   workflowPermissionModeArgv,
@@ -88,6 +96,94 @@ function baseContext(mode: ToolPermissionContext["mode"]): ToolPermissionContext
     isBypassPermissionsModeAvailable: true,
   };
 }
+
+describe("managed verification sandbox boundary", () => {
+  it("runs only the immutable wrapper with a private per-check writable grant", async () => {
+    const environmentRoot = join(home, "verification-environments");
+    const runtimeRoot = join(home, "live-runtime");
+    const dependencyRoot = join(home, "dependency-material");
+    mkdirSync(environmentRoot, { mode: 0o700 });
+    mkdirSync(runtimeRoot, { mode: 0o700 });
+    mkdirSync(dependencyRoot, { mode: 0o700 });
+    const digest = "a".repeat(64);
+    const checkId = "npm-test";
+
+    const command = await prepareManagedVerificationCommand({
+      script: `/opt/agenc/bin/agenc-verify-contract ${digest} ${checkId}`,
+      cwd,
+      env: {
+        AGENC_MANAGED_LIVE_RUNTIME_ROOT: runtimeRoot,
+        AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
+        AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT: dependencyRoot,
+        AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_TRUSTED_UID: "10001",
+        OPENAI_API_KEY: "must-not-reach-verification",
+      },
+    });
+
+    const checkoutIdentity = createHash("sha256").update(cwd).digest("hex");
+    const writablePath = join(
+      environmentRoot,
+      digest,
+      checkoutIdentity,
+      checkId,
+    );
+    expect(command).toMatchObject({
+      program: "/opt/agenc/bin/agenc-verify-contract",
+      args: [digest, checkId],
+      cwd,
+      trustedExecutable: true,
+      env: {
+        AGENC_MANAGED_LIVE_RUNTIME_ROOT: runtimeRoot,
+        AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
+        AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT: dependencyRoot,
+        AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_TRUSTED_UID: "10001",
+      },
+      additionalPermissions: {
+        fileSystem: {
+          entries: [
+            {
+              path: { kind: "path", path: writablePath },
+              access: "write",
+            },
+          ],
+        },
+      },
+    });
+    expect(command?.env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(lstatSync(writablePath).mode & 0o777).toBe(0o700);
+  });
+
+  it("rejects shell additions to the managed wrapper command", async () => {
+    const environmentRoot = join(home, "verification-environments");
+    mkdirSync(environmentRoot, { mode: 0o700 });
+    await expect(
+      prepareManagedVerificationCommand({
+        script: `/opt/agenc/bin/agenc-verify-contract ${"b".repeat(64)} npm-test; echo unsafe`,
+        cwd,
+        env: {
+          AGENC_MANAGED_LIVE_RUNTIME_ROOT: join(home, "live-runtime"),
+          AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
+        },
+      }),
+    ).rejects.toThrow("must contain exactly");
+  });
+
+  it("rejects a verification root writable by another local principal", async () => {
+    const environmentRoot = join(home, "verification-environments");
+    mkdirSync(environmentRoot, { mode: 0o700 });
+    chmodSync(environmentRoot, 0o750);
+    await expect(
+      prepareManagedVerificationCommand({
+        script: `/opt/agenc/bin/agenc-verify-contract ${"c".repeat(64)} npm-test`,
+        cwd,
+        env: {
+          AGENC_MANAGED_LIVE_RUNTIME_ROOT: join(home, "live-runtime"),
+          AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
+        },
+      }),
+    ).rejects.toThrow("private runtime-owned directory");
+  });
+});
 
 /**
  * Minimal bootstrap double: derives the session's initial permission mode

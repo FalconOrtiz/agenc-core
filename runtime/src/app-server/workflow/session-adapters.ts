@@ -25,7 +25,9 @@
  *   isolated child session pinned to the spec's reviewer model.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, mkdir, realpath } from "node:fs/promises";
+import path from "node:path";
 
 import type {
   AgenCBootstrapFunction,
@@ -99,6 +101,143 @@ import { parseWorkflowStepId } from "./steps.js";
 
 const COMMAND_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const SETTLED_CHILDREN_LIMIT = 64;
+const MANAGED_VERIFICATION_PROGRAM = "/opt/agenc/bin/agenc-verify-contract";
+const MANAGED_VERIFICATION_COMMAND =
+  /^\/opt\/agenc\/bin\/agenc-verify-contract ([a-f0-9]{64}) ([A-Za-z0-9][A-Za-z0-9._:-]{2,127})$/u;
+const MANAGED_VERIFICATION_PATH =
+  "/opt/agenc/verification-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+function managedAbsolutePath(
+  env: NodeJS.ProcessEnv,
+  name: string,
+): string {
+  const value = env[name]?.trim();
+  if (
+    value === undefined ||
+    !path.isAbsolute(value) ||
+    path.resolve(value) !== value ||
+    value === path.parse(value).root ||
+    value.includes("\0")
+  ) {
+    throw new WorkflowSessionSeamError(
+      `${name} must be an absolute dedicated directory`,
+    );
+  }
+  return value;
+}
+
+async function assertPrivateVerificationDirectory(
+  directory: string,
+  label: string,
+): Promise<void> {
+  const metadata = await lstat(directory);
+  if (
+    !metadata.isDirectory() ||
+    metadata.isSymbolicLink() ||
+    (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+    (metadata.mode & 0o777) !== 0o700 ||
+    (await realpath(directory)) !== directory
+  ) {
+    throw new WorkflowSessionSeamError(
+      `${label} must be a private runtime-owned directory`,
+    );
+  }
+}
+
+/**
+ * Recognize the one immutable managed verification wrapper without invoking a
+ * shell. Its writable grant is narrowed to this checkout/check identity, so a
+ * verifier cannot mutate another run's cache inside the shared tmpfs.
+ */
+export async function prepareManagedVerificationCommand(input: {
+  readonly script: string;
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+}): Promise<
+  | Parameters<SandboxExecutionBrokerLike["prepareSpawn"]>[1]
+  | undefined
+> {
+  if (!input.script.startsWith(MANAGED_VERIFICATION_PROGRAM)) return undefined;
+  const match = MANAGED_VERIFICATION_COMMAND.exec(input.script);
+  if (match === null) {
+    throw new WorkflowSessionSeamError(
+      "managed verification command must contain exactly the admitted digest and check id",
+    );
+  }
+  const cwd = path.resolve(input.cwd);
+  if (cwd !== input.cwd || cwd === path.parse(cwd).root) {
+    throw new WorkflowSessionSeamError(
+      "managed verification checkout must be an absolute dedicated directory",
+    );
+  }
+  const environmentRoot = managedAbsolutePath(
+    input.env,
+    "AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT",
+  );
+  const runtimeRoot = managedAbsolutePath(
+    input.env,
+    "AGENC_MANAGED_LIVE_RUNTIME_ROOT",
+  );
+  await assertPrivateVerificationDirectory(
+    environmentRoot,
+    "managed verification environment root",
+  );
+  const checkoutIdentity = createHash("sha256").update(cwd).digest("hex");
+  const components = [match[1], checkoutIdentity, match[2]];
+  let environmentPath = environmentRoot;
+  for (const component of components) {
+    environmentPath = path.join(environmentPath, component);
+    try {
+      await mkdir(environmentPath, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    await assertPrivateVerificationDirectory(
+      environmentPath,
+      "managed verification environment",
+    );
+  }
+
+  const env: Record<string, string> = {
+    PATH: MANAGED_VERIFICATION_PATH,
+    AGENC_MANAGED_LIVE_RUNTIME_ROOT: runtimeRoot,
+    AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
+  };
+  const dependencyRoot = input.env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT?.trim();
+  if (dependencyRoot !== undefined && dependencyRoot.length > 0) {
+    env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT = managedAbsolutePath(
+      input.env,
+      "AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT",
+    );
+  }
+  const trustedUid =
+    input.env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_TRUSTED_UID?.trim();
+  if (trustedUid !== undefined && trustedUid.length > 0) {
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(trustedUid)) {
+      throw new WorkflowSessionSeamError(
+        "AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_TRUSTED_UID must be an integer",
+      );
+    }
+    env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_TRUSTED_UID = trustedUid;
+  }
+  return {
+    program: MANAGED_VERIFICATION_PROGRAM,
+    args: [match[1], match[2]],
+    cwd,
+    env,
+    trustedExecutable: true,
+    additionalPermissions: {
+      fileSystem: {
+        entries: [
+          {
+            path: { kind: "path", path: environmentPath },
+            access: "write",
+          },
+        ],
+      },
+    },
+  };
+}
 
 /** Session-coupled seam failure with a stable, typed diagnostic. */
 export class WorkflowSessionSeamError extends Error {
@@ -932,18 +1071,27 @@ export function createWorkflowSessionSeams(
       const runId = worktreeRunIds.get(input.cwd);
       const entry = await requireEntry(runId, "commands.run");
       const broker = sessionBroker(entry, input.cwd);
-      const command = broker.prepareSpawn("child_agent", {
-        program: "bash",
-        args: ["-lc", input.script],
-        cwd: input.cwd,
-        env: Object.fromEntries(
-          Object.entries(options.env ?? process.env).filter(
-            (pair): pair is [string, string] => typeof pair[1] === "string",
-          ),
+      const inheritedEnv = Object.fromEntries(
+        Object.entries(options.env ?? process.env).filter(
+          (pair): pair is [string, string] => typeof pair[1] === "string",
         ),
-        argv0: "bash",
-        trustedExecutable: true,
+      );
+      const managedVerification = await prepareManagedVerificationCommand({
+        script: input.script,
+        cwd: input.cwd,
+        env: inheritedEnv,
       });
+      const command = broker.prepareSpawn(
+        "child_agent",
+        managedVerification ?? {
+          program: "bash",
+          args: ["-lc", input.script],
+          cwd: input.cwd,
+          env: inheritedEnv,
+          argv0: "bash",
+          trustedExecutable: true,
+        },
+      );
       const startedAt = performance.now();
       const result = await runSupervisedProcess(command, {
         maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
