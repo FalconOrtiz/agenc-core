@@ -103,7 +103,10 @@ import {
   encodeWorkflowReviewTerminal,
   recordWorkflowChildTerminal,
 } from "./child-terminals.js";
-import { projectWorkflowStatus, type WorkflowRunStatus } from "./status-projection.js";
+import {
+  projectWorkflowStatus,
+  type WorkflowRunStatus,
+} from "./status-projection.js";
 import {
   deriveStageProjection,
   finalizeIdempotencyKey,
@@ -170,7 +173,9 @@ export interface WorkflowRunJournal {
    * The optional intent (additive, Phase 5) lets a real rollout-backed
    * journal emit a faithful `run_terminal` event; test journals ignore it.
    */
-  appendTerminal(intent?: WorkflowTerminalJournalIntent): WorkflowEffectEventRef;
+  appendTerminal(
+    intent?: WorkflowTerminalJournalIntent,
+  ): WorkflowEffectEventRef;
   close(): Promise<void>;
 }
 
@@ -219,7 +224,8 @@ export interface WorkflowJournalWriter {
   ): Promise<WorkflowRunJournal>;
 }
 
-export type WorkflowSpawnKind = "plan" | "implement" | "verify_agent" | "review";
+export type WorkflowSpawnKind =
+  "plan" | "implement" | "verify_agent" | "review";
 
 export interface WorkflowChildOutcome {
   readonly status: RunTerminalStatus;
@@ -322,7 +328,9 @@ export interface VerifiedChangeWorkflowControllerDeps {
   readonly commands: WorkflowCommandRunner;
   readonly spawner: WorkflowAgentSpawner;
   readonly reviewer: ReviewerInvoker;
-  readonly evidenceLedger: (spec: WorkflowSpec) => Promise<WorkflowEvidenceLedger>;
+  readonly evidenceLedger: (
+    spec: WorkflowSpec,
+  ) => Promise<WorkflowEvidenceLedger>;
   readonly warn: (message: string) => void;
   readonly now?: () => Date;
   readonly newRunId?: () => string;
@@ -869,7 +877,8 @@ export class VerifiedChangeWorkflowController {
       await this.#closeJournal(ctx);
       return true;
     }
-    const specDigest = (evidence.specDigest ?? computeSpecDigest(spec)) as Sha256Digest;
+    const specDigest = (evidence.specDigest ??
+      computeSpecDigest(spec)) as Sha256Digest;
     const admission = this.#deps.admission({
       runId,
       sessionId: journal.sessionId,
@@ -1178,11 +1187,7 @@ export class VerifiedChangeWorkflowController {
         script: preExportCommand,
         cwd: handle.path,
       });
-      if (
-        prepared.exitCode !== 0 ||
-        prepared.timedOut ||
-        prepared.truncated
-      ) {
+      if (prepared.exitCode !== 0 || prepared.timedOut || prepared.truncated) {
         throw new Error(
           "approved pre-export verification did not produce an exact passing tree",
         );
@@ -1193,7 +1198,10 @@ export class VerifiedChangeWorkflowController {
     const exported = await this.#deps.worktrees.exportPatch({
       handle,
       baseCommit: spec.baseCommit,
-      step: { runId: ctx.runId, stepId: stageStepId("workflow.verify", attempt) },
+      step: {
+        runId: ctx.runId,
+        stepId: stageStepId("workflow.verify", attempt),
+      },
       sink: ledger,
     });
     ctx.export = exported;
@@ -1438,7 +1446,11 @@ export class VerifiedChangeWorkflowController {
           kind: "spawn",
           recoveryCategory: "side-effecting",
           intentDigest: sha256Digest(
-            canonicalizeJson({ stepId, childRunId, reviewer: ctx.spec.reviewerModel }),
+            canonicalizeJson({
+              stepId,
+              childRunId,
+              reviewer: ctx.spec.reviewerModel,
+            }),
           ),
           childRunId,
           // The review model call is admitted and reconciled by its isolated
@@ -1536,7 +1548,8 @@ export class VerifiedChangeWorkflowController {
       throw new WorkflowHaltError({
         status: "failed",
         stopReason: "evidence_invalid",
-        finalMessage: "review committed without its independent_review artifact",
+        finalMessage:
+          "review committed without its independent_review artifact",
       });
     }
     ctx.review = {
@@ -1841,7 +1854,9 @@ export class VerifiedChangeWorkflowController {
     const verification = ctx.verification;
     const review = ctx.review;
     if (verification === undefined || review === undefined) {
-      throw new Error("record assembly requires verification and review context");
+      throw new Error(
+        "record assembly requires verification and review context",
+      );
     }
     const finalVerificationAttempt = Math.max(
       1,
@@ -2278,9 +2293,8 @@ export class VerifiedChangeWorkflowController {
     }
     if (existing !== undefined && plan.recoveryCategory === "side-effecting") {
       // D3: ADOPT, never respawn.
-      const adopted = plan.adopt === undefined
-        ? undefined
-        : await plan.adopt(existing);
+      const adopted =
+        plan.adopt === undefined ? undefined : await plan.adopt(existing);
       if (adopted === undefined) {
         ctx.journal.appendUnknown({
           stepId: plan.stepId,
@@ -2418,7 +2432,10 @@ export class VerifiedChangeWorkflowController {
       if (error instanceof WorkflowHaltError) {
         if (!settled) {
           if (dispatched) {
-            ctx.admission.holdUnknown(reservationId, "workflow_halt_after_dispatch");
+            ctx.admission.holdUnknown(
+              reservationId,
+              "workflow_halt_after_dispatch",
+            );
           } else {
             ctx.admission.void(reservationId, "workflow_halt_before_dispatch");
           }
@@ -2444,7 +2461,10 @@ export class VerifiedChangeWorkflowController {
             },
             true,
           );
-          ctx.admission.holdUnknown(reservationId, "workflow_cancelled_after_dispatch");
+          ctx.admission.holdUnknown(
+            reservationId,
+            "workflow_cancelled_after_dispatch",
+          );
           settled = true;
           throw new WorkflowHaltError({
             status: "cancelled",
@@ -2498,7 +2518,10 @@ export class VerifiedChangeWorkflowController {
             costUsd: 0,
           });
         } else {
-          ctx.admission.void(reservationId, "workflow_step_failed_before_dispatch");
+          ctx.admission.void(
+            reservationId,
+            "workflow_step_failed_before_dispatch",
+          );
         }
         settled = true;
         return {
@@ -2717,8 +2740,7 @@ function freezeWorkflowSpec(
     },
     ...(params.model !== undefined ? { model: params.model } : {}),
     ...(params.provider !== undefined ? { provider: params.provider } : {}),
-    reviewerModel:
-      params.reviewerModel ?? params.model ?? "default-reviewer",
+    reviewerModel: params.reviewerModel ?? params.model ?? "default-reviewer",
     permissionMode: params.permissionMode ?? DEFAULT_PERMISSION_MODE,
     ...(params.unattendedAllow !== undefined
       ? { unattendedAllow: params.unattendedAllow }
@@ -2791,9 +2813,7 @@ function buildImplementPrompt(
       ctx.verification.records,
       ctx.verification.excerpts,
     );
-    const timedOut = ctx.verification.records.some(
-      (record) => record.timedOut,
-    );
+    const timedOut = ctx.verification.records.some((record) => record.timedOut);
     lines.push(
       "",
       `## Previous verification failure (attempt ${attempt - 1})`,
@@ -2835,11 +2855,7 @@ function buildVerificationFailureDiagnostics(
   const lines: string[] = [];
   let remaining = MAX_RETRY_DIAGNOSTIC_CHARACTERS;
   for (const record of records) {
-    if (
-      record.exitCode === 0 &&
-      !record.timedOut &&
-      !record.truncated
-    ) {
+    if (record.exitCode === 0 && !record.timedOut && !record.truncated) {
       continue;
     }
     const diagnostic = excerpts[record.label];
@@ -2871,7 +2887,8 @@ function buildVerifyAgentPrompt(
     "You are an ADVERSARIAL verification agent for a proposed code change.",
     "Independently verify the change in the current worktree against the goal.",
     "Re-run spot checks; do not trust the implementer's claims.",
-    "The runtime hard-stops this stage after 3 model turns. Use at most 2 tool calls: inspect the relevant diff and run at most one focused adversarial probe; the final response consumes the last turn.",
+    "The runtime hard-stops this stage after 4 model turns. Use at most 2 tool calls: inspect the relevant diff and run at most one focused adversarial probe; normally the final response is the third turn.",
+    "The fourth turn is reserved only for recovery if runtime policy denies an extra tool request. After a denial, request no more tools and emit the final report immediately.",
     "Never repeat a command or an equivalent check while the worktree is unchanged.",
     "An exec_command result's exit_code is authoritative even when the command writes no stdout; do not rerun it only to print the exit code.",
     "After the bounded checks, immediately write the final report and VERDICT line instead of using the remaining turn allowance.",

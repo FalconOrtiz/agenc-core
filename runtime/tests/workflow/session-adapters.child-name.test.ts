@@ -48,7 +48,7 @@ describe("workflowDelegateBounds", () => {
     expect(workflowDelegateBounds("implement")).toEqual({ maxTurns: 8 });
     expect(workflowDelegateBounds("verify_agent")).toEqual({
       role: "verification",
-      maxTurns: 3,
+      maxTurns: 4,
     });
   });
 });
@@ -58,7 +58,10 @@ describe("workflowImplementReachedBoundWithProgress", () => {
     expect(
       workflowImplementReachedBoundWithProgress(
         "implement",
-        { outcome: "errored", error: new Error("subagent exceeded maxTurns (8)") },
+        {
+          outcome: "errored",
+          error: new Error("subagent exceeded maxTurns (8)"),
+        },
         2,
       ),
     ).toBe(true);
@@ -81,14 +84,20 @@ describe("workflowImplementReachedBoundWithProgress", () => {
     expect(
       workflowImplementReachedBoundWithProgress(
         "implement",
-        { outcome: "errored", error: new Error("subagent exceeded maxTurns (8)") },
+        {
+          outcome: "errored",
+          error: new Error("subagent exceeded maxTurns (8)"),
+        },
         0,
       ),
     ).toBe(false);
     expect(
       workflowImplementReachedBoundWithProgress(
         "verify_agent",
-        { outcome: "errored", error: new Error("subagent exceeded maxTurns (3)") },
+        {
+          outcome: "errored",
+          error: new Error("subagent exceeded maxTurns (3)"),
+        },
         2,
       ),
     ).toBe(false);
@@ -132,7 +141,11 @@ describe("workflowDelegateToolPolicy", () => {
     expect(
       await policy!(
         { name: "FileRead" },
-        { file_path: "/checkout/repo/tests/a.test.ts", offset: 800, limit: 1_200 },
+        {
+          file_path: "/checkout/repo/tests/a.test.ts",
+          offset: 800,
+          limit: 1_200,
+        },
       ),
     ).toEqual({
       behavior: "allow",
@@ -165,7 +178,10 @@ describe("workflowDelegateToolPolicy", () => {
       updatedInput: { file_path: "src/a.ts" },
     });
     expect(
-      await policy!({ name: "FileRead" }, { file_path: "tests/a.test.ts", limit: 900 }),
+      await policy!(
+        { name: "FileRead" },
+        { file_path: "tests/a.test.ts", limit: 900 },
+      ),
     ).toEqual({
       behavior: "allow",
       updatedInput: { file_path: "tests/a.test.ts", limit: 320 },
@@ -192,9 +208,35 @@ describe("workflowDelegateToolPolicy", () => {
     });
   });
 
-  it("does not constrain non-implementation workflow children", () => {
+  it("caps adversarial verification tools and preserves a final-response recovery turn", async () => {
+    const policy = workflowDelegateToolPolicy("verify_agent");
+    expect(policy).toBeDefined();
+    expect(
+      await policy!({ name: "FileRead" }, { file_path: "src/a.ts" }),
+    ).toEqual({
+      behavior: "allow",
+      updatedInput: { file_path: "src/a.ts" },
+    });
+    expect(
+      await policy!({ name: "Bash" }, { command: "npm test -- --focused" }),
+    ).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "npm test -- --focused" },
+    });
+    expect(
+      await policy!({ name: "Grep" }, { pattern: "another-check" }),
+    ).toMatchObject({
+      behavior: "deny",
+      metadata: {
+        workflowPolicy: "verify_agent_tool_limit",
+        limit: 2,
+        attemptedTool: "Grep",
+      },
+    });
+  });
+
+  it("does not constrain plan or review workflow children", () => {
     expect(workflowDelegateToolPolicy("plan")).toBeUndefined();
-    expect(workflowDelegateToolPolicy("verify_agent")).toBeUndefined();
     expect(workflowDelegateToolPolicy("review")).toBeUndefined();
   });
 });

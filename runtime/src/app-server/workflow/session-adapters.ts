@@ -29,9 +29,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
-import type {
-  AgenCBootstrapFunction,
-} from "../background-agent-runner.js";
+import type { AgenCBootstrapFunction } from "../background-agent-runner.js";
 import {
   bootstrapLocalRuntimeSession,
   type LocalRuntimeBootstrap,
@@ -107,10 +105,7 @@ const MANAGED_VERIFICATION_COMMAND =
 const MANAGED_VERIFICATION_PATH =
   "/opt/agenc/verification-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-function managedAbsolutePath(
-  env: NodeJS.ProcessEnv,
-  name: string,
-): string {
+function managedAbsolutePath(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (
     value === undefined ||
@@ -134,7 +129,8 @@ async function assertPrivateVerificationDirectory(
   if (
     !metadata.isDirectory() ||
     metadata.isSymbolicLink() ||
-    (typeof process.getuid === "function" && metadata.uid !== process.getuid()) ||
+    (typeof process.getuid === "function" &&
+      metadata.uid !== process.getuid()) ||
     (metadata.mode & 0o777) !== 0o700 ||
     (await realpath(directory)) !== directory
   ) {
@@ -154,8 +150,7 @@ export async function prepareManagedVerificationCommand(input: {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
 }): Promise<
-  | Parameters<SandboxExecutionBrokerLike["prepareSpawn"]>[1]
-  | undefined
+  Parameters<SandboxExecutionBrokerLike["prepareSpawn"]>[1] | undefined
 > {
   if (!input.script.startsWith(MANAGED_VERIFICATION_PROGRAM)) return undefined;
   const match = MANAGED_VERIFICATION_COMMAND.exec(input.script);
@@ -203,7 +198,8 @@ export async function prepareManagedVerificationCommand(input: {
     AGENC_MANAGED_LIVE_RUNTIME_ROOT: runtimeRoot,
     AGENC_MANAGED_VERIFICATION_ENVIRONMENT_ROOT: environmentRoot,
   };
-  const dependencyRoot = input.env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT?.trim();
+  const dependencyRoot =
+    input.env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT?.trim();
   if (dependencyRoot !== undefined && dependencyRoot.length > 0) {
     env.AGENC_MANAGED_NPM_DEPENDENCY_MATERIAL_ROOT = managedAbsolutePath(
       input.env,
@@ -377,6 +373,7 @@ export interface WorkflowDelegateBounds {
 const IMPLEMENT_PRE_MUTATION_TOOL_LIMIT = 3;
 const IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT = 1;
 const IMPLEMENT_FILE_READ_LINE_LIMIT = 320;
+const VERIFY_AGENT_TOOL_LIMIT = 2;
 const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Edit",
   "FileEdit",
@@ -449,6 +446,25 @@ export function workflowDelegateToolPolicy(
   prompt?: string,
   onMutationDispatch?: () => void,
 ): ChildToolPolicy | undefined {
+  if (kind === "verify_agent") {
+    let toolCalls = 0;
+    return (tool, input) => {
+      toolCalls += 1;
+      if (toolCalls <= VERIFY_AGENT_TOOL_LIMIT) {
+        return { behavior: "allow", updatedInput: { ...input } };
+      }
+      return {
+        behavior: "deny",
+        message:
+          "Adversarial verification tool budget exhausted. Do not request another tool. Use the diff and probe results already returned, write the final verification report now, and end with exactly one VERDICT line. A denied call consumes the recovery turn.",
+        metadata: {
+          workflowPolicy: "verify_agent_tool_limit",
+          limit: VERIFY_AGENT_TOOL_LIMIT,
+          attemptedTool: tool.name,
+        },
+      };
+    };
+  }
   if (kind !== "implement") return undefined;
   let preMutationCalls = 0;
   let mutationDispatches = 0;
@@ -475,9 +491,7 @@ export function workflowDelegateToolPolicy(
         return { behavior: "allow", updatedInput };
       }
       postMutationInspections += 1;
-      if (
-        postMutationInspections <= IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT
-      ) {
+      if (postMutationInspections <= IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT) {
         return { behavior: "allow", updatedInput };
       }
       return {
@@ -517,7 +531,10 @@ export function workflowDelegateBounds(
     case "implement":
       return { maxTurns: 8 };
     case "verify_agent":
-      return { role: "verification", maxTurns: 3 };
+      // Two independent checks, one normal final-response turn, and one
+      // recovery turn if the model ignores the tool cap and policy denies a
+      // third call. The denied call never reaches a tool or changes state.
+      return { role: "verification", maxTurns: 4 };
     case "review":
       return { maxTurns: 4 };
   }
@@ -537,9 +554,7 @@ export function workflowChildFailureMessage(
   return `workflow ${kind} child ${result.outcome}${reason}`;
 }
 
-type WorkflowImplementProgressHandoff =
-  | "turn_bound"
-  | "token_budget_exhausted";
+type WorkflowImplementProgressHandoff = "turn_bound" | "token_budget_exhausted";
 
 /**
  * A bounded implementer can exhaust either its conversation or the signed
@@ -1249,12 +1264,12 @@ export function createWorkflowSessionSeams(
         return {
           status,
           finalMessage:
-            (progressHandoff === "turn_bound"
+            progressHandoff === "turn_bound"
               ? `implementation turn bound reached after ${mutationDispatches} mutation dispatch(es); controller verification owns the next decision`
               : progressHandoff === "token_budget_exhausted"
                 ? `implementation token budget reached after ${mutationDispatches} mutation dispatch(es); controller verification owns the next decision`
-              : result.finalMessage ??
-                workflowChildFailureMessage(input.kind, result)),
+                : (result.finalMessage ??
+                  workflowChildFailureMessage(input.kind, result)),
           usage,
           ...(heldUnknownCount > 0
             ? { usageHeldUnknownCount: heldUnknownCount }
@@ -1305,8 +1320,7 @@ export function createWorkflowSessionSeams(
       // (D3: the run terminates unknown_outcome with review pending, never
       // a silent respawn).
       try {
-        const repo =
-          entry?.repo ?? options.durability({ runId: ownerRunId });
+        const repo = entry?.repo ?? options.durability({ runId: ownerRunId });
         const durable = inspectWorkflowChildTerminal(repo, childRunId);
         if (durable !== undefined) {
           return { state: "terminal", outcome: durable };

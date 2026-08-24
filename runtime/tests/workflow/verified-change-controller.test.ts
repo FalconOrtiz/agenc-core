@@ -17,7 +17,10 @@ import {
   type WorkflowWorktreeBroker,
 } from "../../src/app-server/workflow/verified-change-controller.js";
 import { inspectWorkflowChildTerminal } from "../../src/app-server/workflow/child-terminals.js";
-import { AdmissionDeniedError, type ExecutionAdmissionClient } from "../../src/budget/admission-client.js";
+import {
+  AdmissionDeniedError,
+  type ExecutionAdmissionClient,
+} from "../../src/budget/admission-client.js";
 import { M5WorkflowFailpointError } from "../../src/durability/failpoints.js";
 import type { AdmissionLease } from "../../src/budget/admission-types.js";
 import type {
@@ -27,9 +30,7 @@ import type {
 } from "../../src/contracts/run-contracts.js";
 import { sha256Digest } from "../../src/eval-contract/canonical-json.js";
 import type { Sha256Digest } from "../../src/eval-contract/types.js";
-import {
-  StateRunDurabilityRepository,
-} from "../../src/state/run-durability.js";
+import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
 import {
   openStateDatabases,
   type StateSqliteDriver,
@@ -45,7 +46,10 @@ import type {
   SealedEvidenceProof,
 } from "../../src/workflow/worktree-lifecycle.js";
 import type { WorktreeHandle } from "../../src/agents/worktree.js";
-import { validateVerifiedChangeRecord, type VerifiedChangeRecord } from "../../src/workflow/evidence-record.js";
+import {
+  validateVerifiedChangeRecord,
+  type VerifiedChangeRecord,
+} from "../../src/workflow/evidence-record.js";
 
 // ---------------------------------------------------------------------------
 // Failpoint arming (throw action — simulated crash, nothing may be recorded)
@@ -277,7 +281,8 @@ class MemoryLedger implements WorkflowEvidenceLedger {
 
   async readArtifact(pointer: RunArtifactPointer): Promise<Uint8Array> {
     const bytes = this.payloads.get(pointer.digest.slice("sha256:".length));
-    if (bytes === undefined) throw new Error(`missing payload ${pointer.digest}`);
+    if (bytes === undefined)
+      throw new Error(`missing payload ${pointer.digest}`);
     return bytes;
   }
 
@@ -427,7 +432,10 @@ class FakeSpawner implements WorkflowAgentSpawner {
     const scripted = this.inspections.get(childRunId);
     if (scripted !== undefined) return scripted;
     if (this.durableRepo !== undefined) {
-      const durable = inspectWorkflowChildTerminal(this.durableRepo, childRunId);
+      const durable = inspectWorkflowChildTerminal(
+        this.durableRepo,
+        childRunId,
+      );
       if (durable !== undefined) return { state: "terminal", outcome: durable };
     }
     return { state: "unknown" };
@@ -576,7 +584,9 @@ async function runToTerminal(
   harness: Harness,
   overrides: Partial<WorkflowStartParams> = {},
 ): Promise<void> {
-  const result = await harness.controller.start(startParams(harness, overrides));
+  const result = await harness.controller.start(
+    startParams(harness, overrides),
+  );
   await harness.controller.awaitRun(result.runId);
 }
 
@@ -628,12 +638,9 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
       "/opt/agenc/bin/agenc-verify-contract " +
       "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
       "npm-test";
-    harness.worktrees.baseCommit =
-      "8935c9e77e5104d0fa4c50a560123b88b92155f0";
+    harness.worktrees.baseCommit = "8935c9e77e5104d0fa4c50a560123b88b92155f0";
     await runToTerminal(harness, {
-      requiredVerification: [
-        { id: "npm-test", label: "npm test", script },
-      ],
+      requiredVerification: [{ id: "npm-test", label: "npm test", script }],
     });
     expect(harness.commands.executed).toEqual([script, script]);
     expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
@@ -731,9 +738,16 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const verifierPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "verify_agent",
     )?.prompt;
-    expect(verifierPrompt).toContain("hard-stops this stage after 3 model turns");
+    expect(verifierPrompt).toContain(
+      "hard-stops this stage after 4 model turns",
+    );
     expect(verifierPrompt).toContain("Use at most 2 tool calls");
-    expect(verifierPrompt).toContain("final response consumes the last turn");
+    expect(verifierPrompt).toContain(
+      "normally the final response is the third turn",
+    );
+    expect(verifierPrompt).toContain(
+      "fourth turn is reserved only for recovery",
+    );
     expect(verifierPrompt).toContain(
       "Never repeat a command or an equivalent check",
     );
@@ -743,7 +757,9 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const implementPrompt = harness.spawner.spawns.find(
       (spawn) => spawn.kind === "implement",
     )?.prompt;
-    expect(implementPrompt).toContain("hard-stops this stage after 8 model turns");
+    expect(implementPrompt).toContain(
+      "hard-stops this stage after 8 model turns",
+    );
     expect(implementPrompt).toContain("Use at most 7 tool calls");
     expect(implementPrompt).toContain("final response consumes the last turn");
     expect(implementPrompt).toContain("deterministic repository context seed");
@@ -752,7 +768,9 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     expect(implementPrompt).toContain(
       "runtime policy denies every non-mutation call",
     );
-    expect(implementPrompt).toContain("first source mutation must be tool call 4");
+    expect(implementPrompt).toContain(
+      "first source mutation must be tool call 4",
+    );
     expect(implementPrompt).toContain("Use only repository-relative paths");
     expect(implementPrompt).toContain("a source-only change is incomplete");
     expect(implementPrompt).toContain("Reserve the final turn");
@@ -803,16 +821,16 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
       (spawn) => spawn.kind === "implement",
     );
     expect(implementSpawns).toHaveLength(2);
-    expect(implementSpawns[1].prompt).toContain("Previous verification failure");
+    expect(implementSpawns[1].prompt).toContain(
+      "Previous verification failure",
+    );
     expect(implementSpawns[1].prompt).toContain(
       "untrusted repository/test data",
     );
     expect(implementSpawns[1].prompt).toContain(
       "tests/amd-gpu-detection.test.js:587 SyntaxError",
     );
-    expect(implementSpawns[1].prompt).toContain(
-      "make the minimal correction",
-    );
+    expect(implementSpawns[1].prompt).toContain("make the minimal correction");
     expect(implementSpawns[1].prompt).toContain(
       "At least one required command timed out",
     );
@@ -894,7 +912,10 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
   it("policy_denied at intake terminates before any pipeline step", async () => {
     harness.admission.denials.push({
       match: (stepId) => stepId === "workflow.intake",
-      error: new AdmissionDeniedError("policy refused unattended writes", "deny"),
+      error: new AdmissionDeniedError(
+        "policy refused unattended writes",
+        "deny",
+      ),
     });
     await expect(
       harness.controller.start(startParams(harness)),
@@ -1151,9 +1172,9 @@ describe("VerifiedChangeWorkflowController — crash recovery (D3)", () => {
     );
     disarmFailpoint();
     expect(harness.commands.executed).toHaveLength(1);
-    expect(harness.repo.getEffect(RUN_ID, "workflow.verify.agent")?.outcome).toBe(
-      "committed",
-    );
+    expect(
+      harness.repo.getEffect(RUN_ID, "workflow.verify.agent")?.outcome,
+    ).toBe("committed");
 
     await harness.controller.resumeOpenWorkflows();
     await harness.controller.awaitRun(RUN_ID);
@@ -1190,9 +1211,9 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     const interrupted = harness.repo.getEffect(RUN_ID, "workflow.review")!;
     expect(interrupted.outcome).toBeUndefined();
     expect(interrupted.childRunId).toBe(REVIEW_CHILD);
-    expect(
-      harness.repo.getCurrentTerminalResult(REVIEW_CHILD)?.status,
-    ).toBe("completed");
+    expect(harness.repo.getCurrentTerminalResult(REVIEW_CHILD)?.status).toBe(
+      "completed",
+    );
     expect(harness.reviewer.invocations).toHaveLength(1);
 
     await harness.controller.resumeOpenWorkflows();
@@ -1231,9 +1252,7 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     expect(
       harness.repo.getEffect(RUN_ID, "workflow.review")?.outcome,
     ).toBeUndefined();
-    expect(
-      harness.repo.getCurrentTerminalResult(REVIEW_CHILD),
-    ).toBeUndefined();
+    expect(harness.repo.getCurrentTerminalResult(REVIEW_CHILD)).toBeUndefined();
 
     await harness.controller.resumeOpenWorkflows();
     await harness.controller.awaitRun(RUN_ID);
@@ -1260,9 +1279,9 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     );
     disarmFailpoint();
     // The unparseable settle IS durable — as a FAILED review child terminal.
-    expect(
-      harness.repo.getCurrentTerminalResult(REVIEW_CHILD)?.status,
-    ).toBe("failed");
+    expect(harness.repo.getCurrentTerminalResult(REVIEW_CHILD)?.status).toBe(
+      "failed",
+    );
 
     await harness.controller.resumeOpenWorkflows();
     await harness.controller.awaitRun(RUN_ID);
@@ -1272,9 +1291,9 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
     expect(harness.repo.getEffect(RUN_ID, "workflow.review")?.outcome).toBe(
       "failed",
     );
-    expect(
-      harness.repo.getEffect(RUN_ID, "workflow.review#2")?.outcome,
-    ).toBe("committed");
+    expect(harness.repo.getEffect(RUN_ID, "workflow.review#2")?.outcome).toBe(
+      "committed",
+    );
     expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
       "completed",
     );
@@ -1328,9 +1347,11 @@ describe("VerifiedChangeWorkflowController — child usage rollup", () => {
     // The durable child evidence carries the usage and NOTES the holds
     // (held_unknown spend is never summed into any total).
     const implement = harness.repo.getEffect(RUN_ID, "workflow.implement")!;
-    const child = (implement.evidence as {
-      child?: { usage?: unknown; usageHeldUnknown?: number };
-    }).child!;
+    const child = (
+      implement.evidence as {
+        child?: { usage?: unknown; usageHeldUnknown?: number };
+      }
+    ).child!;
     expect(child.usage).toEqual({
       inputTokens: 100,
       outputTokens: 50,
