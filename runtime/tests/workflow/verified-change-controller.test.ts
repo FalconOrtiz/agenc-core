@@ -729,6 +729,10 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
   it("verification_failed after the bounded re-implement budget is exhausted", async () => {
     harness.commands.byScript.set("run-tests", {
       exitCode: 1,
+      timedOut: true,
+      stdout: new TextEncoder().encode(
+        "Fast unit... OK (20ms)\nCleanup regression... OK (58.1s)\n",
+      ),
       stderr: new TextEncoder().encode(
         "tests/amd-gpu-detection.test.js:587 SyntaxError: await is only valid in async functions",
       ),
@@ -761,6 +765,15 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     );
     expect(implementSpawns[1].prompt).toContain(
       "make the minimal correction",
+    );
+    expect(implementSpawns[1].prompt).toContain(
+      "At least one required command timed out",
+    );
+    expect(implementSpawns[1].prompt).toContain(
+      "a test reported as passing may still keep its process alive",
+    );
+    expect(implementSpawns[1].prompt).toContain(
+      "Cleanup regression... OK (58.1s)",
     );
     expect(
       harness.spawner.spawns.filter((spawn) => spawn.kind === "verify_agent"),
