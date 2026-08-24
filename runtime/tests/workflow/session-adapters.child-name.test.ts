@@ -53,8 +53,8 @@ describe("workflowDelegateBounds", () => {
       maxOutputTokens: 4_096,
     });
     expect(workflowDelegateBounds("review")).toEqual({
-      maxTurns: 4,
-      maxOutputTokens: 4_096,
+      maxTurns: 1,
+      maxOutputTokens: 32_768,
     });
   });
 });

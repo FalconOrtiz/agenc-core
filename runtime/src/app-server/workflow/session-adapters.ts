@@ -376,6 +376,12 @@ const IMPLEMENT_POST_MUTATION_INSPECTION_LIMIT = 1;
 const IMPLEMENT_FILE_READ_LINE_LIMIT = 320;
 const VERIFY_AGENT_TOOL_LIMIT = 0;
 const WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS = 4_096;
+// Reasoning providers can report hidden reasoning tokens as output usage even
+// when the visible one-shot review is a compact JSON object. Reserve enough
+// for that provider-reported usage so a valid settled review cannot be turned
+// into provider_overrun after dispatch. This remains well below the signed
+// per-run token ceiling and the review still has exactly one model response.
+const WORKFLOW_REVIEW_MAX_OUTPUT_TOKENS = 32_768;
 const IMPLEMENT_MUTATION_TOOLS = new Set([
   "Edit",
   "FileEdit",
@@ -544,8 +550,8 @@ export function workflowDelegateBounds(
       };
     case "review":
       return {
-        maxTurns: 4,
-        maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
+        maxTurns: 1,
+        maxOutputTokens: WORKFLOW_REVIEW_MAX_OUTPUT_TOKENS,
       };
   }
 }
@@ -1369,7 +1375,7 @@ export function createWorkflowSessionSeams(
           reviewerModel: input.reviewerModel,
           systemPrompt: input.systemPrompt,
           timeoutMs: input.timeoutMs,
-          maxOutputTokens: WORKFLOW_VERIFICATION_MAX_OUTPUT_TOKENS,
+          maxOutputTokens: WORKFLOW_REVIEW_MAX_OUTPUT_TOKENS,
           reuseKey: false,
         },
       );
