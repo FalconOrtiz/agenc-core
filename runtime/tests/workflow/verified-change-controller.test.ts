@@ -606,28 +606,48 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("VerifiedChangeWorkflowController — happy path", () => {
-  it("scopes the funded Strix pre-export verifier to the exact base and command", () => {
-    const script =
+  it("scopes funded pre-export verifiers to exact bases and commands", () => {
+    const strixScript =
       "/opt/agenc/bin/agenc-verify-contract " +
       "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
+      "npm-test";
+    const defaultModelScript =
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "e9e452e4df3cf13c0f4e5cf8b8e2cc7bdb3fb0a961c27339b753d8a3e6e3b792 " +
       "npm-test";
     expect(
       approvedPreExportVerificationCommand({
         baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
-        requiredVerification: [{ id: "npm-test", label: "npm test", script }],
+        requiredVerification: [
+          { id: "npm-test", label: "npm test", script: strixScript },
+        ],
       }),
-    ).toBe(script);
+    ).toBe(strixScript);
+    expect(
+      approvedPreExportVerificationCommand({
+        baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
+        requiredVerification: [
+          { id: "npm-test", label: "npm test", script: defaultModelScript },
+        ],
+      }),
+    ).toBe(defaultModelScript);
     expect(
       approvedPreExportVerificationCommand({
         baseCommit: "a".repeat(40),
-        requiredVerification: [{ id: "npm-test", label: "npm test", script }],
+        requiredVerification: [
+          { id: "npm-test", label: "npm test", script: strixScript },
+        ],
       }),
     ).toBeUndefined();
     expect(
       approvedPreExportVerificationCommand({
         baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
         requiredVerification: [
-          { id: "npm-test", label: "npm test", script: `${script} extra` },
+          {
+            id: "npm-test",
+            label: "npm test",
+            script: `${defaultModelScript} extra`,
+          },
         ],
       }),
     ).toBeUndefined();
@@ -637,6 +657,21 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     const script =
       "/opt/agenc/bin/agenc-verify-contract " +
       "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
+      "npm-test";
+    harness.worktrees.baseCommit = "8935c9e77e5104d0fa4c50a560123b88b92155f0";
+    await runToTerminal(harness, {
+      requiredVerification: [{ id: "npm-test", label: "npm test", script }],
+    });
+    expect(harness.commands.executed).toEqual([script, script]);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+  });
+
+  it("runs the exact default-model preparation before the evidence-bearing verification", async () => {
+    const script =
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "e9e452e4df3cf13c0f4e5cf8b8e2cc7bdb3fb0a961c27339b753d8a3e6e3b792 " +
       "npm-test";
     harness.worktrees.baseCommit = "8935c9e77e5104d0fa4c50a560123b88b92155f0";
     await runToTerminal(harness, {

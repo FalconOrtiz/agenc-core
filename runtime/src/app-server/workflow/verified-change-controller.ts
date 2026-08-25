@@ -512,14 +512,24 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-const APPROVED_STRIX_PRE_EXPORT = Object.freeze({
-  baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
-  commandId: "npm-test",
-  script:
-    "/opt/agenc/bin/agenc-verify-contract " +
-    "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
-    "npm-test",
-});
+const APPROVED_PRE_EXPORT_VERIFICATIONS = Object.freeze([
+  Object.freeze({
+    baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
+    commandId: "npm-test",
+    script:
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "47b661cfedc3d23adbd4d4b7737cb7961c2a937eb5b15563b494bb2e85f08d04 " +
+      "npm-test",
+  }),
+  Object.freeze({
+    baseCommit: "8935c9e77e5104d0fa4c50a560123b88b92155f0",
+    commandId: "npm-test",
+    script:
+      "/opt/agenc/bin/agenc-verify-contract " +
+      "e9e452e4df3cf13c0f4e5cf8b8e2cc7bdb3fb0a961c27339b753d8a3e6e3b792 " +
+      "npm-test",
+  }),
+] as const);
 
 /**
  * One funded-order recovery seam. Running the exact managed verifier once
@@ -531,15 +541,16 @@ export function approvedPreExportVerificationCommand(
   spec: Pick<WorkflowSpec, "baseCommit" | "requiredVerification">,
 ): string | undefined {
   const command = spec.requiredVerification[0];
-  if (
-    spec.baseCommit !== APPROVED_STRIX_PRE_EXPORT.baseCommit ||
-    spec.requiredVerification.length !== 1 ||
-    command?.id !== APPROVED_STRIX_PRE_EXPORT.commandId ||
-    command.script !== APPROVED_STRIX_PRE_EXPORT.script
-  ) {
+  if (spec.requiredVerification.length !== 1 || command === undefined) {
     return undefined;
   }
-  return command.script;
+  const approved = APPROVED_PRE_EXPORT_VERIFICATIONS.find(
+    (candidate) =>
+      spec.baseCommit === candidate.baseCommit &&
+      command.id === candidate.commandId &&
+      command.script === candidate.script,
+  );
+  return approved === undefined ? undefined : command.script;
 }
 
 // ---------------------------------------------------------------------------
