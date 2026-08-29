@@ -1,4 +1,4 @@
-import { readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ValidationResult } from "../validation.js";
 import {
@@ -38,6 +38,11 @@ export type AgenCPluginCliCommand =
   | { readonly kind: "error"; readonly message: string };
 
 export interface AgenCPluginCliOptions extends MarketplaceOperationOptions {
+  readonly agencHome?: string;
+  readonly pluginStorageRoot: string;
+  readonly sessionTempRoot: string;
+  readonly workspaceRoot: string;
+  readonly env: NodeJS.ProcessEnv;
   readonly io?: PluginCliIo;
 }
 
@@ -49,10 +54,10 @@ export function formatAgenCPluginCliHelpText(): string {
     "  list [--json]                                  List installed plugins",
     "  validate <path> [--marketplace] [--json]       Validate a plugin or marketplace manifest",
     "  install <path> [--scope <user|project|local>]  Install a local plugin directory",
-    "  uninstall <name> [--scope <user|project|local>] Remove an installed plugin",
-    "  update <name> [--source <path>]                 Refresh an installed plugin from its source",
-    "  enable <name> [--path <path>]                  Enable a plugin in user config",
-    "  disable <name>                                 Disable a plugin in user config",
+    "  uninstall <id> [--scope <user|project|local>]  Remove an installed plugin",
+    "  update <id> [--source <path>]                  Refresh an installed plugin from its source",
+    "  enable <id> [--path <path>]                    Enable a plugin in user config",
+    "  disable <id>                                   Disable a plugin in user config",
     "  disable-all                                    Disable every currently enabled plugin",
     "  marketplace list [--json]                      List configured marketplaces",
     "  marketplace add <path|git|url|github> [--name <name>]",
@@ -61,7 +66,7 @@ export function formatAgenCPluginCliHelpText(): string {
     "  marketplace upgrade [name]                     Refresh git or local marketplaces",
     "",
     "Install options:",
-    "  --name <name>     Override the installed plugin or marketplace name",
+    "  --name <name>     Set the installed plugin ID or marketplace name",
     "  --force           Replace an existing install",
     "  --keep-data       Keep plugin data during uninstall",
     "",
@@ -111,20 +116,12 @@ export function parseAgenCPluginCliArgs(
 
 /**
  * Names the plugin components a non-user-scope (repository-controlled)
- * install will silently strip: hooks and MCP servers. Checks both the
- * conventional component files and the manifest declarations.
+ * install will silently strip: hooks and MCP servers declared by the
+ * canonical manifest.
  */
 async function detectProvenanceStrippedComponents(
   pluginRoot: string,
 ): Promise<string[]> {
-  const exists = async (path: string): Promise<boolean> => {
-    try {
-      await stat(path);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   let manifest: Record<string, unknown> = {};
   try {
     const parsed: unknown = JSON.parse(
@@ -134,19 +131,13 @@ async function detectProvenanceStrippedComponents(
       manifest = parsed as Record<string, unknown>;
     }
   } catch {
-    // No readable manifest: fall back to the conventional file checks.
+    // No readable canonical manifest means there is nothing to report here.
   }
   const stripped: string[] = [];
-  if (
-    (await exists(join(pluginRoot, "hooks", "hooks.json"))) ||
-    manifest.hooks !== undefined
-  ) {
+  if (manifest.hooks !== undefined) {
     stripped.push("hooks");
   }
-  if (
-    (await exists(join(pluginRoot, ".mcp.json"))) ||
-    manifest.mcpServers !== undefined
-  ) {
+  if (manifest.mcpServers !== undefined) {
     stripped.push("MCP servers");
   }
   return stripped;
@@ -154,7 +145,7 @@ async function detectProvenanceStrippedComponents(
 
 export async function runAgenCPluginCli(
   command: AgenCPluginCliCommand,
-  options: AgenCPluginCliOptions = {},
+  options: AgenCPluginCliOptions,
 ): Promise<number> {
   const io = options.io ?? { stdout: process.stdout, stderr: process.stderr };
   try {
@@ -176,6 +167,7 @@ export async function runAgenCPluginCli(
       case "validate": {
         const result = await validatePluginPath(command.path, {
           marketplace: command.marketplace,
+          workspaceRoot: options.workspaceRoot,
         });
         io.stdout.write(command.json
           ? `${JSON.stringify(result, null, 2)}\n`
@@ -191,7 +183,7 @@ export async function runAgenCPluginCli(
           force: command.force,
         });
         io.stdout.write(
-          `Installed plugin ${result.plugin.name} to ${result.scope} scope: ${result.destination}\n`,
+          `Installed plugin ${result.plugin.id} to ${result.scope} scope: ${result.destination}\n`,
         );
         // Workspace-resident plugin content is repository-controlled, which
         // strips hooks and MCP servers at load time (plugins/loader.ts). Say
@@ -231,7 +223,7 @@ export async function runAgenCPluginCli(
           ...(command.source !== undefined ? { source: command.source } : {}),
         });
         io.stdout.write(
-          `Updated plugin ${result.plugin.name} from ${result.source}: ${result.destination}\n`,
+          `Updated plugin ${result.plugin.id} from ${result.source}: ${result.destination}\n`,
         );
         return 0;
       }
@@ -295,7 +287,7 @@ export async function runAgenCPluginCli(
           ...options,
           name: command.name,
         });
-        io.stdout.write(`Removed marketplace ${result.marketplace.name}\n`);
+        io.stdout.write(`Removed marketplace ${result.marketplaceName}\n`);
         return 0;
       }
       case "marketplace-upgrade": {
