@@ -142,6 +142,27 @@ Load + register: `refreshPluginRegistrations` →
 `loadPluginHooks`, `loadPluginMcpServers`, `loadPluginLspServers`,
 `loadPluginOutputStyles`.
 
+### Plugin MCP servers
+
+`loadPluginMcpServers` is not enough by itself. Session startup must also
+merge those registrations into the live `MCPManager`
+(`getAllMcpConfigs` in `runtime/src/services/mcp/config.ts`). Enabled
+user-scoped plugins then appear in `/mcp` as `plugin:<id>:<server>` and
+as model tools `mcp.plugin:<id>:<server>.<tool>`.
+
+Project- and local-scope installs are **repository-controlled**
+(`isRepositoryControlledPlugin`). The loader strips their `mcpServers`,
+hooks, and `lspServers` so workspace-resident packages cannot become a second
+process authority. Skills, commands, agents, and output styles still load.
+`agenc plugin install --scope project` (or `local`) warns when the manifest
+ships hooks or MCP servers. Reinstall with `--scope user` to load those
+surfaces.
+
+Stdio plugin servers run under a tight sandbox profile (writes confined
+to the plugin data directory). Landlock can express this profile;
+ordinary workspace-write MCP is not. Operator merge rules, templates,
+and failure symptoms: [mcp.md](mcp.md#plugin-declared-servers).
+
 ## Shipped plugins
 
 Source of truth is repo `plugins/<name>/`. `runtime/scripts/sync-shipped-plugins.mjs`
@@ -231,18 +252,13 @@ Install roots use the same collision-resistant child key: user
 `<workspace>/plugins/` and git-root `plugins/`. `[plugins] enabled = false`
 in `defaultConfig()`.
 
+For a non-user install, the CLI writes an install-time stderr warning when the
+plugin ships hooks or MCP servers. The loader enforces the scope restriction
+even if the warning is missed.
+
 A canonical plugin ID can be installed in one managed scope at a time.
 Uninstall it before moving it between user and project/local scope. Uninstall
 still accepts an explicit scope so old duplicate copies can be removed safely.
-
-Workspace-resident (`project` / `local`) packages are
-**repository-controlled**. The loader strips `hooks`, `mcpServers`, and
-`lspServers` at load time so a cloned repo cannot inject session-owned
-process children. `agenc plugin install --scope project` (or `local`)
-warns on stderr when the manifest still declares hooks or MCP servers and
-tells you to reinstall with `--scope user`. Skills, commands, agents, and
-output styles from those packages still load. Plugin MCP merge, sandbox
-profile, and connect diagnostics: [mcp.md](mcp.md#plugin-mcp-servers).
 
 ### Marketplace
 
