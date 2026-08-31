@@ -13,6 +13,7 @@ Sources of truth:
 | Registration | `runtime/src/plugins/registration/*` |
 | CLI | `runtime/src/plugins/cli/pluginCliCommands.ts` → `agenc plugin` |
 | Marketplace | `runtime/src/plugins/marketplace/` |
+| Publisher signatures | `runtime/src/plugins/resolution.ts` (`verifyResolvedPluginSignature`) |
 | Config | `[plugins]` in [config.md](config.md) |
 
 ---
@@ -433,14 +434,92 @@ a generic card, never a broken catalog.
 `install` resolves `plugin@marketplace` (last-`@` split). A bare name is
 accepted only when exactly one configured marketplace offers that plugin
 to the requested product; ambiguity is an error. The JSON result reports
-`signatureVerified`. Remote plugin sources from non-local marketplaces request
-publisher-signature verification, but an in-tree local source follows the local
-directory install path and is not signature-verified; callers must treat a
-false verdict as unverified.
+`signatureVerified` (see [Publisher signatures](#publisher-signatures)).
 `--scope` is `user` or `project` (not `local`). The install result carries the
 manifest interface (logo stripped; artwork travels as a verified path) and
 command rows. A subsequent `plugin list --json` also includes skill rows read
 from each skill directory's `SKILL.md` frontmatter.
+
+### Publisher signatures
+
+Remote plugin resolution (`resolvePluginSource` in
+`runtime/src/plugins/resolution.ts`) verifies an Ed25519 publisher signature
+against a local keyring. Marketplace install sets `requireSignature` when the
+marketplace `sourceType` is not `local` (`installRequiresSignature` in
+`catalog-cli.ts`). There is no `agenc plugin sign` command and no shipped
+default keyring.
+
+#### When verification runs
+
+| Path | Signature check |
+| --- | --- |
+| `agenc plugin install ./dir` | Never. The CLI does not pass `requireSignature`. |
+| Marketplace install from a **local** marketplace | Not required, even when its catalog row points at a remote source. |
+| Marketplace install from a non-local marketplace (`sourceType` git or url), including a bundled `./path` directory | Required. `installPluginOp` verifies a directory before copying it. A missing `.agenc-plugin/signature.json` fails the install and leaves the configured plugin list unchanged. |
+| Resolver for git / npm / tarball / mcpb outside marketplace install | Required by default unless the caller passes `requireSignature: false`. Structured git using a `file:` URL or absolute filesystem path is local and is not required by that default. |
+
+Callers must treat `signatureVerified: false` as **unverified**, not as a pass.
+The shipped CLI and `/plugins` marketplace paths require a verified result for
+non-local marketplaces. A successful non-local marketplace install reporting
+`false` is an invariant failure.
+
+#### Keyring
+
+Default path: `$AGENC_HOME/plugin-publishers.json`. The resolver accepts an
+in-process `publishersPath` override; there is no operator CLI for it.
+
+```json
+{
+  "publishers": {
+    "tetsuo": {
+      "publicKey": "<base64 DER SPKI Ed25519>"
+    }
+  }
+}
+```
+
+A publisher entry may be that base64 string directly. A parsed keyring without
+a usable entry for the named publisher throws
+`plugin publisher is not trusted: <name>`. Missing, unreadable, or malformed
+keyrings surface their filesystem or JSON error. A well-formed public key and
+signature that do not verify throw
+`plugin signature verification failed for publisher <name>`; malformed key
+material can surface a crypto parsing error.
+
+#### Signature file
+
+`.agenc-plugin/signature.json`:
+
+```json
+{
+  "publisher": "tetsuo",
+  "signature": "<base64 Ed25519>",
+  "files": {
+    "skills/SKILL.md": "sha256:<64 lowercase hex>"
+  }
+}
+```
+
+The signed payload is UTF-8 JSON `{ manifestSha256, files }`. `files` is
+sorted by path; digests normalize to `sha256:<hex>` (`sha256:` prefix
+optional on input). `plugin.json` is hashed as `manifestSha256` and omitted
+from `files`. `signature.json` and `.agenc-plugin/agenc-install.json` are
+omitted. `.git` / `.hg` / `.svn` are ignored. Symlinks fail closed.
+Signature paths must stay inside the plugin root (no `..`, no absolute
+paths). Resolver defaults: depth **32**, **4096** files, **200 MiB**.
+
+A later `verifyResolvedPluginSignature` on the install destination still
+succeeds for a signed copy because install metadata is excluded from the
+payload.
+
+#### Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `plugin signature is required` | A required install lacks `.agenc-plugin/signature.json`. Direct local `plugin install ./dir` does not take this path. |
+| `plugin publisher is not trusted` | The parsed `$AGENC_HOME/plugin-publishers.json` has no usable key for that publisher. Missing, unreadable, or malformed keyrings report their underlying error instead. |
+| `signatureVerified: false` after marketplace install | Expected only for a local marketplace or a custom caller that disabled the requirement. A successful non-local marketplace install returning false violates the shipped path's invariant. |
+| `payload digest set does not match` / `digest mismatch` | Extra, missing, or edited regular payload files vs `files`. The manifest, `signature.json`, install metadata, and `.git` / `.hg` / `.svn` directories are excluded as described above. |
 
 ---
 
