@@ -33,8 +33,8 @@ configured-hook engine (`runtime/src/hooks/engine/discovery.ts`):
 | `Notification` | Waiting on user (e.g. permission); fire-and-forget |
 | `Stop` | Before concluding the response |
 | `StopFailure` | Turn ended on API error |
-| `PreCompact` | Before context compaction |
-| `PostCompact` | After compaction |
+| `PreCompact` | Before context compaction. Can add focus instructions; cannot restore tools. |
+| `PostCompact` | After a durable `compaction_committed`. Observes the replacement; cannot change the catalog. |
 
 CamelCase and lowerCamel aliases normalize (e.g. `preToolUse` → `PreToolUse`).
 
@@ -42,6 +42,16 @@ The SDK type list in `entrypoints/sdk/coreTypes.ts` (`HOOK_EVENTS`) is **wider**
 (e.g. `SubagentStart`, `Setup`, `ConfigChange`, `InstructionsLoaded`, …). Those
 extra names are for the broader runtime/SDK surface; **TOML `hooks` validation
 only accepts the table above**.
+
+`PreCompact` / `PostCompact` do not change the admitted summary catalog.
+`invokeCompactionProvider` always sends `tools: []` and
+`toolRouting: { allowedToolNames: [] }`, and hook output cannot change those
+options. `PreCompact` may return `newCustomInstructions`; those merge into the
+summary focus prompt and **do** count against the summary window. If
+`PreCompact` fails or throws, compaction continues without its focus text.
+`PostCompact` runs only after a flushed `compaction_committed` and receives
+`compact_summary`. Details:
+[mcp.md](mcp.md#compaction-summaries-stay-tool-free).
 
 ### Config map shape
 
