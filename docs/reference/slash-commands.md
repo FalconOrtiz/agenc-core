@@ -80,6 +80,18 @@ Sources: `runtime/src/commands/*.ts(x)` modules imported by
 
 ---
 
+## `/login`
+
+`/login` signs into the AgenC account. The PromptInput footer
+[usesAnthropicAccountFlow](../../runtime/src/utils/model/providers.ts) gates
+the login prompt to first-party providers (`anthropic`, `amazon-bedrock`). A
+Grok or openai-compatible BYOK session does not show it when the provider
+selection is correct. Use `/grok-login` for Grok and `/openai-login` only for
+the `openai` provider. The `openai-compatible` provider uses
+`OPENAI_COMPATIBLE_API_KEY`, its documented fallback, or a provider-scoped
+saved BYOK credential. See
+[env.md](env.md#provider-credential-isolation).
+
 ## `/swarm`
 
 | Invocation | Effect |
