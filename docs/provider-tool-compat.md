@@ -129,6 +129,12 @@ keep the union on the tool definition. The normalizer collapses it for the
 wire and reports `strictEligible: false`. Do not rely on `$ref` or `x-agenc-*`
 reaching LM Studio, openai-compatible, or Gemini.
 
+For a tool to remain callable through the LM Studio/openai-compatible profile,
+its registry name must appear in `LOCAL_PROFILE_TOOL_NAMES`, and its wire
+schema must tolerate grammar-keyword stripping. `system.searchTools` does not
+bypass this allowlist: discovery may find another tool, including an MCP tool,
+but `builtTools` applies the local-profile filter afterward.
+
 ## Troubleshooting
 
 | Symptom | Cause |
