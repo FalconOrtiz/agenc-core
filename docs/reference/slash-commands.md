@@ -119,6 +119,33 @@ locally. Turning swarm mode off does not disable explicit use of the
 multi-agent tools. Full routing, receipt, and integration semantics:
 [swarm-orchestration.md](../design/swarm-orchestration.md).
 
+## `/compact`
+
+`/compact [focus]` runs a manual transactional compaction
+(`manualCompactCall` → `compactConversation`). Optional args are custom
+focus instructions, not a keep-count. It refuses while
+`session.activeTurn` is set.
+
+The daemon-backed TUI has no in-process `newDefaultTurnWithSubId`. It calls
+`session.partialCompactFromMessage` with `messageOrdinal: 0` and
+`direction: "from"` for a full forward compact. The daemon emits the
+authoritative `history_replaced` event and returns the operator display text.
+
+Neither `AGENC_DISABLE_COMPACT` nor `AGENC_DISABLE_AUTO_COMPACT` disables
+this command. They are not interchangeable on the automatic path: the
+mid-turn outer gate consults only `AGENC_DISABLE_AUTO_COMPACT`. Setting
+`AGENC_DISABLE_COMPACT` alone still trips that gate, then
+`autoCompactIfNeeded` returns `wasCompacted: false`, and the turn ends
+with `mid_turn_compact_skipped`. Env catalog: [env.md](env.md).
+
+Successful transactional compaction reports its durable attempt ID in the
+command result. A replacement-history boundary also displays the ID, so it
+remains available in transcript history. `/compact-rollback` and
+`/compact-retain` accept that ID; it is also recorded on the
+`compaction_committed` payload and retention pin. Both commands refuse during
+an active turn (`ACTIVE_TURN`). Syntax:
+[cli.md](cli.md#compaction-operator-commands).
+
 ## `/permissions`
 
 `/permissions` opens the permission editor. The command also accepts `list`,
