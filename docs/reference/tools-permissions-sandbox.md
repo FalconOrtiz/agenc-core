@@ -460,6 +460,15 @@ closed on handoff input that would widen or hide the boundary:
 Production sessions never invoke this helper with operator-typed argv. The
 contract matters when diagnosing a spawn refusal or writing a regression.
 
+### Plugin MCP confinement
+
+Plugin-declared stdio MCP servers use a tighter profile: root read access and
+writes confined to the plugin data directory. Landlock can express this
+profile, so plugin servers keep working when bubblewrap is blocked. Ordinary
+workspace-write MCP still needs bubblewrap; see
+[install.md](../install.md#ubuntu-apparmor-and-bubblewrap) and
+[mcp.md](mcp.md#plugin-mcp-servers).
+
 Runtime `read_only` and `workspace_write` profiles use a full-disk read
 baseline. Explicit deny-read entries still override it. `read_only` grants no
 write entries; `workspace_write` grants writes only to the workspace, approved
