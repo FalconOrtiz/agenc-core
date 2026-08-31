@@ -117,6 +117,30 @@ export interface StreamModelRequestContract {
   readonly skipCacheWrite?: boolean;
 }
 
+type AdmittedModelAttempt = "primary" | "prewarm" | "prewarm_fallback";
+
+/**
+ * Durable identity for one physical model sample.
+ *
+ * Recovery re-entries already bump `recoveryReentryCount`. Other resamples
+ * use the durable `modelSampleOrdinal`. Ordinal zero deliberately keeps the
+ * historical id so a running admission row survives an upgrade; later
+ * physical samples receive a distinct suffix.
+ */
+export function admittedModelStepId(
+  ctx: Pick<TurnContext, "subId">,
+  state: Pick<
+    TurnState,
+    "turnCount" | "recoveryReentryCount" | "modelSampleOrdinal"
+  >,
+  attempt: AdmittedModelAttempt,
+): string {
+  const base = `model:${ctx.subId}:${state.turnCount}:${state.recoveryReentryCount}`;
+  return state.modelSampleOrdinal === 0
+    ? `${base}:${attempt}`
+    : `${base}:sample-${state.modelSampleOrdinal}:${attempt}`;
+}
+
 interface AssistantDisplayState {
   parser: AssistantVisibleTextStreamParser;
   visibleText: string;
@@ -1065,7 +1089,7 @@ export async function streamModel(
       provider: session.services.provider,
       messages,
       options,
-      stepId: `model:${ctx.subId}:${state.turnCount}:${state.recoveryReentryCount}:${attempt}`,
+      stepId: admittedModelStepId(ctx, state, attempt),
       sessionId: session.conversationId,
       model,
       providerName,
