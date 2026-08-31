@@ -75,12 +75,22 @@ agenc skills list --json
 
 ### Compaction operator commands
 
-The interactive runtime and daemon-backed TUI expose explicit recovery
-commands for a previously committed compaction. These commands require the
+`/compact [focus]` runs a manual transactional compaction. It is not gated by
+`AGENC_DISABLE_COMPACT` or `AGENC_DISABLE_AUTO_COMPACT`. Auto-compact (pre-turn
+and mid-turn) uses those flags. Above 13,000 tokens, the threshold is
+`min(window - 13_000, floor(window * 0.75))`. At or below 13,000 tokens, it is
+`min(floor(window * 0.8), floor(window * 0.75))`. Mid-turn context-limit
+compaction is forced after its outer condition is met and does not recheck the
+threshold. See
+[CP-0006](../design/critical-path/0006-compaction-transaction.md#operator-contract-current-main).
+
+The interactive runtime and daemon-backed TUI also expose recovery
+commands for a previously committed compaction. These require the
 attempt ID reported by the compaction transaction and refuse to run during an
 active turn.
 
 ```text
+/compact [focus]
 /compact-rollback <attempt-id>
 /compact-rollback <attempt-id> --branch <target-session-id>
 /compact-retain <attempt-id> --until <ISO-8601>
@@ -91,6 +101,11 @@ active turn.
   history as the named reviewed session.
 - `/compact-retain` accepts an absolute future deadline and can only extend,
   never shorten, the durable rollback-retention window.
+- Setting `AGENC_DISABLE_COMPACT` without `AGENC_DISABLE_AUTO_COMPACT` does
+  not skip mid-turn compact. The outer condition can still be met, auto returns
+  `wasCompacted: false`, and the sampling loop emits event cause
+  `mid_turn_compact_failed`. Its message starts with
+  `mid_turn_compact_skipped`.
 
 ---
 

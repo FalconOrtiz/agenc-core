@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Accepted target; implementation pending |
+| Status | Shipped (0.14.0+). The [critical-path README](README.md) is authoritative. |
 | Audit snapshot | `d2b228e87ea63bd6a5d93e6f599f36bce88d672b` |
 | Audit date | 2026-07-31 |
 | Owner | Transactional, injection-safe context compaction (C2) |
@@ -196,3 +196,121 @@ Primary references: [The Instruction Hierarchy](https://arxiv.org/abs/2404.13208
 [Context as a Tool](https://aclanthology.org/2026.findings-acl.1032/),
 [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785), and
 [PoWER Never Corrupts](https://www.usenix.org/conference/osdi25/presentation/leblanc).
+
+## Operator contract (current main)
+
+The decision above is the durable-transaction spec. This section is the
+live operator surface. Sources: `runtime/src/services/compact/autoCompact.ts`,
+`compact.ts`, `transaction.ts`, `session/run-turn.ts`,
+`commands/session-compact.ts`, and `budget/admitted-model-call.ts`.
+
+### Entry points
+
+| Path | Trigger | If it does not compact |
+| --- | --- | --- |
+| `/compact [focus]` | Manual. `querySource: "compact"`. Not gated by the disable env vars. | Error only. History stays as-is until a durable `compaction_committed`. |
+| Pre-sampling auto | `autoCompactIfNeeded` when estimated tokens ≥ the safety threshold. | Increments `consecutiveFailures`. Three failures skip later autos this turn. User/provider abort does not count. |
+| Mid-turn sampling loop | Last sample `promptTokens` is at least the mid-turn outer limit and the turn still needs follow-up (tools, mailbox, or `needsFollowUp`). | A thrown error or a no-op compact terminates this turn with event cause `mid_turn_compact_failed`. A no-op compact puts `mid_turn_compact_skipped` in the event message. |
+| Post-tool follow-up | Last sample `promptTokens` is at least the same outer limit and tools still require follow-up. | The loop repeats only after a committed compact. A no-op result continues to the commit phase. |
+
+Same-context callers serialize on a `WeakMap` (`compactConversation`). A
+second `/compact` or mid-turn auto against the same `CompactContext` awaits
+the in-flight result instead of writing a competing summary.
+
+Agent-invocation envelope messages are never summarized. The kept suffix is
+about 20 percent of history (min 1, max 4; empty when there are two or fewer
+messages), then walked forward so a tool result is not kept without its
+parent `tool_calls` message.
+
+### Thresholds
+
+For a context window above 13,000 tokens, `getAutoCompactThreshold` uses:
+
+```text
+min(window - 13_000, floor(window * 0.75))
+```
+
+For a context window at or below 13,000 tokens, it uses:
+
+```text
+min(floor(window * 0.8), floor(window * 0.75))
+```
+
+`window` is `AGENC_AUTO_COMPACT_WINDOW` (positive integer) if set, then the
+live `CompactContext.options.contextWindowTokens`, then the model-string
+fallback from `lookupContextWindowForModel`. That fallback uses 200k for
+haiku, sonnet, and opus. For other models, it checks the OpenAI-compatible
+table and uses 128k for an unknown model.
+
+`AGENC_AUTOCOMPACT_PCT_OVERRIDE` is a percentage from `1` through `100`. It
+can only make auto-compact run earlier than that default because it is capped
+at the safety threshold.
+
+Pre-sampling uses that threshold unless `modelInfo.autoCompactTokenLimit`
+provides an explicit limit. The mid-turn outer gate also uses
+`modelInfo.autoCompactTokenLimit` when set. Otherwise it uses
+`window - 13_000` for windows above 13,000 tokens and `window` for smaller
+windows. Mid-turn compaction passes
+`force: true`, so `autoCompactIfNeeded` does not recheck the threshold after
+the outer condition is met. The outer gate reads the last provider-reported
+`promptTokens`, not cumulative usage.
+
+### Disable flags
+
+Truthy values are `1`, `true`, `yes`, `on` (case-insensitive).
+
+| Var | What it actually gates |
+| --- | --- |
+| `AGENC_DISABLE_AUTO_COMPACT` | Auto-compact and the pre-sampling and mid-turn outer gates. It takes precedence even when `modelInfo.autoCompactTokenLimit` is set. |
+| `AGENC_DISABLE_COMPACT` | `autoCompactIfNeeded` only. The mid-turn outer gate does not consult it. |
+
+`/compact` ignores both. If only `AGENC_DISABLE_COMPACT` is set, the mid-turn
+outer gate can still require a compact. `autoCompactIfNeeded` then returns
+`wasCompacted: false`. The sampling loop terminates the turn with event cause
+`mid_turn_compact_failed` and a message that starts with
+`mid_turn_compact_skipped`.
+
+### Admitted summary calls
+
+Every provider summary goes through `runAdmittedModelCall` with step id
+`compact:<attemptId>:<callCount>`. That is a different namespace from streamed
+model samples (`model:...`). Summary calls set `tools: []` and
+`toolRouting.allowedToolNames: []`. Constructor-scoped client tools are not
+copied into the request, and the provider-native routing allowlist selects no
+native tools. Admission derives its provider-native accounting catalog from
+the same options that the wire adapter receives, so it accounts the same
+selected native tools that can reach the provider.
+
+Accepted output is still strict `CompactionSummaryV1`. Shrink must save at
+least **1,024** tokens and **20 percent**. Automatic compaction is suppressed
+after **two** durable `compaction_failed` rows for the same
+history/configuration digest; `/compact` (manual) is the explicit retry.
+
+### Rollback and retention
+
+Committed source spans stay rollback-eligible for at least seven days
+(`COMPACTION_ROLLBACK_RETENTION_MS`). Operators:
+
+```text
+/compact-rollback <attempt-id>
+/compact-rollback <attempt-id> --branch <target-session-id>
+/compact-retain <attempt-id> --until <ISO-8601>
+```
+
+Same-session rollback is refused when later canonical work exists; `--branch`
+keeps that work and materializes the restored history as the named session.
+`/compact-retain` can only extend the deadline. Commands refuse during an
+active turn.
+
+### Troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| Event cause is `mid_turn_compact_failed` and its message starts with `mid_turn_compact_skipped` | The outer condition was met and compact returned no committed result. Check `AGENC_DISABLE_COMPACT`, the 3-strike counter, and the 2-failure digest guard. |
+| Auto never runs, then the next turn is `context_window_exceeded` | Confirm the live window instead of assuming the 128k fallback. Above 13k, the threshold is `min(window-13k, 75%)`. Also check `AGENC_AUTOCOMPACT_PCT_OVERRIDE` and `AGENC_DISABLE_AUTO_COMPACT`. |
+| A summary call includes a client or provider-native tool | This violates the summary-call contract. Summary calls must send an empty client catalog and an empty native-tool routing allowlist. Admission must account the same selected native catalog as the wire. |
+| History vanished after a failed compact | Only a flushed `compaction_committed` may replace active history. Any earlier replacement is a transaction bug and must not be treated as a commit. |
+| `/compact` says durable adapter unavailable | Compaction requires the canonical rollout owner (`readCompactionTransactionAdapter`). There is no character-extract fallback. |
+
+Operator command syntax also lives in [cli.md](../../reference/cli.md#compaction-operator-commands).
+Threshold vs admission accounting: [provider-aware-token-accounting.md](../provider-aware-token-accounting.md).
