@@ -3,6 +3,7 @@
 Live help: `agenc help` and `agenc help <topic>`. Sources:
 `runtime/src/bin/*-cli.ts`, `runtime/src/app-server/{daemon,agent}-cli.ts`,
 `runtime/src/plugins/cli/pluginCliCommands.ts`,
+`runtime/src/skills/skills-cli.ts`,
 `runtime/src/permissions/permission-cli.ts`, and top-level
 `formatCliHelpText()` in `runtime/src/bin/agenc-main.ts`.
 Top-level help is a command index; `agenc help <topic>` contains each
@@ -68,6 +69,8 @@ agenc --no-tui "run the tests and report failures"
 agenc --print --output-format stream-json "summarize this repository"
 agenc --resume <session-id>
 agenc help permissions
+agenc help skills
+agenc skills list --json
 ```
 
 ### Compaction operator commands
@@ -588,6 +591,38 @@ the desktop enumeration and qualified-install surface; see
 
 A canonical plugin ID can be installed in one managed scope at a time. Remove
 the existing copy before installing that ID in another scope.
+
+---
+
+## `skills`
+
+```text
+agenc skills list
+agenc skills list --json
+```
+
+Skill inventory for the current cwd and `AGENC_HOME`. Desktop clients can use
+this instead of opening a session to read `/skills`. It does not install
+content or print skill bodies. Normal runtime initialization can still create
+runtime directories or migrate legacy plugin-data directories.
+
+```bash
+agenc skills list --json
+```
+
+`--json` emits `{ schemaVersion: 1, kind: "agenc.skills.inventory", skills, errors }`.
+Text mode prints `[origin] name — description`. After an inventory is emitted,
+both modes exit 0; inspect `errors[]` (or stderr in text mode) for
+config/registry failures.
+
+Only `list` plus optional `--json` is a skills command. `agenc skills` or
+`agenc skills --help` is **not** help: the parser rejects it and the default
+route treats those tokens as a prompt. Use `agenc help skills`. Top-level
+`agenc help` does not list this command.
+
+This is not `agenc plugin`. Details, JSON fields, and differences from
+`/skills`:
+[skills-plugins.md](skills-plugins.md#agenc-skills-list-cli).
 
 ---
 

@@ -6,6 +6,7 @@ Sources of truth:
 | --- | --- |
 | Skill load / `SKILL.md` | `runtime/src/skills/local-loader.ts` |
 | Bundled skills | `runtime/src/skills/bundledSkills.ts` |
+| Headless inventory CLI | `runtime/src/skills/skills-cli.ts` → `agenc skills list` |
 | MCP skills | `runtime/src/skills/mcpSkills.ts` |
 | Plugin load / dirs | `runtime/src/plugins/loader.ts`, `directories.ts` |
 | Manifest | `runtime/src/plugins/manifest.ts`, `manifest-schema.ts` |
@@ -38,10 +39,12 @@ Existing directories only (missing roots skipped). Project walk: cwd up to home.
 
 The runtime command catalog and `/skills` use this same discovery result.
 `/skills` can list roots and manage project skills; bundled skills are tagged
-`[bundled]`. Local-snapshot inventory rows preserve `whenToUse` and
-`argumentHint` when declared, including inline built-ins that have no
-`SKILL.md` a client could open. Registry-only bundled fallback rows currently
-expose their descriptions but not those two optional fields.
+`[bundled]`. Headless clients that must not open a session use
+[`agenc skills list`](#agenc-skills-list-cli) instead. Local-snapshot
+inventory rows preserve `whenToUse` and `argumentHint` when declared,
+including inline built-ins that have no `SKILL.md` a client could open.
+Registry-only bundled fallback rows currently expose their descriptions but
+not those two optional fields.
 
 A plugin manifest may declare a skill root that **is** the skill
 (`skills: ["./skills/flash-board"]` with `SKILL.md` in that directory).
@@ -56,12 +59,25 @@ literal placeholder was not rendered from a plugin root.
 
 ### Bundled skills
 
+The local loader defines eleven built-in skills: `update-config`,
+`keybindings`, `debug`, `simplify`, `batch`, `loop`, `agenc-in-browser`,
+`schedule-agents`, `agenc-api`, `ledger-wallet-cli`, and `verify`.
+
+Separately, `registerBundledSkill` in `bundledSkills.ts` registers these two
+commands. They are compiled into the runtime and appear as
+`origin: "built-in"` on `agenc skills list`.
+
 | Name | Purpose |
 | --- | --- |
 | `browser-automation` | Snapshot → act → re-snapshot workflow for the LIVE `Browser` tool ([browser.md](../browser.md)) |
 | `agenc-marketplace-kit-installer` | Marketplace kit install helper |
-| `iot-builder` | IoT/embedded project builder: measurement-first hardware identification, toolchain selection (PlatformIO, Arduino CLI, ESP-IDF, MicroPython, SBC cross-compile), build → flash → serial-monitor loop, flash backup before first overwrite, and an electrical-safety checklist. Extracts per-board and per-toolchain reference files on first invoke |
-| `zeroday-hunter` | See shipped plugins below (not `bundledSkills.ts`) |
+
+`zeroday-hunter` is a signed marketplace plugin, not a `bundledSkills.ts`
+registration. The in-package builtin-plugin skill seam
+(`initBuiltinPlugins` / `getBuiltinPluginSkillCommands`) is intentionally
+empty so a first-party skill cannot exist twice under one name.
+`/skills` still folds that seam; `agenc skills list` does not. An older
+`iot-builder` bundled skill is not registered in this tree.
 
 ### `SKILL.md` frontmatter (high level)
 
@@ -85,6 +101,90 @@ Parsed fields include:
 
 Author under e.g. `.agenc/skills/my-skill/SKILL.md` in the project or
 `$AGENC_HOME/skills/my-skill/SKILL.md` for user-global skills.
+
+### `agenc skills list` CLI
+
+Inventory of the local-loader snapshot plus the registered bundled skills.
+Desktop and other GUI clients can use it without opening a session. It does
+not change config, install content, or print skill bodies. Ordinary runtime
+initialization can create runtime directories, and plugin discovery can
+migrate legacy plugin-data directories.
+
+```text
+agenc skills list
+agenc skills list --json
+agenc help skills
+```
+
+```bash
+agenc skills list --json
+```
+
+`--json` writes a schema-versioned document to stdout:
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "agenc.skills.inventory",
+  "skills": [
+    {
+      "name": "verify",
+      "description": "Checks the requested behavior.",
+      "whenToUse": "Use after making a change.",
+      "origin": "built-in",
+      "root": "/path/to/skill",
+      "userInvocable": true
+    }
+  ],
+  "errors": []
+}
+```
+
+| Field | Notes |
+| --- | --- |
+| `origin` | `built-in`, `personal`, `project`, `plugin`, or `managed` |
+| `pluginRoot` | Owning plugin directory; present only for `plugin` origin |
+| `root` | Loader discovery root for disk-backed skills. Inline built-ins use their prospective extraction directory. Empty string for registry-only bundled rows with no local-loader entry |
+| `whenToUse` / `argumentHint` | Omitted when empty. Registry-only bundled fallback rows currently omit both even when the in-session command has them |
+| `conditional` | `true` when the skill activates only for configured paths |
+| `errors` | Config or bundled-registry failures. A config load error still lists personal/project/built-in rows and skips plugin skills |
+
+Text mode prints one line per skill, sorted by origin then name:
+
+```text
+[built-in] verify — Plan and run a concrete verification pass.
+[personal] my-notes — Consult personal project notes.
+[plugin] demo-skill — Use the demo plugin workflow.
+```
+
+Errors go to stderr with an `agenc: ` prefix. Both text and JSON return **0**
+after emitting the document, so callers must inspect `errors[]`.
+
+Workspace is `process.cwd()`. Home and plugin storage follow
+`AGENC_HOME` and the captured `pluginStorageRoot`
+(`AGENC_PLUGIN_CACHE_DIR` replaces `$AGENC_HOME/plugins` as one unit).
+No daemon or session is required. `--bare` is a session ingress flag and does
+not change this CLI; a `--bare` TUI session still skips skill discovery for
+that session only.
+
+#### Constraints
+
+- The parser accepts only `agenc skills list` and optional `--json`.
+  `agenc skills`, `agenc skills --help`, `agenc skills install <name>`, and any
+  extra flag return `null` from `parseAgenCSkillsCliArgs` and fall through
+  to the default CLI route, which treats the tokens as a **session prompt**.
+  Use `agenc help skills` for syntax.
+- Top-level `agenc help` / `agenc --help` does not list this command.
+- This is not `agenc plugin`. Skills are authored capabilities; plugins
+  are the installable distribution unit.
+- This inventory is not identical to `/skills`. It includes inactive
+  path-conditional rows with `conditional: true` and preserves same-name rows
+  from different origins. It omits MCP skills, live invocation state, the
+  effective skill-root summary, and the builtin-plugin command seam. Therefore,
+  an in-package plugin skill (none are registered today) can appear in
+  `/skills` and remain absent from `agenc skills list`.
+- Duplicate `origin:name` keys keep the first row (local snapshot before
+  the bundled-registry fallback).
 
 ---
 
