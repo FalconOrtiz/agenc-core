@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cp, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { resolveHomeContext } from "../../config/home.js";
 import { loadCanonicalConfig } from "../../config/repository.js";
 import type { PluginEntryConfig } from "../../config/schema.js";
@@ -31,6 +31,7 @@ import {
   pluginFilesystemKey,
 } from "../directories.js";
 import {
+  classifyPluginSource,
   pluginDependencyIdentityFromSource,
   parsePluginInstallSource,
   pluginInstallSourceNeedsRedaction,
@@ -376,7 +377,10 @@ export async function installPluginOp(
 ): Promise<InstallPluginResult> {
   const scope = input.scope ?? "user";
   const workspaceRoot = resolvePluginWorkspaceRoot(input);
-  const localSource = typeof input.source === "string"
+  const sourceKind = typeof input.source === "string"
+    ? await classifyPluginSource(input.source, workspaceRoot)
+    : "git";
+  const localSource = sourceKind === "local" && typeof input.source === "string"
     ? resolvePath(input.source, workspaceRoot)
     : undefined;
   let resolved: ResolvedPluginSource | null = null;
@@ -384,7 +388,7 @@ export async function installPluginOp(
   let resolutionKind: PluginResolutionKind = "local";
   let signatureRequired = false;
   let signatureVerified = false;
-  if (localSource === undefined || !(await pathIsDirectory(localSource))) {
+  if (localSource === undefined) {
     resolved = await resolvePluginSource(input.source, {
       agencHome: resolvePluginAgencHome(input),
       pluginStorageRoot: input.pluginStorageRoot,
@@ -578,21 +582,10 @@ export async function updatePluginOp(
   const source = input.source ?? recordedSource.source;
   if (source === undefined) {
     throw new Error(
-      `plugin ${input.pluginId} has no recorded source; rerun with --source <path>`,
+      `plugin ${input.pluginId} has no recorded source; rerun with --source <source>`,
     );
   }
-  if (typeof source === "string") {
-    const localSource = resolvePath(source, workspaceRoot);
-    if (await pathExists(localSource)) {
-      const sourceReal = await realpath(localSource);
-      const rootReal = await realpath(previousRoot);
-      if (sourceReal === rootReal || sourceReal.startsWith(`${rootReal}/`)) {
-        throw new Error(
-          `plugin update source cannot be the installed plugin root: ${source}`,
-        );
-      }
-    }
-  }
+  await assertUpdateSourceOutsideInstalledRoot(source, workspaceRoot, previousRoot);
   let requireSignature = input.requireSignature;
   if (requireSignature === undefined && recordedSource.signatureRequired) {
     requireSignature = true;
@@ -613,6 +606,23 @@ export async function updatePluginOp(
     previousRoot,
     source,
   };
+}
+
+async function assertUpdateSourceOutsideInstalledRoot(
+  source: PluginInstallSource,
+  workspaceRoot: string,
+  previousRoot: string,
+): Promise<void> {
+  if (typeof source !== "string") return;
+  if (await classifyPluginSource(source, workspaceRoot) !== "local") return;
+  const localSource = resolvePath(source, workspaceRoot);
+  if (!(await pathExists(localSource))) return;
+  const sourceReal = await realpath(localSource);
+  const rootReal = await realpath(previousRoot);
+  if (!isPathInside(sourceReal, rootReal)) return;
+  throw new Error(
+    `plugin update source cannot be the installed plugin root or its descendant: ${source}`,
+  );
 }
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
@@ -848,8 +858,10 @@ async function copyDirectoryAtomically(
   if (existing) {
     const sourceReal = await realpath(source);
     const destinationReal = await realpath(destination);
-    if (sourceReal === destinationReal || sourceReal.startsWith(`${destinationReal}/`)) {
-      throw new Error(`plugin source cannot be the installed plugin root: ${source}`);
+    if (isPathInside(sourceReal, destinationReal)) {
+      throw new Error(
+        `plugin source cannot be the installed plugin root or its descendant: ${source}`,
+      );
     }
   }
   if (existing && !options.force) {
@@ -958,10 +970,43 @@ async function pluginIdRemainsInstalled(
   return listed.plugins.some((plugin) => plugin.id === pluginId);
 }
 
-function isPathInside(path: string, root: string): boolean {
-  const relativePath = relative(resolve(root), resolve(path));
+interface PathContainmentApi {
+  readonly isAbsolute: (path: string) => boolean;
+  readonly relative: (from: string, to: string) => string;
+  readonly resolve: (...paths: string[]) => string;
+  readonly sep: string;
+}
+
+function isPathInsideWithApi(
+  path: string,
+  root: string,
+  pathApi: PathContainmentApi,
+): boolean {
+  const relativePath = pathApi.relative(
+    pathApi.resolve(root),
+    pathApi.resolve(path),
+  );
   return relativePath === "" ||
-    (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+    (relativePath !== ".." &&
+      !relativePath.startsWith(`..${pathApi.sep}`) &&
+      !pathApi.isAbsolute(relativePath));
+}
+
+function isPathInside(path: string, root: string): boolean {
+  return isPathInsideWithApi(path, root, {
+    isAbsolute,
+    relative,
+    resolve,
+    sep,
+  });
+}
+
+export function __isPathInsideForTesting(
+  path: string,
+  root: string,
+  platform: "posix" | "win32",
+): boolean {
+  return isPathInsideWithApi(path, root, platform === "win32" ? win32 : posix);
 }
 
 async function writePluginConfigEntry(

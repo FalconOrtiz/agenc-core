@@ -226,13 +226,14 @@ export async function resolvePluginSource(
 
 export async function classifyPluginSource(
   source: string,
-  workspaceRoot: string,
+  _workspaceRoot: string,
 ): Promise<PluginResolutionKind> {
-  const localPath = resolve(workspaceRoot, source);
-  if (await pathIsDirectory(localPath)) return "local";
+  if (isExplicitLocalPluginSource(source)) {
+    return source.endsWith(".mcpb") ? "mcpb" : "local";
+  }
   if (isGitSource(source)) return "git";
   if (isTarballSource(source)) return "tarball";
-  if (isMcpbSource(source) || (source.endsWith(".mcpb") && await pathIsFile(localPath))) return "mcpb";
+  if (isMcpbSource(source)) return "mcpb";
   return "npm";
 }
 
@@ -1791,6 +1792,15 @@ function assertNotOptionLikeSource(source: string, label: string): void {
   if (trimmed.includes("\0")) throw new Error(`invalid ${label} source: null bytes are not allowed`);
 }
 
+function isExplicitLocalPluginSource(source: string): boolean {
+  if (isAbsolute(source)) return true;
+  if (source === "." || source === "..") return true;
+  return source.startsWith("./") ||
+    source.startsWith("../") ||
+    source.startsWith(".\\") ||
+    source.startsWith("..\\");
+}
+
 function isGitSource(source: string): boolean {
   if (source.startsWith("git+") ||
     source.startsWith("git@") ||
@@ -1844,14 +1854,6 @@ function tarballExtension(source: string): string {
 async function pathIsDirectory(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function pathIsFile(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isFile();
   } catch {
     return false;
   }
