@@ -7707,6 +7707,119 @@ describe("AgenC delegate background-agent runner", () => {
     expect(rolloutStore.recordRunStartupActivationEvent).not.toHaveBeenCalled();
     expect(stub.thread.submit).not.toHaveBeenCalled();
     expect(control.sendInput).not.toHaveBeenCalled();
+    const snapshot = await runner.getAgentSnapshot(
+      "session-follow-up-prompt-blocked",
+    );
+    expect(snapshot?.status).not.toBe("error");
+  });
+
+  it("[managed-thread] keeps the run alive after a blocked follow-up so a later allowed prompt can run", async () => {
+    const blockHook = vi.fn((input: { readonly prompt: string }) =>
+      input.prompt === "blocked follow-up prompt"
+        ? { blockingError: { blockingError: "follow-up prompt denied" } }
+        : {},
+    );
+    const { runner, control, stub } = makeTopLevelRunner({
+      conversationId: "session-follow-up-prompt-survives-block",
+      userPromptSubmitHooks: [blockHook],
+    });
+    await runner.startAgent({
+      objective: "passive hook test",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    await expect(
+      runner.submitAgentMessage("session-follow-up-prompt-survives-block", {
+        sessionId: "session_1",
+        content: "blocked follow-up prompt",
+        originalContent: "blocked follow-up prompt",
+        messageId: "blocked-follow-up-message",
+        streamId: "blocked-follow-up-stream",
+        acceptedAt: "2026-08-25T00:00:00.000Z",
+      }),
+    ).rejects.toMatchObject({
+      code: "PROMPT_BLOCKED",
+    });
+    const snapshot = await runner.getAgentSnapshot(
+      "session-follow-up-prompt-survives-block",
+    );
+    expect(snapshot?.status).not.toBe("error");
+
+    await expect(
+      runner.submitAgentMessage("session-follow-up-prompt-survives-block", {
+        sessionId: "session_1",
+        content: "allowed follow-up prompt",
+        originalContent: "allowed follow-up prompt",
+        messageId: "allowed-follow-up-after-block",
+        streamId: "allowed-follow-up-after-block-stream",
+        acceptedAt: "2026-08-25T00:00:01.000Z",
+      }),
+    ).resolves.toMatchObject({ disposition: "started" });
+    expect(control.sendInput).toHaveBeenCalledTimes(1);
+    expect(stub.thread.submit).not.toHaveBeenCalled();
+  });
+
+  it("[managed-thread] replays a legacy hook-block error as session-only after attach", async () => {
+    const { runner, session } = makeTopLevelRunner({
+      conversationId: "session-hook-block-legacy-error",
+    });
+    const started = await runner.startAgent({
+      objective: "passive hook test",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    session.emit({
+      id: "legacy-hook-block",
+      msg: {
+        type: "error",
+        payload: {
+          cause: "user_prompt_submit_hook_blocked",
+          message: "policy denied",
+        },
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const snapshot = await runner.getAgentSnapshot(
+      "session-hook-block-legacy-error",
+    );
+    expect(snapshot?.status).not.toBe("error");
+
+    const emitted: JsonObject[] = [];
+    await runner.attachAgentSessionEvents(started.agentId, {
+      sessionId: "session_1",
+      emit: async (notification) => {
+        emitted.push(notification);
+      },
+    });
+    expect(emitted).toContainEqual(
+      expect.objectContaining({
+        jsonrpc: JSON_RPC_VERSION,
+        method: "event.session_event",
+        params: expect.objectContaining({
+          sessionId: "session_1",
+          agentId: "session-hook-block-legacy-error",
+          event: expect.objectContaining({
+            id: "legacy-hook-block",
+            type: "error",
+            payload: expect.objectContaining({
+              cause: "user_prompt_submit_hook_blocked",
+              message: "policy denied",
+            }),
+          }),
+        }),
+      }),
+    );
+    expect(emitted).not.toContainEqual(
+      expect.objectContaining({
+        method: "event.agent_status",
+        params: expect.objectContaining({ message: "policy denied" }),
+      }),
+    );
   });
 
   it("[managed-thread] applies owning-session hook context to follow-up model input exactly once", async () => {
