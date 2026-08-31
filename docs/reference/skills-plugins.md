@@ -444,12 +444,17 @@ from each skill directory's `SKILL.md` frontmatter.
 
 Remote plugin resolution (`resolvePluginSource` in
 `runtime/src/plugins/resolution.ts`) verifies an Ed25519 publisher signature
-against a local keyring. Marketplace install sets `requireSignature` when the
-marketplace `sourceType` is not `local` (`installRequiresSignature` in
-`catalog-cli.ts`). There is no `agenc plugin sign` command and no shipped
-default keyring.
+against a local keyring. Marketplace install through either the CLI or the
+`/plugins` menu sets `requireSignature` when the marketplace `sourceType` is
+not `local` (`installRequiresSignature` in `catalog-cli.ts`). The official
+`agenc-plugins` catalog is a URL marketplace, so this gate applies to it.
+There is no `agenc plugin sign` command and no shipped default keyring.
 
 #### When verification runs
+
+The marketplace's `sourceType` controls this gate. A bundled `./path` row or
+an already-materialized directory does not waive a non-local marketplace's
+signature requirement.
 
 | Path | Signature check |
 | --- | --- |
@@ -460,8 +465,18 @@ default keyring.
 
 Callers must treat `signatureVerified: false` as **unverified**, not as a pass.
 The shipped CLI and `/plugins` marketplace paths require a verified result for
-non-local marketplaces. A successful non-local marketplace install reporting
-`false` is an invariant failure.
+non-local marketplaces. A successful non-local marketplace install reports
+`true` and `(signature verified)` in text mode; reporting `false` is an
+invariant failure.
+
+Install metadata in `.agenc-plugin/agenc-install.json` records
+`signatureRequired` and `signatureVerified`. `agenc plugin update` has no
+`--require-signature` flag, so it re-applies the recorded requirement. A legacy
+metadata file with `signatureVerified: true` and no `signatureRequired` field
+is also treated as signature-required. An unsigned copy installed before
+directory verification was enforced has neither signal and can update without
+a signature; uninstall and reinstall it from the marketplace to establish the
+current requirement.
 
 #### Keyring
 
@@ -519,6 +534,7 @@ payload.
 | `plugin signature is required` | A required install lacks `.agenc-plugin/signature.json`. Direct local `plugin install ./dir` does not take this path. |
 | `plugin publisher is not trusted` | The parsed `$AGENC_HOME/plugin-publishers.json` has no usable key for that publisher. Missing, unreadable, or malformed keyrings report their underlying error instead. |
 | `signatureVerified: false` after marketplace install | Expected only for a local marketplace or a custom caller that disabled the requirement. A successful non-local marketplace install returning false violates the shipped path's invariant. |
+| `plugin update` accepts an unsigned tree | Install metadata has neither `signatureRequired: true` nor the legacy `signatureVerified: true` signal. Reinstall the plugin from its marketplace to establish the current requirement. |
 | `payload digest set does not match` / `digest mismatch` | Extra, missing, or edited regular payload files vs `files`. The manifest, `signature.json`, install metadata, and `.git` / `.hg` / `.svn` directories are excluded as described above. |
 
 ---
