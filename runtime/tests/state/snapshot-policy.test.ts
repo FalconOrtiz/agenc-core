@@ -711,6 +711,78 @@ describe("AgenCSessionSnapshotPolicy", () => {
     expect(sessionAgent("session-linked")).toBe("agent-linked");
   });
 
+  // Review P1-8: every forwarded event carries agentId, and each one ran an
+  // autocommit upsert into session_agent_links (one fsync under
+  // synchronous=FULL) plus a SELECT per completion-only tool event.
+  it("writes session_agent_links once per session and serves later lookups from memory", () => {
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      agencHome: home,
+    });
+    const prepareState = vi.spyOn(driver, "prepareState");
+    const linkWrites = (): number =>
+      prepareState.mock.calls.filter(([sql]) =>
+        /INSERT INTO session_agent_links/.test(sql),
+      ).length;
+    const linkReads = (): number =>
+      prepareState.mock.calls.filter(([sql]) =>
+        /SELECT agent_id FROM session_agent_links/.test(sql),
+      ).length;
+
+    for (let i = 0; i < 200; i++) {
+      policy.recordSessionEvent("session-links", {
+        method: "event.message_chunk",
+        params: {
+          agentId: "run-links",
+          delta: "x",
+          messageId: "message-links",
+          streamId: "stream-links",
+          eventId: `chunk-${i}`,
+        },
+      });
+    }
+    policy.recordSessionEvent("session-links", {
+      method: "event.tool_request",
+      params: {
+        agentId: "run-links",
+        eventId: "evt-links",
+        requestId: "tool-links",
+        toolName: "FileRead",
+      },
+    });
+    // Completion without an agentId resolves the owner from memory.
+    policy.recordSessionEvent("session-links", {
+      method: "event.session_event",
+      params: {
+        event: {
+          type: "tool_call_completed",
+          payload: { callId: "tool-links", result: "ok", isError: false },
+        },
+      },
+    });
+
+    expect(linkWrites()).toBe(1);
+    expect(linkReads()).toBe(0);
+    expect(sessionAgent("session-links")).toBe("run-links");
+    expect(inFlightToolOutput("session-links", "tool-links").status).toBe(
+      "completed",
+    );
+
+    // A changed owner is written again, exactly once.
+    policy.recordSessionEvent("session-links", {
+      method: "event.message_chunk",
+      params: {
+        agentId: "run-links-2",
+        delta: "y",
+        messageId: "message-links-2",
+        streamId: "stream-links",
+        eventId: "chunk-owner-change",
+      },
+    });
+    expect(linkWrites()).toBe(2);
+    expect(sessionAgent("session-links")).toBe("run-links-2");
+  });
+
   it("keeps tool identity for completion-only tool events", () => {
     const policy = new AgenCSessionSnapshotPolicy(driver, {
       now: clock(["2026-05-01T00:00:00.000Z"]),

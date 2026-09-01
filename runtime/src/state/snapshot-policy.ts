@@ -130,6 +130,8 @@ interface SessionSnapshotState {
   // Policy-clock time of the last durable write, for coalescing.
   lastWriteMs?: number;
   coalesceTimer?: SnapshotPolicyTimer;
+  // Agent id already persisted in session_agent_links for this session.
+  agentId?: string;
   conversation: JsonValue[];
   seenConversationKeys: Set<string>;
   toolState: {
@@ -895,6 +897,11 @@ export class AgenCSessionSnapshotPolicy {
 
   #rememberSessionAgent(sessionId: string, agentId: string): void {
     if (sessionId.length === 0 || agentId.length === 0) return;
+    // Every forwarded event carries agentId, so this ran an autocommit
+    // upsert (one fsync under synchronous=FULL) per event: ~8,200 for the
+    // measured session. Write only when the link actually changes.
+    const state = this.#session(sessionId);
+    if (state.agentId === agentId) return;
     this.#driver
       .prepareState<[string, string]>(
         `INSERT INTO session_agent_links (
@@ -906,14 +913,19 @@ export class AgenCSessionSnapshotPolicy {
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
       )
       .run(sessionId, agentId);
+    state.agentId = agentId;
   }
 
   #sessionAgentId(sessionId: string): string | undefined {
-    return this.#driver
+    const state = this.#sessions.get(sessionId);
+    if (state?.agentId !== undefined) return state.agentId;
+    const agentId = this.#driver
       .prepareState<[string], { agent_id: string }>(
         "SELECT agent_id FROM session_agent_links WHERE session_id = ?",
       )
       .get(sessionId)?.agent_id;
+    if (state !== undefined && agentId !== undefined) state.agentId = agentId;
+    return agentId;
   }
 
   #appendConversation(
