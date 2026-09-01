@@ -60,7 +60,10 @@ import {
   validateToolCallsForDispatch,
 } from "./execute-tools.js";
 import { isPlanMode } from "../session/plan-mode.js";
-import { getInitialEffortSetting } from "../utils/effort.js";
+import {
+  effortValueToReasoningEffort,
+  getInitialEffortSetting,
+} from "../utils/effort.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
 
 type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
@@ -72,25 +75,36 @@ type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
  * provider default applies and grok-4.5 burns ~16k hidden reasoning
  * tokens per trivial reply at xAI's HIGH default (measured: ~2m30s for
  * a 150-word answer, matching the user's "grok is fucking slow").
- * An explicit per-session "none" stays respected as an opt-out; values
- * outside the wire vocabulary ("max", "none") are dropped rather than
- * sent upstream to a provider that would reject them.
+ * An explicit per-session "none" stays respected as an opt-out.
+ *
+ * The persisted spelling of the deepest tier is `max`; on the wire it is
+ * `xhigh`. It is forwarded only when the model's catalog advertises xhigh
+ * (grok-4.6); every other model clamps to `high`, which every reasoning
+ * Grok accepts. Before this mapping a configured xhigh reached this function
+ * as `max`, fell through the switch, and no `reasoning.effort` was sent at
+ * all, so the session ran at the provider default (measured: 348 reasoning
+ * tokens per call on a coding task, effort `null` in every settings event).
  */
 function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
+  supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
 ): WireReasoningEffort | undefined {
-  if (turnEffort !== undefined) {
-    return turnEffort === "none" ? undefined : turnEffort;
+  const requested =
+    turnEffort !== undefined
+      ? turnEffort === "none"
+        ? undefined
+        : turnEffort
+      : effortValueToReasoningEffort(getInitialEffortSetting());
+  if (requested === undefined) return undefined;
+  const wire: WireReasoningEffort = requested === "max" ? "xhigh" : requested;
+  if (
+    wire === "xhigh" &&
+    supportedReasoningLevels !== undefined &&
+    !supportedReasoningLevels.includes("xhigh")
+  ) {
+    return "high";
   }
-  const settingsEffort = getInitialEffortSetting();
-  switch (settingsEffort) {
-    case "low":
-    case "medium":
-    case "high":
-      return settingsEffort;
-    default:
-      return undefined;
-  }
+  return wire;
 }
 
 // Exported for unit tests; the wiring above is the single call site.
@@ -249,7 +263,10 @@ function buildProviderOptions(
         ? { toolChoice: "required" as const }
         : {}),
     toolRouting: { allowedToolNames },
-    reasoningEffort: resolveSessionReasoningEffort(ctx.reasoningEffort),
+    reasoningEffort: resolveSessionReasoningEffort(
+      ctx.reasoningEffort,
+      ctx.modelInfo.supportedReasoningLevels,
+    ),
     reasoningSummary: ctx.reasoningSummary,
     modelVerbosity: ctx.modelVerbosity,
     serviceTier:
