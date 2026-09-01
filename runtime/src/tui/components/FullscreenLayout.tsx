@@ -15,6 +15,7 @@ import type { Message } from '../../types/message';
 import { openBrowser, openPath } from '../../utils/browser.js';
 import { logError } from '../../utils/log.js';
 import { plural } from '../../utils/stringUtils.js';
+import { truncateMiddleToWidth } from '../../utils/truncate.js';
 import { modelDisplayString } from '../../utils/model/model.js';
 import { getTotalCost } from '../../cost/tracker.js';
 import { formatUsdCost } from '../../session/cost.js';
@@ -527,14 +528,6 @@ export function FullscreenLayout(t0) {
   return t8;
 }
 
-function trimMiddle(value: string, maxWidth: number): string {
-  if (value.length <= maxWidth) return value;
-  if (maxWidth <= 1) return value.slice(0, Math.max(0, maxWidth));
-  const left = Math.ceil((maxWidth - 1) / 2);
-  const right = Math.floor((maxWidth - 1) / 2);
-  return `${value.slice(0, left)}…${value.slice(value.length - right)}`;
-}
-
 const execFileAsync = promisify(execFile);
 
 /** Slow poll cadence for the git chrome probe — covers branch switches made
@@ -673,8 +666,8 @@ export function DesignTopChrome({ columns, noColor }: { columns: number; noColor
     const values = Object.values(tasks ?? {});
     return values.find(task => task?.status === 'running' || task?.status === 'queued') ?? values[0];
   }, [tasks]);
-  const taskPda = activeTask?.id ? trimMiddle(String(activeTask.id), Math.max(12, Math.floor(columns * 0.18))) : '—';
-  const title = trimMiddle(`~/${cwdName}`, Math.max(12, Math.floor(columns * 0.24)));
+  const taskPda = activeTask?.id ? truncateMiddleToWidth(String(activeTask.id), Math.max(12, Math.floor(columns * 0.18))) : '—';
+  const title = truncateMiddleToWidth(`~/${cwdName}`, Math.max(12, Math.floor(columns * 0.24)));
   return <TuiHeader columns={columns} title={title} tabLabel="agenc · orchestrator" tabStatus={activeTask?.status === 'failed' ? 'warn' : 'live'} permissionMode={mode} taskPda={taskPda} />;
 }
 
@@ -688,7 +681,7 @@ export function formatDesignBottomChromeLabels(
   const modeLabel = permissionModeFooterChrome(mode).label;
   const trimmedGitLabel = gitLabel === null
     ? null
-    : trimMiddle(gitLabel, columns >= 100 ? 32 : 18);
+    : truncateMiddleToWidth(gitLabel, columns >= 100 ? 32 : 18);
   return {
     left: `● ${modeLabel} · ${modelLabel}${trimmedGitLabel === null ? '' : ` · ${trimmedGitLabel}`}`,
     right: `spend ${spend}`,
@@ -706,7 +699,7 @@ function DesignBottomChrome({ columns }: { columns: number }): React.ReactNode {
   const spend = useSessionSpendLabel();
   const gitLabel = useGitChromeLabel();
   const { right } = formatDesignBottomChromeLabels(columns, modelLabel, mode, gitLabel, spend);
-  const trimmedGitLabel = gitLabel === null ? null : trimMiddle(gitLabel, columns >= 100 ? 32 : 18);
+  const trimmedGitLabel = gitLabel === null ? null : truncateMiddleToWidth(gitLabel, columns >= 100 ? 32 : 18);
   return <V2StatusBar variant={mode === 'plan' ? 'plan' : mode === 'bypassPermissions' ? 'error' : mode === 'auto' ? 'success' : mode === 'acceptEdits' ? 'accent' : 'neutral'} left={[
       <DesignBottomLeftLabel key="left" gitLabel={trimmedGitLabel} mode={mode} modelLabel={modelLabel} />,
     ]} right={[
