@@ -52,6 +52,7 @@ export type PhaseEvent =
         | "error"
         | "empty_response"
         | "no_progress" // behavioral backstop (semantic non-termination, goal #3)
-        | "compact_failed"; // mid-turn / pre-sampling compact skip or throw
+        | "compact_failed" // mid-turn / pre-sampling compact skip or throw
+        | "editor_request_failed"; // request-scoped Editor limit, refusal, or blocked recovery
       readonly error?: Error;
     };
