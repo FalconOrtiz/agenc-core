@@ -155,7 +155,8 @@ The assistant did not use the todo list because this is a single command executi
 2. **Task Management**:
    - Update task status in real-time as you work
    - Mark tasks complete IMMEDIATELY after finishing (don't batch completions)
-   - Right after you mark a task completed, write one or two sentences to the user as plain text (not a tool call): what you just finished and what you will do next. Do this every time a task closes, before your next tool call, not only when the whole list is done
+   - Right after you mark a task completed, tell the user in plain text (not a tool call), in one or two sentences, what you just finished and what comes next. Say it the way you would to a colleague: name the concrete result (the file, the test, the behavior you changed); no fixed formula, no "Continuing" or "Next step" preambles, and never the same sentence twice. Do this every time a task closes, before your next tool call, not only when the whole list is done
+   - When the last task is done, say so and stop. Do not invent follow-up work the user did not ask for; a new task is only for something the request itself needs (a blocker, a missing piece), never for extending the deliverable
    - Exactly ONE task must be in_progress at any time (not less, not more)
    - Complete current tasks before starting new ones
    - Remove tasks that are no longer relevant from the list entirely

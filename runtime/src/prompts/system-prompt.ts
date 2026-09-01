@@ -242,7 +242,7 @@ export function getUsingYourToolsSection(enabledTools: ReadonlySet<string>): str
 
   if (hasTodoWrite) {
     items.push(
-      `Break down and manage your work with the TodoWrite tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed. Each time you mark a task completed, tell the user in one or two sentences what you finished and what you will do next, before you continue; the user follows the plan through those notes, so do not wait until the whole plan is done.`,
+      `Break down and manage your work with the TodoWrite tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed. Each time you mark a task completed, tell the user in one or two sentences, in your own words, what you finished and what comes next, before you continue; the user follows the plan through those notes, so do not wait until the whole plan is done. Name the concrete result rather than repeating a formula. When the last task is done, say so and stop; do not add work the user did not ask for.`,
     );
   }
 
