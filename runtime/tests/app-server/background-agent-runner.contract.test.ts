@@ -7878,6 +7878,63 @@ describe("AgenC delegate background-agent runner", () => {
     expect(stub.thread.submit).not.toHaveBeenCalled();
   });
 
+  it("[managed-thread] keeps the run alive after a request-scoped editor cap", async () => {
+    const { runner, session, control, stub } = makeTopLevelRunner({
+      conversationId: "session-survives-editor-limit",
+    });
+    await runner.startAgent({
+      objective: "passive editor cap test",
+      initialContent: [],
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    session.emit({
+      id: "legacy-editor-interaction-limit",
+      msg: {
+        type: "error",
+        payload: {
+          cause: "editor_interaction_limit",
+          message:
+            "Editor interaction stopped at the request-scoped sampling_iterations limit (12; observed 12). No additional tools ran and no buffer changes were applied.",
+        },
+      },
+    });
+    session.emitPhaseEvent({
+      type: "turn_complete",
+      content:
+        "Editor interaction stopped at the request-scoped sampling_iterations limit (12; observed 12). No additional tools ran and no buffer changes were applied.",
+      usage: {
+        promptTokens: 100,
+        completionTokens: 10,
+        totalTokens: 110,
+      },
+      stopReason: "editor_limit",
+      error: new Error(
+        "editor_interaction_limit: Editor interaction stopped at the request-scoped sampling_iterations limit (12; observed 12).",
+      ),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const snapshot = await runner.getAgentSnapshot(
+      "session-survives-editor-limit",
+    );
+    expect(snapshot?.status).not.toBe("error");
+
+    await expect(
+      runner.submitAgentMessage("session-survives-editor-limit", {
+        sessionId: "session_1",
+        content: "continue after editor cap",
+        originalContent: "continue after editor cap",
+        messageId: "after-editor-limit",
+        streamId: "after-editor-limit-stream",
+        acceptedAt: "2026-09-01T00:00:01.000Z",
+      }),
+    ).resolves.toMatchObject({ disposition: "started" });
+    expect(control.sendInput).toHaveBeenCalledTimes(1);
+    expect(stub.thread.submit).not.toHaveBeenCalled();
+  });
+
   it("[managed-thread] applies owning-session hook context to follow-up model input exactly once", async () => {
     const contextHook = vi.fn(() => ({
       additionalContexts: ["session-owned daemon context"],

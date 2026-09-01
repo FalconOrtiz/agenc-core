@@ -299,6 +299,12 @@ When done, return your result using the ${SYNTHETIC_OUTPUT_TOOL_NAME} tool with:
                 'Agent hook stopped because compaction could not shrink the context',
             )
           }
+          if (event.stopReason === 'editor_limit') {
+            throw new Error(
+              event.error?.message ??
+                'Agent hook stopped because the editor request hit its scoped limit',
+            )
+          }
         }
       }
 

@@ -298,6 +298,8 @@ const USER_VISIBLE_WARNING_CAUSES: ReadonlySet<string> = new Set([
   "mid_turn_compact_failed",
   "pre_sampling_compact_failed",
   "auto_compact_failed",
+  "editor_interaction_limit",
+  "editor_proposal_missing",
   "max_output_tokens_exhausted",
   "prompt_too_long_exhausted",
   "stop_hook_loop",

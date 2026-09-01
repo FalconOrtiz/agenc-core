@@ -2066,6 +2066,42 @@ function compactFailedTurnComplete(
   };
 }
 
+const EDITOR_INTERACTION_LIMIT_CAUSE = "editor_interaction_limit";
+const EDITOR_PROPOSAL_MISSING_CAUSE = "editor_proposal_missing";
+
+function emitEditorLimitWarning(
+  session: Session,
+  cause:
+    | typeof EDITOR_INTERACTION_LIMIT_CAUSE
+    | typeof EDITOR_PROPOSAL_MISSING_CAUSE,
+  message: string,
+): void {
+  session.emit({
+    id: session.nextInternalSubId(),
+    msg: {
+      type: "warning",
+      payload: {
+        cause,
+        message,
+      },
+    },
+  });
+}
+
+function editorLimitTurnComplete(
+  content: string,
+  usage: LLMUsage,
+  error: Error,
+): Extract<PhaseEvent, { type: "turn_complete" }> {
+  return {
+    type: "turn_complete",
+    content,
+    usage,
+    stopReason: "editor_limit",
+    error,
+  };
+}
+
 function sessionQuerySourceForPostSampling(session: Session): string {
   const raw =
     typeof session.services.querySource === "string" &&
@@ -4485,30 +4521,18 @@ async function* runTurnKernelInner(
     // Pair any model-emitted tool calls without dispatching them so the
     // transcript remains structurally valid at the fail-closed boundary.
     await drainInFlight(state, ctx, session);
-    const cause = "editor_interaction_limit";
+    const cause = EDITOR_INTERACTION_LIMIT_CAUSE;
     const message =
       `Editor interaction stopped at the request-scoped ${limitKind} ` +
       `limit (${limit}; observed ${observed}). No additional tools ran and ` +
       "no buffer changes were applied.";
     const error = new Error(`${cause}: ${message}`);
-    session.emit({
-      id: session.nextInternalSubId(),
-      msg: {
-        type: "error",
-        payload: { cause, message },
-      },
-    });
+    emitEditorLimitWarning(session, cause, message);
     await syncSessionState();
     emitTurnComplete(message);
     return {
       terminal: { reason: "completed", error },
-      event: {
-        type: "turn_complete",
-        content: message,
-        usage,
-        stopReason: "error",
-        error,
-      },
+      event: editorLimitTurnComplete(message, usage, error),
     };
   };
   const finishCancelledIfAborted = async (): Promise<{
@@ -5004,31 +5028,16 @@ async function* runTurnKernelInner(
         ctx.editorInteraction?.policy === "proposal_only" &&
         !hasValidatedEditorProposal
       ) {
-        const cause = "editor_proposal_missing";
+        const cause = EDITOR_PROPOSAL_MISSING_CAUSE;
         lastContent =
           "Editor edit request incomplete: the model did not return a valid " +
           "EditorProposal. No buffer changes were made.";
         const error = new Error(`${cause}: ${lastContent}`);
-        session.emit({
-          id: session.nextInternalSubId(),
-          msg: {
-            type: "error",
-            payload: {
-              cause,
-              message: lastContent,
-            },
-          },
-        });
+        emitEditorLimitWarning(session, cause, lastContent);
         await syncSessionState();
         emitTurnComplete(lastContent);
         const terminal: Terminal = { reason: "completed", error };
-        yield {
-          type: "turn_complete",
-          content: lastContent,
-          usage,
-          stopReason: "error",
-          error,
-        };
+        yield editorLimitTurnComplete(lastContent, usage, error);
         return terminal;
       }
       // Reasoning providers can occasionally complete a response after

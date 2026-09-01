@@ -559,6 +559,15 @@ Those paths now emit `warning` with the same cause and yield
 "error"` records with those causes are remapped
 `statusProjection: "session_only"` on the live bridge.
 
+Request-scoped editor caps (`editor_interaction_limit`: sampling or
+tool quota) and a missing `EditorProposal`
+(`editor_proposal_missing`) used the same fatal pair. An Explain
+that kept reading past 12 samples, a 33-tool FileRead fan-out, or an
+edit that returned prose instead of `EditorProposal` answered
+`no longer running (status: error)` for every later prompt. Those
+paths now emit `warning` and yield `editor_limit`, mapped like the
+other bounded stops.
+
 `TaskCreate` accepts a subject-only call. `description` defaults to the
 subject instead of failing validation. A model that retried a missing
 description used to walk into the no-progress backstop and brick the

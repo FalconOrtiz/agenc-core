@@ -5757,6 +5757,8 @@ const SESSION_ONLY_ERROR_CAUSES: ReadonlySet<string> = new Set([
   "user_prompt_submit_hook_blocked",
   "mid_turn_compact_failed",
   "pre_sampling_compact_failed",
+  "editor_interaction_limit",
+  "editor_proposal_missing",
 ]);
 
 function isSessionOnlyErrorCause(cause: unknown): boolean {
@@ -5772,6 +5774,10 @@ function isSessionOnlyErrorCause(cause: unknown): boolean {
  * type. Those close one turn (context could not shrink) and must not
  * flip the daemon agent to `error`, or later prompts die with
  * "no longer running (status: error)".
+ *
+ * Request-scoped editor caps (`editor_interaction_limit`) and a missing
+ * EditorProposal (`editor_proposal_missing`) are the same class: the
+ * editor turn ends, the keep-alive session must stay promptable.
  */
 function projectPerPromptRejectionAsSessionOnly(
   event: BackgroundAgentDaemonEvent,
@@ -7743,24 +7749,27 @@ export function phaseEventToProgressEvent(
           error: event.error?.message ?? "turn errored",
         };
       }
-      // Bounded stops — the backstop, a turn cap, the cost cap, and a
-      // compact skip/throw — are per-TURN outcomes, not run deaths.
-      // Mapping them to run_error bricked the whole session: the user
-      // saw "no longer running (status: error)" and could never prompt
-      // again after one bad turn. The turn ends honestly with its
-      // message; the session stays available for the next prompt,
-      // exactly like "completed".
+      // Bounded stops — the backstop, a turn cap, the cost cap, a
+      // compact skip/throw, and a request-scoped editor cap — are
+      // per-TURN outcomes, not run deaths. Mapping them to run_error
+      // bricked the whole session: the user saw "no longer running
+      // (status: error)" and could never prompt again after one bad
+      // turn. The turn ends honestly with its message; the session
+      // stays available for the next prompt, exactly like "completed".
       const boundedStopFallback: Partial<Record<string, string>> = {
         max_turns: "Turn capped: iteration limit hit; send a new prompt to continue.",
         max_budget_usd: "Turn capped: cost ceiling hit; send a new prompt to continue.",
         no_progress: "Turn halted by the progress backstop; send a new prompt to continue.",
         compact_failed:
           "Turn stopped: compaction could not shrink the context; send a new prompt to continue.",
+        editor_limit:
+          "Turn stopped: the editor request hit its scoped limit; send a new prompt to continue.",
       };
       const boundedFallback = boundedStopFallback[event.stopReason];
       if (boundedFallback !== undefined) {
-        const compactMessage =
-          event.stopReason === "compact_failed" &&
+        const preferredMessage =
+          (event.stopReason === "compact_failed" ||
+            event.stopReason === "editor_limit") &&
           event.error instanceof Error &&
           event.error.message.length > 0
             ? event.error.message
@@ -7770,7 +7779,7 @@ export function phaseEventToProgressEvent(
           turnId,
           toolCallCount: 0,
           finalMessage:
-            compactMessage ??
+            preferredMessage ??
             (event.content.length > 0 ? event.content : boundedFallback),
         };
       }

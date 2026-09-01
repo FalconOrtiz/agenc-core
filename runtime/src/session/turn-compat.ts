@@ -834,6 +834,18 @@ export async function* runTurnCompat(
           next = requestNext();
           continue;
         }
+        if (event.stopReason === "editor_limit") {
+          yield {
+            type: "message",
+            message: createAssistantAPIErrorMessage({
+              content:
+                event.error?.message ??
+                "Turn stopped: the editor request hit its scoped limit",
+            }),
+          };
+          next = requestNext();
+          continue;
+        }
         if (
           event.content.length > 0 &&
           event.content !== flushedToolAssistantText

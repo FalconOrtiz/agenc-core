@@ -20,6 +20,7 @@ describe("stop-reason mapping decides turn versus run scope", () => {
       "max_turns",
       "max_budget_usd",
       "compact_failed",
+      "editor_limit",
     ]) {
       const mapped = phaseEventToProgressEvent(turnComplete(reason));
       expect(mapped?.kind, reason).toBe("turn_complete");
@@ -44,6 +45,23 @@ describe("stop-reason mapping decides turn versus run scope", () => {
     expect(mapped?.kind).toBe("turn_complete");
     expect((mapped as { finalMessage?: string }).finalMessage).toContain(
       "mid_turn_compact_skipped",
+    );
+  });
+
+  test("editor_limit prefers the scoped-limit message over leftover assistant text", () => {
+    const mapped = phaseEventToProgressEvent({
+      type: "turn_complete",
+      content: "I am still reading files",
+      usage,
+      stopReason: "editor_limit",
+      error: new Error(
+        "editor_interaction_limit: Editor interaction stopped at the request-scoped sampling_iterations limit (12; observed 12).",
+      ),
+      turnId: "turn-1",
+    } as never);
+    expect(mapped?.kind).toBe("turn_complete");
+    expect((mapped as { finalMessage?: string }).finalMessage).toContain(
+      "editor_interaction_limit",
     );
   });
 
