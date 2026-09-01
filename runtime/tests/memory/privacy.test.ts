@@ -149,7 +149,7 @@ describe('memory privacy', () => {
     )
   })
 
-  it('scans and redacts high-confidence memory secrets without returning values', () => {
+  it('keeps memory classification independent from canonical egress redaction', () => {
     installMemoryAuthority()
     const content = `token=${fakeGitHubPat}`
 
@@ -159,7 +159,7 @@ describe('memory privacy', () => {
     expect(scanForSecrets(`${content}\nagain=${fakeGitHubPat}`)).toHaveLength(1)
     // branding-scan: allow real provider display name
     expect(getSecretLabel('openai-api-key')).toBe('OpenAI API Key')
-    expect(redactSecrets(content)).toBe('token=[REDACTED]')
+    expect(redactSecrets(content)).toBe('token=[REDACTED_SECRET]')
     expect(redactSecrets(content)).not.toContain(fakeGitHubPat)
   })
 

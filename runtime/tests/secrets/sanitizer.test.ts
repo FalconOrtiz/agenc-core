@@ -13,6 +13,7 @@ import {
   redactSecretsInValue,
   SecretName,
 } from "./index.js";
+import { canonicalRedactionFixtures } from "./canonical-redaction-corpus.js";
 
 const tempDirs: string[] = [];
 
@@ -29,6 +30,21 @@ afterEach(() => {
 });
 
 describe("secrets sanitizer", () => {
+  it.each(canonicalRedactionFixtures)(
+    "redacts canonical outbound text: $name",
+    ({ input, expected, secretFragments, preservedFragments }) => {
+      const redacted = redactSecrets(input);
+
+      expect(redacted).toBe(expected);
+      for (const secret of secretFragments) {
+        expect(redacted).not.toContain(secret);
+      }
+      for (const preserved of preservedFragments) {
+        expect(redacted).toContain(preserved);
+      }
+    },
+  );
+
   it("redacts common API keys and token forms", () => {
     const input = [
       "openai=sk-proj-abcdefghijklmnopqrstuvwxyz123456",
