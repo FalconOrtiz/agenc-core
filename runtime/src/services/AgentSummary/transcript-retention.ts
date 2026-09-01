@@ -128,24 +128,89 @@ function utf8Prefix(text: string, maxBytes: number): string {
   return buffer.subarray(0, end).toString("utf8");
 }
 
-function isDurableToolResultReference(text: string): boolean {
-  const trimmed = text.trimStart();
+function utf8Suffix(text: string, maxBytes: number): string {
+  const buffer = Buffer.from(text, "utf8");
+  if (buffer.byteLength <= maxBytes) return text;
+  let start = buffer.byteLength - maxBytes;
+  while (start < buffer.byteLength && (buffer[start]! & 0xc0) === 0x80) {
+    start += 1;
+  }
+  return buffer.subarray(start).toString("utf8");
+}
+
+function persistedOutputReference(text: string): string | null {
+  const match =
+    /^<persisted-output>\r?\n(?<reference>Output too large \([^\r\n]+\)\. Full output saved to: [^\r\n]+)(?:\r?\n[\s\S]*)?<\/persisted-output>\s*$/u.exec(
+      text,
+    );
+  const reference = match?.groups?.reference;
+  return reference === undefined
+    ? null
+    : `<persisted-output>\n${reference}\n</persisted-output>`;
+}
+
+function offloadedOutputReference(text: string): string | null {
   return (
-    trimmed.startsWith("<persisted-output>") ||
-    trimmed.startsWith("[full output (")
+    /^(\[full output \(~[^\r\n]+ saved to [^\r\n]+:\])(?:\r?\n|$)/u.exec(
+      text,
+    )?.[1] ?? null
+  );
+}
+
+function webFetchOutputReference(text: string): string | null {
+  return (
+    /(?:^|\r?\n\r?\n)(\[Binary content \([^\r\n]+\) also saved to [^\r\n]+\])$/u.exec(
+      text,
+    )?.[1] ?? null
+  );
+}
+
+function durableToolResultReference(text: string): string | null {
+  return (
+    persistedOutputReference(text) ??
+    offloadedOutputReference(text) ??
+    webFetchOutputReference(text)
   );
 }
 
 function clampRawToolResult(text: string, maxBytes: number): string {
   const originalBytes = Buffer.byteLength(text, "utf8");
-  if (originalBytes <= maxBytes || isDurableToolResultReference(text)) {
-    return text;
-  }
-  const marker =
+  if (originalBytes <= maxBytes) return text;
+  const rawMarker =
     `\n[tool result truncated; original UTF-8 size: ${originalBytes} bytes]`;
+  const marker = utf8Prefix(rawMarker, maxBytes);
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  const prefix = utf8Prefix(text, Math.max(0, maxBytes - markerBytes));
-  return `${prefix}${marker}`;
+  const reference = durableToolResultReference(text);
+  const referenceBudget = Math.max(0, maxBytes - markerBytes - 1);
+  const boundedReference =
+    reference === null ? "" : utf8Suffix(reference, referenceBudget);
+  const separator = boundedReference.length === 0 ? "" : "\n";
+  const reservedBytes =
+    markerBytes +
+    Buffer.byteLength(separator, "utf8") +
+    Buffer.byteLength(boundedReference, "utf8");
+  const prefix = utf8Prefix(text, Math.max(0, maxBytes - reservedBytes));
+  return `${prefix}${marker}${separator}${boundedReference}`;
+}
+
+function oldestLinkedMessageIndexes(
+  messages: ReadonlyArray<Message>,
+): ReadonlySet<number> {
+  const indexes = new Set<number>([0]);
+  const linkedIds = new Set(toolMessageIds(messages[0]!).all);
+  let changed = linkedIds.size > 0;
+  while (changed) {
+    changed = false;
+    for (let index = 1; index < messages.length; index += 1) {
+      if (indexes.has(index)) continue;
+      const ids = toolMessageIds(messages[index]!).all;
+      if (![...ids].some((id) => linkedIds.has(id))) continue;
+      indexes.add(index);
+      for (const id of ids) linkedIds.add(id);
+      changed = true;
+    }
+  }
+  return indexes;
 }
 
 function boundedProgressEvent(
@@ -202,7 +267,9 @@ export class AgentSummaryTranscript {
   ) {
     this.limits = resolveLimits(limitOverrides);
     this.forkContextMessages = Object.freeze(
-      initialMessages.map(llmMessageToAgentSummaryMessage),
+      initialMessages.map((message, index) =>
+        llmMessageToAgentSummaryMessage(message, index),
+      ),
     );
     this.nextMessageIndex = this.forkContextMessages.length;
   }
@@ -289,33 +356,17 @@ export class AgentSummaryTranscript {
   }
 
   private removeOldestLinkedUnit(): Message[] {
-    const indexes = new Set<number>([0]);
-    const linkedIds = new Set(toolMessageIds(this.rollingMessages[0]!).all);
-    let changed = linkedIds.size > 0;
-    while (changed) {
-      changed = false;
-      for (let index = 1; index < this.rollingMessages.length; index += 1) {
-        if (indexes.has(index)) continue;
-        const ids = toolMessageIds(this.rollingMessages[index]!).all;
-        if (![...ids].some((id) => linkedIds.has(id))) continue;
-        indexes.add(index);
-        for (const id of ids) linkedIds.add(id);
-        changed = true;
-      }
-    }
-
-    const removed: Message[] = [];
-    const retained: Message[] = [];
-    for (let index = 0; index < this.rollingMessages.length; index += 1) {
-      const message = this.rollingMessages[index]!;
-      if (indexes.has(index)) {
-        removed.push(message);
-        this.rollingPayloadBytes -= serializedMessageBytes(message);
-      } else {
-        retained.push(message);
-      }
-    }
-    this.rollingMessages = retained;
+    const indexes = oldestLinkedMessageIndexes(this.rollingMessages);
+    const removed = this.rollingMessages.filter((_message, index) =>
+      indexes.has(index),
+    );
+    this.rollingMessages = this.rollingMessages.filter(
+      (_message, index) => !indexes.has(index),
+    );
+    this.rollingPayloadBytes -= removed.reduce(
+      (total, message) => total + serializedMessageBytes(message),
+      0,
+    );
     return removed;
   }
 

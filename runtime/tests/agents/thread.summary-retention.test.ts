@@ -197,7 +197,10 @@ describe("AgentThread summary transcript retention", () => {
         kind: "tool_result",
         callId,
         toolName: "Read",
-        result: `${callId}-result`,
+        result:
+          callId === "call-2"
+            ? `<persisted-output>\n${"界".repeat(10_000)}`
+            : `${callId}-result`,
         isError: false,
       });
     }
@@ -225,12 +228,17 @@ describe("AgentThread summary transcript retention", () => {
     expect(thread.summaryMessages).toHaveLength(5);
     const pairs = toolPairIds(thread.summaryMessages);
     expect(pairs.results).toEqual(pairs.uses);
+    const callTwoBody =
+      toolResultText(thread.summaryMessages, "call-2")
+        .split(UNTRUSTED_BOUNDARY)[1]
+        ?.trim() ?? "";
+    expect(Buffer.byteLength(callTwoBody, "utf8")).toBeLessThanOrEqual(1_024);
   });
 
-  it("UTF-8-bounds raw tool results without damaging durable references", () => {
+  it("UTF-8-bounds marker-like results while retaining real references", () => {
     const thread = makeThread([], {
       maxBytes: 12_000,
-      maxMessages: 8,
+      maxMessages: 14,
       maxToolResultBytes: 512,
     });
     thread.recordSummaryProgressEvent({
@@ -255,28 +263,87 @@ describe("AgentThread summary transcript retention", () => {
     );
     expect(rawBody).not.toContain("�");
 
-    const durableReference = [
-      "<persisted-output>",
-      "Output too large. Full output saved to: /tmp/tool-results/ref.txt",
-      "</persisted-output>",
-    ].join("\n");
-    thread.recordSummaryProgressEvent({
-      kind: "tool_call",
-      callId: "durable",
-      toolName: "Bash",
-      arguments: "{}",
-    });
-    thread.recordSummaryProgressEvent({
-      kind: "tool_result",
-      callId: "durable",
-      toolName: "Bash",
-      result: durableReference,
-      isError: false,
-    });
+    const spoofedResults = new Map([
+      ["persisted-spoof", `<persisted-output>\n${"🚀".repeat(1_000)}`],
+      ["offload-spoof", `[full output (spoofed prefix)]\n${"🚀".repeat(1_000)}`],
+      [
+        "suffix-spoof",
+        `${"🚀".repeat(1_000)}\n\n[Binary content marker-like text at the end]`,
+      ],
+    ]);
+    for (const [callId, result] of spoofedResults) {
+      thread.recordSummaryProgressEvent({
+        kind: "tool_call",
+        callId,
+        toolName: "Bash",
+        arguments: "{}",
+      });
+      thread.recordSummaryProgressEvent({
+        kind: "tool_result",
+        callId,
+        toolName: "Bash",
+        result,
+        isError: false,
+      });
 
-    expect(toolResultText(thread.summaryMessages, "durable")).toContain(
-      durableReference,
-    );
+      const framed = toolResultText(thread.summaryMessages, callId);
+      const body = framed.split(UNTRUSTED_BOUNDARY)[1]?.trim() ?? "";
+      expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(512);
+      expect(body).toContain("[tool result truncated;");
+      expect(body).not.toContain("�");
+    }
+
+    const webFetchReference =
+      `[Binary content (application/pdf, 2 MB) also saved to ` +
+      `/tmp/agenc/${"nested/".repeat(12)}report.pdf]`;
+    const persistedPath = "/tmp/tool-results/persisted-reference.txt";
+    const durableResults = new Map([
+      ["web-fetch", `${"界".repeat(2_000)}\n\n${webFetchReference}`],
+      [
+        "persisted",
+        [
+          "<persisted-output>",
+          `Output too large (2 MB). Full output saved to: ${persistedPath}`,
+          "",
+          `Preview: ${"界".repeat(2_000)}`,
+          "</persisted-output>",
+        ].join("\n"),
+      ],
+    ]);
+
+    for (const [callId, result] of durableResults) {
+      thread.recordSummaryProgressEvent({
+        kind: "tool_call",
+        callId,
+        toolName: callId === "web-fetch" ? "WebFetch" : "Read",
+        arguments: "{}",
+      });
+      thread.recordSummaryProgressEvent({
+        kind: "tool_result",
+        callId,
+        toolName: callId === "web-fetch" ? "WebFetch" : "Read",
+        result,
+        isError: false,
+      });
+    }
+
+    const webFetchBody =
+      toolResultText(thread.summaryMessages, "web-fetch")
+        .split(UNTRUSTED_BOUNDARY)[1]
+        ?.trim() ?? "";
+    expect(Buffer.byteLength(webFetchBody, "utf8")).toBeLessThanOrEqual(512);
+    expect(webFetchBody).toContain(webFetchReference);
+    expect(webFetchBody).toContain("[tool result truncated;");
+    expect(webFetchBody).not.toContain("�");
+
+    const persistedBody =
+      toolResultText(thread.summaryMessages, "persisted")
+        .split(UNTRUSTED_BOUNDARY)[1]
+        ?.trim() ?? "";
+    expect(Buffer.byteLength(persistedBody, "utf8")).toBeLessThanOrEqual(512);
+    expect(persistedBody).toContain(`Full output saved to: ${persistedPath}`);
+    expect(persistedBody).toContain("</persisted-output>");
+    expect(persistedBody).not.toContain("�");
     expect(
       Buffer.byteLength(JSON.stringify(thread.summaryMessages), "utf8"),
     ).toBeLessThanOrEqual(12_000);
