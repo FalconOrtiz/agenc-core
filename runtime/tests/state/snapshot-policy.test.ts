@@ -562,6 +562,18 @@ describe("AgenCSessionSnapshotPolicy", () => {
       streamId: "stream-periodic",
       acceptedAt: "2026-05-01T00:00:00.000Z",
     });
+    // A streaming chunk dirties the session without writing; the periodic
+    // tick is what lands it.
+    policy.recordSessionEvent("session-periodic", {
+      method: "event.message_chunk",
+      params: {
+        agentId: "agent-periodic",
+        delta: "hello",
+        messageId: "message-assistant",
+        streamId: "stream-periodic",
+        eventId: "chunk-periodic",
+      },
+    });
     policy.startPeriodic();
     tick?.();
     policy.stopPeriodic();
@@ -570,7 +582,63 @@ describe("AgenCSessionSnapshotPolicy", () => {
     expect(latestSnapshot("session-periodic").toolState).toMatchObject({
       lastTrigger: "periodic",
     });
+    expect(latestSnapshot("session-periodic").conversation).toEqual([
+      expect.objectContaining({ role: "user", content: "watch" }),
+      expect.objectContaining({ role: "assistant", delta: "hello" }),
+    ]);
     expect(clearInterval).toHaveBeenCalledTimes(1);
+  });
+
+  // Review P1-3: after the measured runs ended, every tracked session still
+  // received a 30 s periodic snapshot forever (21 per session in ten idle
+  // minutes, up to 349 KB and four fsyncs each) with the desktop idle.
+  it("flushPeriodic writes nothing for a session without changes", () => {
+    seedRun("run-idle", "session-idle");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+    });
+    policy.recordMessageExchange({
+      sessionId: "session-idle",
+      agentId: "run-idle",
+      content: "one",
+      messageId: "message-idle",
+      streamId: "stream-idle",
+      acceptedAt: "2026-05-01T00:00:00.000Z",
+    });
+    expect(snapshotCount("session-idle")).toBe(1);
+
+    for (let tick = 0; tick < 21; tick++) {
+      expect(policy.flushPeriodic()).toEqual([]);
+    }
+    expect(snapshotCount("session-idle")).toBe(1);
+    expect(policy.trackedSessionIds()).toEqual(["session-idle"]);
+    expect(policy.flushSession("session-idle")).toBeUndefined();
+  });
+
+  it("close flushes dirty sessions once and forgets them", () => {
+    seedRun("run-close", "session-close");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+    });
+    policy.recordSessionEvent("session-close", {
+      method: "event.message_chunk",
+      params: {
+        agentId: "run-close",
+        delta: "partial",
+        messageId: "message-close",
+        streamId: "stream-close",
+        eventId: "chunk-close",
+      },
+    });
+    expect(snapshotCount("session-close")).toBe(0);
+
+    policy.close();
+
+    expect(snapshotCount("session-close")).toBe(1);
+    expect(latestSnapshot("session-close").conversation).toEqual([
+      expect.objectContaining({ role: "assistant", delta: "partial" }),
+    ]);
+    expect(policy.trackedSessionIds()).toEqual([]);
   });
 
   it("hydrates recovered session state before periodic flush", () => {
@@ -943,12 +1011,13 @@ describe("AgenCSessionSnapshotPolicy", () => {
     expect(reports).toEqual([]);
 
     policy.flushPeriodic();
-    expect(reports).toHaveLength(1);
-    expect(reports[0]).toMatchObject({
-      prunedSessionIds: ["session-retention-fast"],
-    });
-    expect(reports[0]?.prunedSnapshots).toBeGreaterThanOrEqual(1);
+    expect(reports).toEqual([
+      { prunedSnapshots: 1, prunedSessionIds: ["session-retention-fast"] },
+    ]);
     expect(snapshotCount("session-retention-fast")).toBe(2);
+    // Nothing new to report on a quiet tick.
+    policy.flushPeriodic();
+    expect(reports).toHaveLength(1);
   });
 
   it("hard-caps snapshot rows per session without any configured retention", () => {

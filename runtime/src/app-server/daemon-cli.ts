@@ -4413,6 +4413,12 @@ class AgenCDaemonSnapshotPolicyRegistry {
       this.#periodicTimer = undefined;
     }
     for (const entry of this.#policies.values()) {
+      // Flush dirty sessions synchronously before the state DB goes away.
+      try {
+        entry.policy.close();
+      } catch (error) {
+        this.#onError(error);
+      }
       entry.driver.close();
     }
     for (const store of this.#threadStores.values()) {
@@ -4492,6 +4498,11 @@ class AgenCDaemonSnapshotPolicyRegistry {
       eventId: terminal.eventId,
     });
     hitM4DurabilityFailpoint("after_terminal_commit");
+    // The run is over: land any unflushed snapshot state and stop tracking
+    // the session in memory, so it neither rides the periodic tick nor holds
+    // its conversation tail until the LRU cap (1,024 sessions) evicts it.
+    entry.policy.flushSession(terminal.sessionId);
+    entry.policy.forgetSession(terminal.sessionId);
   }
 
   threadStoreForAgentLogs(

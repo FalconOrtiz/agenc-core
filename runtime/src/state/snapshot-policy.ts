@@ -437,6 +437,11 @@ export class AgenCSessionSnapshotPolicy {
     if (hydration.snapshotAt !== undefined) {
       this.#rememberSnapshotAt(hydration.snapshotAt);
     }
+    // Hydration normalizes the recovered state (array-shaped maps are
+    // dropped, the tail is re-capped); write that once on the next tick so
+    // the newest row reflects what this daemon instance actually holds.
+    state.dirty = true;
+    state.pendingTrigger = "periodic";
   }
 
   recordMessageExchange(
@@ -611,9 +616,15 @@ export class AgenCSessionSnapshotPolicy {
   }
 
   flushPeriodic(): readonly SnapshotPolicySnapshotRecord[] {
-    const records = [...this.#sessions.values()].map((state) =>
-      this.#writeSnapshot(state, "periodic"),
-    );
+    // Only sessions with unflushed changes are written. Without this check
+    // every session the daemon had ever seen was re-serialized and fsynced
+    // every 30 s forever: 21 identical snapshots per session in the ten idle
+    // minutes after the measured runs ended.
+    const records: SnapshotPolicySnapshotRecord[] = [];
+    for (const state of this.#sessions.values()) {
+      if (!state.dirty) continue;
+      records.push(this.#writeSnapshot(state, "periodic"));
+    }
     // Piggy-back the disk-retention sweep on the same throttled tick so
     // rollout/session pruning runs on a bounded timer, not a tight loop.
     this.sweepRolloutRetention();
