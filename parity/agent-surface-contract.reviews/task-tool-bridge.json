@@ -98,7 +98,6 @@
       "runtime/src/bin/model-facing-tools.ts",
       "runtime/src/agents/jobs/job-orchestrator.ts",
       "runtime/src/agents/jobs/csv-reader.ts",
-      "runtime/src/agents/jobs/instruction-template.ts",
       "runtime/src/state/csv-agent-jobs.ts",
       "runtime/src/session/turn-context.ts",
       "runtime/src/llm/model-registry.ts",
