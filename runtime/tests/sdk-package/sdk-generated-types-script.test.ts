@@ -1,4 +1,7 @@
+import { execFile } from "node:child_process";
 import {
+  chmod,
+  lstat,
   mkdtemp,
   readFile,
   readdir,
@@ -7,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -15,6 +19,8 @@ import {
 } from "../../scripts/check-sdk-generated-types.mjs";
 
 const temporaryRoots: string[] = [];
+const execFileAsync = promisify(execFile);
+const repositoryRoot = join(import.meta.dirname, "../../..");
 
 afterEach(async () => {
   await Promise.all(
@@ -85,6 +91,24 @@ describe("SDK generated transcript v2 script", () => {
     expect(() => parseSdkGeneratedTypesMode(["--check"])).toThrow(/usage/);
     expect(() => parseSdkGeneratedTypesMode(["--write", "extra"])).toThrow(
       /usage/,
+    );
+  });
+
+  it("accepts the documented npm write entrypoint", async () => {
+    const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
+    const { stdout } = await execFileAsync(
+      npmExecutable,
+      [
+        "--workspace=@tetsuo-ai/runtime",
+        "run",
+        "check:sdk-generated-types",
+        "--",
+        "--write",
+      ],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    );
+    expect(stdout).toContain(
+      "packages/agenc-sdk/src/transcript-v2.generated.ts is already current",
     );
   });
 
@@ -209,6 +233,35 @@ describe("SDK generated transcript v2 script", () => {
     expect(canonicalized.changed).toBe(true);
     expect(await readFile(fixture.generatedPath, "utf8")).toBe(generated);
   });
+
+  it.runIf(process.platform !== "win32")(
+    "preserves existing permissions and respects the umask for a missing target",
+    async () => {
+      const fixture = await createFixture();
+      await chmod(fixture.generatedPath, 0o640);
+
+      await synchronizeTranscriptV2Generated({
+        runtimeProtocolPath: fixture.protocolPath,
+        generatedPath: fixture.generatedPath,
+        write: true,
+      });
+      expect((await lstat(fixture.generatedPath)).mode & 0o777).toBe(0o640);
+
+      await rm(fixture.generatedPath);
+      const previousUmask = process.umask(0o007);
+      try {
+        await synchronizeTranscriptV2Generated({
+          runtimeProtocolPath: fixture.protocolPath,
+          generatedPath: fixture.generatedPath,
+          write: true,
+        });
+      } finally {
+        process.umask(previousUmask);
+      }
+
+      expect((await lstat(fixture.generatedPath)).mode & 0o777).toBe(0o660);
+    },
+  );
 
   it("rejects missing interfaces and invalid runtime heritage before writing", async () => {
     const missingResult = runtimeProtocol().replace(

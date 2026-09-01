@@ -117,21 +117,23 @@ function renderTranscriptV2Generated(runtimeProtocol) {
 async function existingFileMode(filePath) {
   try {
     const metadata = await lstat(filePath);
-    return metadata.isFile() ? metadata.mode & 0o777 : 0o666;
+    return metadata.isFile() ? metadata.mode & 0o777 : undefined;
   } catch (error) {
-    if (error?.code === "ENOENT") return 0o666;
+    if (error?.code === "ENOENT") return undefined;
     throw error;
   }
 }
 
 async function writeFileAtomically(filePath, contents) {
-  const mode = await existingFileMode(filePath);
+  const existingMode = await existingFileMode(filePath);
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   let handle;
   try {
-    handle = await open(temporaryPath, "wx", mode);
+    handle = await open(temporaryPath, "wx", existingMode ?? 0o666);
     await handle.writeFile(contents, { encoding: "utf8" });
-    await handle.chmod(mode);
+    if (existingMode !== undefined) {
+      await handle.chmod(existingMode);
+    }
     await handle.sync();
     await handle.close();
     handle = undefined;
