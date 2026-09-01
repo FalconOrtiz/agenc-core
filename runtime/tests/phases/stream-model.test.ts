@@ -479,6 +479,34 @@ describe("streamModel — live assistant text sanitization", () => {
     });
   });
 
+  test("routes every provider request with the session conversation id as the prompt cache key", async () => {
+    // xAI prefix caching is routed by `prompt_cache_key`; without it 77 of
+    // 220 calls in the reviewed desktop session lost part of the cached
+    // prefix and re-prefilled 20k-150k tokens.
+    const ctx = mkCtx("chat");
+    const seenOptions: Array<Record<string, unknown> | undefined> = [];
+    const provider = mkProvider(async (_messages, _onChunk, options) => {
+      seenOptions.push(options as Record<string, unknown> | undefined);
+      return {
+        content: "ok",
+        toolCalls: [],
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        model: "test-model",
+        finishReason: "stop",
+      };
+    });
+    const { session } = mkSession(provider);
+
+    await streamModel(
+      mkState(ctx),
+      ctx,
+      session,
+      mkRequest([{ role: "user", content: "hello" }]),
+    );
+
+    expect(seenOptions[0]).toMatchObject({ promptCacheKey: "conv-stream" });
+  });
+
   test("keeps base instructions out of provider transcript messages", async () => {
     const ctx = mkCtx("chat");
     const seenMessages: LLMMessage[][] = [];

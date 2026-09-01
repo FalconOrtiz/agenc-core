@@ -235,19 +235,36 @@ function cloneProviderTools(tools: ReadonlyArray<LLMTool>): LLMTool[] {
   }));
 }
 
+/**
+ * Stable prompt-cache routing hint for one session. xAI (and the OpenAI
+ * Responses API) route requests carrying the same `prompt_cache_key` to the
+ * backend holding that conversation's cached prefix; without it 77 of 220
+ * calls in the reviewed desktop session lost part of the cached prefix and
+ * re-prefilled 20k-150k tokens each. Gemini reinterprets the same option as
+ * a `cachedContents/...` resource name, so it keeps its own configured value.
+ */
+function resolveSessionPromptCacheKey(session: Session): string | undefined {
+  if (session.services.provider.name === "gemini") return undefined;
+  const conversationId = String(session.conversationId ?? "").trim();
+  return conversationId.length > 0 ? conversationId : undefined;
+}
+
 function buildProviderOptions(
   request: StreamModelRequestContract,
   ctx: TurnContext,
   signal: AbortSignal,
+  session: Session,
 ): LLMChatOptions {
   const allowedToolNames = request.tools.map((spec) => spec.function.name);
   const planMode = isPlanMode(ctx);
   const systemPrompt = request.baseInstructions.trim();
+  const promptCacheKey = resolveSessionPromptCacheKey(session);
   return {
     signal,
     tools: cloneProviderTools(request.tools),
     parallelToolCalls: request.parallelToolCalls,
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
+    ...(promptCacheKey !== undefined ? { promptCacheKey } : {}),
     ...(request.contextWindowTokens !== undefined
       ? { contextWindowTokens: request.contextWindowTokens }
       : {}),
@@ -1089,7 +1106,7 @@ export async function streamModel(
   ): Promise<LLMResponse> => {
     resetCanonicalAssistantOutput();
     const messages = buildProviderMessages(request);
-    const options = buildProviderOptions(request, ctx, scoped.signal);
+    const options = buildProviderOptions(request, ctx, scoped.signal, session);
     const recoveryFallback = state.pendingAdmissionFallback;
     const clearRecoveryFallback = (): void => {
       // Do not clear a newer recovery decision installed while this attempt
