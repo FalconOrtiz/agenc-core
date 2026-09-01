@@ -532,9 +532,42 @@ describe("plugin marketplace runtime", () => {
     }>;
     expect(index["url-team"]?.source).toEqual({
       source: "url",
-      url: "https://agenc.tech/marketplace.json?token=%3Credacted%3E",
+      url: "https://agenc.tech/marketplace.json?redacted=1",
     });
     expect(index["url-team"]?.refreshable).toBe(false);
+  });
+
+  it("keeps canonicalized safe URLs refreshable", async () => {
+    const { pluginStorageRoot, workspaceRoot } = await tempRuntime();
+    const sourceUrl = "https://EXAMPLE.com:443";
+
+    const added = await addMarketplaceOp({
+      pluginStorageRoot,
+      workspaceRoot,
+      source: { source: "url", url: sourceUrl },
+      fetcher: async () => jsonResponse({
+        metadata: { name: "safe-url-team" },
+        plugins: [],
+      }),
+    });
+
+    expect(added.marketplace.sourceDescriptor).toEqual({
+      source: "url",
+      url: sourceUrl,
+    });
+    expect(added.marketplace.refreshable).toBeUndefined();
+    const index = JSON.parse(await readFile(
+      marketplaceIndexPath({ pluginStorageRoot }),
+      "utf8",
+    )) as Record<string, {
+      source?: { source?: string; url?: string };
+      refreshable?: boolean;
+    }>;
+    expect(index["safe-url-team"]?.source).toEqual({
+      source: "url",
+      url: "https://example.com",
+    });
+    expect(index["safe-url-team"]?.refreshable).toBeUndefined();
   });
 
   it("skips credential-bearing URL marketplace upgrades instead of fetching redacted URLs", async () => {
@@ -568,6 +601,79 @@ describe("plugin marketplace runtime", () => {
     expect(result.skipped).toHaveLength(1);
     expect(result.skipped[0]).toMatchObject({
       marketplace: { name: "url-team" },
+      reason: expect.stringContaining("credentials that are not stored"),
+    });
+  });
+
+  it("does not persist or list credentials from git marketplace sources", async () => {
+    const { pluginStorageRoot, workspaceRoot } = await tempRuntime();
+    const credentialUrl =
+      "https://opaque-token@agenc.tech/private/marketplace.git?X-Amz-Signature=opaque-signature#opaque-fragment";
+    const cloneUrls: string[] = [];
+
+    const added = await addMarketplaceOp({
+      pluginStorageRoot,
+      workspaceRoot,
+      env: {},
+      source: { source: "git", url: credentialUrl },
+      runProcess: async (_command, args) => {
+        if (args.includes("clone")) {
+          const repositorySeparator = args.indexOf("--");
+          const gitUrl = args[repositorySeparator + 1];
+          const target = args.at(-1);
+          if (gitUrl === undefined || target === undefined) {
+            throw new Error("missing git clone arguments");
+          }
+          cloneUrls.push(gitUrl);
+          await writeMarketplace(target, "git-team");
+          return { stdout: "", stderr: "" };
+        }
+        if (args.includes("rev-parse")) {
+          return { stdout: "abc123\n", stderr: "" };
+        }
+        return { stdout: "", stderr: "" };
+      },
+    });
+
+    expect(cloneUrls).toEqual([credentialUrl]);
+    expect(added.marketplace.source).not.toContain("opaque-token");
+    expect(added.marketplace.sourceDescriptor).toEqual({
+      source: "git",
+      url:
+        "https://redacted@agenc.tech/private/marketplace.git?redacted=1#redacted",
+    });
+    expect(added.marketplace.refreshable).toBe(false);
+
+    const rawIndex = await readFile(
+      marketplaceIndexPath({ pluginStorageRoot }),
+      "utf8",
+    );
+    expect(rawIndex).not.toContain("opaque-token");
+    expect(rawIndex).not.toContain("opaque-signature");
+    expect(rawIndex).not.toContain("opaque-fragment");
+    const listed = await readMarketplaceIndex({
+      pluginStorageRoot,
+      workspaceRoot,
+    });
+    expect(listed.marketplaces["git-team"]?.source).not.toContain("opaque-token");
+    expect(listed.marketplaces["git-team"]?.sourceDescriptor).toEqual({
+      source: "git",
+      url:
+        "https://redacted@agenc.tech/private/marketplace.git?redacted=1#redacted",
+    });
+
+    const upgraded = await upgradeMarketplaceOp({
+      pluginStorageRoot,
+      workspaceRoot,
+      env: {},
+      runProcess: async () => {
+        throw new Error("git should not run for redacted git marketplace upgrades");
+      },
+    });
+    expect(upgraded.upgraded).toEqual([]);
+    expect(upgraded.skipped).toHaveLength(1);
+    expect(upgraded.skipped[0]).toMatchObject({
+      marketplace: { name: "git-team" },
       reason: expect.stringContaining("credentials that are not stored"),
     });
   });

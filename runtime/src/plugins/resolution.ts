@@ -312,7 +312,7 @@ export function redactPluginSource(source: string): string {
 }
 
 export function pluginSourceNeedsRedaction(source: string): boolean {
-  return redactPluginSource(source) !== source;
+  return redactSecrets(source) !== source || credentialUrlNeedsRedaction(source);
 }
 
 export function redactPluginInstallSource(
@@ -331,7 +331,7 @@ export function pluginInstallSourceNeedsRedaction(
 ): boolean {
   return typeof source === "string"
     ? pluginSourceNeedsRedaction(source)
-    : redactPluginSource(source.url) !== source.url;
+    : pluginSourceNeedsRedaction(source.url);
 }
 
 export function parsePluginInstallSource(
@@ -1670,15 +1670,19 @@ function pluginInstallSourceIdentity(source: PluginInstallSource): string {
 
 function redactCredentialUrls(input: string): string {
   return input.replace(/\b(?:git\+)?(?:https?|ssh):\/\/[^\s"'<>]+/giu, (raw) => {
-    const prefix = raw.startsWith("git+") ? "git+" : "";
-    const urlText = prefix ? raw.slice("git+".length) : raw;
+    const prefix = /^git\+/iu.exec(raw)?.[0] ?? "";
+    const urlText = raw.slice(prefix.length);
     try {
       const url = new URL(urlText);
-      if (url.username || url.password) {
-        url.username = "redacted";
+      const sshUsername = url.protocol.toLowerCase() === "ssh:";
+      if (url.password.length > 0) {
+        if (!sshUsername) url.username = "redacted";
         url.password = "";
+      } else if (url.username.length > 0 && !sshUsername) {
+        url.username = "redacted";
       }
       if (url.search) url.search = "?redacted=1";
+      if (url.hash) url.hash = "#redacted";
       return `${prefix}${url.toString()}`;
     } catch {
       return redactUnparseableCredentialUrl(raw);
@@ -1686,20 +1690,68 @@ function redactCredentialUrls(input: string): string {
   });
 }
 
+function credentialUrlNeedsRedaction(input: string): boolean {
+  for (
+    const match of input.matchAll(
+      /\b(?:git\+)?(?:https?|ssh):\/\/[^\s"'<>]+/giu,
+    )
+  ) {
+    const raw = match[0];
+    const urlText = /^git\+/iu.test(raw) ? raw.slice("git+".length) : raw;
+    try {
+      const url = new URL(urlText);
+      const sshUsername = url.protocol.toLowerCase() === "ssh:";
+      if (
+        url.password.length > 0 ||
+        (!sshUsername && url.username.length > 0) ||
+        url.search.length > 0 ||
+        url.hash.length > 0
+      ) {
+        return true;
+      }
+    } catch {
+      if (unparseableCredentialUrlNeedsRedaction(raw)) return true;
+    }
+  }
+  return false;
+}
+
+function unparseableCredentialUrlNeedsRedaction(raw: string): boolean {
+  const urlText = /^git\+/iu.test(raw) ? raw.slice("git+".length) : raw;
+  const schemeMatch = /^(https?|ssh):\/\//iu.exec(urlText);
+  if (schemeMatch === null) return false;
+  const rest = urlText.slice(schemeMatch[0].length);
+  if (rest.search(/[?#]/u) !== -1) return true;
+  const userinfoEnd = rest.indexOf("@");
+  if (userinfoEnd === -1) return false;
+  const scheme = schemeMatch[1]?.toLowerCase();
+  return scheme !== "ssh" || rest.slice(0, userinfoEnd).includes(":");
+}
+
 function redactUnparseableCredentialUrl(raw: string): string {
-  const prefix = raw.startsWith("git+") ? "git+" : "";
-  const urlText = prefix ? raw.slice("git+".length) : raw;
+  const prefix = /^git\+/iu.exec(raw)?.[0] ?? "";
+  const urlText = raw.slice(prefix.length);
   const schemeMatch = /^(https?|ssh):\/\//iu.exec(urlText);
   if (schemeMatch === null) return raw;
   const scheme = schemeMatch[0];
   let rest = urlText.slice(scheme.length);
   const userinfoEnd = rest.indexOf("@");
   if (userinfoEnd !== -1) {
-    rest = `redacted@${rest.slice(userinfoEnd + 1)}`;
+    const userinfo = rest.slice(0, userinfoEnd);
+    if (schemeMatch[1]?.toLowerCase() === "ssh") {
+      const passwordSeparator = userinfo.indexOf(":");
+      if (passwordSeparator !== -1) {
+        const username = userinfo.slice(0, passwordSeparator);
+        rest = `${username.length > 0 ? `${username}@` : ""}${rest.slice(userinfoEnd + 1)}`;
+      }
+    } else {
+      rest = `redacted@${rest.slice(userinfoEnd + 1)}`;
+    }
   }
   const queryIndex = rest.search(/[?#]/u);
   if (queryIndex !== -1) {
-    rest = `${rest.slice(0, queryIndex)}?redacted=1`;
+    const delimiter = rest[queryIndex] === "#" ? "#redacted" : "?redacted=1";
+    rest = `${rest.slice(0, queryIndex)}${delimiter}`;
   }
   return `${prefix}${scheme}${rest}`;
 }

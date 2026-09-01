@@ -30,6 +30,10 @@ import { pluginMarketplaceRootPath } from "../directories.js";
 import { loadPluginManifest } from "../manifest.js";
 import type { PluginManifest, PluginManifestInterface } from "../manifest-schema.js";
 import {
+  pluginSourceNeedsRedaction,
+  redactPluginSource,
+} from "../resolution.js";
+import {
   assertHttpsOrLoopbackUrl,
   fetchWithTimeout as fetchWithTimeoutGuard,
   readResponseErrorText,
@@ -309,7 +313,7 @@ function marketplaceRecordFromInventory(
   name: string,
   entry: KnownMarketplace,
 ): MarketplaceRecord {
-  const source = installableMarketplaceSource(entry.source);
+  const source = persistedMarketplaceSource(installableMarketplaceSource(entry.source));
   const sparse = source.source === "github" || source.source === "git"
     ? source.path ?? source.sparsePaths?.[0]
     : undefined;
@@ -382,11 +386,7 @@ export async function addMarketplaceOp(
     const sparse = source.source === "git" || source.source === "github"
       ? source.path ?? source.sparsePaths?.[0]
       : undefined;
-    const refreshable = source.source === "url"
-      ? persistedSource.source === "url" &&
-        persistedSource.url === source.url &&
-        !hasMarketplaceUrlHeaders(source)
-      : undefined;
+    const refreshable = marketplaceSourceIsRefreshable(source);
     const marketplace: MarketplaceRecord = {
       name,
       source: displayMarketplaceSource(persistedSource),
@@ -1350,20 +1350,47 @@ function displayMarketplaceSource(source: MarketplaceSource): string {
       return source.repo;
     case "git":
     case "url":
-      return source.url;
+      return redactPluginSource(source.url);
     case "directory":
     case "file":
       return source.path;
+    default: {
+      const exhaustive: never = source;
+      throw new Error(`unhandled marketplace source: ${JSON.stringify(exhaustive)}`);
+    }
   }
 }
 
 function persistedMarketplaceSource(source: MarketplaceSource): MarketplaceSource {
-  if (source.source !== "url") return source;
-  const url = redactSensitiveText(source.url);
-  return {
-    source: "url",
-    url,
-  };
+  if (source.source === "url") {
+    const url = pluginSourceNeedsRedaction(source.url)
+      ? redactPluginSource(source.url)
+      : source.url;
+    if (url === source.url && source.headers === undefined) return source;
+    return {
+      source: "url",
+      url,
+    };
+  }
+  if (source.source === "git") {
+    return pluginSourceNeedsRedaction(source.url)
+      ? { ...source, url: redactPluginSource(source.url) }
+      : source;
+  }
+  return source;
+}
+
+function marketplaceSourceIsRefreshable(
+  source: MarketplaceSource,
+): boolean | undefined {
+  if (source.source === "url") {
+    return !pluginSourceNeedsRedaction(source.url) &&
+      !hasMarketplaceUrlHeaders(source);
+  }
+  if (source.source === "git") {
+    return !pluginSourceNeedsRedaction(source.url);
+  }
+  return undefined;
 }
 
 function hasMarketplaceUrlHeaders(
@@ -1374,9 +1401,12 @@ function hasMarketplaceUrlHeaders(
 
 function marketplaceUpgradeSkipReason(record: MarketplaceRecord): string | undefined {
   const source = record.sourceDescriptor;
-  if (source.source !== "url") return undefined;
-  if (record.refreshable === false || source.url.includes("<redacted>") || hasMarketplaceUrlHeaders(source)) {
-    return "URL marketplace source requires credentials that are not stored; re-add the marketplace with fresh credentials to refresh it";
+  if (source.source !== "url" && source.source !== "git") return undefined;
+  if (
+    record.refreshable === false ||
+    (source.source === "url" && hasMarketplaceUrlHeaders(source))
+  ) {
+    return "Marketplace source requires credentials that are not stored; re-add the marketplace with fresh credentials to refresh it";
   }
   return undefined;
 }
@@ -1457,14 +1487,11 @@ function appendBoundedOutput(
 }
 
 function redactProcessArgs(args: readonly string[]): string[] {
-  return args.map((arg) => redactSensitiveText(arg));
+  return args.map((arg) => redactPluginSource(arg));
 }
 
 function redactSensitiveText(value: string): string {
-  return value
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^@\s/]+)@/giu, "$1<redacted>@")
-    .replace(/([?&](?:token|access_token|password|apikey|api_key)=)[^&\s]+/giu, "$1<redacted>")
-    .replace(/((?:token|access_token|password|apikey|api_key)=)[^&\s]+/giu, "$1<redacted>");
+  return redactPluginSource(value);
 }
 
 

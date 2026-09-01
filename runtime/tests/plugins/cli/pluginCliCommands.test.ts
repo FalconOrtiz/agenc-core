@@ -106,6 +106,26 @@ function options(
   };
 }
 
+function marketplaceGitRunner(
+  manifestName: string,
+  cloneCalls?: string[][],
+): NonNullable<AgenCPluginCliOptions["runProcess"]> {
+  return async (_command, args) => {
+    if (args.includes("clone")) {
+      cloneCalls?.push([...args]);
+      const target = args.at(-1);
+      if (target === undefined) throw new Error("missing clone target");
+      await mkdir(join(target, ".agenc-plugin"), { recursive: true });
+      await writeFile(
+        join(target, ".agenc-plugin", "marketplace.json"),
+        JSON.stringify({ metadata: { name: manifestName }, plugins: [] }),
+      );
+    }
+    if (args.includes("rev-parse")) return { stdout: "abc123\n", stderr: "" };
+    return { stdout: "", stderr: "" };
+  };
+}
+
 describe("agenc plugin CLI", () => {
   it("documents marketplace and plugin source forms in help text", () => {
     const help = formatAgenCPluginCliHelpText();
@@ -499,20 +519,7 @@ describe("agenc plugin CLI", () => {
       force: false,
     }, {
       ...options(agencHome, workspaceRoot, gitIo),
-      runProcess: async (_command, args) => {
-        if (args.includes("clone")) {
-          cloneCalls.push([...args]);
-          const target = args.at(-1);
-          if (target === undefined) throw new Error("missing clone target");
-          await mkdir(join(target, ".agenc-plugin"), { recursive: true });
-          await writeFile(
-            join(target, ".agenc-plugin", "marketplace.json"),
-            JSON.stringify({ metadata: { name: "github-team" }, plugins: [] }),
-          );
-        }
-        if (args.includes("rev-parse")) return { stdout: "abc123\n", stderr: "" };
-        return { stdout: "", stderr: "" };
-      },
+      runProcess: marketplaceGitRunner("github-team", cloneCalls),
     });
     expect(gitExit).toBe(0);
     expect(cloneCalls[0]).toContain("https://github.com/agenc-org/plugins.git");
@@ -520,6 +527,40 @@ describe("agenc plugin CLI", () => {
     const repositorySeparator = cloneCalls[0]!.indexOf("--");
     expect(repositorySeparator).toBeGreaterThan(-1);
     expect(cloneCalls[0]![repositorySeparator + 1]).toBe("https://github.com/agenc-org/plugins.git");
+  });
+
+  it("redacts credential-bearing git marketplace sources from list output", async () => {
+    const { agencHome, workspaceRoot } = await tempRuntime();
+    const credentialUrl =
+      "https://opaque-token@agenc.tech/private/marketplace.git";
+    const addIo = createIo();
+    const addExit = await runAgenCPluginCli({
+      kind: "marketplace-add",
+      source: credentialUrl,
+      name: "private-git",
+      force: false,
+    }, {
+      ...options(agencHome, workspaceRoot, addIo),
+      runProcess: marketplaceGitRunner("private-git"),
+    });
+    expect(addExit).toBe(0);
+    expect(addIo.stdoutText()).not.toContain("opaque-token");
+    const listIo = createIo();
+    const listExit = await runAgenCPluginCli({
+      kind: "marketplace-list",
+      json: false,
+    }, options(agencHome, workspaceRoot, listIo));
+    expect(listExit).toBe(0);
+    expect(listIo.stdoutText()).toContain("private-git");
+    expect(listIo.stdoutText()).toContain("redacted");
+    expect(listIo.stdoutText()).not.toContain("opaque-token");
+
+    const jsonIo = createIo();
+    await runAgenCPluginCli({
+      kind: "marketplace-list",
+      json: true,
+    }, options(agencHome, workspaceRoot, jsonIo));
+    expect(jsonIo.stdoutText()).not.toContain("opaque-token");
   });
 
   it("refuses unsigned bundled plugins from a git marketplace", async () => {
@@ -774,6 +815,6 @@ describe("agenc plugin CLI", () => {
       timeoutMs: 1_000,
       maxOutputBytes: 512,
       environment: Object.freeze({ ...process.env }),
-    })).rejects.toThrow("https://<redacted>@agenc.tech/repo?token=<redacted>");
+    })).rejects.toThrow("https://redacted@agenc.tech/repo?redacted=1");
   });
 });

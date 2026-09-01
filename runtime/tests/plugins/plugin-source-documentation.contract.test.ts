@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   classifyPluginSource,
+  pluginInstallSourceNeedsRedaction,
   pluginSourceNeedsRedaction,
   redactPluginInstallSource,
   redactPluginSource,
@@ -110,6 +111,37 @@ describe("plugin source documentation contract", () => {
     ).resolves.toBe("mcpb");
     expect(pluginSourceNeedsRedaction(queryUrl)).toBe(true);
     expect(pluginSourceNeedsRedaction(cleanUrl)).toBe(false);
+    expect(pluginSourceNeedsRedaction("https://EXAMPLE.com:443")).toBe(false);
+    const sshUsernameUrl = "ssh://git@github.com/acme/tool.git";
+    const sshPasswordUrl = "ssh://git:secret@github.com/acme/tool.git";
+    const malformedSshUsernameUrl =
+      "ssh://git@github.com:notaport/acme/tool.git";
+    const malformedSshPasswordUrl =
+      "ssh://git:secret@github.com:notaport/acme/tool.git";
+    expect(pluginSourceNeedsRedaction(sshUsernameUrl)).toBe(false);
+    expect(redactPluginSource(sshUsernameUrl)).toBe(sshUsernameUrl);
+    expect(pluginSourceNeedsRedaction(malformedSshUsernameUrl)).toBe(false);
+    expect(redactPluginSource(malformedSshUsernameUrl))
+      .toBe(malformedSshUsernameUrl);
+    expect(pluginInstallSourceNeedsRedaction({
+      type: "git",
+      url: sshUsernameUrl,
+    })).toBe(false);
+    expect(pluginInstallSourceNeedsRedaction({
+      type: "git",
+      url: sshPasswordUrl,
+    })).toBe(true);
+    expect(redactPluginInstallSource({
+      type: "git",
+      url: sshPasswordUrl,
+    })).toEqual({
+      type: "git",
+      url: sshUsernameUrl,
+    });
+    expect(pluginSourceNeedsRedaction(malformedSshPasswordUrl)).toBe(true);
+    expect(redactPluginSource(malformedSshPasswordUrl)).toBe(
+      malformedSshUsernameUrl,
+    );
     expect(
       pluginSourceNeedsRedaction("https://opaque-token@agenc.tech/plugin.tgz"),
     ).toBe(true);
@@ -117,6 +149,8 @@ describe("plugin source documentation contract", () => {
       "https://agenc.tech/plugins/sk-proj-abcdefghijklmnopqrstuvwxyz123456/tool.tgz";
     const secretFragment =
       "https://agenc.tech/plugins/tool.tgz#sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+    const opaqueFragment =
+      "https://agenc.tech/plugins/tool.tgz#opaque-credential-material";
     expect(pluginSourceNeedsRedaction(secretPath)).toBe(true);
     expect(pluginSourceNeedsRedaction(secretFragment)).toBe(true);
     expect(redactPluginSource(secretPath)).not.toContain(
@@ -124,6 +158,9 @@ describe("plugin source documentation contract", () => {
     );
     expect(redactPluginSource(secretFragment)).not.toContain(
       "sk-proj-abcdefghijklmnopqrstuvwxyz123456",
+    );
+    expect(redactPluginSource(opaqueFragment)).toBe(
+      "https://agenc.tech/plugins/tool.tgz#redacted",
     );
   });
 
