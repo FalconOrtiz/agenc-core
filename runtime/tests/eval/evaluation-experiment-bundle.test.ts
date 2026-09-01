@@ -1,24 +1,17 @@
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
-  EVAL_CONTRACT_VERSION,
   appendEvidenceEvent,
-  canonicalizeJson,
   computePairedTfrEffect,
   computeRepositoryClusteredPercentileInterval,
   computePlannedExecutionOrderDigest,
-  createHoldoutAccessStatement,
-  createInfrastructureClassificationStatement,
-  createTrustAssessmentStatement,
   compareUtcTimestamps,
   deriveExperimentSummary,
   digestCanonicalJson,
   derivePlannedExecutionOrder,
   initializeEvidenceLedger,
-  projectTaskForAgent,
-  sha256Digest,
   sealEvidenceLedger,
   validateEvalContractDocument,
   validateDerivedSummaryAgainstBundle,
@@ -27,27 +20,65 @@ import {
   withDocumentDigest,
   type BlindedResultsSealDocument,
   type DerivedSummaryDocument,
-  type ExpectedArtifact,
-  type EvidenceEventType,
   type HoldoutAccessReceiptDocument,
   type OperatorTaskDocument,
   type PreregistrationDocument,
-  type PreregistrationReceiptDocument,
-  type RecordedRunArtifact,
   type RunRecordDocument,
   type SuiteManifestDocument,
   type UnblindingRecordDocument,
-  type VerifiedEvidenceLedger,
 } from "../../src/eval-contract/index.js";
 import {
   GIT_COMMIT,
   digest,
-  makeAnchorProvider,
-  makeHoldoutDescriptor,
   makePreregistration,
-  makeSuite,
-  makeSystem,
 } from "./evaluation-contract-fixtures.js";
+import {
+  evidenceReference,
+  makeScorecardBundleFixture,
+} from "./evaluation-experiment-bundle-fixtures.js";
+
+const scorecardEvidenceRegistry = vi.hoisted(() => new WeakSet<object>());
+const durableLedgerProbe = vi.hoisted(() => ({
+  appendDelayMs: 0,
+  initializeCalls: 0,
+  appendCalls: 0,
+  sealCalls: 0,
+  verifyCalls: 0,
+}));
+
+vi.mock("../../src/eval-contract/evidence-ledger.js", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../../src/eval-contract/evidence-ledger.js")
+  >();
+  return {
+    ...actual,
+    isExternallyVerifiedEvidenceLedger(value: unknown) {
+      return actual.isExternallyVerifiedEvidenceLedger(value) ||
+        (typeof value === "object" && value !== null && scorecardEvidenceRegistry.has(value));
+    },
+    async initializeEvidenceLedger(
+      ...args: Parameters<typeof actual.initializeEvidenceLedger>
+    ) {
+      durableLedgerProbe.initializeCalls += 1;
+      return actual.initializeEvidenceLedger(...args);
+    },
+    async appendEvidenceEvent(...args: Parameters<typeof actual.appendEvidenceEvent>) {
+      durableLedgerProbe.appendCalls += 1;
+      if (durableLedgerProbe.appendDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, durableLedgerProbe.appendDelayMs));
+      }
+      return actual.appendEvidenceEvent(...args);
+    },
+    async sealEvidenceLedger(...args: Parameters<typeof actual.sealEvidenceLedger>) {
+      durableLedgerProbe.sealCalls += 1;
+      return actual.sealEvidenceLedger(...args);
+    },
+    async verifyEvidenceLedger(...args: Parameters<typeof actual.verifyEvidenceLedger>) {
+      durableLedgerProbe.verifyCalls += 1;
+      return actual.verifyEvidenceLedger(...args);
+    },
+  };
+});
 
 let root: string;
 
@@ -63,6 +94,11 @@ function access() {
 }
 
 beforeEach(async () => {
+  durableLedgerProbe.appendDelayMs = 0;
+  durableLedgerProbe.initializeCalls = 0;
+  durableLedgerProbe.appendCalls = 0;
+  durableLedgerProbe.sealCalls = 0;
+  durableLedgerProbe.verifyCalls = 0;
   root = await mkdtemp(path.join(tmpdir(), "agenc-eval-bundle-"));
   await chmod(root, 0o700);
 });
@@ -71,62 +107,43 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-function requiredArtifacts(
-  runId: string,
-  expected: ExpectedArtifact,
-): Array<{ readonly record: RecordedRunArtifact; readonly bytes: Buffer }> {
-  const roles = [
-    "patch",
-    "changed_files",
-    "test_result",
-    "independent_review",
-    "cost_usage",
-    "approval_log",
-    "effect_log",
-    "risk_register",
-  ] as const;
-  return roles.map((role) => {
-    const bytes = Buffer.from(`${runId}:${role}`, "utf8");
-    const artifactDigest = sha256Digest(bytes);
-    return {
-      bytes,
-      record: {
-        artifactId: `${runId}-${role}`,
-        expectedArtifactId: role === "patch" ? expected.id : null,
-        path: role === "patch" ? expected.path : null,
-        role,
-        digest: artifactDigest,
-        sizeBytes: bytes.byteLength,
-        mediaType: role === "patch" ? expected.mediaType : "application/json",
-        uri: `cas://sha256/${artifactDigest.slice("sha256:".length)}`,
-      },
-    };
-  });
+interface PhaseTiming {
+  readonly name: string;
+  readonly elapsedMs: number;
 }
 
-function evidenceReference(verified: VerifiedEvidenceLedger): RunRecordDocument["evidence"] {
-  const { inspection, seal } = verified;
-  if (!inspection.genesisEventDigest || !inspection.headEventDigest) throw new Error("empty test ledger");
-  return {
-    contractDigest: inspection.contractDigest,
-    taskId: inspection.taskId,
-    systemId: inspection.systemId,
-    ledgerDigest: inspection.ledgerDigest,
-    ledgerByteLength: inspection.ledgerByteLength,
-    genesisEventDigest: inspection.genesisEventDigest,
-    headEventDigest: inspection.headEventDigest,
-    eventCount: inspection.eventCount,
-    platformProtectionVerifierDigest: inspection.platformProtectionVerifierDigest,
-    sealDigest: seal.sealDigest,
-    statementDigest: seal.receipt.statementDigest,
-    anchorPolicyDigest: seal.receipt.anchorPolicyDigest,
-    signatureAlgorithm: seal.receipt.signatureAlgorithm,
-    signatureDigest: seal.receipt.signatureDigest,
-    verificationMaterialDigest: seal.receipt.verificationMaterialDigest,
-    anchorUri: seal.receipt.anchorUri,
-    signerIdentity: seal.receipt.signerIdentity,
-    sealedAt: seal.statement.sealedAt,
-  };
+async function runPhase<T>(
+  timings: PhaseTiming[],
+  name: string,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  const startedAt = performance.now();
+  try {
+    return await operation();
+  } finally {
+    timings.push({ name, elapsedMs: performance.now() - startedAt });
+  }
+}
+
+function testWithPhaseTimings(
+  name: string,
+  operation: (timings: PhaseTiming[]) => Promise<void>,
+): void {
+  test(name, async () => {
+    const timings: PhaseTiming[] = [];
+    try {
+      await operation(timings);
+    } catch (error) {
+      const details = timings
+        .map((timing) => `${timing.name}=${timing.elapsedMs.toFixed(1)}ms`)
+        .join(", ");
+      if (error instanceof Error) {
+        error.message = `${error.message}\nphase timings: ${details}`;
+        throw error;
+      }
+      throw new Error(`test failed: ${String(error)}\nphase timings: ${details}`);
+    }
+  });
 }
 
 describe("cross-document evaluation bundle", () => {
@@ -172,454 +189,89 @@ describe("cross-document evaluation bundle", () => {
     });
   });
 
-  test("derives the complete equal-task scorecard from anchored planned cells", async () => {
-    const suite = makeSuite("private_holdout");
-    const holdoutDescriptor = makeHoldoutDescriptor(suite);
-    const basePreregistration = makePreregistration(suite, holdoutDescriptor);
-    const secondComparator = makeSystem("comparator-two");
-    const seedSlots = [101, 202] as const;
-    const preregistration = withDocumentDigest<PreregistrationDocument>({
-      ...basePreregistration,
-      systems: [...basePreregistration.systems, secondComparator],
-      comparisons: [
-        ...basePreregistration.comparisons,
-        {
-          comparisonId: "agenc-vs-two",
-          primarySystemId: basePreregistration.primarySystemId,
-          comparatorSystemId: secondComparator.systemId,
-        },
-      ],
-      trialDesign: {
-        ...basePreregistration.trialDesign,
-        repetitionsPerSystemTask: seedSlots.length,
-        seedSlots,
-        plannedExecutionOrderDigest: computePlannedExecutionOrderDigest({
-          systemIds: [...basePreregistration.systems, secondComparator]
-            .map((system) => system.systemId),
-          taskIds: suite.tasks.map((task) => task.taskId),
-          seedSlots,
-          orderSeed: basePreregistration.trialDesign.orderSeed,
-        }),
-      },
-    });
-    const provider = makeAnchorProvider();
-    const preregistrationBytes = Buffer.from(canonicalizeJson(preregistration), "utf8");
-    const preregistrationStatementDigest = digestCanonicalJson(
-      "agenc.eval.preregistration-statement.v1",
-      preregistration,
+  testWithPhaseTimings("binds one real durable ledger through the matrix bundle validation path", async (phaseTimings) => {
+    const fixture = await runPhase(
+      phaseTimings,
+      "deterministic matrix fixture",
+      makeScorecardBundleFixture,
     );
-    const preregistrationAnchor = await provider.anchor(
-      preregistrationBytes,
-      preregistrationStatementDigest,
-    );
-    const preregistrationReceipt = withDocumentDigest<PreregistrationReceiptDocument>({
-      kind: "agenc.eval.preregistration-receipt",
-      contractVersion: EVAL_CONTRACT_VERSION,
-      preregistrationDigest: preregistration.documentDigest,
-      ...preregistrationAnchor,
-      anchoredAt: "2026-07-15T12:00:01Z",
-    });
+    const expectedEvidence = fixture.bundle.verifiedEvidence[0];
+    if (!expectedEvidence) throw new Error("scorecard fixture has no verified evidence");
+    const ledgerInput = fixture.ledgerInputsByRun.get(expectedEvidence.inspection.runId);
+    if (!ledgerInput) throw new Error("scorecard fixture has no durable ledger input");
 
-    const plannedOrder = derivePlannedExecutionOrder({
-      systemIds: preregistration.systems.map((system) => system.systemId),
-      taskIds: suite.tasks.map((task) => task.taskId),
-      seedSlots: preregistration.trialDesign.seedSlots,
-      orderSeed: preregistration.trialDesign.orderSeed,
-    });
-    const executionIndexByCell = new Map(plannedOrder.map((cell, index) => [
-      `${cell.systemId}\u0000${cell.taskId}\u0000${cell.seedSlot}`,
-      index,
-    ]));
-    const timestampAt = (executionIndex: number, offsetNanoseconds: number) =>
-      `2026-07-15T12:00:02.${String(
-        executionIndex * 1_000 + offsetNanoseconds,
-      ).padStart(9, "0")}Z`;
-
-    const runs: RunRecordDocument[] = [];
-    const verifiedEvidence: VerifiedEvidenceLedger[] = [];
-    for (const system of preregistration.systems) {
-      const primary = system.systemId === preregistration.primarySystemId;
-      for (const task of suite.tasks) {
-        for (const seedSlot of preregistration.trialDesign.seedSlots) {
-        const runId = `${system.systemId}-${task.taskId}-${seedSlot}`;
-        const executionIndex = executionIndexByCell.get(
-          `${system.systemId}\u0000${task.taskId}\u0000${seedSlot}`,
-        );
-        if (executionIndex === undefined) throw new Error("missing planned execution cell");
-        const startedAt = timestampAt(executionIndex, 0);
-        const evidenceAt = timestampAt(executionIndex, 2);
-        const finishedAt = timestampAt(executionIndex, 10);
-        const sealedAt = timestampAt(executionIndex, 12);
-        const context = {
-          runId,
-          contractDigest: preregistration.documentDigest,
-          taskId: task.taskId,
-          systemId: system.systemId,
-        } as const;
-        const infrastructureInvalid =
-          task.taskId === suite.tasks[0].taskId &&
-          seedSlot === seedSlots[0] &&
-          (system.systemId === preregistration.primarySystemId ||
-            system.systemId === "comparator-one");
-        const crossedSeedSuccess =
-          system.systemId === "comparator-one" &&
-          task.taskId === suite.tasks[0].taskId &&
-          seedSlot === seedSlots[1];
-        const successfulFix = !infrastructureInvalid && (primary || crossedSeedSuccess);
-        await initializeEvidenceLedger(access(), runId);
-        await appendEvidenceEvent({
-          ...access(),
-          event: {
-            ...context,
-            eventId: `${runId}-start`,
-            occurredAt: startedAt,
-            producer: {
-              identity: "test-evaluator",
-              version: "1.0.0",
-              binaryDigest: preregistration.evaluator.analysisImplementation.digest,
-            },
-            type: "run.started",
-            mediaType: "application/json",
-            redactionPolicyDigest: preregistration.evidencePolicy.redactionPolicyDigest,
-          },
-          payloadBytes: Buffer.from(`{\"runId\":${JSON.stringify(runId)}}`),
-        });
-        const expectedArtifact = task.expectedArtifacts[0];
-        if (!expectedArtifact) throw new Error("test task is missing its required artifact");
-        const artifactEntries = requiredArtifacts(runId, expectedArtifact);
-        const appendTypedEvidence = async (
-          type: EvidenceEventType,
-          label: string,
-          payloadBytes: Buffer,
-          mediaType = "application/json",
-          binaryDigest = preregistration.evaluator.analysisImplementation.digest,
-        ) => (await appendEvidenceEvent({
-          ...access(),
-          event: {
-            ...context,
-            eventId: `${runId}-${label}`,
-            occurredAt: evidenceAt,
-            producer: { identity: "test-evaluator", version: "1.0.0", binaryDigest },
-            type,
-            mediaType,
-            redactionPolicyDigest: preregistration.evidencePolicy.redactionPolicyDigest,
-          },
-          payloadBytes,
-        })).event.payload.digest;
-        const artifactEvidence: Array<`sha256:${string}`> = [];
-        for (const entry of artifactEntries) {
-          const eventType = entry.record.role === "independent_review"
-            ? "review.completed"
-            : entry.record.role === "risk_register"
-              ? "risk.recorded"
-              : "artifact.recorded";
-          artifactEvidence.push(await appendTypedEvidence(
-            eventType,
-            `artifact-${entry.record.role}`,
-            entry.bytes,
-            entry.record.mediaType,
-          ));
-        }
-        const policyEvidence = [];
-        for (const type of [
-          "budget.reconciled",
-          "policy.evaluated",
-          "sandbox.evaluated",
-          "usage.reported",
-        ] as const) {
-          policyEvidence.push(await appendTypedEvidence(type, type.replace(".", "-"), Buffer.from(type)));
-        }
-        const effectEvidence = await appendTypedEvidence(
-          "effect.result",
-          "effect-result",
-          Buffer.from("{\"duplicated\":0,\"unknown\":0}"),
-        );
-        const unknownEffectEvidence = successfulFix
-          ? null
-          : await appendTypedEvidence(
-            "effect.unknown_outcome",
-            "effect-unknown-outcome",
-            Buffer.from("{\"unresolved\":1}"),
-          );
-        const recoveryEvidence = await appendTypedEvidence(
-          "recovery.assessed",
-          "recovery-assessed",
-          Buffer.from("{\"faults\":0,\"gaps\":0}"),
-        );
-        const eventGapEvidence = successfulFix
-          ? null
-          : await appendTypedEvidence(
-            "event.gap",
-            "event-gap",
-            Buffer.from("{\"gaps\":1}"),
-          );
-        const interventionEvidence = await appendTypedEvidence(
-          "intervention.recorded",
-          "intervention-recorded",
-          Buffer.from("{\"undeclared\":0}"),
-        );
-        const verifierEvidence = await appendTypedEvidence(
-          "verifier.completed",
-          "verifier-completed",
-          Buffer.from(successfulFix ? "{\"passed\":true}" : "{\"passed\":false}"),
-        );
-        const counterpartRunId = primary
-          ? `comparator-one-${task.taskId}-${seedSlot}`
-          : `${preregistration.primarySystemId}-${task.taskId}-${seedSlot}`;
-        const classifierStatement = infrastructureInvalid
-          ? createInfrastructureClassificationStatement({
-            comparisonId: "agenc-vs-one",
-            taskId: task.taskId,
-            seedSlot,
-            incidentId: "evaluator-incident-one",
-            reason: "evaluator_host_failure",
-            classifierVersion: preregistration.exclusions.classifierVersion,
-            classifierImplementationDigest:
-              preregistration.exclusions.classifierImplementation.digest,
-          })
-          : null;
-        const classifierEvidence = classifierStatement
-          ? await appendTypedEvidence(
-            "infrastructure.classified",
-            "infrastructure-classified",
-            Buffer.from(canonicalizeJson(classifierStatement)),
-            "application/vnd.agenc.eval-infrastructure-classification+json",
-            preregistration.exclusions.classifierImplementation.digest,
-          )
-          : null;
-        const infrastructureInvalidPairs = classifierEvidence
-          ? [{
-            comparisonId: "agenc-vs-one",
-            counterpartRunId,
-            reason: "evaluator_host_failure" as const,
-            incidentId: "evaluator-incident-one",
-            evidenceDigest: classifierEvidence,
-            classifierVersion: preregistration.exclusions.classifierVersion,
-            classifierImplementationDigest:
-              preregistration.exclusions.classifierImplementation.digest,
-          }]
-          : [];
-        const hiddenVerifier = {
-          status: successfulFix ? "passed" as const : "failed" as const,
-          evidenceDigests: [verifierEvidence],
-          inaccessibleDuringRun: true,
-          deterministicAssertionsPassed: successfulFix,
-        };
-        const criteria = {
-          hiddenVerifier,
-          policyAndBudget: {
-            status: "passed" as const,
-            evidenceDigests: policyEvidence,
-            permissionEscapes: 0,
-            sandboxEscapes: 0,
-            concurrencyEscapes: 0,
-            budgetOverruns: 0,
-            unresolvedUsageFullyReserved: true,
-          },
-          effectSafety: {
-            status: successfulFix ? "passed" as const : "failed" as const,
-            evidenceDigests: [effectEvidence, ...(unknownEffectEvidence ? [unknownEffectEvidence] : [])],
-            duplicatedUncertainMutations: 0,
-            unsafeAutomaticRetries: 0,
-            unresolvedUnknownOutcomes: successfulFix ? 0 : 1,
-          },
-          recoveryIntegrity: {
-            status: successfulFix ? "passed" as const : "failed" as const,
-            evidenceDigests: [recoveryEvidence, ...(eventGapEvidence ? [eventGapEvidence] : [])],
-            scheduledFaults: 0,
-            successfulRecoveries: 0,
-            eventGaps: successfulFix ? 0 : 1,
-            hiddenEventLoss: 0,
-          },
-          evidenceBundle: {
-            status: "passed" as const,
-            evidenceDigests: artifactEvidence,
-            schemaValid: true,
-            hashesValid: true,
-            unresolvedReviewBlockers: 0,
-            missingRequiredArtifacts: 0,
-          },
-          interventionFree: {
-            status: "passed" as const,
-            evidenceDigests: [interventionEvidence],
-            undeclaredInterventions: 0,
-          },
-        };
-        const usage = {
-          inputTokens: 100,
-          outputTokens: 20,
-          reasoningTokens: 10,
-          cacheReadTokens: 0,
-          cacheWriteTokens: 0,
-          totalTokens: 130,
-          providerCost: {
-            status: "reported" as const,
-            amount: "0.01" as const,
-            currency: "USD" as const,
-            source: "provider_reported" as const,
-          },
-          toolCalls: 2,
-          turns: 1,
-          retries: 0,
-        };
-        const artifacts = artifactEntries.map((entry) => entry.record);
-        const verifier = {
-          verifierId: task.hiddenVerifier.id,
-          verifierVersion: task.hiddenVerifier.version,
-          bundleDigest: task.hiddenVerifier.bundle.digest,
-          result: successfulFix ? "passed" as const : "failed" as const,
-          assertionCount: 1,
-          passedAssertions: successfulFix ? 1 : 0,
-          evidenceDigest: verifierEvidence,
-        };
-        const trustAssessment = {
-          status: "assessed" as const,
-          trustedFix: successfulFix,
-          assessmentImplementationDigest:
-            preregistration.evaluator.trustAssessmentImplementation.digest,
-          criteria,
-        };
-        const outcome = infrastructureInvalid
-          ? "infrastructure_invalid" as const
-          : successfulFix ? "pass" as const : "fail" as const;
-        const attestationBytes = Buffer.from(canonicalizeJson(createTrustAssessmentStatement({
-          runId,
-          experimentId: preregistration.experimentId,
-          taskId: task.taskId,
-          systemId: system.systemId,
-          startedAt,
-          finishedAt,
-          outcome,
-          verifiedFix: successfulFix,
-          usage,
-          approvals: [],
-          interventions: [],
-          artifacts,
-          verifier,
-          trustAssessment,
-          infrastructureInvalidPairs,
-        })), "utf8");
-        await appendTypedEvidence(
-          "trust.assessed",
-          "trust-assessed",
-          attestationBytes,
-          "application/vnd.agenc.eval-trust-assessment+json",
-          preregistration.evaluator.trustAssessmentImplementation.digest,
-        );
-        await appendEvidenceEvent({
-          ...access(),
-          event: {
-            ...context,
-            eventId: `${runId}-finish`,
-            occurredAt: finishedAt,
-            producer: {
-              identity: "test-evaluator",
-              version: "1.0.0",
-              binaryDigest: preregistration.evaluator.analysisImplementation.digest,
-            },
-            type: "run.finished",
-            mediaType: "application/json",
-            redactionPolicyDigest: preregistration.evidencePolicy.redactionPolicyDigest,
-          },
-          payloadBytes: Buffer.from(canonicalizeJson({ outcome })),
-        });
-        const seal = await sealEvidenceLedger({
-          ...access(),
-          context,
-          sealedAt,
-          anchorProvider: provider,
-        });
-        const verified = await verifyEvidenceLedger({
-          ...access(),
-          runId,
-          expectedSealDigest: seal.sealDigest,
-          anchorVerifier: provider,
-        });
-        verifiedEvidence.push(verified);
-        const runEvidence = evidenceReference(verified);
-        const agentTask = projectTaskForAgent(task);
-        const run = withDocumentDigest<RunRecordDocument>({
-          kind: "agenc.eval.run-record",
-          contractVersion: EVAL_CONTRACT_VERSION,
-          runId,
-          experimentId: preregistration.experimentId,
-          preregistrationDigest: preregistration.documentDigest,
-          preregistrationReceiptDigest: preregistrationReceipt.documentDigest,
-          suiteManifestDigest: suite.documentDigest,
-          taskId: task.taskId,
-          operatorTaskDigest: task.documentDigest,
-          agentTaskDigest: agentTask.documentDigest,
-          repositoryCluster: task.repository.cluster,
-          systemId: system.systemId,
-          trialIndex: preregistration.trialDesign.seedSlots.indexOf(seedSlot),
-          seedSlot,
-          executionIndex,
-          startedAt,
-          finishedAt,
-          wallTimeMs: Date.parse(finishedAt) - Date.parse(startedAt),
-          evaluator: {
-            commit: preregistration.evaluator.commit,
-            image: preregistration.evaluator.image,
-            harnessConfigDigest: preregistration.evaluator.harnessConfigDigest,
-            analysisImplementationDigest: preregistration.evaluator.analysisImplementation.digest,
-            trustAssessmentImplementationDigest:
-              preregistration.evaluator.trustAssessmentImplementation.digest,
-          },
-          system: {
-            systemId: system.systemId,
-            release: system.release,
-            commit: system.commit,
-            packageDigest: system.package.digest,
-            image: system.image,
-            agentConfigDigest: system.agentConfigDigest,
-            publicConfigDigest: system.publicConfigDigest,
-            redactedConfigFields: system.redactedConfigFields,
-            systemPromptDigest: system.systemPromptDigest,
-            toolManifestDigest: system.toolManifestDigest,
-            installCommandDigest: system.installCommandDigest,
-            environmentClassDigest: system.environmentClassDigest,
-            provider: system.provider,
-            requestedModelId: system.requestedModelId,
-            immutableModelId: system.immutableModelId,
-            providerReportedModelId: system.immutableModelId,
-            generationParameters: system.generationParameters,
-            retryPolicy: system.retryPolicy,
-            approvalPolicy: system.approvalPolicy,
-          },
-          environment: {
-            operatingSystem: "linux",
-            architecture: "x64",
-            kernel: "test-kernel",
-            platform: task.environment.platform,
-            hardwareClass: task.environment.hardwareClass,
-            image: task.environment.image,
-            toolchain: task.environment.toolchain,
-            networkPolicy: task.networkPolicy,
-            permissionPolicyDigest: task.permissionPolicy.policyDigest,
-          },
-          resetReceipt: {
-            recipeDigest: preregistration.resetPolicy.digest,
-            repositoryCommit: task.repository.commit,
-            workspaceFingerprint: digest(`${runId}:workspace`),
-            cacheEmpty: true,
-            memoryEmpty: true,
-            sessionFresh: true,
-          },
-          usage,
-          approvals: [],
-          interventions: [],
-          artifacts,
-          verifier,
-          evidence: runEvidence,
-          outcome,
-          verifiedFix: successfulFix,
-          trustAssessment,
-          infrastructureInvalidPairs,
-        });
-        runs.push(run);
-        }
+    await runPhase(phaseTimings, "ledger initialization", () =>
+      initializeEvidenceLedger(access(), ledgerInput.context.runId));
+    await runPhase(phaseTimings, "ledger append", async () => {
+      for (const event of ledgerInput.events) {
+        await appendEvidenceEvent({ ...access(), ...event });
       }
+    });
+    const seal = await runPhase(phaseTimings, "ledger sealing", () =>
+      sealEvidenceLedger({
+        ...access(),
+        context: ledgerInput.context,
+        sealedAt: ledgerInput.sealedAt,
+        anchorProvider: fixture.provider,
+      }));
+    const verified = await runPhase(phaseTimings, "ledger verification", () =>
+      verifyEvidenceLedger({
+        ...access(),
+        runId: ledgerInput.context.runId,
+        expectedSealDigest: seal.sealDigest,
+        anchorVerifier: fixture.provider,
+      }));
+    expect(verified).toEqual(expectedEvidence);
+    expect(durableLedgerProbe).toMatchObject({
+      initializeCalls: 1,
+      appendCalls: ledgerInput.events.length,
+      sealCalls: 1,
+      verifyCalls: 1,
+    });
+
+    const verifiedEvidence = fixture.bundle.verifiedEvidence.map((entry) => {
+      if (entry.inspection.runId === verified.inspection.runId) return verified;
+      scorecardEvidenceRegistry.add(entry);
+      return entry;
+    });
+    const targetRun = fixture.bundle.runs.find((run) => run.runId === verified.inspection.runId);
+    if (!targetRun) throw new Error("scorecard fixture has no matching run record");
+    expect(evidenceReference(verified)).toEqual(targetRun.evidence);
+    expect(validateEvalContractDocument(targetRun)).toEqual(targetRun);
+    const validated = await runPhase(phaseTimings, "bundle validation", () =>
+      validateEvaluationBundle({ ...fixture.bundle, verifiedEvidence }));
+    expect(validated.evidenceByRun.get(verified.inspection.runId)).toBe(verified);
+  });
+
+  testWithPhaseTimings("derives the complete equal-task scorecard from anchored planned cells", async (phaseTimings) => {
+    durableLedgerProbe.appendDelayMs = 5;
+    const fixture = await runPhase(
+      phaseTimings,
+      "deterministic matrix fixture",
+      makeScorecardBundleFixture,
+    );
+    const { bundle } = fixture;
+    const {
+      suite,
+      holdoutDescriptor,
+      holdoutAccessReceipt,
+      preregistration,
+      preregistrationReceipt,
+      blindedResultsSeal,
+      unblindingRecord,
+      runs,
+      verifiedEvidence,
+    } = bundle;
+    if (!holdoutDescriptor || !holdoutAccessReceipt) {
+      throw new Error("scorecard fixture is missing holdout lifecycle documents");
     }
+    for (const evidence of verifiedEvidence) scorecardEvidenceRegistry.add(evidence);
+    expect(durableLedgerProbe).toMatchObject({
+      initializeCalls: 0,
+      appendCalls: 0,
+      sealCalls: 0,
+      verifyCalls: 0,
+    });
 
     const verifiedButExposedSource = runs.find((run) => run.verifiedFix);
     if (!verifiedButExposedSource || verifiedButExposedSource.trustAssessment.status !== "assessed") {
@@ -646,132 +298,21 @@ describe("cross-document evaluation bundle", () => {
       trustAssessment: { status: "assessed", trustedFix: false },
     });
 
-    const completeRunMatrixDigest = digestCanonicalJson(
-      "agenc.eval.complete-run-matrix.v1",
-      [...runs]
-        .map((run) => ({ runId: run.runId, runDigest: run.documentDigest, sealDigest: run.evidence.sealDigest }))
-        .sort((left, right) => left.runId < right.runId ? -1 : left.runId > right.runId ? 1 : 0),
-    );
-    const evidenceSealSetDigest = digestCanonicalJson(
-      "agenc.eval.evidence-seal-set.v1",
-      [...runs].map((run) => run.evidence.sealDigest).sort(),
-    );
-    const blindedResultsSeal = withDocumentDigest<BlindedResultsSealDocument>({
-      kind: "agenc.eval.blinded-results-seal",
-      contractVersion: EVAL_CONTRACT_VERSION,
-      experimentId: preregistration.experimentId,
-      preregistrationDigest: preregistration.documentDigest,
-      preregistrationReceiptDigest: preregistrationReceipt.documentDigest,
-      completeRunMatrixCommitment: {
-        algorithm: "hmac-sha256",
-        keyId: "results-key-v1",
-        digest: digest("complete-run-matrix-commitment"),
-      },
-      completeRunMatrixDigest,
-      evidenceSealSetDigest,
-      sealedAt: "2026-07-15T12:00:04Z",
-    });
-    const authorizationEvidenceDigest = digest("unblinding-authorization");
-    const holdoutReceiptBody = {
-      kind: "agenc.eval.holdout-access-receipt" as const,
-      contractVersion: EVAL_CONTRACT_VERSION,
-      experimentId: preregistration.experimentId,
-      holdoutDescriptorDigest: holdoutDescriptor.documentDigest,
-      suiteManifestDigest: suite.documentDigest,
-      preregistrationDigest: preregistration.documentDigest,
-      blindedResultsSealDigest: blindedResultsSeal.documentDigest,
-      completeRunMatrixDigest,
-      accessPolicyDigest: holdoutDescriptor.accessPolicyDigest,
-      unsealPolicyDigest: holdoutDescriptor.unsealPolicyDigest,
-      projectionPolicyDigest: holdoutDescriptor.custody.projectionPolicyDigest,
-      implementerPrincipalSetDigest:
-        holdoutDescriptor.custody.implementerPrincipalSetDigest,
-      custodianIdentity: holdoutDescriptor.custody.custodianIdentity,
-      accessLogHeadDigest: digest("access-log-head"),
-      projectedRunIdsDigest: digestCanonicalJson(
-        "agenc.eval.projected-run-ids.v1",
-        [...runs].map((run) => run.runId).sort(),
-      ),
-      authorizationEvidenceDigest,
-      authorizedRole: preregistration.unblinding.authorizedRole,
-      authorizedPrincipal: "test-custodian",
-      firstAccessAt: "2026-07-15T12:00:01.500Z",
-      lastAccessAt: "2026-07-15T12:00:03.900Z",
-      issuedAt: "2026-07-15T12:00:04.500Z",
-      receiptVerifierDigest: holdoutDescriptor.custody.custodyVerifierDigest,
-      signatureAlgorithm: "ed25519" as const,
-      verificationMaterialDigest: digest("holdout-receipt-public-key"),
-      receiptUri: "https://example.invalid/holdout-access/experiment-one",
-    };
-    const placeholderHoldoutReceipt = withDocumentDigest<HoldoutAccessReceiptDocument>({
-      ...holdoutReceiptBody,
-      signatureDigest: digest("placeholder-holdout-signature"),
-    });
-    const signHoldoutReceipt = (receipt: HoldoutAccessReceiptDocument) => sha256Digest(
-      Buffer.concat([
-        Buffer.from("test-holdout-receipt\0"),
-        Buffer.from(canonicalizeJson(createHoldoutAccessStatement(receipt))),
-      ]),
-    );
-    const holdoutAccessReceipt = withDocumentDigest<HoldoutAccessReceiptDocument>({
-      ...holdoutReceiptBody,
-      signatureDigest: signHoldoutReceipt(placeholderHoldoutReceipt),
-    });
-    const unblindingRecord = withDocumentDigest<UnblindingRecordDocument>({
-      kind: "agenc.eval.unblinding-record",
-      contractVersion: EVAL_CONTRACT_VERSION,
-      experimentId: preregistration.experimentId,
-      preregistrationDigest: preregistration.documentDigest,
-      preregistrationReceiptDigest: preregistrationReceipt.documentDigest,
-      blindedResultsSealDigest: blindedResultsSeal.documentDigest,
-      holdoutDescriptorDigest: holdoutDescriptor.documentDigest,
-      holdoutAccessReceiptDigest: holdoutAccessReceipt.documentDigest,
-      policyDigest: preregistration.unblinding.policyDigest,
-      authorizedRole: preregistration.unblinding.authorizedRole,
-      authorizationEvidenceDigest,
-      unblindedBy: "test-custodian",
-      unblindedAt: "2026-07-15T12:00:05Z",
-    });
-    const bundle = {
-      suite,
-      holdoutDescriptor,
-      holdoutAccessReceipt,
-      preregistration,
-      preregistrationReceipt,
-      blindedResultsSeal,
-      unblindingRecord,
-      runs,
-      verifiedEvidence,
-      lifecycleAnchors: {
-        expectedPreregistrationReceiptDigest: preregistrationReceipt.documentDigest,
-        expectedBlindedResultsSealDigest: blindedResultsSeal.documentDigest,
-        expectedUnblindingRecordDigest: unblindingRecord.documentDigest,
-        preregistrationReceiptVerifierDigest: preregistration.evidencePolicy.anchorVerifierDigest,
-        expectedHoldoutAccessReceiptDigest: holdoutAccessReceipt.documentDigest,
-        holdoutAccessReceiptVerifierDigest: holdoutDescriptor.custody.custodyVerifierDigest,
-        verifyPreregistrationReceipt: (bytes: Uint8Array, receipt: PreregistrationReceiptDocument) =>
-          provider.verify(bytes, receipt),
-        verifyHoldoutAccessReceipt: (bytes: Uint8Array, receipt: HoldoutAccessReceiptDocument) =>
-          receipt.signatureDigest === sha256Digest(Buffer.concat([
-            Buffer.from("test-holdout-receipt\0"),
-            Buffer.from(bytes),
-          ])),
-      },
-    } as const;
-
     const callerMutableRuns = [...runs];
-    const snapshotResult = await validateEvaluationBundle({
-      ...bundle,
-      runs: callerMutableRuns,
-      lifecycleAnchors: {
-        ...bundle.lifecycleAnchors,
-        async verifyPreregistrationReceipt(bytes, receipt) {
-          const verified = await bundle.lifecycleAnchors.verifyPreregistrationReceipt(bytes, receipt);
-          callerMutableRuns.pop();
-          return verified;
+    const snapshotResult = await runPhase(phaseTimings, "bundle snapshot validation", () =>
+      validateEvaluationBundle({
+        ...bundle,
+        runs: callerMutableRuns,
+        lifecycleAnchors: {
+          ...bundle.lifecycleAnchors,
+          async verifyPreregistrationReceipt(bytes, receipt) {
+            const verified = await bundle.lifecycleAnchors
+              .verifyPreregistrationReceipt(bytes, receipt);
+            callerMutableRuns.pop();
+            return verified;
+          },
         },
-      },
-    });
+      }));
     expect(callerMutableRuns).toHaveLength(59);
     expect(snapshotResult.bundle.runs).toHaveLength(60);
     expect(Object.isFrozen(snapshotResult.bundle.runs)).toBe(true);
@@ -783,27 +324,31 @@ describe("cross-document evaluation bundle", () => {
       summaryId: "snapshot-summary",
       generatedAt: "2026-07-15T12:00:06Z",
     };
-    const optionSnapshotSummary = await deriveExperimentSummary({
-      ...bundle,
-      lifecycleAnchors: {
-        ...bundle.lifecycleAnchors,
-        async verifyPreregistrationReceipt(bytes, receipt) {
-          const verified = await bundle.lifecycleAnchors.verifyPreregistrationReceipt(bytes, receipt);
-          callerMutableOptions.summaryId = "mutated-summary";
-          return verified;
+    const optionSnapshotSummary = await runPhase(phaseTimings, "option snapshot derivation", () =>
+      deriveExperimentSummary({
+        ...bundle,
+        lifecycleAnchors: {
+          ...bundle.lifecycleAnchors,
+          async verifyPreregistrationReceipt(bytes, receipt) {
+            const verified = await bundle.lifecycleAnchors
+              .verifyPreregistrationReceipt(bytes, receipt);
+            callerMutableOptions.summaryId = "mutated-summary";
+            return verified;
+          },
         },
-      },
-    }, callerMutableOptions);
+      }, callerMutableOptions));
     expect(optionSnapshotSummary.summaryId).toBe("snapshot-summary");
     expect(callerMutableOptions.summaryId).toBe("mutated-summary");
 
-    await expect(validateEvaluationBundle(bundle)).resolves.toMatchObject({
+    await expect(runPhase(phaseTimings, "bundle validation", () =>
+      validateEvaluationBundle(bundle))).resolves.toMatchObject({
       exclusions: [expect.objectContaining({ comparisonId: "agenc-vs-one" })],
     });
-    const summary = await deriveExperimentSummary(bundle, {
-      summaryId: "summary-one",
-      generatedAt: "2026-07-15T12:00:06Z",
-    });
+    const summary = await runPhase(phaseTimings, "scorecard derivation", () =>
+      deriveExperimentSummary(bundle, {
+        summaryId: "summary-one",
+        generatedAt: "2026-07-15T12:00:06Z",
+      }));
     expect(summary.rawEvidenceEmbedded).toBe(false);
     expect(summary.systems).toEqual(expect.arrayContaining([
       expect.objectContaining({
@@ -831,7 +376,8 @@ describe("cross-document evaluation bundle", () => {
     ]));
     expect(summary.superiorityEstablished).toBeNull();
     expect(summary.evidenceSeals).toHaveLength(60);
-    await expect(validateDerivedSummaryAgainstBundle(bundle, summary)).resolves.toEqual(summary);
+    await expect(runPhase(phaseTimings, "summary validation", () =>
+      validateDerivedSummaryAgainstBundle(bundle, summary))).resolves.toEqual(summary);
     const winningEffect = summary.pairedEffects[0];
     if (!winningEffect || winningEffect.confidenceLower <= 0) {
       throw new Error("missing winning paired-effect fixture");
@@ -1241,7 +787,7 @@ describe("cross-document evaluation bundle", () => {
       ...bundle,
       preregistration: overstatedSample,
     })).rejects.toThrow(/selected suite task count is outside/u);
-  }, 60_000);
+  });
 });
 
 describe("paired TFR inference", () => {
