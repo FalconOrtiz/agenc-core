@@ -138,6 +138,8 @@ export interface GetAttachmentsOptions {
         readonly whenToUse?: string;
         readonly disableModelInvocation?: boolean;
         readonly loadedFrom?: string;
+        readonly scope?: string;
+        readonly root?: string;
       }>;
     }>;
   };

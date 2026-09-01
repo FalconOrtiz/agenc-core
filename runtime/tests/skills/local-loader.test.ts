@@ -888,6 +888,101 @@ All=$ARGUMENTS
       10,
     );
     expect(listing).toContain("- long");
+    expect(listing).not.toContain("more skill");
+  });
+
+  it("reports skills beyond the per-root cap and keeps descriptions in the trimmed listing", async () => {
+    const agencHome = tmpRoot("skills-home");
+    const workspaceRoot = tmpRoot("skills-workspace");
+    const userRoot = join(agencHome, "skills");
+    for (let i = 0; i < 600; i++) {
+      const name = `skill-${String(i).padStart(3, "0")}`;
+      writeSkill(
+        userRoot,
+        name,
+        `---\ndescription: ${name} does a specific job\n---\nBody\n`,
+      );
+    }
+
+    const snapshot = await loadLocalSkillsSnapshot({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: {},
+    });
+
+    expect(snapshot.truncatedRoots).toEqual([
+      { root: userRoot, loadedCount: 500, droppedCount: 100 },
+    ]);
+    expect(
+      snapshot.skills.filter((skill) => skill.root === userRoot),
+    ).toHaveLength(500);
+
+    // A 100k-token window gives a 4,000-char budget, far below the ~25k
+    // chars the 500 full lines need.
+    const listing = formatSkillListingWithinBudget(snapshot.skills, 100_000);
+    const lines = listing.split("\n");
+    expect(listing.length).toBeLessThanOrEqual(4_000);
+    expect(lines).toContain("- skill-000: skill-000 does a specific job");
+    const listedUserSkills = lines.filter((line) => line.startsWith("- skill-"));
+    expect(listedUserSkills.length).toBeGreaterThan(1);
+    expect(listedUserSkills.every((line) => line.includes(": skill-"))).toBe(
+      true,
+    );
+    expect(lines.at(-1)).toBe(
+      `- ...and ${500 - listedUserSkills.length} more skills not shown; ask the user to run /skills <search> to find one`,
+    );
+  });
+
+  it("ranks workspace skills first and the shared agents catalog last when trimming", () => {
+    const home = join("/home", "dev");
+    // Descriptions longer than the closing count line, so a budget that
+    // holds two lines plus the count cannot hold all three lines.
+    const describe = (text: string) => text.padEnd(90, ".");
+    const skills = [
+      {
+        name: "shared",
+        description: describe("From the shared catalog"),
+        loadedFrom: "skills",
+        scope: "user",
+        root: join(home, ".agents", "skills"),
+      },
+      {
+        name: "home",
+        description: describe("From the AgenC home"),
+        loadedFrom: "skills",
+        scope: "user",
+        root: join(home, ".agenc", "skills"),
+      },
+      {
+        name: "proj",
+        description: describe("From the workspace"),
+        loadedFrom: "skills",
+        scope: "project",
+        root: join("/work", ".agenc", "skills"),
+      },
+    ];
+
+    // Everything fits: the incoming (name) order is kept.
+    expect(
+      formatSkillListingWithinBudget(skills, 1_000_000).split("\n").map(
+        (line) => line.split(":")[0],
+      ),
+    ).toEqual(["- shared", "- home", "- proj"]);
+
+    // Budget for two full lines plus the closing count (1% of the window in
+    // chars, so 25 tokens per char, plus a little slack for the reserve).
+    const expected = [
+      `- proj: ${describe("From the workspace")}`,
+      `- home: ${describe("From the AgenC home")}`,
+      "- ...and 1 more skill not shown; ask the user to run /skills <search> to find one",
+    ];
+    expect(
+      formatSkillListingWithinBudget(
+        skills,
+        (expected.join("\n").length + 3) * 25,
+      ).split("\n"),
+    ).toEqual(expected);
   });
 
   it("neutralizes system-reminder tags in skill listing metadata", () => {

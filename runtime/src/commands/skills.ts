@@ -36,6 +36,12 @@ export interface SkillsSnapshot {
     readonly aliases?: readonly string[];
   }>;
   readonly effectiveSkillRoots: ReadonlyArray<string>;
+  /** Skill roots holding more SKILL.md files than the loader reads per root. */
+  readonly truncatedRoots?: ReadonlyArray<{
+    readonly root: string;
+    readonly loadedCount: number;
+    readonly droppedCount: number;
+  }>;
 }
 
 type AvailableSkillSnapshot = SkillsSnapshot["availableSkills"][number];
@@ -381,6 +387,10 @@ export async function collectSkillsSnapshot(
     effectiveSkillRoots: normalizeRoots(pluginView.effectiveSkillRoots()).sort(
       (a, b) => a.localeCompare(b),
     ),
+    ...(outcome.truncatedSkillRoots !== undefined &&
+      outcome.truncatedSkillRoots.length > 0
+      ? { truncatedRoots: outcome.truncatedSkillRoots }
+      : {}),
   };
 }
 
@@ -429,6 +439,11 @@ export function formatSkillsSnapshot(
         `  more: ${hiddenCount} hidden; use /skills all or /skills <search>`,
       );
     }
+  }
+  for (const truncated of snapshot.truncatedRoots ?? []) {
+    lines.push(
+      `  not loaded: ${truncated.droppedCount} SKILL.md files under ${truncated.root} (per-root cap reached after ${truncated.loadedCount})`,
+    );
   }
 
   if (snapshot.invokedSkills.length === 0) {

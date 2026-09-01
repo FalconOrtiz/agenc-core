@@ -65,4 +65,27 @@ describe("agenc skills CLI", () => {
     const names = inventory.skills.map((skill) => skill.name);
     expect(names).not.toContain("iot-builder");
   });
+
+  it("reports roots holding more skills than the per-root cap", async () => {
+    const agencHome = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-ws-"));
+    const userRoot = join(agencHome, "skills");
+    for (let i = 0; i < 505; i++) {
+      await writeSkill(userRoot, `cap-${String(i).padStart(3, "0")}`);
+    }
+
+    const inventory = await buildSkillsInventory({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: { AGENC_HOME: agencHome },
+    });
+
+    expect(
+      inventory.skills.filter((skill) => skill.name.startsWith("cap-")),
+    ).toHaveLength(500);
+    expect(inventory.errors).toContain(
+      `5 SKILL.md files under ${userRoot} were not loaded: the per-root cap was reached after 500`,
+    );
+  });
 });

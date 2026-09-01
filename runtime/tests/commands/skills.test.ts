@@ -178,6 +178,25 @@ describe("skillsCommand", () => {
     );
   });
 
+  it("reports roots the loader stopped reading at the per-root cap", () => {
+    const text = formatSkillsSnapshot({
+      invokedSkills: [],
+      availableSkills: [
+        { name: "repo-docs", description: "Repository docs", loadedFrom: "skills" },
+      ],
+      effectiveSkillRoots: [],
+      truncatedRoots: [
+        { root: "/home/dev/.agents/skills", loadedCount: 500, droppedCount: 1323 },
+      ],
+    });
+    const lines = text.split("\n");
+    const notLoaded = lines.indexOf(
+      "  not loaded: 1323 SKILL.md files under /home/dev/.agents/skills (per-root cap reached after 500)",
+    );
+    expect(notLoaded).toBeGreaterThan(lines.indexOf("  available: 1"));
+    expect(notLoaded).toBeLessThan(lines.indexOf("  invoked: none"));
+  });
+
   it("formats skills with dollar prefixes, descriptions, and source tags", () => {
     expect(
       formatSkillsSnapshot({

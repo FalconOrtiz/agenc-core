@@ -253,6 +253,12 @@ export interface SkillLoadOutcome {
     readonly paths?: readonly string[];
     readonly contentLength?: number;
   }>;
+  /** Skill roots holding more SKILL.md files than the loader reads per root. */
+  readonly truncatedSkillRoots?: ReadonlyArray<{
+    readonly root: string;
+    readonly loadedCount: number;
+    readonly droppedCount: number;
+  }>;
 }
 export class TurnSkillsContext {
   readonly outcome: SkillLoadOutcome;
