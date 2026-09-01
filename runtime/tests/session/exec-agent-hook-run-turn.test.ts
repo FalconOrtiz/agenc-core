@@ -406,7 +406,11 @@ describe("execAgentHook run-turn integration", () => {
     expect(result.message?.attachment.stderr).toContain("provider exploded");
   });
 
-  test("surfaces compact failures from hook agents as non-blocking errors", async () => {
+  test("a declined compaction inside a hook agent is a warning, not a failure", async () => {
+    // The gate fires with headroom left under the window, so a dispatcher
+    // that runs and declines no longer ends the turn: the hook agent keeps
+    // sampling and finishes its work. (Before, one declined attempt turned
+    // every hook into a non-blocking error.)
     const provider = providerWithResponses([
       {
         content: "checking",
@@ -421,12 +425,74 @@ describe("execAgentHook run-turn integration", () => {
         model: "test-model",
         finishReason: "tool_calls",
       },
+      {
+        content: "verified",
+        toolCalls: [
+          {
+            id: "tool-structured",
+            name: "StructuredOutput",
+            arguments: JSON.stringify({ ok: true }),
+          },
+        ],
+        usage: { promptTokens: 120, completionTokens: 5, totalTokens: 125 },
+        model: "test-model",
+        finishReason: "tool_calls",
+      },
+    ]);
+    const parent = createParentSession(provider);
+    Object.assign(parent.modelInfo, { autoCompactTokenLimit: 1 });
+    setCurrentRuntimeSession(parent);
+    const compactImpl = vi.fn<AutoCompactImpl>(async () => ({
+      wasCompacted: false,
+      skippedReason: "declined for the test",
+    }));
+    setAutoCompactImplForTests(compactImpl);
+
+    const result = await execAgentHook(
+      {
+        type: "agent",
+        prompt: "verify",
+      } as never,
+      "Stop",
+      "Stop" as never,
+      "{}",
+      new AbortController().signal,
+      createToolUseContext({
+        roleWorkspace: parent.roleWorkspace,
+        tools: [echoTool()],
+      }),
+      undefined,
+      [],
+    );
+
+    expect(provider.chatStream).toHaveBeenCalledTimes(2);
+    expect(compactImpl).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe("success");
+  });
+
+  test("surfaces a thrown compaction failure from a hook agent as a non-blocking error", async () => {
+    const provider = providerWithResponses([
+      {
+        content: "checking",
+        toolCalls: [
+          {
+            id: "tool-compact-throw",
+            name: "Echo",
+            arguments: JSON.stringify({ value: "ok" }),
+          },
+        ],
+        usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
+        model: "test-model",
+        finishReason: "tool_calls",
+      },
     ]);
     const parent = createParentSession(provider);
     Object.assign(parent.modelInfo, { autoCompactTokenLimit: 1 });
     setCurrentRuntimeSession(parent);
     setAutoCompactImplForTests(
-      vi.fn<AutoCompactImpl>(async () => ({ wasCompacted: false })),
+      vi.fn<AutoCompactImpl>(async () => {
+        throw new Error("compaction exploded");
+      }),
     );
 
     const result = await execAgentHook(
@@ -446,11 +512,10 @@ describe("execAgentHook run-turn integration", () => {
       [],
     );
 
-    expect(provider.chatStream).toHaveBeenCalledTimes(1);
+    // The pre-turn gate threw before the first sample was ever taken.
+    expect(provider.chatStream).toHaveBeenCalledTimes(0);
     expect(result.outcome).toBe("non_blocking_error");
-    expect(result.message?.attachment.stderr).toContain(
-      "mid_turn_compact_skipped",
-    );
+    expect(result.message?.attachment.stderr).toContain("compaction exploded");
   });
 
   test("surfaces a runaway hook (identical call+result every turn) as a non-blocking error", async () => {
@@ -1280,7 +1345,7 @@ describe("execAgentHook run-turn integration", () => {
     });
   });
 
-  test("projects compact failures into legacy assistant error messages", async () => {
+  test("a declined compaction no longer surfaces as an assistant API error; the turn goes on", async () => {
     const provider = providerWithResponses([
       {
         content: "checking",
@@ -1319,8 +1384,9 @@ describe("execAgentHook run-turn integration", () => {
       events.push(event);
     }
 
-    expect(provider.chatStream).toHaveBeenCalledTimes(1);
-    expect(events).toContainEqual(
+    // Two samples: the decline did not end the turn, maxTurns did.
+    expect(provider.chatStream).toHaveBeenCalledTimes(2);
+    expect(events).not.toContainEqual(
       expect.objectContaining({
         type: "message",
         message: expect.objectContaining({
