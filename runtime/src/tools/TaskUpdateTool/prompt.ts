@@ -8,6 +8,7 @@ export const PROMPT = `Use this tool to update a task in the task list.
 - When you have completed the work described in a task
 - When a task is no longer needed or has been superseded
 - IMPORTANT: Always mark your assigned tasks as resolved when you finish them
+- Right after marking a task completed, tell the user in one or two sentences of plain text what you just finished and what you will do next, before your next tool call. Every closed task gets such a note; do not save them all for the end
 - After resolving, call TaskList to find your next task
 
 - ONLY mark a task as completed when you have FULLY accomplished it
