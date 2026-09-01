@@ -1705,6 +1705,7 @@ async function runDaemonOneShotPrompt(params: {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly initialContent?: string | readonly MessageContentBlock[];
   readonly permissionMode?: AgentCreateParams["permissionMode"];
   readonly signal: AbortSignal;
@@ -1746,6 +1747,9 @@ async function runDaemonOneShotPrompt(params: {
       ...(params.profile !== undefined ? { profile: params.profile } : {}),
       ...(params.configPath !== undefined
         ? { configPath: params.configPath }
+        : {}),
+      ...(params.addDirs !== undefined
+        ? { addDirs: [...params.addDirs] }
         : {}),
       ...(params.initialContent !== undefined
         ? { initialContent: params.initialContent }
@@ -2138,6 +2142,9 @@ export async function oneShotCLI(
         : {}),
       ...(startupLayers.flagConfigPath !== undefined
         ? { configPath: startupLayers.flagConfigPath }
+        : {}),
+      ...(startupCliFlags.addDirs !== undefined
+        ? { addDirs: startupCliFlags.addDirs }
         : {}),
       ...(initialContent !== undefined ? { initialContent } : {}),
       ...(oneShotPermissionMode !== undefined
@@ -2673,6 +2680,7 @@ async function createDeferredDaemonPromptTuiSession(params: {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly preparePrompt?: typeof prepareDaemonTuiPrompt;
   readonly permissionMode?: AgentCreateParams["permissionMode"];
 }): Promise<{
@@ -3274,6 +3282,9 @@ async function createDeferredDaemonPromptTuiSession(params: {
           ...(pendingProfile !== undefined ? { profile: pendingProfile } : {}),
           ...(params.configPath !== undefined
             ? { configPath: params.configPath }
+            : {}),
+          ...(params.addDirs !== undefined
+            ? { addDirs: params.addDirs }
             : {}),
           ...(deferInitialTurn
             ? { deferInitialTurn: true }
@@ -4515,6 +4526,9 @@ async function resumeColdDaemonSession(params: {
     ...(startupLayers.flagConfigPath !== undefined
       ? { configPath: startupLayers.flagConfigPath }
       : {}),
+    ...(startupFlags.addDirs !== undefined
+      ? { addDirs: startupFlags.addDirs }
+      : {}),
     ...(permissionMode !== undefined ? { permissionMode } : {}),
   });
 }
@@ -4670,6 +4684,9 @@ export async function bootTUIEntry(
           ...(startupLayers.flagConfigPath !== undefined
             ? { configPath: startupLayers.flagConfigPath }
             : {}),
+          ...(startupCliFlags.addDirs !== undefined
+            ? { addDirs: startupCliFlags.addDirs }
+            : {}),
           // Seed the deferred bootstrap permission mode the same way the daemon
           // createTuiContext above does: an explicit `--dangerously-bypass-approvals-and-sandbox` forces bypass,
           // otherwise honor the startup `--permission-mode` flag. Pre-first-turn
@@ -4746,6 +4763,9 @@ export async function bootTUIEntry(
           : {}),
         ...(startupLayers.flagConfigPath !== undefined
           ? { configPath: startupLayers.flagConfigPath }
+          : {}),
+        ...(startupCliFlags.addDirs !== undefined
+          ? { addDirs: startupCliFlags.addDirs }
           : {}),
         ...(initialContent !== undefined ? { initialContent } : {}),
         ...(promptPermissionMode !== undefined

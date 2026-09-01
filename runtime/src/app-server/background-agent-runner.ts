@@ -236,6 +236,7 @@ export interface AgenCBackgroundAgentStartParams {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly initialContent?: MessageContent;
   readonly deferInitialTurn?: boolean;
   readonly initialDisplayUserMessage?: string | null;
@@ -280,6 +281,7 @@ export interface AgenCBackgroundAgentRestoreParams {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly permissionMode?:
     | "default"
     | "plan"
@@ -9934,6 +9936,7 @@ function restoreBootstrapSelection(params: AgenCBackgroundAgentRestoreParams): {
   readonly model?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly permissionMode?:
     | "default"
     | "plan"
@@ -9951,6 +9954,7 @@ function restoreBootstrapSelection(params: AgenCBackgroundAgentRestoreParams): {
     ...(params.configPath !== undefined
       ? { configPath: params.configPath }
       : {}),
+    ...(params.addDirs !== undefined ? { addDirs: params.addDirs } : {}),
   };
 }
 
@@ -10004,6 +10008,7 @@ function buildBootstrapArgv(
     readonly model?: string;
     readonly profile?: string;
     readonly configPath?: string;
+    readonly addDirs?: readonly string[];
     readonly permissionMode?:
       | "default"
       | "plan"

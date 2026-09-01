@@ -896,6 +896,9 @@ export class AgenCDaemonAgentManager {
               ...(provider !== undefined ? { provider } : {}),
               ...(profile !== undefined ? { profile } : {}),
               ...(configPath !== undefined ? { configPath } : {}),
+              ...(params.addDirs !== undefined
+                ? { addDirs: params.addDirs }
+                : {}),
               ...(params.initialContent !== undefined
                 ? { initialContent: params.initialContent }
                 : {}),
@@ -942,6 +945,9 @@ export class AgenCDaemonAgentManager {
               ...(provider !== undefined ? { provider } : {}),
               ...(profile !== undefined ? { profile } : {}),
               ...(configPath !== undefined ? { configPath } : {}),
+              ...(params.addDirs !== undefined
+                ? { addDirs: params.addDirs }
+                : {}),
               ...(permissionMode !== undefined ? { permissionMode } : {}),
               ...(canonicalRuntimeSettings !== undefined
                 ? { runtimeSettings: canonicalRuntimeSettings }
@@ -1211,6 +1217,7 @@ export class AgenCDaemonAgentManager {
     readonly provider?: string;
     readonly profile?: string;
     readonly configPath?: string;
+    readonly addDirs?: readonly string[];
     readonly permissionMode?:
       | "default"
       | "plan"
@@ -1267,6 +1274,7 @@ export class AgenCDaemonAgentManager {
       ...(params.configPath !== undefined
         ? { configPath: params.configPath }
         : {}),
+      ...(params.addDirs !== undefined ? { addDirs: params.addDirs } : {}),
       ...(params.permissionMode !== undefined
         ? { permissionMode: params.permissionMode }
         : {}),
