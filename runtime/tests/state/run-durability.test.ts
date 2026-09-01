@@ -15,6 +15,7 @@ import type {
   EffectReviewResolution,
   RunTerminalResult,
 } from "../../src/contracts/run-contracts.js";
+import { updateAgentRunStatus } from "../../src/state/agent-runs.js";
 import {
   RunDurabilityConflictError,
   StateRunDurabilityRepository,
@@ -305,15 +306,30 @@ describe("StateRunDurabilityRepository", () => {
       expect.objectContaining({ code: "RUN_CANCELLATION_CONFLICT" }),
     );
 
+  });
+
+  it("reopens a cancelled run into a fresh epoch while implicit writers stay locked out", () => {
+    // The cancellation lock exists so a dying agent's late status write
+    // loses against an explicit cancel. An operator reopening a settled
+    // terminal is the authorized transition — refusing it left every
+    // interrupted session permanently unresumable.
     runs.ensureInitialEpoch({ runId: "run-reopen-cancelled", openedAt: T0 });
     runs.recordTerminalResult({
       epoch: 1,
       result: terminal({
         runId: "run-reopen-cancelled",
         finishedAt: T1,
+        status: "cancelled",
       }),
       eventId: "event-terminal-before-cancel-lock",
     });
+    driver
+      .prepareState(
+        `INSERT INTO agent_runs (
+           id, objective, status, started_at, last_active_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("run-reopen-cancelled", "cancelled work", "cancelled", T0, T1);
     driver
       .prepareState(
         `INSERT INTO execution_admission_cancellations (
@@ -321,7 +337,8 @@ describe("StateRunDurabilityRepository", () => {
          ) VALUES (?, ?, ?)`,
       )
       .run("run-reopen-cancelled", "operator", T2);
-    expect(() =>
+
+    expect(
       runs.reopenRun({
         runId: "run-reopen-cancelled",
         fromEpoch: 1,
@@ -329,9 +346,46 @@ describe("StateRunDurabilityRepository", () => {
         eventId: "event-reopen-after-cancel",
         reason: "retry",
       }),
-    ).toThrowError(
-      expect.objectContaining({ code: "RUN_CANCELLATION_CONFLICT" }),
-    );
+    ).toMatchObject({
+      applied: true,
+      value: { epoch: 2, reopenedFromEpoch: 1 },
+    });
+    expect(
+      driver
+        .prepareState<[string], { status: string }>(
+          "SELECT status FROM agent_runs WHERE id = ?",
+        )
+        .get("run-reopen-cancelled")?.status,
+    ).toBe("running");
+  });
+
+  it("keeps a late implicit status write from undoing an explicit cancel", () => {
+    driver
+      .prepareState(
+        `INSERT INTO agent_runs (
+           id, objective, status, started_at, last_active_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("run-late-writer", "cancelled work", "cancelled", T0, T1);
+
+    expect(
+      updateAgentRunStatus(driver, {
+        id: "run-late-writer",
+        status: "running",
+        lastActiveAt: T2,
+      }),
+    ).toMatchObject({
+      applied: false,
+      reason: "cancel_locked_status_sticky",
+      existingStatus: "cancelled",
+    });
+    expect(
+      driver
+        .prepareState<[string], { status: string }>(
+          "SELECT status FROM agent_runs WHERE id = ?",
+        )
+        .get("run-late-writer")?.status,
+    ).toBe("cancelled");
   });
 
   it("lifts cancellation locks that an explicit reopen superseded", () => {

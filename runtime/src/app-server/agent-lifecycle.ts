@@ -736,15 +736,24 @@ export class AgenCDaemonAgentManager {
           resumeProof,
           this.#agencHome,
         );
-        if (
-          retainedAgent?.objective !== undefined &&
-          retainedAgent.objective !== resumeProof.objective
-        ) {
-          throw new AgenCDaemonAgentLifecycleError(
-            "INVALID_ARGUMENT",
-            `canonical session ${resumeSessionId} retained objective disagrees with the rollout`,
-          );
-        }
+        /*
+         * The retained objective is NOT a session identity. A client that
+         * defers the initial turn (every interactive session: the desktop
+         * app, `agenc` itself) passes a label like "Interactive session"
+         * while the rollout's canonical objective is whatever the user
+         * typed first, so the two never agree and strict equality refused
+         * 100% of legitimate interactive resumes — the same failure shape
+         * as the retained `createdAt` equality fixed in #1750. The label is
+         * disposable either way: a successful resume replaces it with
+         * `resumeProof.objective` a few lines below.
+         *
+         * A rollout swapped in from another session is still refused, by
+         * evidence rather than by label: the path must live under
+         * `sessions/<resumeSessionId>/` and its filename must end in
+         * `-<resumeSessionId>.jsonl`, the caller's dev/ino/size/sha256
+         * proof is revalidated here against the real file, and the journal
+         * is validated with `expectedRunId` set to this session id.
+         */
         if (
           retainedAgent?.createdAt !== undefined &&
           !retainedCreatedAtMatchesRollout(
