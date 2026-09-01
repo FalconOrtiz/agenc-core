@@ -412,19 +412,7 @@ describe("execAgentHook run-turn integration", () => {
     // sampling and finishes its work. (Before, one declined attempt turned
     // every hook into a non-blocking error.)
     const provider = providerWithResponses([
-      {
-        content: "checking",
-        toolCalls: [
-          {
-            id: "tool-compact",
-            name: "Echo",
-            arguments: JSON.stringify({ value: "ok" }),
-          },
-        ],
-        usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
-        model: "test-model",
-        finishReason: "tool_calls",
-      },
+      echoCallResponse("tool-compact"),
       {
         content: "verified",
         toolCalls: [
@@ -439,31 +427,11 @@ describe("execAgentHook run-turn integration", () => {
         finishReason: "tool_calls",
       },
     ]);
-    const parent = createParentSession(provider);
-    Object.assign(parent.modelInfo, { autoCompactTokenLimit: 1 });
-    setCurrentRuntimeSession(parent);
     const compactImpl = vi.fn<AutoCompactImpl>(async () => ({
       wasCompacted: false,
       skippedReason: "declined for the test",
     }));
-    setAutoCompactImplForTests(compactImpl);
-
-    const result = await execAgentHook(
-      {
-        type: "agent",
-        prompt: "verify",
-      } as never,
-      "Stop",
-      "Stop" as never,
-      "{}",
-      new AbortController().signal,
-      createToolUseContext({
-        roleWorkspace: parent.roleWorkspace,
-        tools: [echoTool()],
-      }),
-      undefined,
-      [],
-    );
+    const result = await runVerifyHookAtCompactionLimit(provider, compactImpl);
 
     expect(provider.chatStream).toHaveBeenCalledTimes(2);
     expect(compactImpl).toHaveBeenCalledTimes(1);
@@ -471,45 +439,12 @@ describe("execAgentHook run-turn integration", () => {
   });
 
   test("surfaces a thrown compaction failure from a hook agent as a non-blocking error", async () => {
-    const provider = providerWithResponses([
-      {
-        content: "checking",
-        toolCalls: [
-          {
-            id: "tool-compact-throw",
-            name: "Echo",
-            arguments: JSON.stringify({ value: "ok" }),
-          },
-        ],
-        usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
-        model: "test-model",
-        finishReason: "tool_calls",
-      },
-    ]);
-    const parent = createParentSession(provider);
-    Object.assign(parent.modelInfo, { autoCompactTokenLimit: 1 });
-    setCurrentRuntimeSession(parent);
-    setAutoCompactImplForTests(
+    const provider = providerWithResponses([echoCallResponse("tool-compact-throw")]);
+    const result = await runVerifyHookAtCompactionLimit(
+      provider,
       vi.fn<AutoCompactImpl>(async () => {
         throw new Error("compaction exploded");
       }),
-    );
-
-    const result = await execAgentHook(
-      {
-        type: "agent",
-        prompt: "verify",
-      } as never,
-      "Stop",
-      "Stop" as never,
-      "{}",
-      new AbortController().signal,
-      createToolUseContext({
-        roleWorkspace: parent.roleWorkspace,
-        tools: [echoTool()],
-      }),
-      undefined,
-      [],
     );
 
     // The pre-turn gate threw before the first sample was ever taken.
@@ -2256,4 +2191,42 @@ function createToolUseContext(opts: {
     updateAttributionState: () => {},
     messages: [],
   } as unknown as ToolUseContext;
+}
+
+/** One "checking" turn that calls Echo once, the way the compaction tests start. */
+function echoCallResponse(id: string): LLMResponse {
+  return {
+    content: "checking",
+    toolCalls: [{ id, name: "Echo", arguments: JSON.stringify({ value: "ok" }) }],
+    usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
+    model: "test-model",
+    finishReason: "tool_calls",
+  };
+}
+
+/** Run the verify hook on a parent session whose compaction limit is already reached. */
+async function runVerifyHookAtCompactionLimit(
+  provider: LLMProvider,
+  compactImpl: AutoCompactImpl,
+): Promise<Awaited<ReturnType<typeof execAgentHook>>> {
+  const parent = createParentSession(provider);
+  Object.assign(parent.modelInfo, { autoCompactTokenLimit: 1 });
+  setCurrentRuntimeSession(parent);
+  setAutoCompactImplForTests(compactImpl);
+  return execAgentHook(
+    {
+      type: "agent",
+      prompt: "verify",
+    } as never,
+    "Stop",
+    "Stop" as never,
+    "{}",
+    new AbortController().signal,
+    createToolUseContext({
+      roleWorkspace: parent.roleWorkspace,
+      tools: [echoTool()],
+    }),
+    undefined,
+    [],
+  );
 }
