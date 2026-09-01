@@ -133,6 +133,132 @@ describe("provider credential authority", () => {
     expect(resolved.factoryOptions.apiKey).toBe("xai-environment-key");
   });
 
+  test("trims API keys while preserving explicit and environment precedence", async () => {
+    const { providerOptions } = await loadCredentialModules();
+
+    const explicit = providerOptions.resolveProviderCredentialAuthority(
+      "grok",
+      {
+        apiKey: "  explicit-key\t",
+        model: "grok-4.6",
+      },
+      {
+        XAI_API_KEY: "  xai-environment-key  ",
+        GROK_API_KEY: "grok-environment-key",
+      },
+      { savedApiKey: "saved-key" },
+    );
+
+    expect(explicit.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "explicit",
+    });
+    expect(explicit.factoryOptions.apiKey).toBe("explicit-key");
+
+    const environment = providerOptions.resolveProviderCredentialAuthority(
+      "grok",
+      {
+        apiKey: " \t\n ",
+        model: "grok-4.6",
+      },
+      {
+        XAI_API_KEY: " \n ",
+        GROK_API_KEY: "  grok-environment-key\t",
+      },
+      { savedApiKey: "saved-key" },
+    );
+
+    expect(environment.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "environment",
+      provenance: {
+        kind: "environment",
+        fields: [{ role: "apiKey", envVar: "GROK_API_KEY" }],
+      },
+    });
+    expect(environment.factoryOptions.apiKey).toBe("grok-environment-key");
+  });
+
+  test("treats empty credentials as absent before saved BYOK fallback", async () => {
+    const { providerOptions } = await loadCredentialModules();
+
+    const saved = providerOptions.resolveProviderCredentialAuthority(
+      "anthropic",
+      {
+        apiKey: " \t\n ",
+        model: "claude-opus-4-7",
+      },
+      {
+        ANTHROPIC_API_KEY: "",
+        ANTHROPIC_AUTH_TOKEN: "  ",
+      },
+      { savedApiKey: "  saved-anthropic-key  " },
+    );
+
+    expect(saved.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "saved-byok",
+    });
+    expect(saved.factoryOptions.apiKey).toBe("saved-anthropic-key");
+
+    const missing = providerOptions.resolveProviderCredentialAuthority(
+      "anthropic",
+      {
+        apiKey: " ",
+        model: "claude-opus-4-7",
+      },
+      {
+        ANTHROPIC_API_KEY: "\t",
+        ANTHROPIC_AUTH_TOKEN: "\n",
+      },
+      { savedApiKey: "  " },
+    );
+
+    expect(missing.credential).toMatchObject({
+      status: "missing",
+      mode: "none",
+      reason: "absent",
+      missingLabel: "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN",
+    });
+    expect(missing.factoryOptions.apiKey).toBeUndefined();
+    expect(missing.factoryOptions.authToken).toBeUndefined();
+  });
+
+  test("isolates credential selection from later environment mutation", async () => {
+    const { providerOptions } = await loadCredentialModules();
+    const sourceEnvironment: Record<string, string | undefined> = {
+      XAI_API_KEY: "captured-xai-key",
+      GROK_API_KEY: "captured-grok-key",
+    };
+    const capturedEnvironment = providerOptions.snapshotProviderEnvironment(
+      sourceEnvironment,
+    );
+
+    sourceEnvironment.XAI_API_KEY = "mutated-xai-key";
+    sourceEnvironment.GROK_API_KEY = undefined;
+
+    const resolved = providerOptions.resolveProviderCredentialAuthority(
+      "grok",
+      { model: "grok-4.6" },
+      capturedEnvironment,
+    );
+
+    expect(Object.isFrozen(capturedEnvironment)).toBe(true);
+    expect(resolved.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "environment",
+      provenance: {
+        kind: "environment",
+        fields: [{ role: "apiKey", envVar: "XAI_API_KEY" }],
+      },
+    });
+    expect(resolved.factoryOptions.apiKey).toBe("captured-xai-key");
+  });
+
   test("does not require a provider credential for Grok composer models", async () => {
     const { providerOptions } = await loadCredentialModules();
 
