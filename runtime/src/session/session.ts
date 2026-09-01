@@ -2279,6 +2279,18 @@ function activeAgentDefinitionsFromRoles(
  * Mirrors agenc runtime `Session` struct (session.rs:6-29).
  */
 export class Session {
+  /**
+   * Automatic compaction back-off. `declines` counts attempts that ran and
+   * did not compact, in a row; after three, the next two turns skip
+   * automatic compaction (`skipTurnsRemaining`) before one more attempt is
+   * allowed. A committed compaction clears both. Without this a session
+   * past the threshold paid a full failed attempt, minutes long, at the
+   * start of every turn.
+   */
+  autoCompactBackoff: { declines: number; skipTurnsRemaining: number } = {
+    declines: 0,
+    skipTurnsRemaining: 0,
+  };
   /** agenc runtime: `conversation_id: ThreadId` */
   readonly conversationId: ThreadId;
 

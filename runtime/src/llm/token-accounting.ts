@@ -71,6 +71,42 @@ const TOKEN_ACCOUNTING_UTF8_WORST_CASE_BYTES_PER_TOKEN = 1;
 const TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN = 2;
 
 /**
+ * Bytes per token for the fallback, by provider family. BPE tokenizers of
+ * these families sit near 3.8 to 4.3 bytes per token on the prose, code and
+ * JSON a coding session sends (grok-4.6 measured at 3.83 on a 600 KB
+ * prompt); 3.5 keeps the estimate above the real count with the 10 %
+ * margin on top, instead of the 2.3x over-count that made compaction fire
+ * at a third of the window and admission deny at 42 % of it. Families
+ * without a measurement keep the floor of 2.
+ */
+const TOKEN_ACCOUNTING_FALLBACK_BYTES_PER_TOKEN_BY_PROVIDER: Readonly<
+  Record<string, number>
+> = {
+  grok: 3.5,
+  xai: 3.5,
+  "x-ai": 3.5,
+  openai: 3.5,
+  gemini: 3.5,
+  groq: 3.5,
+  github: 3.5,
+  deepseek: 3.2,
+  mistral: 3.2,
+  anthropic: 2.8,
+  openrouter: 2.8,
+  minimax: 2.8,
+};
+
+export function conservativeBytesPerTokenForProvider(
+  provider: string | undefined,
+): number {
+  const key = provider?.trim().toLowerCase() ?? "";
+  return (
+    TOKEN_ACCOUNTING_FALLBACK_BYTES_PER_TOKEN_BY_PROVIDER[key] ??
+    TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN
+  );
+}
+
+/**
  * Ceiling charged for one inline (base64) image or document.
  *
  * Base64 payloads are not prose, and the bytes-per-token divisor above does
@@ -987,7 +1023,9 @@ function conservativeFallbackResult(
   );
   const proseBytes = Math.max(0, serializedBytes - inspection.inlineMediaBytes);
   const promptTokens = safeTokenSum(
-    Math.ceil(proseBytes / TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN),
+    Math.ceil(
+      proseBytes / conservativeBytesPerTokenForProvider(request.provider),
+    ),
     inspection.inlineMediaCount * TOKEN_ACCOUNTING_INLINE_MEDIA_TOKENS,
   );
   const frameTokens =
