@@ -83,7 +83,7 @@ vi.mock("../../../src/tui/components/Message.js", async () => {
   };
 });
 
-vi.mock("../../../src/tui/components/Messages.js", () => ({
+vi.mock("../../../src/tui/components/messageRenderPolicy.js", () => ({
   shouldRenderStatically: (message: { uuid: string }) =>
     harness.staticMessages.has(message.uuid),
 }));
