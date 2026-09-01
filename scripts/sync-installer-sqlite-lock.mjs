@@ -5,6 +5,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const canonicalInstallerPath = join(
+  repoRoot,
+  "scripts/install/runtime-installer.cjs",
+);
 const sqliteSourcePath = join(repoRoot, "packages/agenc/lib/sqlite-lock.mjs");
 const activationIdentitySourcePath = join(
   repoRoot,
@@ -14,10 +18,22 @@ const generatedWrapperSourcePath = join(
   repoRoot,
   "packages/agenc/lib/generated-wrapper.mjs",
 );
-const installerPaths = [
-  join(repoRoot, "scripts/install/install.sh"),
-  join(repoRoot, "scripts/install/install.ps1"),
+const installerTargets = [
+  {
+    path: join(repoRoot, "scripts/install/install.sh"),
+    transportStart: `cat > "$RUNTIME_INSTALLER_JS" <<'AGENC_RUNTIME_INSTALLER'\n`,
+    transportEnd: "\nAGENC_RUNTIME_INSTALLER\n",
+  },
+  {
+    path: join(repoRoot, "scripts/install/install.ps1"),
+    transportStart: "$RuntimeInstaller = @'\n",
+    transportEnd:
+      "\n'@\n  $runtimeInstallerPath = Join-Path $work \"runtime-installer.cjs\"\n",
+  },
 ];
+const installerStartMarker =
+  "// BEGIN GENERATED AGENC RUNTIME INSTALLER PROGRAM";
+const installerEndMarker = "// END GENERATED AGENC RUNTIME INSTALLER PROGRAM";
 const sqliteStartMarker = "// BEGIN GENERATED AGENC SQLITE LOCK MODULE";
 const sqliteEndMarker = "// END GENERATED AGENC SQLITE LOCK MODULE";
 const sqliteLegacyStart = 'const { DatabaseSync } = require("node:sqlite");';
@@ -97,14 +113,14 @@ function replaceGeneratedBlock(
       markerCount(startMarker) !== 1 ||
       markerCount(endMarker) !== 1
     ) {
-      throw new Error(`invalid generated SQLite lock markers: ${path}`);
+      throw new Error(`invalid generated module markers: ${path}`);
     }
     return input.slice(0, generatedStart) + normalizeBoundary(
       input.slice(generatedEnd + endMarker.length),
     );
   }
   if (markerCount(endMarker) !== 0) {
-    throw new Error(`invalid generated SQLite lock markers: ${path}`);
+    throw new Error(`invalid generated module markers: ${path}`);
   }
 
   const start = input.indexOf(legacyStart);
@@ -117,20 +133,82 @@ function replaceGeneratedBlock(
   );
 }
 
-const args = new Set(process.argv.slice(2));
-for (const arg of args) {
-  if (arg !== "--check") throw new Error(`unknown argument: ${arg}`);
+function normalizeLf(input) {
+  return input.replace(/^\uFEFF/u, "").replace(/\r\n?/gu, "\n");
 }
-const sqliteReplacement = generatedSqliteBlock(readFileSync(sqliteSourcePath, "utf8"));
-const identityReplacement = generatedActivationIdentityBlock(
-  readFileSync(activationIdentitySourcePath, "utf8"),
-);
-const wrapperReplacement = generatedWrapperBlock(
-  readFileSync(generatedWrapperSourcePath, "utf8"),
-);
-let stale = false;
-for (const path of installerPaths) {
-  const current = readFileSync(path, "utf8");
+
+function withFinalNewline(input) {
+  return input.endsWith("\n") ? input : `${input}\n`;
+}
+
+function countOccurrences(input, value) {
+  return input.split(value).length - 1;
+}
+
+function generatedInstallerProgram(source) {
+  if (source.includes(installerStartMarker) || source.includes(installerEndMarker)) {
+    throw new Error(
+      `canonical installer contains generated wrapper markers: ${canonicalInstallerPath}`,
+    );
+  }
+  return `${installerStartMarker}\n${source}${installerEndMarker}`;
+}
+
+function replaceInstallerProgram(input, target, replacement) {
+  const transportStartCount = countOccurrences(input, target.transportStart);
+  if (transportStartCount !== 1) {
+    throw new Error(`invalid installer transport start marker: ${target.path}`);
+  }
+  const transportStart = input.indexOf(target.transportStart);
+  const bodyStart = transportStart + target.transportStart.length;
+  const bodyEnd = input.indexOf(target.transportEnd, bodyStart);
+  if (
+    bodyEnd === -1 ||
+    input.indexOf(target.transportEnd, bodyEnd + target.transportEnd.length) !== -1
+  ) {
+    throw new Error(`invalid installer transport end marker: ${target.path}`);
+  }
+
+  const startCount = countOccurrences(input, installerStartMarker);
+  const endCount = countOccurrences(input, installerEndMarker);
+  if (startCount === 0 && endCount === 0) {
+    return input.slice(0, bodyStart) + replacement + input.slice(bodyEnd);
+  }
+  const generatedStart = input.indexOf(installerStartMarker);
+  const generatedEnd = input.indexOf(installerEndMarker, generatedStart);
+  if (
+    startCount !== 1 ||
+    endCount !== 1 ||
+    generatedStart !== bodyStart ||
+    generatedEnd + installerEndMarker.length !== bodyEnd
+  ) {
+    throw new Error(`invalid generated installer program markers: ${target.path}`);
+  }
+  return input.slice(0, generatedStart) + replacement +
+    input.slice(generatedEnd + installerEndMarker.length);
+}
+
+function parseMode(argv) {
+  if (argv.length === 0 || (argv.length === 1 && argv[0] === "--check")) {
+    return "check";
+  }
+  if (argv.length === 1 && argv[0] === "--write") return "write";
+  throw new Error(`unknown arguments: ${argv.join(" ")}`);
+}
+
+function expectedCanonicalInstaller() {
+  const current = withFinalNewline(
+    normalizeLf(readFileSync(canonicalInstallerPath, "utf8")),
+  );
+  const sqliteReplacement = generatedSqliteBlock(
+    readFileSync(sqliteSourcePath, "utf8"),
+  );
+  const identityReplacement = generatedActivationIdentityBlock(
+    readFileSync(activationIdentitySourcePath, "utf8"),
+  );
+  const wrapperReplacement = generatedWrapperBlock(
+    readFileSync(generatedWrapperSourcePath, "utf8"),
+  );
   const withSqlite = replaceGeneratedBlock(
     current,
     {
@@ -140,7 +218,7 @@ for (const path of installerPaths) {
       legacyEnd: sqliteLegacyEnd,
     },
     sqliteReplacement,
-    path,
+    canonicalInstallerPath,
   );
   const withIdentity = replaceGeneratedBlock(
     withSqlite,
@@ -152,9 +230,9 @@ for (const path of installerPaths) {
       retainLegacyEnd: true,
     },
     identityReplacement,
-    path,
+    canonicalInstallerPath,
   );
-  const expected = replaceGeneratedBlock(
+  return withFinalNewline(replaceGeneratedBlock(
     withIdentity,
     {
       startMarker: wrapperStartMarker,
@@ -164,11 +242,35 @@ for (const path of installerPaths) {
       retainLegacyEnd: true,
     },
     wrapperReplacement,
-    path,
-  );
-  if (current === expected) continue;
-  stale = true;
-  if (!args.has("--check")) writeFileSync(path, expected);
-  else process.stderr.write(`stale embedded installer lock modules: ${path}\n`);
+    canonicalInstallerPath,
+  ));
 }
-if (args.has("--check") && stale) process.exitCode = 1;
+
+const mode = parseMode(process.argv.slice(2));
+const currentCanonical = readFileSync(canonicalInstallerPath, "utf8");
+const expectedCanonical = expectedCanonicalInstaller();
+const generatedProgram = generatedInstallerProgram(expectedCanonical);
+const outputs = [
+  {
+    path: canonicalInstallerPath,
+    current: currentCanonical,
+    expected: expectedCanonical,
+  },
+  ...installerTargets.map((target) => {
+    const current = readFileSync(target.path, "utf8");
+    return {
+      path: target.path,
+      current,
+      expected: replaceInstallerProgram(normalizeLf(current), target, generatedProgram),
+    };
+  }),
+];
+
+let stale = false;
+for (const output of outputs) {
+  if (output.current === output.expected) continue;
+  stale = true;
+  if (mode === "write") writeFileSync(output.path, output.expected, "utf8");
+  else process.stderr.write(`stale generated installer source: ${output.path}\n`);
+}
+if (mode === "check" && stale) process.exitCode = 1;

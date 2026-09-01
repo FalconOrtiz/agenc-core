@@ -1414,6 +1414,7 @@ try {
   # --- download + verify + extract (idempotent via the marker contract) -----
 
   $RuntimeInstaller = @'
+// BEGIN GENERATED AGENC RUNTIME INSTALLER PROGRAM
 const { spawnSync } = require("node:child_process");
 const { createHash, randomUUID } = require("node:crypto");
 const {
@@ -2562,6 +2563,7 @@ main().catch((error) => {
   console.error(installerErrorMessages(error).join("\n"));
   process.exitCode = 1;
 });
+// END GENERATED AGENC RUNTIME INSTALLER PROGRAM
 '@
   $runtimeInstallerPath = Join-Path $work "runtime-installer.cjs"
   Set-Content -LiteralPath $runtimeInstallerPath -Value $RuntimeInstaller -Encoding UTF8
