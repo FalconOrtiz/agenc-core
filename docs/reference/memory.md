@@ -98,6 +98,12 @@ returns two pieces that the system prompt assembler places separately:
 loader creates both memory directories so the model can write to them
 without checking first. The block is about 700 tokens in total.
 
+Each live turn also appends the global and project `MEMORY.md` indexes to
+the instruction envelope (`prompts/live-instructions.ts`), truncated by
+`truncateEntrypointContent` and framed as untrusted
+`<persistent_memory_context type="AutoMem">` blocks ahead of the trusted
+base prompt.
+
 ---
 
 ## Persona files (workspace root)
