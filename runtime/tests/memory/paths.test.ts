@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -39,7 +39,7 @@ let oldRemoteMemoryDir: string | undefined;
 let oldPathOverride: string | undefined;
 
 beforeEach(() => {
-  tempRoot = mkdtempSync(join(tmpdir(), "agenc-memory-paths-"));
+  tempRoot = mkdtempSync(join(realpathSync(tmpdir()), "agenc-memory-paths-"));
   oldProjectRoot = getProjectRoot();
   oldAgencHome = process.env.AGENC_HOME;
   oldRemoteMemoryDir = process.env.AGENC_REMOTE_MEMORY_DIR;

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -48,7 +48,7 @@ beforeAll(async () => {
 }, 30_000);
 
 beforeEach(() => {
-  tempRoot = mkdtempSync(join(tmpdir(), "agenc-memory-prompt-"));
+  tempRoot = mkdtempSync(join(realpathSync(tmpdir()), "agenc-memory-prompt-"));
   oldProjectRoot = getProjectRoot();
   oldOriginalCwd = getOriginalCwd();
   oldAgencHome = process.env.AGENC_HOME;

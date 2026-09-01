@@ -2,7 +2,7 @@
  * Tests for the relevant durable-memory attachment producer.
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,7 +45,7 @@ const admittedMemorySelector: AdmittedMemorySelector = {
 };
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), "agenc-relevant-memory-"));
+  root = mkdtempSync(join(realpathSync(tmpdir()), "agenc-relevant-memory-"));
   cwd = join(root, "repo");
   agencHome = join(root, "home");
   mkdirSync(join(agencHome, "memory"), { recursive: true });

@@ -1,4 +1,5 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,7 +37,7 @@ afterEach(async () => {
 describe("C3b production memory recall wiring", () => {
   it("runs full-corpus recall older than 200 through admission and a provider", async () => {
     previousAgenCHome = process.env.AGENC_HOME;
-    temporaryRoot = await mkdtemp(join(tmpdir(), "agenc-c3a-production-"));
+    temporaryRoot = await mkdtemp(join(realpathSync(tmpdir()), "agenc-c3a-production-"));
     const agencHome = join(temporaryRoot, "home");
     const cwd = join(temporaryRoot, "workspace");
     await mkdir(join(agencHome, "memory"), { recursive: true });

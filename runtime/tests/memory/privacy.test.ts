@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -50,7 +50,7 @@ let oldPathOverride: string | undefined
 const fakeGitHubPat = `ghp_${'A'.repeat(36)}`
 
 beforeEach(() => {
-  tempRoot = mkdtempSync(join(tmpdir(), 'agenc-memory-privacy-'))
+  tempRoot = mkdtempSync(join(realpathSync(tmpdir()), 'agenc-memory-privacy-'))
   oldProjectRoot = getProjectRoot()
   oldAgencHome = process.env.AGENC_HOME
   oldRemoteMemoryDir = process.env.AGENC_REMOTE_MEMORY_DIR
