@@ -2844,10 +2844,15 @@ describe("AgenC background agent lifecycle", () => {
     expect(session).not.toHaveProperty("activeAttachmentIds");
   });
 
-  it("agent.create explicitly reopens a retained canonical session", async () => {
-    const fixture = createResumeFixture("conv-retained1");
+  /** Manager pair wired for one explicit canonical resume. */
+  function resumeManagers(createdSessionId: string): {
+    readonly sessions: AgenCDaemonSessionManager;
+    readonly agents: AgenCDaemonAgentManager;
+    readonly startAgent: ReturnType<typeof vi.fn>;
+    readonly restoreAgent: ReturnType<typeof vi.fn>;
+  } {
     const sessions = new AgenCDaemonSessionManager({
-      createSessionId: sequence(["session_resumed"]),
+      createSessionId: sequence([createdSessionId]),
       now: sequence(["2026-08-19T12:00:01.000Z"]),
     });
     const startAgent = vi.fn(async () => ({
@@ -2861,6 +2866,13 @@ describe("AgenC background agent lifecycle", () => {
       runner: { startAgent, restoreAgent },
       sessionManager: sessions,
     });
+    return { sessions, agents, startAgent, restoreAgent };
+  }
+
+  it("agent.create explicitly reopens a retained canonical session", async () => {
+    const fixture = createResumeFixture("conv-retained1");
+    const { sessions, agents, startAgent, restoreAgent } =
+      resumeManagers("session_resumed");
 
     await expect(
       createTestAgent(agents, {
@@ -2936,21 +2948,9 @@ describe("AgenC background agent lifecycle", () => {
     const fixture = createResumeFixture("conv-interactive1", {
       objective: "Reply with the single word: ok",
     });
-    const sessions = new AgenCDaemonSessionManager({
-      createSessionId: sequence(["session_interactive_resumed"]),
-      now: sequence(["2026-08-19T12:00:01.000Z"]),
-    });
-    const startAgent = vi.fn(async () => ({
-      agentId: "unexpected_fresh_agent",
-      startedAt: "2026-08-19T12:00:00.500Z",
-      status: "running" as const,
-    }));
-    const restoreAgent = vi.fn(async () => true);
-    const agents = new AgenCDaemonAgentManager({
-      now: sequence(["2026-08-19T12:00:00.000Z"]),
-      runner: { startAgent, restoreAgent },
-      sessionManager: sessions,
-    });
+    const { agents, startAgent, restoreAgent } = resumeManagers(
+      "session_interactive_resumed",
+    );
     await agents.restoreAgent({
       agentId: "conv-interactive1",
       // The label a deferred-initial-turn client registers.

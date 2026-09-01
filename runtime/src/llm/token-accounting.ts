@@ -69,6 +69,25 @@ const TOKEN_ACCOUNTING_UTF8_WORST_CASE_BYTES_PER_TOKEN = 1;
  * tokenizer can reach.
  */
 const TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN = 2;
+
+/**
+ * Ceiling charged for one inline (base64) image or document.
+ *
+ * Base64 payloads are not prose, and the bytes-per-token divisor above does
+ * not describe them: providers tokenize an image by its tiled dimensions,
+ * not by the length of its transport encoding. Counting the payload as text
+ * made a single generated 1024x1024 PNG — around 1.5 MB of base64 — reserve
+ * ~750k tokens, so ONE image denied `context_window_exceeded` on a 500k
+ * model whose real conversation was under 60k. Observed on grok-4.6: an
+ * interactive build ran 31 iterations at 52k-56k actual prompt tokens, then
+ * died the moment two generated images entered the transcript.
+ *
+ * 3,000 is an upper bound over the catalogued image costs (Anthropic caps a
+ * full-size image near 1,600 tokens; OpenAI's high-detail tiling lands near
+ * 1,100; Gemini charges 258 per tile) with room for provider framing, so the
+ * estimate stays conservative without being physically impossible.
+ */
+const TOKEN_ACCOUNTING_INLINE_MEDIA_TOKENS = 3_000;
 const TOKEN_ACCOUNTING_MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const TOKEN_ACCOUNTING_METRICS_OVERFLOW_MODEL = "other";
 const TOKEN_ACCOUNTING_METRICS_OVERFLOW_PROVIDER = "other";
@@ -956,9 +975,20 @@ function conservativeFallbackResult(
     request.provider,
     request.options.promptCacheKey,
   );
-  const promptTokens = estimateUtf8TokenUnits(
+  /*
+   * Charge prose by bytes and inline media by the image cost providers
+   * actually bill. The serialized prompt carries every base64 payload, so
+   * its bytes are removed from the byte-based estimate first — leaving them
+   * in reserved hundreds of thousands of tokens for a single picture and
+   * denied the run on a window it was nowhere near.
+   */
+  const serializedBytes = normalizedUtf8UpperBound(
     stableStringify(promptIdentity),
-    TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN,
+  );
+  const proseBytes = Math.max(0, serializedBytes - inspection.inlineMediaBytes);
+  const promptTokens = safeTokenSum(
+    Math.ceil(proseBytes / TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN),
+    inspection.inlineMediaCount * TOKEN_ACCOUNTING_INLINE_MEDIA_TOKENS,
   );
   const frameTokens =
     TOKEN_ACCOUNTING_REQUEST_FRAME_TOKENS +
@@ -1078,12 +1108,17 @@ function inspectRequestContent(
   readonly mediaCount: number;
   readonly hasImages: boolean;
   readonly hasDocuments: boolean;
+  /** Serialized bytes of inline base64 payloads, which are not prose. */
+  readonly inlineMediaBytes: number;
+  readonly inlineMediaCount: number;
 } {
   const contentTypes = new Set<TokenAccountingContentType>();
   const uncertainComponents = new Set<string>();
   let mediaCount = 0;
   let hasImages = false;
   let hasDocuments = false;
+  let inlineMediaBytes = 0;
+  let inlineMediaCount = 0;
 
   if (
     provider === "gemini" &&
@@ -1125,6 +1160,8 @@ function inspectRequestContent(
         const url = part.image_url?.url?.trim() ?? "";
         if (isInlineDataUrl(url)) {
           contentTypes.add("image_inline");
+          inlineMediaBytes += utf8ByteLength(url);
+          inlineMediaCount += 1;
         } else {
           contentTypes.add("image_remote");
           uncertainComponents.add(
@@ -1141,6 +1178,8 @@ function inspectRequestContent(
           : {};
         if (source.type === "base64" && typeof source.data === "string") {
           contentTypes.add("image_inline");
+          inlineMediaBytes += utf8ByteLength(source.data);
+          inlineMediaCount += 1;
         } else {
           contentTypes.add("image_remote");
           uncertainComponents.add(
@@ -1154,6 +1193,8 @@ function inspectRequestContent(
         mediaCount += 1;
         if (part.source?.type === "base64" && part.source.data.length > 0) {
           contentTypes.add("document_inline");
+          inlineMediaBytes += utf8ByteLength(part.source.data);
+          inlineMediaCount += 1;
         } else if (typeof part.fallbackText === "string") {
           contentTypes.add("text");
         } else {
@@ -1177,7 +1218,14 @@ function inspectRequestContent(
     mediaCount,
     hasImages,
     hasDocuments,
+    inlineMediaBytes,
+    inlineMediaCount,
   };
+}
+
+/** UTF-8 length without allocating a copy of a multi-megabyte payload. */
+function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
 }
 
 function componentSetForRequest(

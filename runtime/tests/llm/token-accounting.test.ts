@@ -160,6 +160,47 @@ describe("conservative complete-request fallback", () => {
     expect(inputTokens).toBeLessThan(promptBytes * 0.75);
   });
 
+  test("charges an inline image like an image, not like its base64 transport", () => {
+    /*
+     * A generated 1024x1024 PNG is ~1.5 MB of base64. Counted as prose it
+     * reserved ~750k tokens, so ONE picture denied `context_window_exceeded`
+     * on a 500k model whose conversation was under 60k — observed killing an
+     * interactive build after 31 healthy iterations at 52k-56k real tokens.
+     */
+    const base64 = "A".repeat(1_500_000);
+    const withImage = estimateTokenAccountingRequest(
+      accountingRequest([
+        { type: "text", text: "wire this sprite into the level" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${base64}` } },
+      ] as never),
+    );
+    const textOnly = estimateTokenAccountingRequest(
+      accountingRequest([
+        { type: "text", text: "wire this sprite into the level" },
+      ] as never),
+    );
+
+    // The payload no longer drives the reservation…
+    expect(withImage.inputTokens).toBeLessThan(20_000);
+    // …but the image is still charged well above a bare text turn.
+    expect(withImage.inputTokens).toBeGreaterThan(textOnly.inputTokens + 1_000);
+    // And it stays inside a 500k window, which is the whole point.
+    expect(withImage.inputTokens).toBeLessThan(500_000);
+  });
+
+  test("keeps every inline image accounted for", () => {
+    const base64 = "A".repeat(200_000);
+    const image = { type: "image_url", image_url: { url: `data:image/png;base64,${base64}` } };
+    const one = estimateTokenAccountingRequest(
+      accountingRequest([image] as never),
+    ).inputTokens;
+    const three = estimateTokenAccountingRequest(
+      accountingRequest([image, image, image] as never),
+    ).inputTokens;
+
+    expect(three).toBeGreaterThan(one * 2);
+  });
+
   test("uses a whole-request ceiling and never loses short-message framing", () => {
     const counts = [0, 1, 2, 100].map((messageCount) => {
       const request = accountingRequest("", {
