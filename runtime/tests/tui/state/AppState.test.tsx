@@ -16,9 +16,6 @@ vi.mock("bun:bundle", () => ({
 vi.mock("../context/mailbox.js", () => ({
   MailboxProvider: ({ children }: { children: React.ReactNode }) => children,
 }));
-vi.mock("../hooks/useEffectEventCompat.js", () => ({
-  useEffectEventCompat: (callback: unknown) => callback,
-}));
 vi.mock("../../services/PromptSuggestion/promptSuggestion.js", () => ({
   shouldEnablePromptSuggestion: () => false,
 }));
