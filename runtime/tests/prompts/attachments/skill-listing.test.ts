@@ -81,7 +81,7 @@ describe("skillListingProducer", () => {
     ).toEqual([]);
   });
 
-  test("emits nothing for subagents or when no skill is model-invocable", async () => {
+  test("emits nothing for subagents and skips skills that are not model-invocable", async () => {
     const subagent = makeOpts({ subagentDepth: 1 });
     expect(
       await skillListingProducer(subagent, getAttachmentTrackingState(subagent.sessionKey)),
@@ -92,13 +92,17 @@ describe("skillListingProducer", () => {
         skillsForConfig: async () => ({
           invokedSkills: [],
           availableSkills: [
-            { name: "batch", description: "Bulk edits", disableModelInvocation: true },
+            { name: "hidden-local", description: "Bulk edits", disableModelInvocation: true },
           ],
         }),
       },
     });
+    // The runtime-registered bundled skills may still be listed; the
+    // user-invocable-only local skill must not be.
     expect(
-      await skillListingProducer(hiddenOnly, getAttachmentTrackingState(hiddenOnly.sessionKey)),
-    ).toEqual([]);
+      JSON.stringify(
+        await skillListingProducer(hiddenOnly, getAttachmentTrackingState(hiddenOnly.sessionKey)),
+      ),
+    ).not.toContain("hidden-local");
   });
 });

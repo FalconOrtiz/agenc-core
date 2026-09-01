@@ -881,7 +881,7 @@ function snapshotFindSkill(
   );
 }
 
-interface SkillListingEntry {
+export interface SkillListingEntry {
   readonly name: string;
   readonly description?: string;
   readonly whenToUse?: string;
@@ -1528,7 +1528,7 @@ Use \`unbind\` for explicit removals because TOML has no null value. The canonic
 function buildBrowserPrompt(args: string): string {
   return `# AgenC Browser Automation
 
-Use browser automation to inspect, test, or debug a web UI.
+Inspect, test, or debug a web UI with the runtime's Browser tool.
 
 ## User Request
 
@@ -1536,12 +1536,12 @@ ${args || "No specific URL or flow was supplied. Ask the user for the URL or app
 
 ## Workflow
 
-1. Start or locate the local dev server.
-2. Use Playwright/browser tooling to navigate the target flow.
-3. Capture screenshots for visual regressions when useful.
+1. The Browser tool is deferred: load it with system.searchTools and the query \`select:Browser\`, then load the browser-automation skill with the Skill tool; it explains the snapshot, act, re-snapshot loop the tool expects.
+2. Start or locate the local dev server. Private and loopback addresses are blocked by the Browser tool's SSRF policy unless \`[browser].allow_private_network\` is enabled.
+3. Navigate the target flow by ref from the latest snapshot. Capture screenshots for visual regressions when useful.
 4. Report exact failures, console errors, network errors, and UI mismatches.
 
-Do not rely on a visual guess when a DOM assertion, screenshot, or browser console check can verify the result.`;
+Do not rely on a visual guess when a snapshot, screenshot, or browser console check can verify the result.`;
 }
 
 function buildSchedulePrompt(args: string): string {
@@ -1663,7 +1663,8 @@ const BUNDLED_SKILLS: readonly BundledSkillDefinition[] = [
   },
   {
     name: "agenc-in-browser",
-    description: "Use browser automation to inspect, test, or debug a web UI.",
+    description:
+      "Inspect, test, or debug a web UI with the runtime's Browser tool.",
     argumentHint: "[url or flow]",
     getPrompt: (args) => buildBrowserPrompt(args),
   },

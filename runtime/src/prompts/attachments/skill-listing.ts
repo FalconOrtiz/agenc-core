@@ -1,7 +1,10 @@
 import type { LLMMessage } from "../../llm/types.js";
 import type { AttachmentProducer } from "./orchestrator.js";
 import { SKILL_LISTING_REMINDER_HEADER } from "./messages.js";
-import { formatSkillListingWithinBudget } from "../../skills/local-loader.js";
+import {
+  formatSkillListingWithinBudget,
+  type SkillListingEntry,
+} from "../../skills/local-loader.js";
 
 function messageCarriesText(message: LLMMessage, needle: string): boolean {
   if (typeof message.content === "string") {
@@ -10,6 +13,35 @@ function messageCarriesText(message: LLMMessage, needle: string): boolean {
   return message.content.some(
     (part) => part.type === "text" && part.text.includes(needle),
   );
+}
+
+/**
+ * Skills registered through `registerBundledSkill` (browser-automation, the
+ * marketplace kit installer) live outside the local loader, but the Skill
+ * tool loads them, so the model must hear about them too. Dynamic literal
+ * import with a catch, as in /skills: in tests the build-time MACRO global
+ * is absent and registration throws at module load, in which case the
+ * listing simply omits them.
+ */
+async function bundledRegistrySkills(): Promise<readonly SkillListingEntry[]> {
+  try {
+    const { getBundledSkills } = await import("../../skills/bundledSkills.js");
+    return getBundledSkills().flatMap((command): SkillListingEntry[] =>
+      command.isEnabled?.() === false
+        ? []
+        : [{
+            name: command.name,
+            description: command.description,
+            ...(command.whenToUse !== undefined
+              ? { whenToUse: command.whenToUse }
+              : {}),
+            disableModelInvocation: command.disableModelInvocation === true,
+            loadedFrom: "bundled",
+          }],
+    );
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -34,8 +66,12 @@ export const skillListingProducer: AttachmentProducer = async (opts) => {
 
   const outcome = await opts.skillsManager.skillsForConfig(opts.config ?? {}, null);
   const skills = outcome.availableSkills ?? [];
+  const known = new Set(skills.map((skill) => skill.name));
+  const bundled = (await bundledRegistrySkills()).filter(
+    (skill) => !known.has(skill.name),
+  );
   const listing = formatSkillListingWithinBudget(
-    skills,
+    [...skills, ...bundled],
     opts.contextWindowTokens,
   );
   if (listing.length === 0) return [];
