@@ -81,6 +81,23 @@ Recommended soft cap: `MAX_MEMORY_CHARACTER_COUNT` (40_000). Entrypoint
 `MEMORY.md` also line/byte truncated for prompt injection
 (`MAX_ENTRYPOINT_LINES` 200, `MAX_ENTRYPOINT_BYTES` 25_000).
 
+### Memory prompt
+
+When auto memory is enabled, `loadMemoryPrompt()` (`memory/memdir.ts`)
+returns two pieces that the system prompt assembler places separately:
+
+- `instructions`: path-free guidance (when to save, where, the
+  one-fact-per-file frontmatter format, the `MEMORY.md` index, how to recall)
+  rendered under `# auto memory` in the cacheable static head.
+- `directories`: the `# Memory directories` block with the global and project
+  paths (and any host-injected per-session guidance) rendered in the dynamic
+  tail.
+
+`prepareTurnRuntimeInputs`, `assembleBaseInstructionsForModel` and the
+`/context` estimate all go through `resolveMemoryPromptInputs()`, and the
+loader creates both memory directories so the model can write to them
+without checking first. The block is about 700 tokens in total.
+
 ---
 
 ## Persona files (workspace root)
