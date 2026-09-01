@@ -212,6 +212,120 @@ export function pruneSessionStateSnapshots(
   });
 }
 
+/**
+ * Rows kept per session regardless of configuration. The daemon-side snapshot
+ * is a recovery convenience whose consumers (loadLatest, hydrateStartupRecovery)
+ * read only the newest row, so a deep history has no reader. One 82-minute
+ * session accumulated 5,607 rows / 1.16 GB before this cap existed because the
+ * configured retention never deleted a row.
+ */
+export const SESSION_SNAPSHOT_HARD_CAP = 50;
+
+/**
+ * Per-session snapshot retention that is cheap enough to run on every write:
+ * the count cap (hard cap and configured `snapshot_max_count`) is one indexed
+ * DELETE below the keep-th newest row, the age cutoff is one indexed DELETE
+ * that spares the newest row, and the byte cap only measures the rows that
+ * survive both (at most the hard cap). Nothing here reads another session or
+ * scans the table, unlike {@link pruneSessionStateSnapshots}.
+ */
+export function pruneSessionSnapshotsForSession(
+  driver: StateSqliteDriver,
+  sessionId: string,
+  options: AgentRunPruningOptions = {},
+): AgentSnapshotPruningReport {
+  const retention = normalizeSnapshotRetention(options);
+  const keep = Math.min(
+    SESSION_SNAPSHOT_HARD_CAP,
+    retention.maxCount ?? SESSION_SNAPSHOT_HARD_CAP,
+  );
+  const maxBytes = retention.maxBytes;
+  return driver.transaction(() => {
+    let prunedSnapshots = driver
+      .prepareState<[string, string, number]>(
+        `DELETE FROM session_state_snapshots
+         WHERE session_id = ?
+           AND snapshot_at < (
+             SELECT snapshot_at
+             FROM session_state_snapshots
+             WHERE session_id = ?
+             ORDER BY snapshot_at DESC
+             LIMIT 1 OFFSET ?
+           )`,
+      )
+      .run(sessionId, sessionId, keep - 1).changes;
+    if (retention.cutoff !== undefined) {
+      prunedSnapshots += driver
+        .prepareState<[string, string, string]>(
+          `DELETE FROM session_state_snapshots
+           WHERE session_id = ?
+             AND snapshot_at < ?
+             AND snapshot_at < (
+               SELECT MAX(snapshot_at)
+               FROM session_state_snapshots
+               WHERE session_id = ?
+             )`,
+        )
+        .run(sessionId, retention.cutoff, sessionId).changes;
+    }
+    if (maxBytes !== undefined) {
+      const rows = driver
+        .prepareState<[string], { snapshot_at: string; bytes: number }>(
+          `SELECT snapshot_at,
+                  LENGTH(conversation_json)
+                    + LENGTH(COALESCE(tool_state_json, ''))
+                    + LENGTH(COALESCE(mcp_connection_state_json, '')) AS bytes
+           FROM session_state_snapshots
+           WHERE session_id = ?
+           ORDER BY snapshot_at DESC`,
+        )
+        .all(sessionId);
+      const deleteSnapshot = driver.prepareState<[string, string]>(
+        `DELETE FROM session_state_snapshots
+         WHERE session_id = ?
+           AND snapshot_at = ?`,
+      );
+      let retainedBytes = 0;
+      rows.forEach((row, index) => {
+        // The newest row is the recovery snapshot and is always kept.
+        if (index === 0 || retainedBytes + row.bytes <= maxBytes) {
+          retainedBytes += row.bytes;
+          return;
+        }
+        prunedSnapshots += deleteSnapshot.run(sessionId, row.snapshot_at).changes;
+      });
+    }
+    return {
+      prunedSnapshots,
+      prunedSessionIds: prunedSnapshots > 0 ? [sessionId] : [],
+    };
+  });
+}
+
+/** Apply {@link pruneSessionSnapshotsForSession} to every session in the table. */
+export function pruneSessionSnapshotsPerSession(
+  driver: StateSqliteDriver,
+  options: AgentRunPruningOptions = {},
+): AgentSnapshotPruningReport {
+  const sessionIds = driver
+    .prepareState<[], { session_id: string }>(
+      `SELECT DISTINCT session_id
+       FROM session_state_snapshots
+       ORDER BY session_id ASC`,
+    )
+    .all()
+    .map((row) => row.session_id);
+  let prunedSnapshots = 0;
+  const prunedSessionIds: string[] = [];
+  for (const sessionId of sessionIds) {
+    const report = pruneSessionSnapshotsForSession(driver, sessionId, options);
+    if (report.prunedSnapshots === 0) continue;
+    prunedSnapshots += report.prunedSnapshots;
+    prunedSessionIds.push(sessionId);
+  }
+  return { prunedSnapshots, prunedSessionIds };
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Rollout/session retention sweep
 //

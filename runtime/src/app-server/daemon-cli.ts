@@ -156,8 +156,10 @@ import {
   type ToolRecoveryAction,
 } from "../state/recovery.js";
 import {
+  pruneSessionSnapshotsPerSession,
   pruneSessionStateSnapshots,
   pruneTerminalAgentRuns,
+  SESSION_SNAPSHOT_HARD_CAP,
   type RolloutRetentionPolicy,
 } from "../state/pruning.js";
 import { StateSqliteHealthStatsReader } from "../state/health-stats.js";
@@ -2924,6 +2926,7 @@ async function runAgenCDaemonForegroundLocked(
       authStartup.daemonHome,
       process.cwd(),
       activeConfig,
+      (message) => io.stderr.write(`agenc: ${message}\n`),
     );
     reportAgenCDaemonStartupRecovery(io, startupRecovery);
     writeAgenCDaemonStartupDebug(
@@ -3078,6 +3081,7 @@ async function runAgenCDaemonForegroundLocked(
           io.stderr.write(
             `agenc: daemon snapshot policy failed: ${formatCleanupError(error)}\n`,
           ),
+        log: (message) => io.stderr.write(`agenc: ${message}\n`),
       });
     } catch (error) {
       io.stderr.write(
@@ -3085,6 +3089,11 @@ async function runAgenCDaemonForegroundLocked(
       );
       return 1;
     }
+    // The resolved retention was previously invisible: the live daemon grew a
+    // 1.3 GB snapshot table without one log line saying which caps applied.
+    io.stderr.write(
+      `agenc: daemon snapshot retention ${describeSnapshotRetention(activeConfig.agent?.retention)}\n`,
+    );
     cleanup.register("daemon-snapshot-policy", async () => {
       snapshotPolicies.close();
     });
@@ -4083,10 +4092,26 @@ async function closeDaemonMcpServerAfterReloadFailure(
   }
 }
 
+function describeSnapshotRetention(
+  retention: AgentRunRetentionConfig | undefined,
+): string {
+  const configured =
+    retention === undefined
+      ? "unconfigured"
+      : `snapshot_days=${retention.snapshot_days ?? "off"} ` +
+        `snapshot_max_count=${retention.snapshot_max_count ?? "off"} ` +
+        `snapshot_max_bytes=${retention.snapshot_max_bytes ?? "off"} ` +
+        `completed_days=${retention.completed_days ?? "off"} ` +
+        `failed_days=${retention.failed_days ?? "off"} ` +
+        `rollout_days=${retention.rollout_days ?? "off"}`;
+  return `${configured} (hard cap ${SESSION_SNAPSHOT_HARD_CAP} rows per session)`;
+}
+
 function recoverAgenCDaemonStartupState(
   daemonHome: string,
   cwd: string,
   config: AgenCConfig,
+  log: (message: string) => void = () => {},
 ): DaemonStartupRecoveryReport {
   const recoveredAt = new Date().toISOString();
   const paths = discoverAgenCDaemonStateDatabasePaths(daemonHome, cwd);
@@ -4101,8 +4126,31 @@ function recoverAgenCDaemonStartupState(
     for (const pathSet of paths) {
       const driver = openStateDatabasePaths(pathSet);
       try {
-        pruneTerminalAgentRuns(driver, config.agent?.retention);
-        pruneSessionStateSnapshots(driver, config.agent?.retention);
+        const prunedRuns = pruneTerminalAgentRuns(
+          driver,
+          config.agent?.retention,
+        );
+        // Per-session hard cap first, so the table-wide agent-grouped sweep
+        // below only measures the rows that survive it.
+        const prunedPerSession = pruneSessionSnapshotsPerSession(
+          driver,
+          config.agent?.retention,
+        );
+        const prunedTable = pruneSessionStateSnapshots(
+          driver,
+          config.agent?.retention,
+        );
+        const prunedSnapshots =
+          prunedRuns.prunedSnapshots +
+          prunedPerSession.prunedSnapshots +
+          prunedTable.prunedSnapshots;
+        if (prunedRuns.prunedRuns > 0 || prunedSnapshots > 0) {
+          log(
+            `daemon retention pruned ${prunedRuns.prunedRuns} terminal run(s) and ` +
+              `${prunedSnapshots} snapshot row(s) across ` +
+              `${new Set([...prunedRuns.prunedSessionIds, ...prunedPerSession.prunedSessionIds, ...prunedTable.prunedSessionIds]).size} session(s) in ${pathSet.projectDir}`,
+          );
+        }
         const report = recoverDaemonStateOnStartup(driver, {
           now: () => recoveredAt,
           retainRuntimeResumeSources: true,
@@ -4282,6 +4330,7 @@ interface AgenCDaemonSnapshotPolicyRegistryOptions {
   readonly snapshotRetention?: AgentRunRetentionConfig;
   readonly periodicIntervalMs?: number;
   readonly onError: (error: unknown) => void;
+  readonly log?: (message: string) => void;
 }
 
 interface AgenCDaemonSnapshotPolicyEntry {
@@ -4295,6 +4344,7 @@ class AgenCDaemonSnapshotPolicyRegistry {
   #snapshotRetention: AgentRunRetentionConfig | undefined;
   readonly #periodicIntervalMs: number;
   readonly #onError: (error: unknown) => void;
+  readonly #log: (message: string) => void;
   readonly #policies = new Map<string, AgenCDaemonSnapshotPolicyEntry>();
   readonly #sessionPolicyKeys = new Map<string, string>();
   readonly #threadStores = new Map<string, FileThreadStore>();
@@ -4306,6 +4356,7 @@ class AgenCDaemonSnapshotPolicyRegistry {
     this.#snapshotRetention = options.snapshotRetention;
     this.#periodicIntervalMs = options.periodicIntervalMs ?? 30_000;
     this.#onError = options.onError;
+    this.#log = options.log ?? (() => {});
     this.#policyForCwd(this.#defaultCwd);
   }
 
@@ -4583,6 +4634,11 @@ class AgenCDaemonSnapshotPolicyRegistry {
       rolloutRetention: rolloutRetentionPolicy(this.#snapshotRetention),
       rolloutSessionsDir: join(paths.projectDir, "sessions"),
       onError: this.#onError,
+      onPruneReport: (report) =>
+        this.#log(
+          `daemon snapshot retention pruned ${report.prunedSnapshots} row(s) ` +
+            `across ${report.prunedSessionIds.length} session(s) in ${paths.projectDir}`,
+        ),
     });
     const entry = { driver, policy };
     this.#policies.set(paths.stateDbPath, entry);

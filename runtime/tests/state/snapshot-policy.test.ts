@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgenCSessionSnapshotPolicy } from "./snapshot-policy.js";
+import {
+  SESSION_SNAPSHOT_HARD_CAP,
+  type AgentSnapshotPruningReport,
+} from "./pruning.js";
 import { openStateDatabases, type StateSqliteDriver } from "./sqlite-driver.js";
 import {
   readRotatedToolOutputLog,
@@ -905,21 +909,24 @@ describe("AgenCSessionSnapshotPolicy", () => {
     );
   });
 
-  it("throttles snapshotRetention sweeps inside the prune interval", () => {
+  // Review P0-2: the previous sweep was a table-wide LENGTH() scan throttled
+  // to once per minute, and the configured 64 MiB cap never deleted a row.
+  // The per-session prune is cheap enough to run on every write, and its
+  // report surfaces on the periodic tick instead of per write.
+  it("applies snapshot retention on every write and reports pruning on the periodic tick", () => {
     seedRun("run-retention-fast", "session-retention-fast");
+    const reports: AgentSnapshotPruningReport[] = [];
     const policy = new AgenCSessionSnapshotPolicy(driver, {
       now: clock([
         "2026-05-01T00:00:00.000Z",
         "2026-05-01T00:00:01.000Z",
         "2026-05-01T00:00:02.000Z",
-        "2026-05-01T00:01:04.000Z",
+        "2026-05-01T00:00:03.000Z",
       ]),
       snapshotRetention: { snapshot_max_count: 2 },
+      onPruneReport: (report) => reports.push(report),
     });
 
-    // Three writes 1s apart: the sweep runs on the first write (nothing to
-    // prune yet) and is then throttled — per-snapshot sweeps would scan the
-    // whole table on the hot path (measured daemon stall).
     for (const index of [1, 2, 3]) {
       policy.recordMessageExchange({
         sessionId: "session-retention-fast",
@@ -929,19 +936,43 @@ describe("AgenCSessionSnapshotPolicy", () => {
         streamId: "stream-retention-fast",
         acceptedAt: `2026-05-01T00:00:0${index}.000Z`,
       });
+      expect(snapshotCount("session-retention-fast")).toBeLessThanOrEqual(2);
     }
-    expect(snapshotCount("session-retention-fast")).toBe(3);
-
-    // Once the interval elapses, the next write sweeps again.
-    policy.recordMessageExchange({
-      sessionId: "session-retention-fast",
-      agentId: "run-retention-fast",
-      content: "message-4",
-      messageId: "message-4",
-      streamId: "stream-retention-fast",
-      acceptedAt: "2026-05-01T00:01:04.000Z",
-    });
     expect(snapshotCount("session-retention-fast")).toBe(2);
+    expect(latestSnapshot("session-retention-fast").conversation).toHaveLength(3);
+    expect(reports).toEqual([]);
+
+    policy.flushPeriodic();
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({
+      prunedSessionIds: ["session-retention-fast"],
+    });
+    expect(reports[0]?.prunedSnapshots).toBeGreaterThanOrEqual(1);
+    expect(snapshotCount("session-retention-fast")).toBe(2);
+  });
+
+  it("hard-caps snapshot rows per session without any configured retention", () => {
+    seedRun("run-hard-cap", "session-hard-cap");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      coalesceIntervalMs: 0,
+    });
+
+    for (let index = 0; index < SESSION_SNAPSHOT_HARD_CAP + 10; index++) {
+      policy.recordMessageExchange({
+        sessionId: "session-hard-cap",
+        agentId: "run-hard-cap",
+        content: `message-${index}`,
+        messageId: `message-${index}`,
+        streamId: "stream-hard-cap",
+        acceptedAt: "2026-05-01T00:00:00.000Z",
+      });
+    }
+
+    expect(snapshotCount("session-hard-cap")).toBe(SESSION_SNAPSHOT_HARD_CAP);
+    expect(latestSnapshot("session-hard-cap").conversation).toHaveLength(
+      SESSION_SNAPSHOT_HARD_CAP + 10,
+    );
   });
 });
 

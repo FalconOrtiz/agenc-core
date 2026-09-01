@@ -4,8 +4,9 @@ import { updateAgentRunStatus } from "./agent-runs.js";
 import { writeSessionSnapshotAtomically } from "./atomic-snapshot-writes.js";
 import {
   pruneRolloutSessions,
-  pruneSessionStateSnapshots,
+  pruneSessionSnapshotsForSession,
   type AgentRunRetentionPolicy,
+  type AgentSnapshotPruningReport,
   type RolloutRetentionPolicy,
 } from "./pruning.js";
 import type { StateSqliteDriver } from "./sqlite-driver.js";
@@ -60,6 +61,9 @@ export interface SnapshotPolicyOptions {
   ) => SnapshotPolicyTimer;
   readonly clearTimeout?: (timer: SnapshotPolicyTimer) => void;
   readonly onError?: (error: unknown) => void;
+  // Aggregated snapshot-retention report, delivered from the periodic tick
+  // (and close) whenever rows were pruned since the previous report.
+  readonly onPruneReport?: (report: AgentSnapshotPruningReport) => void;
   readonly snapshotRetention?: AgentRunRetentionPolicy;
   // Rollout/session disk-retention sweep config. Disabled unless
   // `rolloutRetention.retention_days` is set AND `rolloutSessionsDir` resolves;
@@ -150,9 +154,6 @@ interface SnapshotRow {
 }
 
 const DEFAULT_PERIODIC_INTERVAL_MS = 30_000;
-// Snapshot-retention sweeps run at most once per interval per policy
-// instance instead of on every snapshot write (see #writeSnapshot).
-const SNAPSHOT_PRUNE_INTERVAL_MS = 60_000;
 const DEFAULT_COALESCE_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_CONVERSATION_EVENTS = 200;
 const DEFAULT_MAX_TRACKED_SESSIONS = 1_024;
@@ -187,6 +188,9 @@ export class AgenCSessionSnapshotPolicy {
   ) => SnapshotPolicyTimer;
   readonly #clearTimeout: (timer: SnapshotPolicyTimer) => void;
   readonly #onError: (error: unknown) => void;
+  readonly #onPruneReport: ((report: AgentSnapshotPruningReport) => void) | undefined;
+  #prunedSinceReport = 0;
+  readonly #prunedSessionsSinceReport = new Set<string>();
   #snapshotRetention: AgentRunRetentionPolicy | undefined;
   #rolloutRetention: RolloutRetentionPolicy | undefined;
   readonly #rolloutSessionsDir: string | undefined;
@@ -196,7 +200,6 @@ export class AgenCSessionSnapshotPolicy {
   readonly #sessions = new Map<string, SessionSnapshotState>();
   #periodicTimer: SnapshotPolicyTimer | undefined;
   #lastSnapshotMs = 0;
-  #lastSnapshotPruneMs = 0;
   #sessionTouchSeq = 0;
 
   constructor(
@@ -247,6 +250,7 @@ export class AgenCSessionSnapshotPolicy {
       options.clearTimeout ??
       ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
     this.#onError = options.onError ?? (() => {});
+    this.#onPruneReport = options.onPruneReport;
     this.#snapshotRetention = options.snapshotRetention;
     this.#rolloutRetention = options.rolloutRetention;
     this.#rolloutSessionsDir = options.rolloutSessionsDir;
@@ -417,6 +421,7 @@ export class AgenCSessionSnapshotPolicy {
       }
       this.#dropSession(state);
     }
+    this.#reportPruning();
   }
 
   hydrateSession(hydration: SnapshotPolicySessionHydration): void {
@@ -612,6 +617,7 @@ export class AgenCSessionSnapshotPolicy {
     // Piggy-back the disk-retention sweep on the same throttled tick so
     // rollout/session pruning runs on a bounded timer, not a tight loop.
     this.sweepRolloutRetention();
+    this.#reportPruning();
     return records;
   }
 
@@ -934,7 +940,13 @@ export class AgenCSessionSnapshotPolicy {
       state.lastWriteMs === undefined || !Number.isFinite(nowMs)
         ? Number.POSITIVE_INFINITY
         : nowMs - state.lastWriteMs;
-    if (sinceLastWriteMs >= this.#coalesceIntervalMs) {
+    // A zero window means "never coalesce". The gap can be negative when the
+    // previous snapshot timestamp had to be bumped past a clock that did not
+    // advance; that still counts as inside the window.
+    if (
+      this.#coalesceIntervalMs === 0 ||
+      sinceLastWriteMs >= this.#coalesceIntervalMs
+    ) {
       return this.#writeSnapshot(state, trigger, nowIso);
     }
     if (state.coalesceTimer === undefined) {
@@ -996,23 +1008,19 @@ export class AgenCSessionSnapshotPolicy {
       },
       { updateRunLastSnapshotAt: true, replayOnStartup: true },
     );
-    // Pruning is maintenance, not a consistency boundary: running it on every
-    // snapshot made each write cost a full-table scan (see pruning.ts note),
-    // which stalled long interactive turns for minutes. Throttle to one pass
-    // per interval per policy instance; retention still applies, just not on
-    // the hot path of every single snapshot.
-    const pruneNowMs = Date.parse(snapshotAt);
-    if (
-      this.#lastSnapshotPruneMs === 0 ||
-      (Number.isFinite(pruneNowMs) &&
-        pruneNowMs - this.#lastSnapshotPruneMs >= SNAPSHOT_PRUNE_INTERVAL_MS)
-    ) {
-      this.#lastSnapshotPruneMs = Number.isFinite(pruneNowMs) ? pruneNowMs : Date.now();
-      pruneSessionStateSnapshots(
-        this.#driver,
-        { ...(this.#snapshotRetention ?? {}), now: () => snapshotAt },
-        state.sessionId,
-      );
+    // Retention runs on every write. The per-session prune is a few indexed
+    // statements over at most SESSION_SNAPSHOT_HARD_CAP rows, unlike the
+    // table-wide LENGTH() scan it replaces, whose 60 s throttle let one
+    // session grow to 5,607 rows / 1.16 GB without ever deleting a row.
+    // Reports are aggregated and surfaced from the periodic tick.
+    const pruned = pruneSessionSnapshotsForSession(
+      this.#driver,
+      state.sessionId,
+      { ...(this.#snapshotRetention ?? {}), now: () => snapshotAt },
+    );
+    if (pruned.prunedSnapshots > 0) {
+      this.#prunedSinceReport += pruned.prunedSnapshots;
+      this.#prunedSessionsSinceReport.add(state.sessionId);
     }
     return {
       sessionId: state.sessionId,
@@ -1022,6 +1030,21 @@ export class AgenCSessionSnapshotPolicy {
       toolState,
       mcpConnectionState,
     };
+  }
+
+  #reportPruning(): void {
+    if (this.#prunedSinceReport === 0) return;
+    const report: AgentSnapshotPruningReport = {
+      prunedSnapshots: this.#prunedSinceReport,
+      prunedSessionIds: [...this.#prunedSessionsSinceReport].sort(),
+    };
+    this.#prunedSinceReport = 0;
+    this.#prunedSessionsSinceReport.clear();
+    try {
+      this.#onPruneReport?.(report);
+    } catch (error) {
+      this.#onError(error);
+    }
   }
 
   #rememberSnapshotAt(snapshotAt: string): void {
