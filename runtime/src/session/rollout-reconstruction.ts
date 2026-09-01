@@ -44,8 +44,11 @@ import { isAgentInvocationTurnBoundary } from "../contracts/agent-invocation-env
 import {
   reduce,
   type ReducedSessionState,
-  type ReductionReport,
 } from "./event-log-reducer.js";
+import {
+  mergeReductionReports,
+  type ReductionReport,
+} from "./reduction-report.js";
 import type { IndexSnapshot } from "./session-store.js";
 import {
   capToolResult,
@@ -902,7 +905,9 @@ export function reconstructFromRollout(
         history: buildCompactedHistory(rawUserMessages, item.payload.message),
         lastCompaction: item.payload,
       };
-      reductionReport = mergeReport(reductionReport, { processed: 1 });
+      reductionReport = mergeReductionReports(reductionReport, {
+        processed: 1,
+      });
       continue;
     }
 
@@ -948,7 +953,7 @@ export function reconstructFromRollout(
     const step = reduce(state, toReduce);
     state = step.state;
     rawState = reduce(rawState, item).state;
-    reductionReport = mergeReport(reductionReport, step.report);
+    reductionReport = mergeReductionReports(reductionReport, step.report);
   }
   reductionReport = {
     ...reductionReport,
@@ -1297,24 +1302,6 @@ export function buildCompactedHistory(
     summaryText.length > 0 ? summaryText : "(no summary available)";
   out.push({ role: "user", content: summary });
   return out;
-}
-
-/** Tiny reducer-report merger used during forward replay. */
-function mergeReport(
-  a: ReductionReport,
-  b: Partial<ReductionReport>,
-): ReductionReport {
-  return {
-    unknownVariantCount: a.unknownVariantCount + (b.unknownVariantCount ?? 0),
-    unknownVariantSamples:
-      b.unknownVariantSamples && b.unknownVariantSamples.length > 0
-        ? [...a.unknownVariantSamples, ...b.unknownVariantSamples].slice(0, 5)
-        : a.unknownVariantSamples,
-    seqGapCount: a.seqGapCount + (b.seqGapCount ?? 0),
-    firstSeqGap: a.firstSeqGap ?? b.firstSeqGap,
-    malformedLineCount: a.malformedLineCount + (b.malformedLineCount ?? 0),
-    processed: a.processed + (b.processed ?? 0),
-  };
 }
 
 /**
