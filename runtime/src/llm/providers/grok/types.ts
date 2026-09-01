@@ -28,6 +28,12 @@ export interface GrokProviderConfig
   contextWindowTokens?: number;
   /** Allow the model to emit multiple tool calls in parallel (default: false). */
   parallelToolCalls?: boolean;
+  /**
+   * Opt in to Responses `previous_response_id` continuation on the streaming
+   * path (`AGENC_XAI_INCREMENTAL=1` / `providers.grok.incremental_continuation`).
+   * Off by default: follow-up requests then re-upload the full history.
+   */
+  incrementalContinuation?: boolean;
   /** Vision-capable model to auto-switch to when images are present (default: 'grok-2-vision-1212') */
   visionModel?: string;
 }

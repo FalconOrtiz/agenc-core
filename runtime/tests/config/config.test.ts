@@ -1707,6 +1707,49 @@ describe("env: resolvers", () => {
     expect(disabled.stream_watchdog_timeout_ms).toBe(0);
   });
 
+  test("applyEnvOverrides folds AGENC_XAI_INCREMENTAL into providers.grok", () => {
+    const base = normalizeRawConfig({
+      providers: { grok: { timeout_ms: 5_000 } },
+    });
+    const on = applyEnvOverrides(base, { AGENC_XAI_INCREMENTAL: "1" });
+    expect(on.providers?.grok).toEqual({
+      timeout_ms: 5_000,
+      incremental_continuation: true,
+    });
+    const off = applyEnvOverrides(on, { AGENC_XAI_INCREMENTAL: "off" });
+    expect(off.providers?.grok?.incremental_continuation).toBe(false);
+
+    const warnings: string[] = [];
+    const invalid = applyEnvOverrides(
+      base,
+      { AGENC_XAI_INCREMENTAL: "sometimes" },
+      (message) => warnings.push(message),
+    );
+    expect(invalid.providers?.grok?.incremental_continuation).toBeUndefined();
+    expect(warnings).toEqual([
+      '[agenc:config] invalid AGENC_XAI_INCREMENTAL="sometimes"; expected boolean-like value',
+    ]);
+    // The flag is off unless set.
+    expect(defaultConfig().providers?.grok?.incremental_continuation).toBeUndefined();
+  });
+
+  test("providers.<provider>.incremental_continuation is a Grok-only boolean", () => {
+    expect(
+      normalizeRawConfig({
+        providers: { grok: { incremental_continuation: true } },
+      }).providers?.grok,
+    ).toEqual({ incremental_continuation: true });
+    expect(
+      validateProviderConfig({ grok: { incremental_continuation: true } }),
+    ).toEqual({ grok: { incremental_continuation: true } });
+    expect(() =>
+      validateProviderConfig({ grok: { incremental_continuation: "yes" } }),
+    ).toThrow(InvalidProviderConfigError);
+    expect(() =>
+      validateProviderConfig({ openai: { incremental_continuation: true } }),
+    ).toThrow(/allowed only under providers.grok/u);
+  });
+
   test("applyEnvOverrides diagnoses invalid loop, coordinator, and watchdog values", () => {
     const warnings: string[] = [];
     const out = applyEnvOverrides(

@@ -10,6 +10,7 @@
 //   AGENC_MAX_TURNS                               → max_turns
 //   AGENC_COORDINATOR_MODE                        → coordinator_mode
 //   AGENC_STREAM_IDLE_TIMEOUT_MS                  → stream_watchdog_timeout_ms
+//   AGENC_XAI_INCREMENTAL                         → providers.grok.incremental_continuation
 //   AGENC_WORKSPACE is consumed only by pre-repository bootstrap cwd
 //   resolution. It is captured here but is not projected into AgenCConfig.
 //   AGENC_HOME                                     → ~/.agenc override
@@ -56,6 +57,7 @@ export interface EnvSnapshot {
   readonly AGENC_MAX_TURNS?: string;
   readonly AGENC_COORDINATOR_MODE?: string;
   readonly AGENC_STREAM_IDLE_TIMEOUT_MS?: string;
+  readonly AGENC_XAI_INCREMENTAL?: string;
   readonly AGENC_DISABLE_STREAM_WATCHDOG?: string;
   readonly AGENC_ENABLE_STREAM_WATCHDOG?: string;
   readonly AGENC_ALWAYS_ENABLE_EFFORT?: string;
@@ -426,6 +428,25 @@ export function applyEnvOverrides(
     } else if (e.AGENC_STREAM_IDLE_TIMEOUT_MS.trim().length > 0) {
       onWarn?.(
         `[agenc:config] invalid AGENC_STREAM_IDLE_TIMEOUT_MS="${e.AGENC_STREAM_IDLE_TIMEOUT_MS}"; expected a non-negative integer`,
+      );
+    }
+  }
+  if (e.AGENC_XAI_INCREMENTAL !== undefined) {
+    // Opt-in for Responses `previous_response_id` continuation on streaming
+    // Grok turns. Folded into the provider table here so the adapter never
+    // reads process env; the factory projects it onto GrokProviderConfig.
+    const incremental = readBoolean(e.AGENC_XAI_INCREMENTAL);
+    if (incremental !== undefined) {
+      override.providers = {
+        ...(override.providers ?? {}),
+        grok: {
+          ...(override.providers?.grok ?? {}),
+          incremental_continuation: incremental,
+        },
+      };
+    } else if (e.AGENC_XAI_INCREMENTAL.trim().length > 0) {
+      onWarn?.(
+        `[agenc:config] invalid AGENC_XAI_INCREMENTAL="${e.AGENC_XAI_INCREMENTAL}"; expected boolean-like value`,
       );
     }
   }

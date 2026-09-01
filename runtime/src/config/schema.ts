@@ -625,6 +625,13 @@ export interface ProviderConfig {
   readonly enable_video_understanding?: boolean;
   readonly collections?: GrokCollectionsConfig;
   readonly remote_mcp?: GrokRemoteMcpConfig;
+  /**
+   * Grok-only opt-in for Responses `previous_response_id` continuation on
+   * streaming turns (`AGENC_XAI_INCREMENTAL=1`). Off by default: with it on,
+   * follow-up requests carry only the items added since the last completed
+   * response instead of re-uploading the full history.
+   */
+  readonly incremental_continuation?: boolean;
 }
 
 /**
@@ -1541,6 +1548,7 @@ const PROVIDER_KEYS: ReadonlySet<string> = new Set([
   "enable_video_understanding",
   "collections",
   "remote_mcp",
+  "incremental_continuation",
 ]);
 
 const GROK_CAPABILITY_BOOLEAN_KEYS = Object.freeze([
@@ -1560,6 +1568,7 @@ function validateGrokCapabilities(
     ...GROK_CAPABILITY_BOOLEAN_KEYS,
     "collections",
     "remote_mcp",
+    "incremental_continuation",
   ] as const;
   if (
     providerId !== "grok" &&
@@ -1582,6 +1591,14 @@ function validateGrokCapabilities(
       makeError,
     );
     if (value !== undefined) out[key] = value;
+  }
+  const incrementalContinuation = optionalBoolean(
+    record.incremental_continuation,
+    fieldPath(providerId, "incremental_continuation"),
+    makeError,
+  );
+  if (incrementalContinuation !== undefined) {
+    out.incremental_continuation = incrementalContinuation;
   }
   if (record.collections !== undefined) {
     const field = fieldPath(providerId, "collections");

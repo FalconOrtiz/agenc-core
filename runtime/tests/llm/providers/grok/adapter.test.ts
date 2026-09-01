@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from "vitest";
 
 import type { LLMMessage, LLMTool } from "../../types.js";
 import { LLMTimeoutError } from "../../errors.js";
+import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER } from "../../wire/shared.js";
 import { DEFAULT_REQUEST_OPEN_TIMEOUT_MS, GrokProvider } from "./adapter.js";
 
 function buildXaiResponse(id: string, text: string): Record<string, unknown> {
@@ -840,6 +841,120 @@ describe("GrokProvider incremental continuation", () => {
       availability: "unknown",
       provenance: "synthetic",
     });
+  });
+});
+
+describe("GrokProvider streaming incremental continuation (AGENC_XAI_INCREMENTAL)", () => {
+  const firstTurn: LLMMessage[] = [{ role: "user", content: "hello" }];
+  const secondTurn: LLMMessage[] = [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi" },
+    { role: "user", content: "follow up" },
+  ];
+  const systemPromptAt = (clock: string): string =>
+    `Static instructions.${SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER}Current time: ${clock}`;
+
+  function streamingProvider(incrementalContinuation: boolean | undefined) {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      emitWarning: (warning) => warnings.push(warning),
+      ...(incrementalContinuation !== undefined
+        ? { incrementalContinuation }
+        : {}),
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    const create = vi.fn((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      const ordinal = requestBodies.length;
+      return withResponse(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse(
+              `resp_${ordinal}`,
+              ordinal === 1 ? "hi" : "done",
+            ),
+          },
+        ]),
+      );
+    });
+    (provider as any).client = { responses: { create } };
+    return { provider, requestBodies, create, warnings };
+  }
+
+  test("the second streaming request carries previous_response_id and only the delta", async () => {
+    const { provider, requestBodies } = streamingProvider(true);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.previous_response_id).toBeUndefined();
+    expect(JSON.stringify(requestBodies[0]?.input)).toContain("Static instructions");
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    const delta = JSON.stringify(requestBodies[1]?.input);
+    // Only the items added since the stored response, plus the fresh dynamic
+    // tail; the static system prompt and the earlier turns live server-side.
+    expect(delta).toContain("follow up");
+    expect(delta).toContain("Current time: one");
+    expect(delta).not.toContain("hello");
+    expect(delta).not.toContain("Static instructions");
+    expect(delta).not.toContain("Current time: noon");
+  });
+
+  test("stays off by default: every streaming request re-sends the full history", async () => {
+    const { provider, requestBodies } = streamingProvider(undefined);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBeUndefined();
+    const full = JSON.stringify(requestBodies[1]?.input);
+    expect(full).toContain("hello");
+    expect(full).toContain("follow up");
+    expect(full).toContain("Static instructions");
+  });
+
+  test("a single-wire attempt that loses its continuation clears the tracker for the next attempt", async () => {
+    const { provider, requestBodies, create, warnings } = streamingProvider(true);
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    expect((provider as any).incrementalTracker.previousResponseId()).toBe("resp_1");
+
+    create.mockImplementationOnce((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      throw Object.assign(new Error("previous response not found"), {
+        status: 404,
+      });
+    });
+
+    await expect(
+      provider.chatStream(secondTurn, () => {}, {
+        systemPrompt: systemPromptAt("one"),
+        singleWireAttempt: true,
+      }),
+    ).rejects.toBeDefined();
+
+    // One rejected wire attempt, no in-band retry, continuation cleared so
+    // the reconnect ladder's next admitted attempt sends full history.
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    expect((provider as any).incrementalTracker.previousResponseId()).toBeUndefined();
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ cause: "previous_response_id_expired" }),
+    );
   });
 });
 

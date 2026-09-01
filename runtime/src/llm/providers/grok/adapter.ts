@@ -1200,7 +1200,7 @@ export class GrokProvider implements LLMProvider {
       // (called from AgenC post-compact cleanup) zeros this on every
       // compaction.
       this.noteIncrementalRequest(
-        plan.requestMessages ?? messages,
+        plan.incrementalBaseline ?? plan.requestMessages ?? messages,
         plan.params as Record<string, unknown>,
       );
 
@@ -1256,7 +1256,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            retryPlan.requestMessages ?? messages,
+            retryPlan.incrementalBaseline ?? retryPlan.requestMessages ?? messages,
             retryPlan.params as Record<string, unknown>,
           );
           const parsed = await retryWithAuthRefresh(
@@ -1333,7 +1333,7 @@ export class GrokProvider implements LLMProvider {
     const client = await this.ensureClient();
     let plan = this.buildRequestPlan(messages, options);
     this.noteIncrementalRequest(
-      plan.requestMessages ?? messages,
+      plan.incrementalBaseline ?? plan.requestMessages ?? messages,
       plan.params as Record<string, unknown>,
     );
     let params: Record<string, unknown> = { ...plan.params, stream: true };
@@ -1384,6 +1384,7 @@ export class GrokProvider implements LLMProvider {
       let streamIterator: AsyncIterator<any> | null = null;
       let responseTracePayload: Record<string, unknown> | undefined;
       let streamResponseMeta: ProviderResponseTraceMeta | undefined;
+      let completedResponseId: string | undefined;
       // Deadline in force for the current phase, reported on a mapped timeout.
       let attemptPhaseTimeoutMs = requestOpenTimeout.timeoutMs;
       try {
@@ -1427,11 +1428,21 @@ export class GrokProvider implements LLMProvider {
         );
       } catch (err) {
         if (
-          options?.singleWireAttempt !== true &&
           isContinuationRetrievalFailure(err) &&
           "previous_response_id" in params
         ) {
           this.incrementalTracker.clearResponseId();
+          if (options?.singleWireAttempt === true) {
+            // The admission boundary forbids an in-band retry. Clearing the
+            // continuation here is what lets the ladder's next admitted
+            // attempt rebuild the request with full history instead of
+            // resending the same rejected id until the ladder exhausts.
+            this.emitRuntimeWarning(
+              "previous_response_id_expired",
+              `${this.name} rejected previous_response_id; continuation state cleared, the next admitted attempt resends full history`,
+            );
+            throw err;
+          }
           this.emitRuntimeWarning(
             "previous_response_id_expired",
             `${this.name} rejected previous_response_id; clearing continuation state and retrying once with full history`,
@@ -1440,7 +1451,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            plan.requestMessages ?? messages,
+            plan.incrementalBaseline ?? plan.requestMessages ?? messages,
             plan.params as Record<string, unknown>,
           );
           params = { ...plan.params, stream: true };
@@ -1696,6 +1707,10 @@ export class GrokProvider implements LLMProvider {
         if (event.type === "response.completed") {
           receivedTerminalEvent = true;
           const response = event.response ?? {};
+          completedResponseId =
+            typeof response.id === "string" && response.id.length > 0
+              ? response.id
+              : undefined;
 
           streamResponseMeta = {
             ...(streamResponseMeta ?? {}),
@@ -1792,6 +1807,25 @@ export class GrokProvider implements LLMProvider {
 
       const toolCalls = Array.from(toolCallAccum.values());
       if (toolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
+
+      // Opt-in continuation (AGENC_XAI_INCREMENTAL): remember the completed
+      // response so the next compatible request sends previous_response_id
+      // plus the delta instead of the full history. Only stored responses can
+      // be continued, and a failed response has nothing to continue from.
+      if (
+        this.config.incrementalContinuation === true &&
+        completedResponseId !== undefined &&
+        params.store !== false &&
+        finishReason !== "error"
+      ) {
+        this.noteIncrementalResponse(completedResponseId, [
+          {
+            role: "assistant",
+            content,
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+        ]);
+      }
 
       onChunk({ content: "", done: true, toolCalls });
 
@@ -2025,6 +2059,7 @@ export class GrokProvider implements LLMProvider {
     toolSelection: ToolSelectionDiagnostics;
     compactionDiagnostics?: LLMCompactionDiagnostics;
     requestMessages?: readonly LLMMessage[];
+    incrementalBaseline?: readonly LLMMessage[];
   } {
     const compactionDiagnostics = undefined;
     const toolSelection = this.resolveResponseTools(
@@ -2056,6 +2091,7 @@ export class GrokProvider implements LLMProvider {
       toolSelection: built.toolSelection,
       compactionDiagnostics,
       requestMessages: built.requestMessages,
+      incrementalBaseline: built.incrementalBaseline,
     };
   }
 
@@ -2097,6 +2133,7 @@ export class GrokProvider implements LLMProvider {
     params: Record<string, unknown>;
     toolSelection: ToolSelectionDiagnostics;
     requestMessages: readonly LLMMessage[];
+    incrementalBaseline: readonly LLMMessage[];
   } {
     const visionModel = this.config.visionModel ?? DEFAULT_VISION_MODEL;
     // Prefix-cache split: xAI caching is prefix-based ("never modify
@@ -2242,19 +2279,42 @@ export class GrokProvider implements LLMProvider {
         currentInput: repairedMessages,
       });
       if (decision.kind === "reuse" && previousResponseId) {
-        const deltaBuilt = this.buildParams(decision.delta, {
-          ...options,
-          disableIncremental: true,
-        });
-        params.input = deltaBuilt.params.input;
+        if (this.config.incrementalContinuation === true) {
+          // The delta is a validated suffix of the full sequence: send its
+          // items as they are. Rebuilding it through buildParams would
+          // prepend the static system prompt (already part of the stored
+          // response) and re-validate a suffix that can legitimately open
+          // with tool output.
+          params.input = buildXaiResponsesInputItems(decision.delta).input;
+        } else {
+          const deltaBuilt = this.buildParams(decision.delta, {
+            ...options,
+            disableIncremental: true,
+          });
+          params.input = deltaBuilt.params.input;
+        }
         params.previous_response_id = previousResponseId;
       }
     }
+
+    // Baseline for the incremental tracker. The trailing dynamic system
+    // message (timestamp, git state) changes every call, so recording it
+    // would fail the next request's prefix check at that position and force
+    // a full resend; the fresh dynamic tail travels in the delta instead.
+    const trailing = repairedMessages[repairedMessages.length - 1];
+    const incrementalBaseline =
+      this.config.incrementalContinuation === true &&
+      dynamicSystemPrompt !== undefined &&
+      trailing?.role === "system" &&
+      trailing.content === dynamicSystemPrompt
+        ? repairedMessages.slice(0, -1)
+        : repairedMessages;
 
     return {
       params,
       toolSelection: selectedTools,
       requestMessages: repairedMessages,
+      incrementalBaseline,
     };
   }
 
