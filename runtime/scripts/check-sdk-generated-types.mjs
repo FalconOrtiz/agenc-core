@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -42,6 +43,14 @@ function expectCondition(failures, condition, message) {
 
 function normalizeLineEndings(source) {
   return source.replace(/\r\n?/g, "\n");
+}
+
+export function parseSdkGeneratedTypesMode(args) {
+  if (args.length === 0) return "check";
+  if (args.length === 1 && args[0] === "--write") return "write";
+  throw new Error(
+    "usage: check-sdk-generated-types.mjs [--write]",
+  );
 }
 
 const transcriptV2InterfaceNames = [
@@ -105,22 +114,99 @@ function renderTranscriptV2Generated(runtimeProtocol) {
   ].join("\n")}`;
 }
 
+async function existingFileMode(filePath) {
+  try {
+    const metadata = await lstat(filePath);
+    return metadata.isFile() ? metadata.mode & 0o777 : 0o666;
+  } catch (error) {
+    if (error?.code === "ENOENT") return 0o666;
+    throw error;
+  }
+}
+
+async function writeFileAtomically(filePath, contents) {
+  const mode = await existingFileMode(filePath);
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", mode);
+    await handle.writeFile(contents, { encoding: "utf8" });
+    await handle.chmod(mode);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, filePath);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+}
+
+export async function synchronizeTranscriptV2Generated({
+  runtimeProtocolPath,
+  generatedPath,
+  write = false,
+}) {
+  const runtimeProtocol = await readFile(runtimeProtocolPath, "utf8");
+  const expected = renderTranscriptV2Generated(runtimeProtocol);
+  let current;
+  try {
+    current = await readFile(generatedPath, "utf8");
+  } catch (error) {
+    if (!write || error?.code !== "ENOENT") throw error;
+  }
+
+  if (!write) {
+    return {
+      changed: false,
+      matches: normalizeLineEndings(current) === expected,
+      expected,
+    };
+  }
+
+  if (current === expected) {
+    return { changed: false, matches: true, expected };
+  }
+
+  await writeFileAtomically(generatedPath, expected);
+  return { changed: true, matches: true, expected };
+}
+
 async function main() {
+  const mode = parseSdkGeneratedTypesMode(process.argv.slice(2));
+  const transcriptV2Path = path.join(
+    runtimeRoot,
+    paths.packageTranscriptV2,
+  );
   const [
     schemas,
     coreTypes,
     generated,
-    runtimeProtocol,
-    packageTranscriptV2,
     packageWorkflowResult,
+    transcriptV2,
   ] = await Promise.all([
     readRuntimeFile(paths.schemas),
     readRuntimeFile(paths.coreTypes),
     readRuntimeFile(paths.generated),
-    readRuntimeFile(paths.runtimeProtocol),
-    readRuntimeFile(paths.packageTranscriptV2),
     readRuntimeFile(paths.packageWorkflowResult),
+    synchronizeTranscriptV2Generated({
+      runtimeProtocolPath: path.join(runtimeRoot, paths.runtimeProtocol),
+      generatedPath: transcriptV2Path,
+      write: mode === "write",
+    }),
   ]);
+  if (mode === "write") {
+    const displayPath = path
+      .relative(path.dirname(runtimeRoot), transcriptV2Path)
+      .split(path.sep)
+      .join("/");
+    process.stdout.write(
+      transcriptV2.changed
+        ? `[sdk generated types] wrote ${displayPath}\n`
+        : `[sdk generated types] ${displayPath} is already current\n`,
+    );
+  }
   const failures = [];
   const sources = [
     [paths.schemas, schemas],
@@ -252,10 +338,9 @@ async function main() {
     "committed SDK types reintroduced removed MCP surface McpSdkServerConfig",
   );
 
-  const expectedTranscriptV2 = renderTranscriptV2Generated(runtimeProtocol);
   expectCondition(
     failures,
-    normalizeLineEndings(packageTranscriptV2) === expectedTranscriptV2,
+    transcriptV2.matches,
     `${paths.packageTranscriptV2} is not the exact generated transcript.v2 mirror; regenerate it from ${paths.runtimeProtocol}`,
   );
 
@@ -270,4 +355,9 @@ async function main() {
   process.stdout.write("[sdk generated types] verified committed SDK types\n");
 }
 
-await main();
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  await main();
+}
