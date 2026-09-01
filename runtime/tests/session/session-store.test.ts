@@ -1378,7 +1378,7 @@ describe("session-store", () => {
       Buffer.byteLength("tool output", "utf8"),
     );
     expect(rolloutStore.getTokenEstimate("turn-emit")).toBe(
-      Math.ceil(Buffer.byteLength("tool output", "utf8") / 4),
+      Math.ceil(Buffer.byteLength(JSON.stringify("tool output"), "utf8") / 4),
     );
     rolloutStore.close();
   });

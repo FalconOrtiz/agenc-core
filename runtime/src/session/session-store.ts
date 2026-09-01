@@ -116,6 +116,9 @@ import {
 } from "./trajectory-export.js";
 import { resolveHomeContext } from "../config/home.js";
 import { getAgenCHomeDir } from "../utils/envUtils.js";
+import {
+  serializedUtf8BytesOrZero as measureToolResultBytesFromPayload,
+} from "./serialization-size.js";
 
 export const I4_FSYNC_RETRY_MS = 100;
 const I83_SUSPEND_DETECTION_MS = 10_000;
@@ -3892,17 +3895,6 @@ export class SessionStoreFlushScheduler {
       clearInterval(this.timer);
       this.timer = null;
     }
-  }
-}
-
-function measureToolResultBytesFromPayload(payload: unknown): number {
-  if (typeof payload === "string") {
-    return Buffer.byteLength(payload, "utf8");
-  }
-  try {
-    return Buffer.byteLength(JSON.stringify(payload ?? ""), "utf8");
-  } catch {
-    return 0;
   }
 }
 
