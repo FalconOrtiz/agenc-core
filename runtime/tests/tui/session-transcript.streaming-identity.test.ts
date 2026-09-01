@@ -102,12 +102,18 @@ describe("session transcript streaming identity (M-TUI-1)", () => {
   });
 
   test("one event fanning out to several messages gets collision-free per-event block indices", () => {
-    // An `error` event mid-stream projects TWO messages from the same source
-    // event: the error row itself and the preserved partial assistant text.
+    // A terminal `error` event mid-stream projects TWO messages from the same
+    // source event: the error row itself and the preserved partial assistant
+    // text. Only the daemon's terminal marker ends the turn; a bare session
+    // error is diagnostic and leaves the stream open (#1978), so it projects
+    // one row and keeps the partial text in the accumulator.
     const events = [
       { id: "turn", msg: { type: "turn_started", payload: { turnId: "t1" } } } as never,
       deltaEvent("delta-0", "partial "),
-      { id: "err", msg: { type: "error", payload: { message: "boom" } } } as never,
+      {
+        id: "err",
+        msg: { type: "error", payload: { message: "boom", terminal: true } },
+      } as never,
     ];
 
     const first = adaptTranscriptEvents(events);

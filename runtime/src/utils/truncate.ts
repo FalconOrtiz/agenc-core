@@ -77,6 +77,68 @@ export function truncateToWidth(text: string | undefined, maxWidth: number): str
 }
 
 /**
+ * Truncates the middle of a string to a terminal-column budget.
+ * Keeps grapheme clusters intact and gives an unmatched column to the prefix.
+ */
+export function truncateMiddleToWidth(
+  text: string | undefined,
+  maxWidth: number,
+): string {
+  const safeText = text ?? ''
+  const budget = maxWidth === Number.POSITIVE_INFINITY
+    ? Number.POSITIVE_INFINITY
+    : Number.isFinite(maxWidth)
+      ? Math.max(0, Math.trunc(maxWidth))
+      : 0
+
+  if (stringWidth(safeText) <= budget) return safeText
+  if (budget <= 0) return ''
+
+  const ellipsis = '…'
+  const ellipsisWidth = stringWidth(ellipsis)
+  if (ellipsisWidth > budget) return ''
+
+  const segments = [...getGraphemeSegmenter().segment(safeText)].map(
+    ({ segment }) => ({ segment, width: stringWidth(segment) }),
+  )
+  const remainingWidth = budget - ellipsisWidth
+  const prefixBudget = Math.ceil(remainingWidth / 2)
+  const suffixBudget = Math.floor(remainingWidth / 2)
+
+  let prefixEnd = 0
+  let prefixWidth = 0
+  if (prefixBudget > 0) {
+    while (prefixEnd < segments.length) {
+      const next = segments[prefixEnd]!
+      if (prefixWidth + next.width > prefixBudget) break
+      prefixWidth += next.width
+      prefixEnd++
+    }
+  }
+
+  let suffixStart = segments.length
+  let suffixWidth = 0
+  if (suffixBudget > 0) {
+    while (suffixStart > prefixEnd) {
+      const next = segments[suffixStart - 1]!
+      if (suffixWidth + next.width > suffixBudget) break
+      suffixWidth += next.width
+      suffixStart--
+    }
+  }
+
+  const prefix = segments
+    .slice(0, prefixEnd)
+    .map(({ segment }) => segment)
+    .join('')
+  const suffix = segments
+    .slice(suffixStart)
+    .map(({ segment }) => segment)
+    .join('')
+  return `${prefix}${ellipsis}${suffix}`
+}
+
+/**
  * Truncates from the start of a string, keeping the tail end.
  * Prepends '…' when truncation occurs.
  * Width-aware and grapheme-safe.

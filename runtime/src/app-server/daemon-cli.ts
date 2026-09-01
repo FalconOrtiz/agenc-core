@@ -41,6 +41,7 @@ import { AgenCDaemonClientMultiplexer } from "./client-multiplexer.js";
 import { AgenCCommandExecService } from "./command-exec.js";
 import { CsvAgentJobsRepositoryAuthority } from "./csv-agent-jobs-authority.js";
 import { AgenCCsvJobReviewStateService } from "./csv-job-review.js";
+import { resolveAgenCDaemonRequestTimeoutMs } from "./daemon-request-policy.js";
 import { resolveDefaultLinuxSandboxExecutable } from "../sandbox/execution-broker.js";
 import {
   daemonInstanceIdentityFromRuntimeInfo,
@@ -259,7 +260,6 @@ const AGENC_DAEMON_WEBSOCKET_ALLOW_NONLOOPBACK_ENV =
   "AGENC_DAEMON_WEBSOCKET_ALLOW_NONLOOPBACK";
 export const AGENC_DAEMON_WEBSOCKET_PORT_ENV = "AGENC_DAEMON_WEBSOCKET_PORT";
 const AGENC_DAEMON_WEBSOCKET_PATH_ENV = "AGENC_DAEMON_WEBSOCKET_PATH";
-const AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV = "AGENC_DAEMON_REQUEST_TIMEOUT_MS";
 const AGENC_DAEMON_STARTUP_DEBUG_ENV = "TUI_E2E_DEBUG";
 const DEFAULT_DAEMON_REQUEST_TIMEOUT_MS = 2_000;
 const DEFAULT_DAEMON_STOP_TIMEOUT_MS = 10_000;
@@ -2084,7 +2084,10 @@ async function requestAgenCDaemonHealthStats(
   const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
   const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
   const authCookie = await readAgenCDaemonCookie(cookiePath);
-  const timeoutMs = resolveAgenCDaemonRequestTimeoutMs(host.env);
+  const timeoutMs = resolveAgenCDaemonRequestTimeoutMs(
+    host.env,
+    DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+  );
   const responses = await sendAgenCDaemonJsonLineRequests(
     socketPath,
     timeoutMs,
@@ -2146,7 +2149,10 @@ export async function requestAgenCDaemonInstanceIdentity(
   const authCookie = await readAgenCDaemonCookie(cookiePath);
   const responses = await sendAgenCDaemonJsonLineRequests(
     socketPath,
-    resolveAgenCDaemonRequestTimeoutMs(host.env),
+    resolveAgenCDaemonRequestTimeoutMs(
+      host.env,
+      DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+    ),
     [
       {
         jsonrpc: JSON_RPC_VERSION,
@@ -2188,7 +2194,10 @@ export async function requestAgenCDaemonShutdown(
   );
   const responses = await sendAgenCDaemonJsonLineRequests(
     socketPath,
-    resolveAgenCDaemonRequestTimeoutMs(host.env),
+    resolveAgenCDaemonRequestTimeoutMs(
+      host.env,
+      DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+    ),
     [
       {
         jsonrpc: JSON_RPC_VERSION,
@@ -2410,7 +2419,10 @@ async function requestAgenCDaemonReload(
   const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
   const cookiePath = resolveAgenCDaemonCookiePath(host.env, host.userHome);
   const authCookie = await readAgenCDaemonCookie(cookiePath);
-  const timeoutMs = resolveAgenCDaemonRequestTimeoutMs(host.env);
+  const timeoutMs = resolveAgenCDaemonRequestTimeoutMs(
+    host.env,
+    DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+  );
   const responses = await sendAgenCDaemonJsonLineRequests(
     socketPath,
     timeoutMs,
@@ -2472,26 +2484,6 @@ async function requestAgenCDaemonReload(
     throw new Error("daemon returned a malformed daemon.reload result");
   }
   return result;
-}
-
-function resolveAgenCDaemonRequestTimeoutMs(
-  env: NodeJS.ProcessEnv = process.env,
-): number {
-  const configured = env[AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV]?.trim();
-  if (configured === undefined || configured.length === 0) {
-    return DEFAULT_DAEMON_REQUEST_TIMEOUT_MS;
-  }
-  const timeoutMs = Number.parseInt(configured, 10);
-  if (
-    !Number.isInteger(timeoutMs) ||
-    String(timeoutMs) !== configured ||
-    timeoutMs <= 0
-  ) {
-    throw new Error(
-      `${AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV} must be a positive integer`,
-    );
-  }
-  return timeoutMs;
 }
 
 async function readAgenCDaemonCookie(cookiePath: string): Promise<string> {

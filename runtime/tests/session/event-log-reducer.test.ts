@@ -97,6 +97,18 @@ describe("event-log-reducer (I-26 + I-27)", () => {
     expect(report.unknownVariantSamples).toContain("future");
   });
 
+  test("reduceAll assigns the exact input length after merging reports", () => {
+    const { report } = reduceAll([
+      {
+        type: "unknown",
+        payload: { raw: '{"type":"future"}', originalType: "future" },
+      } as RolloutItem,
+      { type: "response_item", payload: { role: "user", content: "ok" } },
+    ]);
+
+    expect(report.processed).toBe(2);
+  });
+
   test("reduceAllWithEmit emits I-26 warning + I-27 error events", () => {
     const log = new EventLog();
     const seen: string[] = [];

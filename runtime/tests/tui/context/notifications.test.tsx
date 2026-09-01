@@ -24,9 +24,6 @@ vi.mock("bun:bundle", () => ({
 vi.mock("../context/mailbox.js", () => ({
   MailboxProvider: ({ children }: { children: React.ReactNode }) => children,
 }));
-vi.mock("../hooks/useEffectEventCompat.js", () => ({
-  useEffectEventCompat: (callback: unknown) => callback,
-}));
 vi.mock("../../bootstrap/state.js", () => ({
   flushInteractionTime: () => {},
   getActiveTimeCounter: () => ({ activeMs: 0, totalMs: 0 }),

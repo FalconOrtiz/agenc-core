@@ -134,6 +134,30 @@ describe("FullscreenLayout modal viewport", () => {
     expect(output).toContain("mode · plan");
   });
 
+  test("keeps joined emoji intact when truncating the active task ID", async () => {
+    const state = getDefaultAppState();
+    const taskId = "👩‍💻abcdefghijklmnop✈️";
+    const output = await renderToString(
+      <AppStateProvider
+        initialState={{
+          ...state,
+          tasks: {
+            [taskId]: {
+              id: taskId,
+              type: "local_agent",
+              status: "running",
+            },
+          } as typeof state.tasks,
+        }}
+      >
+        <DesignTopChrome columns={100} noColor={true} />
+      </AppStateProvider>,
+      100,
+    );
+
+    expect(output).toContain("👩‍💻abcdefg…klmnop✈️");
+  });
+
   test.each([
     ["plan", true],
     ["default", false],
@@ -190,6 +214,21 @@ describe("FullscreenLayout modal viewport", () => {
       formatDesignBottomChromeLabels(100, "grok-4-fast", "default", null, "$0.00"),
     ).toEqual({
       left: "● default on · grok-4-fast",
+      right: "spend $0.00",
+    });
+  });
+
+  test("truncates wide git labels by terminal display width", () => {
+    expect(
+      formatDesignBottomChromeLabels(
+        60,
+        "grok-4-fast",
+        "default",
+        "界界界界界界界界界界",
+        "$0.00",
+      ),
+    ).toEqual({
+      left: "● default on · grok-4-fast · 界界界界…界界界界",
       right: "spend $0.00",
     });
   });

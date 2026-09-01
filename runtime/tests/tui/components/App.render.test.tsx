@@ -244,10 +244,6 @@ vi.mock("../context/mailbox.js", async () => {
   };
 });
 
-vi.mock("../hooks/useEffectEventCompat.js", () => ({
-  useEffectEventCompat: (callback: unknown) => callback,
-}));
-
 vi.mock("../hooks/useApiKeyVerification.js", () => ({
   useApiKeyVerification: (context: unknown) => {
     apiKeyVerificationProbe.contexts.push(context);

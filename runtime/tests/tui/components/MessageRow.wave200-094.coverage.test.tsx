@@ -71,7 +71,7 @@ vi.mock("./MessageTimestamp.js", async () => {
   };
 });
 
-vi.mock("./Messages.js", () => ({
+vi.mock("./messageRenderPolicy.js", () => ({
   shouldRenderStatically: () => {
     harness.staticCalls++;
     return false;
