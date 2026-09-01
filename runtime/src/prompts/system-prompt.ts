@@ -248,7 +248,7 @@ export function getUsingYourToolsSection(enabledTools: ReadonlySet<string>): str
 
   if (enabledTools.has("Skill")) {
     items.push(
-      `When creating or editing project skills under .agenc/skills/<name>/SKILL.md, include useful non-empty frontmatter. Set allowed-tools to the narrow tool names the skill actually needs (for example FileRead, Grep, Glob, Edit, Write, exec_command) instead of [] when the skill expects tool access.`,
+      `When creating or editing project skills under .agenc/skills/<name>/SKILL.md, give the frontmatter a name and a one-line description and leave allowed-tools empty: project skills ignore it, and for user skills a non-empty allowed-tools makes every Skill invocation ask for approval.`,
       `Skill is only for skills. Do not pass MCP tool names such as mcp.<server>.<tool> to Skill.`,
     );
   }

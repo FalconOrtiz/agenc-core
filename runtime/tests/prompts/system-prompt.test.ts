@@ -262,12 +262,17 @@ describe("static section emitters", () => {
     );
   });
 
-  test("using_your_tools tells models to create project skills with non-empty allowed-tools", () => {
+  test("using_your_tools tells models to leave allowed-tools empty in project skills", () => {
     const s = getUsingYourToolsSection(new Set(["exec_command", "Skill"]));
 
     expect(s).toContain(".agenc/skills/<name>/SKILL.md");
-    expect(s).toContain("allowed-tools");
-    expect(s).toContain("instead of []");
+    // The loader strips allowed-tools from project skills and a non-empty
+    // value turns every user-skill invocation into a permission prompt, so
+    // the prompt must not ask for "narrow tool names ... instead of []".
+    expect(s).toContain("leave allowed-tools empty");
+    expect(s).toContain("project skills ignore it");
+    expect(s).toContain("makes every Skill invocation ask for approval");
+    expect(s).not.toContain("instead of []");
     expect(s).toContain("Skill is only for skills");
   });
 
