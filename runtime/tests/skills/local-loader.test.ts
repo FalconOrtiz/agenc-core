@@ -1033,6 +1033,73 @@ All=$ARGUMENTS
     ).resolves.toEqual([join(nested, ".agenc", "skills")]);
   });
 
+  it("does not rescan skill roots for touched files when no skill is path-gated", async () => {
+    const agencHome = tmpRoot("skills-home");
+    const workspaceRoot = tmpRoot("skills-workspace");
+    const skillRoot = join(workspaceRoot, ".agenc", "skills");
+    writeSkill(skillRoot, "always-on");
+    const services = createLocalSkillsServices({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: {},
+    });
+    const names = async () =>
+      (await services.skillsManager.skillsForConfig({}, null)).availableSkills
+        ?.map((skill) => skill.name) ?? [];
+
+    expect(await names()).toContain("always-on");
+    // A skill written after the first load only shows up after a rescan.
+    writeSkill(skillRoot, "late");
+
+    await services.skillsManager.discoverSkillDirsForPaths?.([
+      join(workspaceRoot, "src", "a.ts"),
+    ]);
+    await services.skillsManager.discoverSkillDirsForPaths?.([
+      join(workspaceRoot, "src", "b.ts"),
+    ]);
+    expect(await names()).not.toContain("late");
+
+    services.skillsManager.clearSkillCaches?.();
+    expect(await names()).toContain("late");
+  });
+
+  it("still rescans for touched files while a path-gated skill exists", async () => {
+    const agencHome = tmpRoot("skills-home");
+    const workspaceRoot = tmpRoot("skills-workspace");
+    const skillRoot = join(workspaceRoot, ".agenc", "skills");
+    writeSkill(skillRoot, "always-on");
+    writeSkill(
+      skillRoot,
+      "docs-helper",
+      "---\ndescription: Docs helper\npaths: docs/**\n---\nBody\n",
+    );
+    const services = createLocalSkillsServices({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: {},
+    });
+    const names = async () =>
+      (await services.skillsManager.skillsForConfig({}, null)).availableSkills
+        ?.map((skill) => skill.name) ?? [];
+
+    expect(await names()).toContain("always-on");
+    expect(await names()).not.toContain("docs-helper");
+    writeSkill(skillRoot, "late");
+
+    await services.skillsManager.discoverSkillDirsForPaths?.([
+      join(workspaceRoot, "src", "a.ts"),
+    ]);
+    expect(await names()).toContain("late");
+    expect(await names()).not.toContain("docs-helper");
+
+    await services.skillsManager.discoverSkillDirsForPaths?.([
+      join(workspaceRoot, "docs", "intro.md"),
+    ]);
+    expect(await names()).toContain("docs-helper");
+  });
+
   it("keeps nested and conditional skill discovery inside the owning service", async () => {
     const agencHome = tmpRoot("skills-home");
     const workspaceRoot = tmpRoot("skills-workspace");

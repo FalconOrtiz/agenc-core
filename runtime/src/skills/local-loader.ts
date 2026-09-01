@@ -190,6 +190,7 @@ interface BundledSkillDefinition {
 const SKILL_FILE_NAME = "SKILL.md";
 const MAX_SKILL_FILES = 500;
 const MAX_SCAN_DEPTH = 12;
+const MAX_ACTIVE_PATHS = 256;
 const INVOKED_MAIN_AGENT_ID = "__main__";
 const SKILL_LISTING_DEFAULT_CHAR_BUDGET = 8_000;
 const SKILL_LISTING_DESC_MAX_CHARS = 250;
@@ -1112,9 +1113,22 @@ export function createLocalSkillsServices(
   let lastPluginConfig: Pick<AgenCConfig, "plugins"> | undefined =
     options.config;
   let watchedPluginConfigKey = JSON.stringify(options.config ?? null);
-  let activePaths = new Set<string>();
-  let discoveredSkillRoots = new Set<string>();
+  const activePaths = new Set<string>();
+  const discoveredSkillRoots = new Set<string>();
   let watcherStarted = false;
+  // Touched paths only feed `paths:`-gated skills and are part of the
+  // snapshot cache key, so the set is bounded: once full, the oldest path
+  // makes room for the newest.
+  const rememberActivePath = (path: string): boolean => {
+    if (activePaths.has(path)) return false;
+    activePaths.add(path);
+    while (activePaths.size > MAX_ACTIVE_PATHS) {
+      const oldest = activePaths.values().next().value;
+      if (oldest === undefined) break;
+      activePaths.delete(oldest);
+    }
+    return true;
+  };
   // Session scoping for invoked-skill tracking. Records stamped with an
   // explicit sessionId (the Skill tool stamps the conversation id) land in
   // that session's scope; unstamped records use this instance's default
@@ -1177,6 +1191,14 @@ export function createLocalSkillsServices(
   const clear = () => {
     cache = null;
   };
+  const snapshotHasConditionalSkills = async (): Promise<boolean> => {
+    if (cache === null) return true;
+    try {
+      return (await cache.value).conditionalSkills.length > 0;
+    } catch {
+      return true;
+    }
+  };
   const startWatcher = () => {
     if (watcherStarted) return Promise.resolve();
     watcherStarted = true;
@@ -1219,7 +1241,7 @@ export function createLocalSkillsServices(
       fsArg: unknown,
     ): Promise<SkillLoadOutcome> {
       for (const path of extractActivePaths(input, fsArg)) {
-        activePaths.add(path);
+        rememberActivePath(path);
       }
       const nextPluginConfig = pluginConfigView(input);
       if (nextPluginConfig !== undefined) {
@@ -1269,15 +1291,19 @@ export function createLocalSkillsServices(
         options.workspaceRoot,
       );
       let changed = false;
-      for (const path of touchedPaths) {
-        if (activePaths.has(path)) continue;
-        activePaths.add(path);
-        changed = true;
-      }
       for (const dir of dirs) {
         if (discoveredSkillRoots.has(dir)) continue;
         discoveredSkillRoots.add(dir);
         changed = true;
+      }
+      // Touched paths can only activate `paths:`-gated skills. Recording
+      // one invalidates the snapshot, and the reload walks every skill root
+      // again before the next model request, so record them only while such
+      // skills exist (or before the first load, which happens anyway).
+      if (await snapshotHasConditionalSkills()) {
+        for (const path of touchedPaths) {
+          if (rememberActivePath(path)) changed = true;
+        }
       }
       if (changed) clear();
       return dirs;
