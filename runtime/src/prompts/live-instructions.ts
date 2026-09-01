@@ -19,7 +19,10 @@ import {
   type InstructionTier,
   type TieredInstructions,
 } from "./agenc-md.js";
-import { findProjectRoot } from "./project-instructions.js";
+import {
+  DEFAULT_PROJECT_DOC_MAX_BYTES,
+  findProjectRoot,
+} from "./project-instructions.js";
 import {
   LIVE_INSTRUCTION_PRECEDENCE,
   type LiveInstructionPolicy,
@@ -108,6 +111,15 @@ function sanitizeRepositoryAuthorityMarkup(content: string): string {
     (_match, tag: string) =>
       `<neutralized-${tag.toLowerCase().replaceAll("_", "-")}-tag>`,
   );
+}
+
+function truncateUtf8ToBudget(content: string, maximumBytes: number): string {
+  if (maximumBytes <= 0) return "";
+  const encoded = Buffer.from(content, "utf8");
+  if (encoded.length <= maximumBytes) return content;
+  let end = maximumBytes;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
+  return encoded.subarray(0, end).toString("utf8");
 }
 
 /** Frame a repository-defined agent prompt without allowing tag breakout. */
@@ -228,6 +240,11 @@ export async function resolveLiveInstructionEnvelope(input: {
     }
   }
   const additionalTierSets: TieredInstructions[] = [];
+  const additionalInstructionParts: string[] = [];
+  const additionalInstructionBudget =
+    config?.project_doc_max_bytes ?? DEFAULT_PROJECT_DOC_MAX_BYTES;
+  let additionalInstructionBytes = 0;
+  let additionalInstructionsTruncated = false;
   if (
     !discoveryDisabledByEnvironment &&
     isEnvTruthy(process.env.AGENC_ADDITIONAL_DIRECTORIES_AGENC_MD)
@@ -248,36 +265,71 @@ export async function resolveLiveInstructionEnvelope(input: {
           : canonicalDirectory;
       if (seenDirectories.has(comparisonKey)) continue;
       seenDirectories.add(comparisonKey);
-      additionalTierSets.push(
-        await loadTieredInstructions({
-          cwd: canonicalDirectory,
-          configHomeDir: configStore.homeContext.path,
-          managedPath: configStore.managedPaths.instructions,
-          enabledTiers: ["project"],
-          projectRootMarkers: [],
-          ...(input.session.services.externalInstructionApprovals !== undefined
-            ? {
-                externalApprovals:
-                  input.session.services.externalInstructionApprovals,
-              }
-            : {}),
-          ...(config?.project_doc_max_bytes !== undefined
-            ? { projectDocMaxBytes: config.project_doc_max_bytes }
-            : {}),
-        }),
+      if (additionalInstructionBytes >= additionalInstructionBudget) {
+        additionalInstructionsTruncated = true;
+        break;
+      }
+      const tierSet = await loadTieredInstructions({
+        cwd: canonicalDirectory,
+        configHomeDir: configStore.homeContext.path,
+        managedPath: configStore.managedPaths.instructions,
+        enabledTiers: ["project"],
+        projectRootMarkers: [],
+        ...(input.session.services.externalInstructionApprovals !== undefined
+          ? {
+              externalApprovals:
+                input.session.services.externalInstructionApprovals,
+            }
+          : {}),
+        ...(config?.project_doc_max_bytes !== undefined
+          ? { projectDocMaxBytes: config.project_doc_max_bytes }
+          : {}),
+      });
+      const assembled = sanitizeRepositoryAuthorityMarkup(
+        assembleTieredInstructions(tierSet),
       );
+      if (assembled.trim().length === 0) {
+        additionalTierSets.push(tierSet);
+        continue;
+      }
+      const separatorBytes = additionalInstructionParts.length > 0 ? 2 : 0;
+      const remaining = Math.max(
+        0,
+        additionalInstructionBudget -
+          additionalInstructionBytes -
+          separatorBytes,
+      );
+      const retained = truncateUtf8ToBudget(assembled, remaining);
+      if (retained.length > 0) {
+        additionalTierSets.push(tierSet);
+        additionalInstructionParts.push(retained);
+        additionalInstructionBytes +=
+          separatorBytes + Buffer.byteLength(retained, "utf8");
+      }
+      if (retained !== assembled) {
+        additionalInstructionsTruncated = true;
+        break;
+      }
     }
   }
   const tierSets = [tiers, ...additionalTierSets];
+  const primaryInstructionText = assembleTieredInstructions(tiers);
+  const additionalInstructionText = additionalInstructionParts.join("\n\n");
   const workspaceText = frameWorkspaceGuidance(
-    tierSets
-      .map((tierSet) => assembleTieredInstructions(tierSet))
+    [primaryInstructionText, additionalInstructionText]
       .filter((text) => text.trim().length > 0)
       .join("\n\n"),
   );
-  const warnings = tierSets.flatMap((tierSet) =>
-    formatTieredInstructionWarnings(tierSet),
-  );
+  const warnings = [
+    ...tierSets.flatMap((tierSet) =>
+      formatTieredInstructionWarnings(tierSet),
+    ),
+    ...(additionalInstructionsTruncated
+      ? [
+          `Additional-directory instructions exceeded the ${additionalInstructionBudget}-byte aggregate UTF-8 budget and were truncated`,
+        ]
+      : []),
+  ];
   input.session.setProjectMemoryWarnings(warnings);
   const sources = tierSets.flatMap((tierSet) =>
     sourcesFromTiers({ tiers: tierSet }),
