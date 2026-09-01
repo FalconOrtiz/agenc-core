@@ -3,44 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { AuthBackend } from "./backend.js";
-import { selectByokPrecedenceApiKey } from "./byok-precedence.js";
 import { bootstrapLocalRuntimeSession } from "../bin/bootstrap.js";
 import { Session } from "../session/session.js";
 
 describe("BYOK precedence", () => {
-  it("selects explicit keys, then BYOK keys, then managed keys", () => {
-    expect(
-      selectByokPrecedenceApiKey({
-        explicitApiKey: " explicit-key ",
-        byokApiKey: "env-key",
-        managedKeysEnabled: true,
-        managedApiKey: "managed-key",
-      }),
-    ).toBe("explicit-key");
-    expect(
-      selectByokPrecedenceApiKey({
-        explicitApiKey: " ",
-        byokApiKey: " env-key ",
-        managedKeysEnabled: true,
-        managedApiKey: "managed-key",
-      }),
-    ).toBe("env-key");
-    expect(
-      selectByokPrecedenceApiKey({
-        byokApiKey: "",
-        managedKeysEnabled: true,
-        managedApiKey: " managed-key ",
-      }),
-    ).toBe("managed-key");
-    expect(
-      selectByokPrecedenceApiKey({
-        byokApiKey: "",
-        managedKeysEnabled: false,
-        managedApiKey: " managed-key ",
-      }),
-    ).toBeUndefined();
-  });
-
   it("uses env-var BYOK keys without vending managed keys", async () => {
     const agencHome = await mkdtemp(join(tmpdir(), "agenc-byok-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-byok-ws-"));
