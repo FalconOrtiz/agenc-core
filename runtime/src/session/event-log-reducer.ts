@@ -34,6 +34,12 @@ import {
 } from "./rollout-reconstruction.js";
 import { sha256Hex, canonicalizeJson } from "../services/compact/summary-v1.js";
 import { COMPACTION_HISTORY_MARKER_VERSION } from "./compaction-history-marker.js";
+import {
+  mergeReductionReports,
+  type ReductionReport,
+} from "./reduction-report.js";
+
+export type { ReductionReport } from "./reduction-report.js";
 
 // ─────────────────────────────────────────────────────────────────────
 // Reducer state shape
@@ -68,28 +74,6 @@ export function emptyReducedState(): ReducedSessionState {
     rolledBackTurns: 0,
     lastSeq: 0,
   };
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Reduction report — diagnostics surfaced post-replay.
-// ─────────────────────────────────────────────────────────────────────
-
-export interface ReductionReport {
-  /** Count of unknown rollout-type variants encountered (I-26). */
-  readonly unknownVariantCount: number;
-  /** Unknown-variant samples for telemetry (max 5). */
-  readonly unknownVariantSamples: ReadonlyArray<string>;
-  /** Count of seq-gap violations (I-27). */
-  readonly seqGapCount: number;
-  /** First seq-gap encountered (useful for reporting). */
-  readonly firstSeqGap?: {
-    readonly expected: EventSeq;
-    readonly actual: EventSeq;
-  };
-  /** Lines that failed to parse and were skipped. */
-  readonly malformedLineCount: number;
-  /** Total rollout items successfully processed. */
-  readonly processed: number;
 }
 
 function emptyReport(): ReductionReport {
@@ -444,7 +428,7 @@ export function reduceAll(items: ReadonlyArray<RolloutItem>): {
   for (const item of items) {
     const step = reduce(state, item);
     state = step.state;
-    report = mergeReports(report, step.report);
+    report = mergeReductionReports(report, step.report);
   }
   report = { ...report, processed: items.length };
   return { state, report };
@@ -495,25 +479,8 @@ export function reduceAllWithEmit(
     }
 
     state = step.state;
-    report = mergeReports(report, step.report);
+    report = mergeReductionReports(report, step.report);
   }
   report = { ...report, processed: items.length };
   return { state, report };
-}
-
-function mergeReports(
-  a: ReductionReport,
-  b: Partial<ReductionReport>,
-): ReductionReport {
-  return {
-    unknownVariantCount: a.unknownVariantCount + (b.unknownVariantCount ?? 0),
-    unknownVariantSamples:
-      b.unknownVariantSamples && b.unknownVariantSamples.length > 0
-        ? [...a.unknownVariantSamples, ...b.unknownVariantSamples].slice(0, 5)
-        : a.unknownVariantSamples,
-    seqGapCount: a.seqGapCount + (b.seqGapCount ?? 0),
-    firstSeqGap: a.firstSeqGap ?? b.firstSeqGap,
-    malformedLineCount: a.malformedLineCount + (b.malformedLineCount ?? 0),
-    processed: a.processed + (b.processed ?? 0),
-  };
 }
