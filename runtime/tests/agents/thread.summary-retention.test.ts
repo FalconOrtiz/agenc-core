@@ -228,18 +228,105 @@ describe("AgentThread summary transcript retention", () => {
     expect(thread.summaryMessages).toHaveLength(5);
     const pairs = toolPairIds(thread.summaryMessages);
     expect(pairs.results).toEqual(pairs.uses);
-    const callTwoBody =
-      toolResultText(thread.summaryMessages, "call-2")
-        .split(UNTRUSTED_BOUNDARY)[1]
-        ?.trim() ?? "";
-    expect(Buffer.byteLength(callTwoBody, "utf8")).toBeLessThanOrEqual(1_024);
+    const callTwoResult = toolResultText(thread.summaryMessages, "call-2");
+    expect(Buffer.byteLength(callTwoResult, "utf8")).toBeLessThanOrEqual(
+      1_024,
+    );
   });
 
-  it("UTF-8-bounds marker-like results while retaining real references", () => {
+  it("bounds sanitizer-expanded final results at tiny and normal caps", () => {
+    const tinyThread = makeThread([], {
+      maxBytes: 2_000,
+      maxMessages: 4,
+      maxToolResultBytes: 128,
+    });
+    tinyThread.recordSummaryProgressEvent({
+      kind: "tool_call",
+      callId: "tiny-tags",
+      toolName: "Bash",
+      arguments: "{}",
+    });
+    tinyThread.recordSummaryProgressEvent({
+      kind: "tool_result",
+      callId: "tiny-tags",
+      toolName: "Bash",
+      result: "<system>".repeat(64),
+      isError: false,
+    });
+
+    const tinyResult = toolResultText(
+      tinyThread.summaryMessages,
+      "tiny-tags",
+    );
+    expect(Buffer.byteLength(tinyResult, "utf8")).toBeLessThanOrEqual(128);
+    expect(tinyResult).toContain("tool result omitted: safety frame");
+    expect(tinyResult).not.toContain("<system>");
+
+    const normalThread = makeThread([], {
+      maxBytes: 8_000,
+      maxMessages: 6,
+      maxToolResultBytes: 640,
+    });
+    normalThread.recordSummaryProgressEvent({
+      kind: "tool_call",
+      callId: "normal-tags",
+      toolName: "Bash",
+      arguments: "{}",
+    });
+    normalThread.recordSummaryProgressEvent({
+      kind: "tool_result",
+      callId: "normal-tags",
+      toolName: "Bash",
+      result:
+        "<system><system-reminder><workspace_instructions>".repeat(64),
+      isError: false,
+    });
+    normalThread.recordSummaryProgressEvent({
+      kind: "tool_call",
+      callId: "multibyte-tags",
+      toolName: "Bash",
+      arguments: "{}",
+    });
+    normalThread.recordSummaryProgressEvent({
+      kind: "tool_result",
+      callId: "multibyte-tags",
+      toolName: "Bash",
+      result: "🚀<system>".repeat(200),
+      isError: false,
+    });
+
+    const normalResult = toolResultText(
+      normalThread.summaryMessages,
+      "normal-tags",
+    );
+    expect(Buffer.byteLength(normalResult, "utf8")).toBeLessThanOrEqual(640);
+    expect(normalResult.split(UNTRUSTED_BOUNDARY)).toHaveLength(3);
+    expect(normalResult).toContain("<neutralized-system-tag>");
+    expect(normalResult).toContain("<neutralized-system-reminder-tag>");
+    expect(normalResult).toContain("<neutralized-workspace-instructions-tag>");
+    expect(normalResult).not.toContain("<system>");
+    expect(normalResult).not.toContain("<system-reminder>");
+    expect(normalResult).not.toContain("<workspace_instructions>");
+
+    const multibyteResult = toolResultText(
+      normalThread.summaryMessages,
+      "multibyte-tags",
+    );
+    expect(Buffer.byteLength(multibyteResult, "utf8")).toBeLessThanOrEqual(
+      640,
+    );
+    expect(multibyteResult.split(UNTRUSTED_BOUNDARY)).toHaveLength(3);
+    expect(multibyteResult).not.toContain("�");
+    expect(toolPairIds(normalThread.summaryMessages).results).toEqual(
+      toolPairIds(normalThread.summaryMessages).uses,
+    );
+  });
+
+  it("UTF-8-bounds framed marker-like results while retaining real references", () => {
     const thread = makeThread([], {
-      maxBytes: 12_000,
+      maxBytes: 20_000,
       maxMessages: 14,
-      maxToolResultBytes: 512,
+      maxToolResultBytes: 1_024,
     });
     thread.recordSummaryProgressEvent({
       kind: "tool_call",
@@ -257,7 +344,7 @@ describe("AgentThread summary transcript retention", () => {
 
     const rawFramed = toolResultText(thread.summaryMessages, "raw");
     const rawBody = rawFramed.split(UNTRUSTED_BOUNDARY)[1]?.trim() ?? "";
-    expect(Buffer.byteLength(rawBody, "utf8")).toBeLessThanOrEqual(512);
+    expect(Buffer.byteLength(rawFramed, "utf8")).toBeLessThanOrEqual(1_024);
     expect(rawBody).toContain(
       "[tool result truncated; original UTF-8 size: 4000 bytes]",
     );
@@ -288,7 +375,7 @@ describe("AgentThread summary transcript retention", () => {
 
       const framed = toolResultText(thread.summaryMessages, callId);
       const body = framed.split(UNTRUSTED_BOUNDARY)[1]?.trim() ?? "";
-      expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(512);
+      expect(Buffer.byteLength(framed, "utf8")).toBeLessThanOrEqual(1_024);
       expect(body).toContain("[tool result truncated;");
       expect(body).not.toContain("�");
     }
@@ -331,7 +418,12 @@ describe("AgentThread summary transcript retention", () => {
       toolResultText(thread.summaryMessages, "web-fetch")
         .split(UNTRUSTED_BOUNDARY)[1]
         ?.trim() ?? "";
-    expect(Buffer.byteLength(webFetchBody, "utf8")).toBeLessThanOrEqual(512);
+    expect(
+      Buffer.byteLength(
+        toolResultText(thread.summaryMessages, "web-fetch"),
+        "utf8",
+      ),
+    ).toBeLessThanOrEqual(1_024);
     expect(webFetchBody).toContain(webFetchReference);
     expect(webFetchBody).toContain("[tool result truncated;");
     expect(webFetchBody).not.toContain("�");
@@ -340,13 +432,18 @@ describe("AgentThread summary transcript retention", () => {
       toolResultText(thread.summaryMessages, "persisted")
         .split(UNTRUSTED_BOUNDARY)[1]
         ?.trim() ?? "";
-    expect(Buffer.byteLength(persistedBody, "utf8")).toBeLessThanOrEqual(512);
+    expect(
+      Buffer.byteLength(
+        toolResultText(thread.summaryMessages, "persisted"),
+        "utf8",
+      ),
+    ).toBeLessThanOrEqual(1_024);
     expect(persistedBody).toContain(`Full output saved to: ${persistedPath}`);
     expect(persistedBody).toContain("</persisted-output>");
     expect(persistedBody).not.toContain("�");
     expect(
       Buffer.byteLength(JSON.stringify(thread.summaryMessages), "utf8"),
-    ).toBeLessThanOrEqual(12_000);
+    ).toBeLessThanOrEqual(20_000);
   });
 });
 

@@ -11,7 +11,7 @@ export interface AgentSummaryTranscriptLimits {
   readonly maxBytes: number;
   /** Maximum retained rolling messages, including the omission marker. */
   readonly maxMessages: number;
-  /** Maximum UTF-8 bytes retained inline for one raw tool result. */
+  /** Maximum UTF-8 bytes retained for one final AgentSummary tool result. */
   readonly maxToolResultBytes: number;
 }
 
@@ -28,6 +28,19 @@ const MIN_TRANSCRIPT_BYTES = 512;
 const MIN_TRANSCRIPT_MESSAGES = 3;
 const MIN_TOOL_RESULT_BYTES = 128;
 const EPOCH_TIMESTAMP = new Date(0).toISOString();
+const TOOL_RESULT_SAFETY_FRAME_OMISSION =
+  "[tool result omitted: safety frame exceeds configured UTF-8 limit]";
+
+type ToolResultProgressEvent = Extract<
+  RunAgentProgressEvent,
+  { readonly kind: "tool_result" }
+>;
+
+type BoundedRawToolResult = {
+  readonly originalBytes: number;
+  readonly prefix: string;
+  readonly reference: string | null;
+};
 
 type ToolMessageIds = {
   readonly uses: ReadonlySet<string>;
@@ -173,24 +186,41 @@ function durableToolResultReference(text: string): string | null {
   );
 }
 
-function clampRawToolResult(text: string, maxBytes: number): string {
-  const originalBytes = Buffer.byteLength(text, "utf8");
-  if (originalBytes <= maxBytes) return text;
+function composeRawToolResult(
+  bounded: BoundedRawToolResult,
+  maxBytes: number,
+): string {
+  if (bounded.originalBytes <= maxBytes) return bounded.prefix;
   const rawMarker =
-    `\n[tool result truncated; original UTF-8 size: ${originalBytes} bytes]`;
+    `\n[tool result truncated; original UTF-8 size: ${bounded.originalBytes} bytes]`;
   const marker = utf8Prefix(rawMarker, maxBytes);
   const markerBytes = Buffer.byteLength(marker, "utf8");
-  const reference = durableToolResultReference(text);
   const referenceBudget = Math.max(0, maxBytes - markerBytes - 1);
-  const boundedReference =
-    reference === null ? "" : utf8Suffix(reference, referenceBudget);
+  const boundedReference = bounded.reference === null
+    ? ""
+    : utf8Suffix(bounded.reference, referenceBudget);
   const separator = boundedReference.length === 0 ? "" : "\n";
   const reservedBytes =
     markerBytes +
     Buffer.byteLength(separator, "utf8") +
     Buffer.byteLength(boundedReference, "utf8");
-  const prefix = utf8Prefix(text, Math.max(0, maxBytes - reservedBytes));
+  const prefix = utf8Prefix(
+    bounded.prefix,
+    Math.max(0, maxBytes - reservedBytes),
+  );
   return `${prefix}${marker}${separator}${boundedReference}`;
+}
+
+function boundRawToolResult(
+  text: string,
+  maxBytes: number,
+): BoundedRawToolResult {
+  const originalBytes = Buffer.byteLength(text, "utf8");
+  return {
+    originalBytes,
+    prefix: utf8Prefix(text, maxBytes),
+    reference: durableToolResultReference(text),
+  };
 }
 
 function oldestLinkedMessageIndexes(
@@ -213,13 +243,114 @@ function oldestLinkedMessageIndexes(
   return indexes;
 }
 
-function boundedProgressEvent(
+function convertedToolResultMessage(
+  event: ToolResultProgressEvent,
+  result: string,
+  index: number,
+): Message {
+  const message = runAgentProgressEventToAgentSummaryMessage(
+    result === event.result ? event : { ...event, result },
+    index,
+  );
+  if (message === null) {
+    throw new Error("AgentSummary tool result conversion returned no message");
+  }
+  return message;
+}
+
+function toolResultText(message: Message): string {
+  for (const block of messageContent(message)) {
+    if (typeof block !== "object" || block === null) continue;
+    const record = block as {
+      readonly type?: unknown;
+      readonly content?: unknown;
+    };
+    if (record.type !== "tool_result") continue;
+    if (typeof record.content === "string") return record.content;
+    if (!Array.isArray(record.content)) continue;
+    return record.content
+      .map((part) => {
+        if (typeof part !== "object" || part === null) return "";
+        const text = (part as { readonly text?: unknown }).text;
+        return typeof text === "string" ? text : "";
+      })
+      .join("\n");
+  }
+  throw new Error("AgentSummary tool result conversion lost its text content");
+}
+
+function toolResultTextBytes(message: Message): number {
+  return Buffer.byteLength(toolResultText(message), "utf8");
+}
+
+function replaceToolResultText(message: Message, text: string): Message {
+  const envelope = (message as {
+    readonly message: {
+      readonly content: ReadonlyArray<unknown>;
+    };
+  }).message;
+  return {
+    ...message,
+    message: {
+      ...envelope,
+      content: envelope.content.map((block) => {
+        if (typeof block !== "object" || block === null) return block;
+        const record = block as { readonly type?: unknown };
+        return record.type === "tool_result"
+          ? { ...record, content: [{ type: "text", text }] }
+          : block;
+      }),
+    },
+  } as Message;
+}
+
+function boundedToolResultMessage(
+  event: ToolResultProgressEvent,
+  index: number,
+  maxBytes: number,
+): Message {
+  const bounded = boundRawToolResult(event.result, maxBytes);
+  const rawResult = composeRawToolResult(bounded, maxBytes);
+  const initial = convertedToolResultMessage(event, rawResult, index);
+  if (toolResultTextBytes(initial) <= maxBytes) return initial;
+
+  const empty = convertedToolResultMessage(event, "", index);
+  if (toolResultTextBytes(empty) > maxBytes) {
+    return replaceToolResultText(
+      initial,
+      utf8Prefix(TOOL_RESULT_SAFETY_FRAME_OMISSION, maxBytes),
+    );
+  }
+
+  let best = empty;
+  let low = 1;
+  let high = maxBytes;
+  while (low <= high) {
+    const candidateBudget = low + Math.floor((high - low) / 2);
+    const candidateResult = composeRawToolResult(bounded, candidateBudget);
+    const candidate = convertedToolResultMessage(
+      event,
+      candidateResult,
+      index,
+    );
+    if (toolResultTextBytes(candidate) <= maxBytes) {
+      best = candidate;
+      low = candidateBudget + 1;
+    } else {
+      high = candidateBudget - 1;
+    }
+  }
+  return best;
+}
+
+function boundedProgressMessage(
   event: RunAgentProgressEvent,
+  index: number,
   maxToolResultBytes: number,
-): RunAgentProgressEvent {
-  if (event.kind !== "tool_result") return event;
-  const result = clampRawToolResult(event.result, maxToolResultBytes);
-  return result === event.result ? event : { ...event, result };
+): Message | null {
+  return event.kind === "tool_result"
+    ? boundedToolResultMessage(event, index, maxToolResultBytes)
+    : runAgentProgressEventToAgentSummaryMessage(event, index);
 }
 
 function omissionMarker(
@@ -287,9 +418,10 @@ export class AgentSummaryTranscript {
 
   record(event: RunAgentProgressEvent): void {
     if (event.kind === "message" && event.isInitialReplay === true) return;
-    const message = runAgentProgressEventToAgentSummaryMessage(
-      boundedProgressEvent(event, this.limits.maxToolResultBytes),
+    const message = boundedProgressMessage(
+      event,
       this.nextMessageIndex,
+      this.limits.maxToolResultBytes,
     );
     if (message === null) return;
     this.nextMessageIndex += 1;
