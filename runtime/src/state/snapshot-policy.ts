@@ -42,12 +42,23 @@ export interface SnapshotPolicyOptions {
   readonly maxInFlightToolCalls?: number;
   readonly maxStatusTransitions?: number;
   readonly maxInMemoryToolResultBytes?: number;
+  // Write coalescing: after a durable snapshot write, further snapshot
+  // requests for the same session inside this window only mark it dirty and
+  // are folded into one trailing write (or the next periodic tick). A burst
+  // of tool events therefore costs one write instead of one per event; the
+  // measured daemon wrote 4.4 snapshots/s (392 MB per 5 min) for one session.
+  readonly coalesceIntervalMs?: number;
   readonly now?: () => string;
   readonly setInterval?: (
     callback: () => void,
     intervalMs: number,
   ) => SnapshotPolicyTimer;
   readonly clearInterval?: (timer: SnapshotPolicyTimer) => void;
+  readonly setTimeout?: (
+    callback: () => void,
+    delayMs: number,
+  ) => SnapshotPolicyTimer;
+  readonly clearTimeout?: (timer: SnapshotPolicyTimer) => void;
   readonly onError?: (error: unknown) => void;
   readonly snapshotRetention?: AgentRunRetentionPolicy;
   // Rollout/session disk-retention sweep config. Disabled unless
@@ -106,6 +117,15 @@ export interface SnapshotPolicySessionHydration {
 interface SessionSnapshotState {
   readonly sessionId: string;
   lastTouchedMs: number;
+  // Set by the conversation/tool/status handlers, cleared by #writeSnapshot.
+  // A clean session never costs a write (streaming chunks, idle periodic
+  // ticks); a dirty one is flushed by the coalescing timer, the periodic
+  // tick, flushSession, or close.
+  dirty: boolean;
+  pendingTrigger?: SnapshotPolicyTrigger;
+  // Policy-clock time of the last durable write, for coalescing.
+  lastWriteMs?: number;
+  coalesceTimer?: SnapshotPolicyTimer;
   conversation: JsonValue[];
   seenConversationKeys: Set<string>;
   toolState: {
@@ -133,9 +153,14 @@ const DEFAULT_PERIODIC_INTERVAL_MS = 30_000;
 // Snapshot-retention sweeps run at most once per interval per policy
 // instance instead of on every snapshot write (see #writeSnapshot).
 const SNAPSHOT_PRUNE_INTERVAL_MS = 60_000;
+const DEFAULT_COALESCE_INTERVAL_MS = 1_000;
 const DEFAULT_MAX_CONVERSATION_EVENTS = 200;
 const DEFAULT_MAX_TRACKED_SESSIONS = 1_024;
-const DEFAULT_MAX_COMPLETED_TOOL_CALLS = 200;
+// Completed calls are already persisted row-by-row in in_flight_tool_calls
+// (recordInFlightToolCallCompletion); the snapshot copy is a preview. 200
+// entries with unbounded inputs made tool_state_json average 181 KB (max 349
+// KB) per row in the measured daemon.
+const DEFAULT_MAX_COMPLETED_TOOL_CALLS = 20;
 const DEFAULT_MAX_IN_FLIGHT_TOOL_CALLS = 256;
 const DEFAULT_MAX_STATUS_TRANSITIONS = 500;
 const DEFAULT_MAX_IN_MEMORY_TOOL_RESULT_BYTES = 4_096;
@@ -149,12 +174,18 @@ export class AgenCSessionSnapshotPolicy {
   readonly #maxInFlightToolCalls: number;
   readonly #maxStatusTransitions: number;
   readonly #maxInMemoryToolResultBytes: number;
+  readonly #coalesceIntervalMs: number;
   readonly #now: () => string;
   readonly #setInterval: (
     callback: () => void,
     intervalMs: number,
   ) => SnapshotPolicyTimer;
   readonly #clearInterval: (timer: SnapshotPolicyTimer) => void;
+  readonly #setTimeout: (
+    callback: () => void,
+    delayMs: number,
+  ) => SnapshotPolicyTimer;
+  readonly #clearTimeout: (timer: SnapshotPolicyTimer) => void;
   readonly #onError: (error: unknown) => void;
   #snapshotRetention: AgentRunRetentionPolicy | undefined;
   #rolloutRetention: RolloutRetentionPolicy | undefined;
@@ -198,6 +229,10 @@ export class AgenCSessionSnapshotPolicy {
       options.maxInMemoryToolResultBytes ??
         DEFAULT_MAX_IN_MEMORY_TOOL_RESULT_BYTES,
     );
+    this.#coalesceIntervalMs = Math.max(
+      0,
+      options.coalesceIntervalMs ?? DEFAULT_COALESCE_INTERVAL_MS,
+    );
     this.#now = options.now ?? (() => new Date().toISOString());
     this.#setInterval =
       options.setInterval ??
@@ -205,6 +240,12 @@ export class AgenCSessionSnapshotPolicy {
     this.#clearInterval =
       options.clearInterval ??
       ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
+    this.#setTimeout =
+      options.setTimeout ??
+      ((callback, delayMs) => setTimeout(callback, delayMs));
+    this.#clearTimeout =
+      options.clearTimeout ??
+      ((timer) => clearTimeout(timer as ReturnType<typeof setTimeout>));
     this.#onError = options.onError ?? (() => {});
     this.#snapshotRetention = options.snapshotRetention;
     this.#rolloutRetention = options.rolloutRetention;
@@ -259,6 +300,21 @@ export class AgenCSessionSnapshotPolicy {
     return `${result.slice(0, cap)}\n…[${
       result.length - cap
     } more chars elided in memory; full result persisted to the snapshot store]`;
+  }
+
+  // Tool inputs were the unbounded half of the snapshot: every Write/Edit
+  // payload sat in `inFlight`, moved to `completed`, and was re-serialized
+  // into every later snapshot row. The full args are persisted once in
+  // in_flight_tool_calls.args_json (recordInFlightToolCallStart) and startup
+  // recovery reconciles calls by id, never from this preview.
+  #boundInMemoryInput(input: JsonValue | null): JsonValue | null {
+    const cap = this.#maxInMemoryToolResultBytes;
+    if (cap === 0 || input === null || typeof input !== "object") return input;
+    const serialized = JSON.stringify(input);
+    if (serialized === undefined || serialized.length <= cap) return input;
+    return `${serialized.slice(0, cap)}\n…[${
+      serialized.length - cap
+    } more chars elided in memory; full input persisted to in_flight_tool_calls]`;
   }
 
   startPeriodic(): void {
@@ -325,7 +381,42 @@ export class AgenCSessionSnapshotPolicy {
   }
 
   forgetSession(sessionId: string): void {
-    this.#sessions.delete(sessionId);
+    const state = this.#sessions.get(sessionId);
+    if (state !== undefined) this.#dropSession(state);
+  }
+
+  /** Session ids currently tracked in memory (diagnostics and tests). */
+  trackedSessionIds(): readonly string[] {
+    return [...this.#sessions.keys()];
+  }
+
+  /**
+   * Write the session's snapshot now if it has unflushed changes. Used when
+   * a run reaches its terminal state so the last state lands before the
+   * session is forgotten.
+   */
+  flushSession(sessionId: string): SnapshotPolicySnapshotRecord | undefined {
+    const state = this.#sessions.get(sessionId);
+    if (state === undefined || !state.dirty) return undefined;
+    return this.#writeSnapshot(state, state.pendingTrigger ?? "periodic");
+  }
+
+  /**
+   * Stop timers, flush every dirty session synchronously, and forget all
+   * tracked sessions. Called by the daemon before the state DB is closed.
+   */
+  close(): void {
+    this.stopPeriodic();
+    for (const state of [...this.#sessions.values()]) {
+      try {
+        if (state.dirty) {
+          this.#writeSnapshot(state, state.pendingTrigger ?? "periodic");
+        }
+      } catch (error) {
+        this.#onError(error);
+      }
+      this.#dropSession(state);
+    }
   }
 
   hydrateSession(hydration: SnapshotPolicySessionHydration): void {
@@ -361,7 +452,7 @@ export class AgenCSessionSnapshotPolicy {
       conversationKey("user", exchange.messageId),
     );
     if (!appended) return undefined;
-    return this.#writeSnapshot(state, "message_exchange");
+    return this.#requestSnapshot(state, "message_exchange");
   }
 
   recordAgentStatusTransition(
@@ -401,7 +492,7 @@ export class AgenCSessionSnapshotPolicy {
     if (transitions.length > this.#maxStatusTransitions) {
       transitions.splice(0, transitions.length - this.#maxStatusTransitions);
     }
-    return this.#writeSnapshot(state, "agent_status");
+    return this.#requestSnapshot(state, "agent_status");
   }
 
   recordSessionEvent(
@@ -427,8 +518,16 @@ export class AgenCSessionSnapshotPolicy {
         },
         conversationKey("assistant_chunk", stringField(params, "eventId")),
       );
-      if (!appended) return undefined;
-      return this.#writeSnapshot(state, "message_exchange");
+      // A streaming chunk only changes the in-memory conversation tail. It
+      // never writes: one snapshot per forwarded delta was 4,931 rows / 980 MB
+      // for one 82-minute session (4 fsyncs each, on the RPC event loop). The
+      // dirty state is flushed by the next tool/status/message write or the
+      // periodic tick.
+      if (appended) {
+        state.dirty = true;
+        state.pendingTrigger ??= "message_exchange";
+      }
+      return undefined;
     }
     if (method === "event.tool_request") {
       const state = this.#session(sessionId);
@@ -444,7 +543,9 @@ export class AgenCSessionSnapshotPolicy {
         state.toolState.inFlight[requestId] = {
           requestId,
           toolName,
-          input: (params.input as JsonValue | undefined) ?? null,
+          input: this.#boundInMemoryInput(
+            (params.input as JsonValue | undefined) ?? null,
+          ),
           eventId: stringField(params, "eventId"),
           recoveryCategory: toolRecoveryCategoryField(params, "recoveryCategory"),
           status: "running",
@@ -479,7 +580,7 @@ export class AgenCSessionSnapshotPolicy {
           };
         }
       }
-      return this.#writeSnapshot(state, "tool_call");
+      return this.#requestSnapshot(state, "tool_call");
     }
     if (method === "event.agent_status") {
       const params = eventParams;
@@ -596,7 +697,7 @@ export class AgenCSessionSnapshotPolicy {
         };
         this.#boundCompletedToolCalls(state);
       }
-      return this.#writeSnapshot(state, "tool_call");
+      return this.#requestSnapshot(state, "tool_call");
     }
     if (type === "tool_call_recovery_poisoned") {
       const state = this.#session(sessionId);
@@ -642,7 +743,7 @@ export class AgenCSessionSnapshotPolicy {
         };
         this.#boundCompletedToolCalls(state);
       }
-      return this.#writeSnapshot(state, "tool_call");
+      return this.#requestSnapshot(state, "tool_call");
     }
     if (type === "tool_progress") {
       const state = this.#session(sessionId);
@@ -691,7 +792,7 @@ export class AgenCSessionSnapshotPolicy {
         };
         this.#boundInFlightToolCalls(state);
       }
-      return this.#writeSnapshot(state, "tool_call");
+      return this.#requestSnapshot(state, "tool_call");
     }
     if (type === "user_message" || type === "agent_message") {
       const state = this.#session(sessionId);
@@ -712,7 +813,7 @@ export class AgenCSessionSnapshotPolicy {
         ),
       );
       if (!appended) return undefined;
-      return this.#writeSnapshot(state, "message_exchange");
+      return this.#requestSnapshot(state, "message_exchange");
     }
     return undefined;
   }
@@ -726,6 +827,7 @@ export class AgenCSessionSnapshotPolicy {
     const created: SessionSnapshotState = {
       sessionId,
       lastTouchedMs: this.#sessionTouchSeq++,
+      dirty: false,
       conversation: [],
       seenConversationKeys: new Set(),
       toolState: {
@@ -747,17 +849,31 @@ export class AgenCSessionSnapshotPolicy {
 
   #evictStaleSessions(): void {
     while (this.#sessions.size > this.#maxTrackedSessions) {
-      let oldestId: string | undefined;
-      let oldestTouch = Number.POSITIVE_INFINITY;
+      let oldest: SessionSnapshotState | undefined;
       for (const state of this.#sessions.values()) {
-        if (state.lastTouchedMs < oldestTouch) {
-          oldestTouch = state.lastTouchedMs;
-          oldestId = state.sessionId;
+        if (oldest === undefined || state.lastTouchedMs < oldest.lastTouchedMs) {
+          oldest = state;
         }
       }
-      if (oldestId === undefined) return;
-      this.#sessions.delete(oldestId);
+      if (oldest === undefined) return;
+      // Unflushed changes must not vanish with the in-memory entry.
+      try {
+        if (oldest.dirty) {
+          this.#writeSnapshot(oldest, oldest.pendingTrigger ?? "periodic");
+        }
+      } catch (error) {
+        this.#onError(error);
+      }
+      this.#dropSession(oldest);
     }
+  }
+
+  #dropSession(state: SessionSnapshotState): void {
+    if (state.coalesceTimer !== undefined) {
+      this.#clearTimeout(state.coalesceTimer);
+      state.coalesceTimer = undefined;
+    }
+    this.#sessions.delete(state.sessionId);
   }
 
   #rememberSessionAgent(sessionId: string, agentId: string): void {
@@ -800,11 +916,59 @@ export class AgenCSessionSnapshotPolicy {
     return true;
   }
 
+  /**
+   * Mark the session dirty and either write now (first change after a quiet
+   * period) or fold the change into one trailing write at most
+   * `coalesceIntervalMs` after the previous write. The decision uses the
+   * policy clock so the write cadence is deterministic under injected clocks.
+   */
+  #requestSnapshot(
+    state: SessionSnapshotState,
+    trigger: SnapshotPolicyTrigger,
+  ): SnapshotPolicySnapshotRecord | undefined {
+    state.dirty = true;
+    state.pendingTrigger = trigger;
+    const nowIso = this.#now();
+    const nowMs = Date.parse(nowIso);
+    const sinceLastWriteMs =
+      state.lastWriteMs === undefined || !Number.isFinite(nowMs)
+        ? Number.POSITIVE_INFINITY
+        : nowMs - state.lastWriteMs;
+    if (sinceLastWriteMs >= this.#coalesceIntervalMs) {
+      return this.#writeSnapshot(state, trigger, nowIso);
+    }
+    if (state.coalesceTimer === undefined) {
+      const delayMs = Math.min(
+        this.#coalesceIntervalMs,
+        Math.max(1, this.#coalesceIntervalMs - sinceLastWriteMs),
+      );
+      state.coalesceTimer = this.#setTimeout(() => {
+        state.coalesceTimer = undefined;
+        if (!state.dirty) return;
+        try {
+          this.#writeSnapshot(state, state.pendingTrigger ?? trigger);
+        } catch (error) {
+          this.#onError(error);
+        }
+      }, delayMs);
+      state.coalesceTimer.unref?.();
+    }
+    return undefined;
+  }
+
   #writeSnapshot(
     state: SessionSnapshotState,
     trigger: SnapshotPolicyTrigger,
+    nowIso?: string,
   ): SnapshotPolicySnapshotRecord {
-    const snapshotAt = this.#nextSnapshotAt();
+    const snapshotAt = this.#nextSnapshotAt(nowIso);
+    if (state.coalesceTimer !== undefined) {
+      this.#clearTimeout(state.coalesceTimer);
+      state.coalesceTimer = undefined;
+    }
+    state.dirty = false;
+    state.pendingTrigger = undefined;
+    state.lastWriteMs = Date.parse(snapshotAt);
     state.toolState.lastTrigger = trigger;
     const conversation = [...state.conversation];
     const toolState = normalizeJsonObject({
@@ -867,8 +1031,8 @@ export class AgenCSessionSnapshotPolicy {
     }
   }
 
-  #nextSnapshotAt(): string {
-    const parsed = Date.parse(this.#now());
+  #nextSnapshotAt(nowIso: string = this.#now()): string {
+    const parsed = Date.parse(nowIso);
     const nextMs = Number.isFinite(parsed)
       ? Math.max(parsed, this.#lastSnapshotMs + 1)
       : this.#lastSnapshotMs + 1;

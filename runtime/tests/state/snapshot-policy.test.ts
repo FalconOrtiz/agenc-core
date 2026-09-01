@@ -151,6 +151,9 @@ describe("AgenCSessionSnapshotPolicy", () => {
         },
       });
     }
+    // Same-instant events coalesce into one trailing write; flush it so the
+    // assertion reads the final in-memory state.
+    policy.flushPeriodic();
 
     const completed = latestSnapshot("session-oom").toolState.completed as Record<
       string,
@@ -193,6 +196,7 @@ describe("AgenCSessionSnapshotPolicy", () => {
         },
       });
     }
+    policy.flushPeriodic();
 
     const inFlight = latestSnapshot("session-oom-inflight").toolState
       .inFlight as Record<string, unknown>;
@@ -234,6 +238,7 @@ describe("AgenCSessionSnapshotPolicy", () => {
         },
       });
     }
+    policy.flushPeriodic();
 
     const inFlight = latestSnapshot("session-inflight-drain").toolState
       .inFlight as Record<string, unknown>;
@@ -255,9 +260,158 @@ describe("AgenCSessionSnapshotPolicy", () => {
         transitionAt: "2026-05-01T00:00:00.000Z",
       });
     }
+    policy.flushPeriodic();
     const transitions = latestSnapshot("session-oom-st").toolState
       .statusTransitions as unknown[];
     expect(transitions.length).toBeLessThanOrEqual(25);
+  });
+
+  // Review P0-1: one snapshot row per forwarded `agent_message_delta` produced
+  // 4,931 rows / 980 MB for a single 82-minute desktop session, each row a
+  // full re-serialization with four fsyncs on the RPC event loop. A chunk now
+  // only extends the in-memory conversation tail; the dirty state rides the
+  // next tool/status write or the periodic tick.
+  it("does not write a snapshot row per streaming message chunk", () => {
+    seedRun("run-chunks", "session-chunks");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      agencHome: home,
+    });
+
+    for (let i = 0; i < 1000; i++) {
+      policy.recordSessionEvent("session-chunks", {
+        method: "event.message_chunk",
+        params: {
+          agentId: "run-chunks",
+          delta: `token-${i} `,
+          messageId: "message-stream",
+          streamId: "stream-1",
+          eventId: `chunk-${i}`,
+        },
+      });
+    }
+    expect(snapshotCount("session-chunks")).toBe(0);
+
+    // The periodic tick flushes the accumulated tail in one write.
+    policy.flushPeriodic();
+    expect(snapshotCount("session-chunks")).toBeLessThanOrEqual(2);
+    const conversation = latestSnapshot("session-chunks").conversation as {
+      delta: string;
+    }[];
+    expect(conversation).toHaveLength(200);
+    expect(conversation.at(-1)?.delta).toBe("token-999 ");
+
+    // A clean session does not write again.
+    policy.flushPeriodic();
+    expect(snapshotCount("session-chunks")).toBeLessThanOrEqual(2);
+  });
+
+  it("coalesces a burst of tool events into one leading and one trailing write", () => {
+    seedRun("run-coalesce", "session-coalesce");
+    const timers: (() => void)[] = [];
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      agencHome: home,
+      setTimeout: (callback, delayMs) => {
+        expect(delayMs).toBeGreaterThan(0);
+        expect(delayMs).toBeLessThanOrEqual(1_000);
+        timers.push(callback);
+        return { unref: vi.fn() };
+      },
+    });
+
+    for (let i = 0; i < 50; i++) {
+      policy.recordSessionEvent("session-coalesce", {
+        method: "event.tool_request",
+        params: {
+          agentId: "run-coalesce",
+          eventId: `evt-${i}`,
+          requestId: `tool-${i}`,
+          toolName: "FileRead",
+          input: { path: `${i}.txt` },
+        },
+      });
+      policy.recordSessionEvent("session-coalesce", {
+        method: "event.session_event",
+        params: {
+          agentId: "run-coalesce",
+          event: {
+            type: "tool_call_completed",
+            payload: { callId: `tool-${i}`, result: "ok", isError: false },
+          },
+        },
+      });
+    }
+
+    // Leading edge: the first event of the burst is written immediately;
+    // the other 99 events armed exactly one trailing timer.
+    expect(snapshotCount("session-coalesce")).toBe(1);
+    expect(timers).toHaveLength(1);
+
+    timers[0]?.();
+    expect(snapshotCount("session-coalesce")).toBe(2);
+    expect(latestSnapshot("session-coalesce").toolState).toMatchObject({
+      lastTrigger: "tool_call",
+      inFlight: {},
+      completed: { "tool-49": { status: "completed" } },
+    });
+    // Every tool result still landed row-by-row in the durable table.
+    expect(inFlightToolOutput("session-coalesce", "tool-49").status).toBe(
+      "completed",
+    );
+  });
+
+  it("bounds tool inputs and keeps at most 20 completed calls in the snapshot", () => {
+    seedRun("run-inputs", "session-inputs");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      agencHome: home,
+    });
+    const bigInput = { file_path: "a.txt", content: "x".repeat(64 * 1024) };
+
+    for (let i = 0; i < 30; i++) {
+      policy.recordSessionEvent("session-inputs", {
+        method: "event.tool_request",
+        params: {
+          agentId: "run-inputs",
+          eventId: `evt-${i}`,
+          requestId: `tool-${i}`,
+          toolName: "FileWrite",
+          input: bigInput,
+        },
+      });
+      policy.recordSessionEvent("session-inputs", {
+        method: "event.session_event",
+        params: {
+          agentId: "run-inputs",
+          event: {
+            type: "tool_call_completed",
+            payload: { callId: `tool-${i}`, result: "ok", isError: false },
+          },
+        },
+      });
+    }
+    policy.flushPeriodic();
+
+    const toolState = latestSnapshot("session-inputs").toolState as {
+      completed: Record<string, { input?: unknown }>;
+    };
+    const keys = Object.keys(toolState.completed);
+    expect(keys.length).toBe(20);
+    expect(toolState.completed["tool-9"]).toBeUndefined();
+    expect(toolState.completed["tool-29"]).toBeDefined();
+    for (const key of keys) {
+      const input = toolState.completed[key]?.input;
+      expect(typeof input).toBe("string");
+      expect((input as string).length).toBeLessThan(8 * 1024);
+    }
+    // The full arguments are persisted once, in in_flight_tool_calls.
+    const args = driver
+      .prepareState<[string], { args_json: string }>(
+        "SELECT args_json FROM in_flight_tool_calls WHERE tool_call_id = ?",
+      )
+      .get("tool-29")?.args_json;
+    expect(JSON.parse(args ?? "null")).toEqual(bigInput);
   });
 
   it("updates agent_runs from runner-emitted terminal run statuses", () => {
@@ -556,6 +710,8 @@ describe("AgenCSessionSnapshotPolicy", () => {
         },
       },
     });
+    // The poison lands within the coalescing window of the request write.
+    policy.flushPeriodic();
 
     expect(latestSnapshot("session-replay-poison").toolState).toMatchObject({
       inFlight: {},
