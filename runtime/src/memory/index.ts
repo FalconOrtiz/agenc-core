@@ -80,6 +80,7 @@ export {
 } from './scan.js'
 
 export {
+  buildProjectMemoryDirectory,
   getAutoMemEntrypoint,
   getAutoMemDailyLogPath,
   getAutoMemPath,

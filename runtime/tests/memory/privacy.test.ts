@@ -131,6 +131,11 @@ describe('memory privacy', () => {
     const projectMemoryFile = join(getProjectMemoryPath(), 'notes.md')
     const projectMemorySibling = `${projectMemoryDir}-evil`
     const projectMemorySiblingFile = join(projectMemorySibling, 'notes.md')
+    // The project memory directory lives inside `$AGENC_HOME/projects/`,
+    // where the whole tree is session state, so a prefix-colliding sibling
+    // of the global memory directory is the negative directory fixture.
+    const globalMemorySibling = `${globalMemoryDir}-evil`
+    const globalMemorySiblingFile = join(globalMemorySibling, 'notes.md')
 
     expect(isMemoryDirectory(projectMemoryDir)).toBe(true)
     expect(isMemoryDirectory(getGlobalMemoryPath())).toBe(true)
@@ -139,10 +144,11 @@ describe('memory privacy', () => {
       true,
     )
     expect(isAutoManagedMemoryFile(projectMemorySiblingFile)).toBe(false)
-    expect(isMemoryDirectory(projectMemorySibling)).toBe(false)
+    expect(isAutoManagedMemoryFile(globalMemorySiblingFile)).toBe(false)
+    expect(isMemoryDirectory(globalMemorySibling)).toBe(false)
     expect(isMemoryDirectory(join(`${agencHome}-evil`, 'memory'))).toBe(false)
     expect(
-      isShellCommandTargetingMemory(`grep token ${projectMemorySiblingFile}`),
+      isShellCommandTargetingMemory(`grep token ${globalMemorySiblingFile}`),
     ).toBe(false)
     expect(isShellCommandTargetingMemory('grep token /tmp/not-memory.txt')).toBe(
       false,

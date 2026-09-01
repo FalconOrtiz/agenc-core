@@ -4,7 +4,10 @@
  *
  * Why this lives here / shape difference from upstream:
  *   - `runtime/src/memdir/**` is excluded from the strict build, so the
- *     extraction service carries the small path subset it needs locally.
+ *     extraction service carries the small path subset it needs locally. The
+ *     final `<base>/projects/<sanitized-root>/memory/` layout itself comes
+ *     from `runtime/src/memory` so the child writes where the prompt and
+ *     recall look.
  *   - Explicit env/settings overrides fail closed when unsafe instead of
  *     silently falling back to another directory, because the child tool
  *     policy uses this path as its only read/write root.
@@ -23,6 +26,7 @@ import {
   sep,
 } from "node:path";
 import { findGitRoot as findCanonicalGitRoot } from "../../agents/worktree.js";
+import { buildProjectMemoryDirectory } from "../../memory/index.js";
 import type { AgenCConfig } from "../../config/schema.js";
 import type { ConfigStore } from "../../config/store.js";
 import {
@@ -38,7 +42,6 @@ import {
 } from "../../session/runtime-options.js";
 
 export const AUTO_MEMORY_INDEX_FILE = "MEMORY.md";
-const AUTO_MEMORY_DIRNAME = "memory";
 
 export interface AutoMemoryPathResult {
   readonly enabled: boolean;
@@ -295,9 +298,7 @@ export async function resolveAutoMemoryDirectory(
   const projectRoot = resolveProjectRoot(effectiveCwd(opts));
   return {
     enabled: true,
-    path: normalizeWithTrailingSep(
-      join(baseRoot, "projects", sanitizePathForProjectKey(projectRoot), AUTO_MEMORY_DIRNAME),
-    ),
+    path: buildProjectMemoryDirectory(baseRoot, projectRoot),
   };
 }
 

@@ -20,19 +20,29 @@ vi.mock("../../utils/settings/settings.js", async (importOriginal) => {
   };
 });
 
+import { getProjectRoot, setProjectRoot } from "../../bootstrap/state.js";
+import { ConfigStore } from "../../config/store.js";
 import { getAttachmentTrackingState } from "../../session/attachment-state.js";
 import type {
   AdmittedMemorySelector,
   MemorySelectorRequest,
 } from "../../memory/recall-contract.js";
 import { closeFullCorpusMemoryIndexes } from "../../memory/find-relevant.js";
+import { getProjectMemoryPath } from "../../memory/paths.js";
+import {
+  enterCanonicalSettingsAuthority,
+  resetCanonicalSettingsAuthorityForTesting,
+} from "../../utils/settings/canonicalAuthority.js";
 import type { GetAttachmentsOptions } from "./orchestrator.js";
 import { relevantMemoriesProducer } from "./relevant-memories.js";
 
 let root: string;
 let cwd: string;
 let agencHome: string;
+/** Project memory root shared with the prompt and the extraction child. */
+let projectMemoryDir: string;
 let savedAgencHome: string | undefined;
+let savedProjectRoot = "";
 let selectedMemoryTitle = "";
 const selectorCall = vi.fn(async (request: MemorySelectorRequest) => ({
   kind: "selected" as const,
@@ -49,9 +59,14 @@ beforeEach(() => {
   cwd = join(root, "repo");
   agencHome = join(root, "home");
   mkdirSync(join(agencHome, "memory"), { recursive: true });
-  mkdirSync(join(cwd, ".agenc", "memory"), { recursive: true });
+  mkdirSync(cwd, { recursive: true });
   savedAgencHome = process.env.AGENC_HOME;
+  savedProjectRoot = getProjectRoot();
   process.env.AGENC_HOME = agencHome;
+  setProjectRoot(cwd);
+  installMemoryAuthority();
+  projectMemoryDir = getProjectMemoryPath();
+  mkdirSync(projectMemoryDir, { recursive: true });
   memoryAuthority.enabled = true;
   selectedMemoryTitle = "";
   selectorCall.mockClear();
@@ -59,6 +74,9 @@ beforeEach(() => {
 
 afterEach(() => {
   closeFullCorpusMemoryIndexes();
+  setProjectRoot(savedProjectRoot);
+  resetCanonicalSettingsAuthorityForTesting();
+  getProjectMemoryPath.cache?.clear?.();
   if (savedAgencHome === undefined) {
     delete process.env.AGENC_HOME;
   } else {
@@ -66,6 +84,22 @@ afterEach(() => {
   }
   rmSync(root, { recursive: true, force: true });
 });
+
+/**
+ * The canonical settings authority is AsyncLocalStorage-scoped, so it has to
+ * be entered inside each test body as well as in `beforeEach` (the vitest
+ * setup harness re-enters its own hermetic authority around hooks).
+ */
+function installMemoryAuthority(): void {
+  enterCanonicalSettingsAuthority(
+    new ConfigStore({
+      home: agencHome,
+      env: { ...process.env, AGENC_HOME: agencHome },
+      cwd,
+    }),
+  );
+  getProjectMemoryPath.cache?.clear?.();
+}
 
 function makeOpts(
   partial?: Partial<GetAttachmentsOptions>,
@@ -113,6 +147,7 @@ function selectMemory(name: string): void {
 
 describe("relevantMemoriesProducer", () => {
   test("skips without an AgenC home", async () => {
+    installMemoryAuthority();
     const trackingState = getAttachmentTrackingState({});
     const out = await relevantMemoriesProducer(
       makeOpts({ agencHome: undefined }),
@@ -123,6 +158,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("recalls a matching memory for a one-word prompt", async () => {
+    installMemoryAuthority();
     const memoryPath = writeMemory(
       join(agencHome, "memory"),
       "browser.md",
@@ -145,6 +181,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("skips when auto-memory is disabled", async () => {
+    installMemoryAuthority();
     memoryAuthority.enabled = false;
     const trackingState = getAttachmentTrackingState({});
     const out = await relevantMemoriesProducer(makeOpts(), trackingState);
@@ -153,6 +190,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("surfaces selected durable memory with bounded content and citation metadata", async () => {
+    installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");
     const memoryPath = writeMemory(
       memoryDir,
@@ -198,6 +236,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("dedupes memories already surfaced in the session", async () => {
+    installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");
     const memoryPath = writeMemory(
       memoryDir,
@@ -216,8 +255,8 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("injects project/CWD-keyed memories on the first turn without a user query", async () => {
-    const projectMemoryDir = join(cwd, ".agenc", "memory");
-    const globalMemoryDir = join(agencHome, "memory");
+    installMemoryAuthority();
+        const globalMemoryDir = join(agencHome, "memory");
     const projectPath = writeMemory(
       projectMemoryDir,
       "build-notes.md",
@@ -266,8 +305,8 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("session-start recall fires only on the first producer run", async () => {
-    const projectMemoryDir = join(cwd, ".agenc", "memory");
-    writeMemory(
+    installMemoryAuthority();
+        writeMemory(
       projectMemoryDir,
       "build-notes.md",
       "Build pipeline notes",
@@ -298,8 +337,9 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("skips session-start recall for subagents", async () => {
+    installMemoryAuthority();
     writeMemory(
-      join(cwd, ".agenc", "memory"),
+      projectMemoryDir,
       "build-notes.md",
       "Build pipeline notes",
       "Run the runtime build twice.",
@@ -314,6 +354,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("does not double-inject when the first prompt is a real query", async () => {
+    installMemoryAuthority();
     const globalMemoryDir = join(agencHome, "memory");
     const browserPath = writeMemory(
       globalMemoryDir,
@@ -322,7 +363,7 @@ describe("relevantMemoriesProducer", () => {
       "Use the browser automation workflow.",
     );
     writeMemory(
-      join(cwd, ".agenc", "memory"),
+      projectMemoryDir,
       "build-notes.md",
       "Build pipeline notes",
       "Run the runtime build twice.",
@@ -348,6 +389,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("truncates large selected memories before attachment emission", async () => {
+    installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");
     writeMemory(
       memoryDir,
@@ -376,6 +418,7 @@ describe("relevantMemoriesProducer", () => {
   });
 
   test("never crosses the cumulative session byte budget with truncation metadata", async () => {
+    installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");
     writeMemory(
       memoryDir,

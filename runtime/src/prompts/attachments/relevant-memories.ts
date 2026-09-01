@@ -1,12 +1,12 @@
 import { Buffer } from "node:buffer";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, normalize, sep } from "node:path";
 
 import {
   findRelevantMemories,
   formatRelevantMemoryHeader,
+  getGlobalMemoryPath,
+  getProjectMemoryPath,
   isAutoMemoryEnabled,
-  MEMORY_DIRNAME,
-  PROJECT_MEMORY_DIR,
   readMemoryContent,
   resolveMemoryIndexDatabasePath,
   type MemoryRecallMode,
@@ -42,7 +42,7 @@ export const relevantMemoriesProducer: AttachmentProducer = async (
   const query = opts.userInput?.trim() ?? "";
   const mode = selectRecallMode(query, opts.subagentDepth, trackingState);
   if (mode === null) return [];
-  const memoryDirs = durableMemorySearchDirs(opts.agencHome, opts.cwd);
+  const memoryDirs = durableMemorySearchDirs(opts.agencHome);
   if (memoryDirs.length === 0) return [];
 
   const selected = await findRelevantMemories({
@@ -117,15 +117,19 @@ function selectRecallMode(
   return firstRun && subagentDepth === 0 ? "session_start" : null;
 }
 
-function durableMemorySearchDirs(
-  agencHome: string | undefined,
-  cwd: string,
-): string[] {
+/**
+ * The two durable roots recall searches. They come from the shared memory
+ * path resolvers, so recall looks exactly where the memory prompt tells the
+ * model to write and where the extraction child writes (including remote
+ * bases, trusted overrides and worktree-shared canonical git roots) instead
+ * of rebuilding a repository-local `.agenc/memory` path from the cwd.
+ */
+function durableMemorySearchDirs(agencHome: string | undefined): string[] {
   if (agencHome === undefined || agencHome.trim().length === 0) return [];
   return Array.from(
     new Set([
-      normalizeDirectory(join(agencHome, MEMORY_DIRNAME)),
-      normalizeDirectory(join(cwd, PROJECT_MEMORY_DIR, MEMORY_DIRNAME)),
+      normalizeDirectory(getGlobalMemoryPath()),
+      normalizeDirectory(getProjectMemoryPath()),
     ]),
   );
 }

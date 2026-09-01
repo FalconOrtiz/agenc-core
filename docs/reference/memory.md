@@ -28,7 +28,7 @@ The sole home authority is `AGENC_HOME`, defaulting to `$HOME/.agenc`
 | --- | --- | --- |
 | Config home / memory base | `$AGENC_HOME` | Override base with `AGENC_REMOTE_MEMORY_DIR` |
 | Global durable memory | `$AGENC_HOME/memory/` | Entrypoint `MEMORY.md` |
-| Project auto-memory | `<projectRoot>/.agenc/memory/` | Entrypoint `MEMORY.md` |
+| Project auto-memory | `$AGENC_HOME/projects/<sanitized-git-root>/memory/` | Entrypoint `MEMORY.md`; shared by the prompt, recall and extraction |
 | Project instructions | `<projectRoot>/AGENC.md` | Preferred root instruction file |
 | User instructions | `$AGENC_HOME/AGENC.md` | Private global |
 | Daily auto-mem logs | `<autoMemPath>/logs/YYYY/MM/YYYY-MM-DD.md` | Distilled later by dream/extract flows when enabled |
@@ -39,8 +39,9 @@ The sole home authority is `AGENC_HOME`, defaulting to `$HOME/.agenc`
 
 1. `AGENC_COWORK_MEMORY_PATH_OVERRIDE` (absolute full-path override)
 2. The trusted canonical auto-memory directory preference (managed/user; never a committed project value)
-3. If `AGENC_REMOTE_MEMORY_DIR` is set: `$base/projects/<sanitized-git-root>/memory/`
-4. Else: `<projectRoot>/.agenc/memory/`
+3. `$base/projects/<sanitized-git-root>/memory/`, where `$base` is
+   `AGENC_REMOTE_MEMORY_DIR` when set and `$AGENC_HOME` otherwise
+   (`buildProjectMemoryDirectory`). Memory never lands inside the repository.
 
 Git worktrees of the same repo share one auto-memory directory when a
 canonical git root is found.
@@ -143,13 +144,13 @@ generations are never queryable.
 `disabled`, under the 60 KiB session-surface budget) calls
 `findRelevantMemories` with:
 
-1. Global root `$AGENC_HOME/memory/` (`role: "global"`)
-2. Project root `<cwd>/.agenc/memory/` (`role: "project"`)
+1. Global root `getGlobalMemoryPath()` (`$AGENC_HOME/memory/`, `role: "global"`)
+2. Project root `getProjectMemoryPath()` (`role: "project"`)
 
-Those two directories are the attachment's search set. They do **not**
-follow `getProjectMemoryPath` (remote override, worktree-shared canonical
-root). Writes that landed only under an override path are invisible to
-index recall until they also exist in one of the two roots above.
+Those two directories are the attachment's search set. They are the same
+resolvers the memory prompt and the permission carve-outs use, so recall
+follows remote bases, trusted overrides and worktree-shared canonical roots
+and searches exactly where the model and the extraction child write.
 
 On a non-empty user query (`mode: "query"`):
 
