@@ -416,6 +416,119 @@ describe("FileThreadStore.archiveThread / listThreads", () => {
     }
   });
 
+  // Review P1-4: the daemon holds its own FileThreadStore next to the one each
+  // session creates, so session.terminate archived (renamed and appended to)
+  // rollouts whose live writer belonged to another instance. That split one
+  // suspended run across two files and left a foreign session_meta line the
+  // writer's offset bookkeeping never saw.
+  it("does not rename or append to a rollout another store instance is still writing", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
+    const rollout = openStore({ cwd, sessionId: "foreign-archive" });
+    const originalPath = rollout.rolloutPath;
+    const owner = new FileThreadStore({ cwd });
+    const daemon = new FileThreadStore({ cwd });
+    try {
+      owner.createThread({ threadId: "foreign-archive", rolloutStore: rollout });
+      owner.appendItems({
+        threadId: "foreign-archive",
+        items: [responseItem("a", "alpha")],
+      });
+      const linesBefore = readFileSync(originalPath, "utf8")
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0).length;
+
+      // The second instance sees no live recorder for the thread, but the
+      // owner's writer still holds `<rollout>.lock`.
+      daemon.archiveThread({ threadId: "foreign-archive" });
+
+      expect(existsSync(originalPath)).toBe(true);
+      expect(
+        existsSync(join(owner.getProjectDir(), "archived_sessions", "foreign-archive")),
+      ).toBe(false);
+      const linesAfter = readFileSync(originalPath, "utf8")
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0).length;
+      expect(linesAfter).toBe(linesBefore);
+      const archived = daemon.readThread({
+        threadId: "foreign-archive",
+        includeArchived: true,
+        includeHistory: false,
+      });
+      expect(archived.archivedAt).toBeDefined();
+      expect(archived.rolloutPath).toBe(originalPath);
+
+      // The owner keeps appending to the same file it opened.
+      owner.appendItems({
+        threadId: "foreign-archive",
+        items: [responseItem("b", "bravo")],
+      });
+      expect(readFileSync(originalPath, "utf8")).toContain("bravo");
+
+      // Once the owner shuts the thread down it completes the deferred move,
+      // and the archived file carries the writer's full journal.
+      owner.shutdownThread("foreign-archive");
+      const moved = owner.readThread({
+        threadId: "foreign-archive",
+        includeArchived: true,
+        includeHistory: true,
+      });
+      expect(moved.rolloutPath).toContain("archived_sessions");
+      expect(existsSync(originalPath)).toBe(false);
+      expect(
+        moved.history?.items.some(
+          (item) => item.type === "response_item" && item.payload.id === "b",
+        ),
+      ).toBe(true);
+    } finally {
+      daemon.close();
+      owner.close();
+      rollout.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("archives a rollout whose writer has gone away, appending the metadata line", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
+    const rollout = openStore({ cwd, sessionId: "released-archive" });
+    const originalPath = rollout.rolloutPath;
+    const owner = new FileThreadStore({ cwd });
+    const daemon = new FileThreadStore({ cwd });
+    try {
+      owner.createThread({ threadId: "released-archive", rolloutStore: rollout });
+      owner.appendItems({
+        threadId: "released-archive",
+        items: [responseItem("a", "alpha")],
+      });
+      owner.discardThread("released-archive");
+      rollout.close(); // releases the lease
+
+      daemon.archiveThread({ threadId: "released-archive" });
+
+      const archived = daemon.readThread({
+        threadId: "released-archive",
+        includeArchived: true,
+        includeHistory: true,
+      });
+      expect(existsSync(originalPath)).toBe(false);
+      expect(archived.rolloutPath).toContain("archived_sessions");
+      expect(
+        archived.history?.items.some(
+          (item) =>
+            item.type === "session_meta" &&
+            (item.payload as { threadMetadata?: { archivedAt?: string } })
+              .threadMetadata?.archivedAt !== undefined,
+        ),
+      ).toBe(true);
+      // The lease taken for the append and the move was released again.
+      expect(existsSync(`${originalPath}.lock`)).toBe(false);
+    } finally {
+      daemon.close();
+      owner.close();
+      rollout.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("prefers an active rollout over an archived rollout with the same thread id", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
     const first = openStore({ cwd, sessionId: "same-id" });
