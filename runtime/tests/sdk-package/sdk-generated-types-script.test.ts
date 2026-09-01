@@ -9,7 +9,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -21,6 +21,42 @@ import {
 const temporaryRoots: string[] = [];
 const execFileAsync = promisify(execFile);
 const repositoryRoot = join(import.meta.dirname, "../../..");
+const npmWriteArgs = [
+  "--workspace=@tetsuo-ai/runtime",
+  "run",
+  "check:sdk-generated-types",
+  "--",
+  "--write",
+] as const;
+
+function npmWriteCommand({
+  nodeExecutable,
+  npmExecPath,
+  windows,
+}: {
+  readonly nodeExecutable: string;
+  readonly npmExecPath: string | undefined;
+  readonly windows: boolean;
+}): { readonly executable: string; readonly args: readonly string[] } {
+  const path = windows ? win32 : posix;
+  const nodeDirectory = path.dirname(nodeExecutable);
+  const npmCliPath =
+    npmExecPath?.trim() ||
+    (windows
+      ? path.join(nodeDirectory, "node_modules", "npm", "bin", "npm-cli.js")
+      : path.join(
+          path.dirname(nodeDirectory),
+          "lib",
+          "node_modules",
+          "npm",
+          "bin",
+          "npm-cli.js",
+        ));
+  return {
+    executable: nodeExecutable,
+    args: [npmCliPath, ...npmWriteArgs],
+  };
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -95,22 +131,51 @@ describe("SDK generated transcript v2 script", () => {
   });
 
   it("accepts the documented npm write entrypoint", async () => {
-    const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
+    const command = npmWriteCommand({
+      nodeExecutable: process.execPath,
+      npmExecPath: process.env.npm_execpath,
+      windows: process.platform === "win32",
+    });
+    expect(command.executable).toMatch(/node(?:\.exe)?$/i);
+    expect(command.executable).not.toMatch(/\.cmd$/i);
+    expect(command.args[0]).toMatch(/npm-cli\.js$/);
+
     const { stdout } = await execFileAsync(
-      npmExecutable,
-      [
-        "--workspace=@tetsuo-ai/runtime",
-        "run",
-        "check:sdk-generated-types",
-        "--",
-        "--write",
-      ],
+      command.executable,
+      [...command.args],
       { cwd: repositoryRoot, encoding: "utf8" },
     );
     expect(stdout).toContain(
       "packages/agenc-sdk/src/transcript-v2.generated.ts is already current",
     );
   });
+
+  it.each([
+    [
+      "POSIX",
+      "/opt/node/bin/node",
+      false,
+      "/opt/node/lib/node_modules/npm/bin/npm-cli.js",
+    ],
+    [
+      "Windows",
+      "C:\\Program Files\\nodejs\\node.exe",
+      true,
+      "C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js",
+    ],
+  ] as const)(
+    "uses the Node executable for the %s npm command",
+    (_label, nodeExecutable, windows, expectedNpmCliPath) => {
+      const command = npmWriteCommand({
+        nodeExecutable,
+        npmExecPath: undefined,
+        windows,
+      });
+
+      expect(command.executable).toBe(nodeExecutable);
+      expect(command.args).toEqual([expectedNpmCliPath, ...npmWriteArgs]);
+    },
+  );
 
   it("accepts LF and CRLF inputs without writing in check mode", async () => {
     const fixture = await createCanonicalFixture();
