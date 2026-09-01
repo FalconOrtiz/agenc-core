@@ -26,7 +26,11 @@ export interface GrokProviderConfig
   baseURL?: string;
   /** Optional operator override for effective context window budgeting. */
   contextWindowTokens?: number;
-  /** Allow the model to emit multiple tool calls in parallel (default: false). */
+  /**
+   * Allow the model to emit multiple tool calls in one response (default:
+   * true, matching the xAI API default). Set false to force one call per
+   * model turn.
+   */
   parallelToolCalls?: boolean;
   /** Vision-capable model to auto-switch to when images are present (default: 'grok-2-vision-1212') */
   visionModel?: string;
