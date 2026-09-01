@@ -944,7 +944,20 @@ export class StateRunDurabilityRepository {
       }
 
       const current = this.currentEpoch(params.runId);
-      this.assertNotCancellationLocked(params.runId);
+      /*
+       * No cancellation-lock check here, deliberately. That lock makes a
+       * dying agent's late status write lose against an explicit cancel;
+       * an operator reopening a settled terminal is the authorized
+       * transition, not a straggler. Applying it here contradicted this
+       * function's own contract ("settled terminals — completed, failed,
+       * cancelled — reopen with reviews still pending", below) and left
+       * every interrupted session permanently unresumable, which is the
+       * failure #1750 set out to end. The gates that matter still run:
+       * the epoch must be terminal, nothing may be suspended, no effect
+       * intent may be unsettled, an unknown-outcome terminal with pending
+       * reviews stays refused, and agent.create proved the caller owns
+       * this session's canonical rollout before reaching this point.
+       */
       if (current === undefined || current.epoch !== params.fromEpoch) {
         throw conflict(
           "RUN_EPOCH_CONFLICT",
@@ -1024,6 +1037,9 @@ export class StateRunDurabilityRepository {
         id: params.runId,
         status: "running",
         lastActiveAt: params.openedAt,
+        // A cancelled run's status is sticky against implicit writers; this
+        // audited reopen is the one transition allowed to move it.
+        reopeningLockedRun: true,
       });
       const value: RunLifecycleEpoch = {
         runId: params.runId,
