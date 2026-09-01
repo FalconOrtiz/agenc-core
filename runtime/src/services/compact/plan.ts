@@ -604,30 +604,12 @@ export function structuredReductionMessages(params: {
         stage: params.stage,
         coverage_priority: params.requestedFocus ?? "",
         allowed_source_ref_ids: params.children.map((child) => child.ref_id),
-        // Every child body was already verified to carry exactly its own
-        // pairs, so their concatenation is what this stage must echo.
-        required_tool_pairs: params.children.flatMap((child) =>
-          childToolPairs(child.body),
-        ),
         summaries: params.children,
       }),
     },
   ];
 }
 
-function childToolPairs(body: unknown): readonly CompactionToolPairV1[] {
-  if (body === null || typeof body !== "object") return [];
-  const pairs = (body as { readonly tool_pairs?: unknown }).tool_pairs;
-  return Array.isArray(pairs)
-    ? pairs.filter(
-        (pair): pair is CompactionToolPairV1 =>
-          pair !== null &&
-          typeof pair === "object" &&
-          typeof (pair as CompactionToolPairV1).tool_call_id === "string" &&
-          typeof (pair as CompactionToolPairV1).result_sha256 === "string",
-      )
-    : [];
-}
 
 export function accountCompactionCall(params: {
   readonly messages: readonly LLMMessage[];
@@ -908,12 +890,9 @@ function structuredTranscriptMessages(
         kind: COMPACTION_STRUCTURED_TRANSCRIPT_KIND,
         coverage_priority: requestedFocus ?? "",
         allowed_source_ref_ids: allowedSourceRefIds,
-        // The exact pairs the summary must echo. The runtime knows them and
-        // verifies them; leaving the model to mine them out of unit messages
-        // failed live as soon as the span held an earlier compaction summary,
-        // whose body quotes its own pairs, so the model returned those too
-        // and the whole attempt was rejected as forged.
-        required_tool_pairs: units.flatMap((unit) => unit.tool_pairs),
+        // Tool call/result pairs are not part of the payload: the runtime
+        // pins them into the summary itself, so the model has nothing to
+        // echo and the output no longer grows with the number of tool calls.
         units: units.map((unit) => ({
           unit_id: unit.unit_id,
           messages: unit.messages,
