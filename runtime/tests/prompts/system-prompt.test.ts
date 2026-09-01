@@ -135,6 +135,11 @@ describe("static section emitters", () => {
     expect(s).toContain("prompt injection");
     // AgenC-specific instruction-file guard.
     expect(s).toContain("AgenC uses AGENC.md as its instruction file");
+    // Compaction is described as lossy so the model paces its tool output;
+    // the old "not limited by the context window" claim worked against that.
+    expect(s).toContain("Compaction loses detail");
+    expect(s).toContain("read targeted spans, use offset and limit, grep before reading");
+    expect(s).not.toContain("not limited by the context window");
   });
 
   test("simple_doing_tasks describes task execution protocol", () => {
