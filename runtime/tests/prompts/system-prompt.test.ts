@@ -200,8 +200,19 @@ describe("static section emitters", () => {
     expect(s).toContain(
       "Reserve using the exec_command exclusively for system commands and terminal operations",
     );
-    // TodoWrite bullet (taskToolName → TodoWrite).
-    expect(s).toContain("Break down and manage your work with the TodoWrite tool");
+    // TodoWrite bullet (taskToolName → TodoWrite): a threshold and a
+    // same-response rule instead of an open invitation to call it often.
+    expect(s).toContain(
+      "Use TodoWrite only for work with 3 or more distinct steps",
+    );
+    expect(s).toContain("update it in the same response as the work it tracks");
+    expect(s).toContain(
+      "Never call it for a single-step request or when nothing changed",
+    );
+    expect(s).not.toContain("Break down and manage your work");
+    // The per-step user note and the stop-when-done rule stay.
+    expect(s).toContain("what you finished and what comes next");
+    expect(s).toContain("When the last task is done, say so and stop");
     // exec_command + write_stdin interactive-session bullet.
     expect(s).toContain("call exec_command with tty=true");
     expect(s).toContain("use write_stdin with that session_id");
