@@ -23,12 +23,22 @@ const ALL_REDIRECT_OPERATORS = new Set([
   ">|",
   "<",
   "<<",
+  "<<-",
   "<>",
   ">&",
   "<&",
   "&>",
   "&>>",
 ]);
+// The tokenizer keeps a file-descriptor prefix glued to its operator
+// (`2>`, `2>>`, `2>&`, `0<`). The prefix does not change what the
+// redirection writes to, so classification looks at the bare operator.
+const FD_PREFIXED_REDIRECT_RE = /^\d+(>>|>&|>\||<<-|<<|<&|<>|>|<)$/;
+
+function redirectOperator(token: string): string | undefined {
+  if (ALL_REDIRECT_OPERATORS.has(token)) return token;
+  return FD_PREFIXED_REDIRECT_RE.exec(token)?.[1];
+}
 const WRITE_REDIRECT_OPERATORS = new Set([
   ">",
   ">>",
@@ -179,7 +189,7 @@ function stripRedirections(tokens: readonly string[]): string[] {
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
     if (!token) continue;
-    if (ALL_REDIRECT_OPERATORS.has(token)) {
+    if (redirectOperator(token) !== undefined) {
       i += 1;
       continue;
     }
@@ -376,16 +386,21 @@ function collectRedirectionTargets(
   let indeterminate = false;
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
-    if (!token || !WRITE_REDIRECT_OPERATORS.has(token)) {
+    const operator = token === undefined ? undefined : redirectOperator(token);
+    if (operator === undefined || !WRITE_REDIRECT_OPERATORS.has(operator)) {
       continue;
     }
     const next = tokens[i + 1];
-    if (!next || SHELL_COMMAND_SEPARATORS.has(next) || ALL_REDIRECT_OPERATORS.has(next)) {
+    if (
+      !next ||
+      SHELL_COMMAND_SEPARATORS.has(next) ||
+      redirectOperator(next) !== undefined
+    ) {
       indeterminate = true;
       continue;
     }
     if (
-      token === ">&" &&
+      operator === ">&" &&
       (/^\d+$/.test(next) || /^&\d+$/.test(next))
     ) {
       continue;
@@ -458,14 +473,9 @@ function collectShellCommandWriteTargets(
 
 function buildPolicyMessage(blockedTargets: readonly string[]): string {
   return (
-    "shell_workspace_file_write_disallowed: Workflow implementation turns " +
-    "must use structured file tools for project file authoring. Use " +
-    "`Edit` for in-place edits, `Write` for new files, " +
-    "`desktop.text_editor`, `system.mkdir`, or `system.move` instead of " +
-    "shell redirection, heredocs, `tee`, `cp`, `mv`, `ln`, `touch`, `install`, " +
-    "`rm`, `rmdir`, `truncate`, `dd`, `sed -i`, or `perl -i` for workspace files. " +
-    "Shell writes are only allowed under generated output roots (`build`, `dist`, " +
-    "`logs`, `.cache`, `tmp`, `coverage`)." +
+    "shell_workspace_file_write_disallowed: shell commands may not write " +
+    "workspace files except under build, dist, logs, .cache, tmp, or coverage; " +
+    "use Edit or Write instead." +
     (blockedTargets.length > 0
       ? ` Blocked target(s): ${blockedTargets.join(", ")}`
       : "")
