@@ -1033,6 +1033,61 @@ All=$ARGUMENTS
     ).resolves.toEqual([join(nested, ".agenc", "skills")]);
   });
 
+  it("still loads a skill whose frontmatter is broken and says why the fields were ignored", async () => {
+    const agencHome = tmpRoot("skills-home");
+    const workspaceRoot = tmpRoot("skills-workspace");
+    const brokenFile = writeSkill(
+      join(workspaceRoot, ".agenc", "skills"),
+      "broken-yaml",
+      "---\nname: [unclosed\ndescription: never parsed\n---\n# Broken skill\nBody\n",
+    );
+    const listFile = writeSkill(
+      join(workspaceRoot, ".agenc", "skills"),
+      "list-frontmatter",
+      "---\n- just\n- a list\n---\nBody\n",
+    );
+    writeSkill(join(workspaceRoot, ".agenc", "skills"), "fine");
+
+    const snapshot = await loadLocalSkillsSnapshot({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: {},
+    });
+
+    const names = snapshot.skills.map((skill) => skill.name);
+    expect(names).toEqual(
+      expect.arrayContaining(["broken-yaml", "list-frontmatter", "fine"]),
+    );
+    expect(
+      snapshot.skills.find((skill) => skill.name === "broken-yaml")?.description,
+    ).not.toBe("never parsed");
+    expect(snapshot.warnings).toHaveLength(2);
+    expect(snapshot.warnings).toEqual(
+      expect.arrayContaining([
+        {
+          path: brokenFile,
+          reason: expect.stringMatching(/^frontmatter is not valid YAML \(.+\); its fields were ignored$/u),
+        },
+        {
+          path: listFile,
+          reason: "frontmatter is not a YAML mapping; its fields were ignored",
+        },
+      ]),
+    );
+
+    const services = createLocalSkillsServices({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: {},
+    });
+    const outcome = await services.skillsManager.skillsForConfig({}, null);
+    expect(outcome.skillLoadWarnings?.map((warning) => warning.path)).toEqual(
+      expect.arrayContaining([brokenFile, listFile]),
+    );
+  });
+
   it("does not rescan skill roots for touched files when no skill is path-gated", async () => {
     const agencHome = tmpRoot("skills-home");
     const workspaceRoot = tmpRoot("skills-workspace");

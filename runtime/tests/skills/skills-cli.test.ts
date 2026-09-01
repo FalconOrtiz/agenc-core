@@ -66,6 +66,33 @@ describe("agenc skills CLI", () => {
     expect(names).not.toContain("iot-builder");
   });
 
+  it("reports SKILL.md files whose frontmatter was ignored", async () => {
+    const agencHome = await mkdtemp(join(tmpdir(), "agenc-skills-cli-warn-"));
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-skills-cli-warn-ws-"));
+    const brokenDir = join(workspaceRoot, ".agenc", "skills", "broken");
+    await mkdir(brokenDir, { recursive: true });
+    await writeFile(
+      join(brokenDir, "SKILL.md"),
+      "---\nname: [unclosed\n---\n# Broken\n",
+    );
+
+    const inventory = await buildSkillsInventory({
+      agencHome,
+      pluginStorageRoot: join(agencHome, "plugins"),
+      workspaceRoot,
+      env: { AGENC_HOME: agencHome },
+    });
+
+    expect(inventory.skills.map((skill) => skill.name)).toContain("broken");
+    expect(inventory.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(
+          /^.*[\\/]broken[\\/]SKILL\.md: frontmatter is not valid YAML \(.+\); its fields were ignored$/u,
+        ),
+      ]),
+    );
+  });
+
   it("reports roots holding more skills than the per-root cap", async () => {
     const agencHome = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-ws-"));

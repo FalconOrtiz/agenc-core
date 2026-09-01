@@ -197,6 +197,29 @@ describe("skillsCommand", () => {
     expect(notLoaded).toBeLessThan(lines.indexOf("  invoked: none"));
   });
 
+  it("lists SKILL.md files that loaded with a warning", () => {
+    const text = formatSkillsSnapshot({
+      invokedSkills: [],
+      availableSkills: [
+        { name: "broken", description: "Broken", loadedFrom: "skills" },
+      ],
+      effectiveSkillRoots: [],
+      warnings: [
+        {
+          path: "/work/.agenc/skills/broken/SKILL.md",
+          reason: "frontmatter is not valid YAML (bad indentation); its fields were ignored",
+        },
+      ],
+    });
+    const lines = text.split("\n");
+    const header = lines.indexOf("  warnings: 1");
+    expect(header).toBeGreaterThan(lines.indexOf("  available: 1"));
+    expect(lines[header + 1]).toBe(
+      "    /work/.agenc/skills/broken/SKILL.md: frontmatter is not valid YAML (bad indentation); its fields were ignored",
+    );
+    expect(header).toBeLessThan(lines.indexOf("  invoked: none"));
+  });
+
   it("formats skills with dollar prefixes, descriptions, and source tags", () => {
     expect(
       formatSkillsSnapshot({

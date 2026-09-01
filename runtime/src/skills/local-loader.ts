@@ -123,12 +123,19 @@ export interface SkillRootTruncation {
   readonly droppedCount: number;
 }
 
+/** A SKILL.md that loaded (or was skipped) with a problem its author should see. */
+export interface SkillLoadWarning {
+  readonly path: string;
+  readonly reason: string;
+}
+
 export interface LocalSkillsSnapshot {
   readonly skills: readonly LocalSkillMetadata[];
   readonly skillRoots: readonly string[];
   readonly pluginSkillRoots: readonly string[];
   readonly conditionalSkills: readonly LocalSkillMetadata[];
   readonly truncatedRoots: readonly SkillRootTruncation[];
+  readonly warnings: readonly SkillLoadWarning[];
 }
 
 export interface LocalSkillsServiceOptions {
@@ -169,6 +176,8 @@ interface SkillWithContent {
 interface SplitFrontmatter {
   readonly frontmatter: Record<string, unknown>;
   readonly markdown: string;
+  /** Why the frontmatter fields were ignored, when they were. */
+  readonly warning?: string;
 }
 
 interface BundledSkillDefinition {
@@ -499,15 +508,29 @@ function splitFrontmatter(raw: string): SplitFrontmatter {
   if (!match) return { frontmatter: {}, markdown: raw };
   try {
     const parsed = loadYaml(match[1] ?? "");
+    if (parsed === null || parsed === undefined) {
+      return { frontmatter: {}, markdown: match[2] ?? "" };
+    }
+    if (typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        frontmatter: {},
+        markdown: match[2] ?? "",
+        warning: "frontmatter is not a YAML mapping; its fields were ignored",
+      };
+    }
     return {
-      frontmatter:
-        parsed && typeof parsed === "object" && !Array.isArray(parsed)
-          ? (parsed as Record<string, unknown>)
-          : {},
+      frontmatter: parsed as Record<string, unknown>,
       markdown: match[2] ?? "",
     };
-  } catch {
-    return { frontmatter: {}, markdown: match[2] ?? raw };
+  } catch (error) {
+    const detail =
+      (error instanceof Error ? error.message : String(error)).split("\n")[0] ??
+      "";
+    return {
+      frontmatter: {},
+      markdown: match[2] ?? raw,
+      warning: `frontmatter is not valid YAML (${detail}); its fields were ignored`,
+    };
   }
 }
 
@@ -552,16 +575,22 @@ function escapeRegExp(value: string): string {
 async function loadSkillFile(
   filePath: string,
   root: SkillRoot,
+  warnings: SkillLoadWarning[],
 ): Promise<SkillWithContent | null> {
   if (!(await pathIsFile(filePath))) return null;
   let raw: string;
   try {
     raw = await readFile(filePath, "utf8");
-  } catch {
+  } catch (error) {
+    warnings.push({
+      path: filePath,
+      reason: `unreadable: ${error instanceof Error ? error.message : String(error)}`,
+    });
     return null;
   }
 
-  const { frontmatter, markdown } = splitFrontmatter(raw);
+  const { frontmatter, markdown, warning } = splitFrontmatter(raw);
+  if (warning !== undefined) warnings.push({ path: filePath, reason: warning });
   const skillName = skillNameForSkillFile(filePath, root.path);
   if (skillName.length === 0) return null;
   const canonicalFields = parseCanonicalSkillFrontmatterFields(
@@ -626,6 +655,7 @@ async function loadSkillFile(
 interface LoadedSkillRoot {
   readonly skills: readonly SkillWithContent[];
   readonly droppedCount: number;
+  readonly warnings: readonly SkillLoadWarning[];
 }
 
 async function loadSkillsFromRoot(root: SkillRoot): Promise<LoadedSkillRoot> {
@@ -643,10 +673,14 @@ async function loadSkillsFromRoot(root: SkillRoot): Promise<LoadedSkillRoot> {
       // Genuinely empty root.
     }
   }
-  const loaded = await Promise.all(files.map((file) => loadSkillFile(file, root)));
+  const warnings: SkillLoadWarning[] = [];
+  const loaded = await Promise.all(
+    files.map((file) => loadSkillFile(file, root, warnings)),
+  );
   return {
     skills: loaded.filter((entry): entry is SkillWithContent => entry !== null),
     droppedCount: scan.droppedCount,
+    warnings,
   };
 }
 
@@ -753,6 +787,7 @@ export async function loadLocalSkillsSnapshot(
       }]
       : [],
   );
+  const warnings = loadedNested.flatMap((loaded) => loaded.warnings);
 
   const allFileSkills = deduped.map((entry) => entry.skill);
   const unconditional: LocalSkillMetadata[] = [];
@@ -789,6 +824,7 @@ export async function loadLocalSkillsSnapshot(
       roots.filter((root) => root.scope === "plugin").map((root) => root.path),
     ).sort((a, b) => a.localeCompare(b)),
     truncatedRoots,
+    warnings,
   };
 }
 
@@ -1254,6 +1290,9 @@ export function createLocalSkillsServices(
         availableSkills: snapshot.skills,
         ...(snapshot.truncatedRoots.length > 0
           ? { truncatedSkillRoots: snapshot.truncatedRoots }
+          : {}),
+        ...(snapshot.warnings.length > 0
+          ? { skillLoadWarnings: snapshot.warnings }
           : {}),
       };
     },

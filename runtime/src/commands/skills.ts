@@ -42,6 +42,11 @@ export interface SkillsSnapshot {
     readonly loadedCount: number;
     readonly droppedCount: number;
   }>;
+  /** SKILL.md files that loaded with ignored frontmatter or could not be read. */
+  readonly warnings?: ReadonlyArray<{
+    readonly path: string;
+    readonly reason: string;
+  }>;
 }
 
 type AvailableSkillSnapshot = SkillsSnapshot["availableSkills"][number];
@@ -391,6 +396,10 @@ export async function collectSkillsSnapshot(
       outcome.truncatedSkillRoots.length > 0
       ? { truncatedRoots: outcome.truncatedSkillRoots }
       : {}),
+    ...(outcome.skillLoadWarnings !== undefined &&
+      outcome.skillLoadWarnings.length > 0
+      ? { warnings: outcome.skillLoadWarnings }
+      : {}),
   };
 }
 
@@ -444,6 +453,13 @@ export function formatSkillsSnapshot(
     lines.push(
       `  not loaded: ${truncated.droppedCount} SKILL.md files under ${truncated.root} (per-root cap reached after ${truncated.loadedCount})`,
     );
+  }
+  const warnings = snapshot.warnings ?? [];
+  if (warnings.length > 0) {
+    lines.push(`  warnings: ${warnings.length}`);
+    for (const warning of warnings) {
+      lines.push(`    ${warning.path}: ${warning.reason}`);
+    }
   }
 
   if (snapshot.invokedSkills.length === 0) {

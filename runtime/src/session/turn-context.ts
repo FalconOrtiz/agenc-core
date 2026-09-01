@@ -259,6 +259,11 @@ export interface SkillLoadOutcome {
     readonly loadedCount: number;
     readonly droppedCount: number;
   }>;
+  /** SKILL.md files that loaded with ignored frontmatter or could not be read. */
+  readonly skillLoadWarnings?: ReadonlyArray<{
+    readonly path: string;
+    readonly reason: string;
+  }>;
 }
 export class TurnSkillsContext {
   readonly outcome: SkillLoadOutcome;
