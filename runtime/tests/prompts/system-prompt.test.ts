@@ -151,6 +151,11 @@ describe("static section emitters", () => {
     );
     // Faithful-reporting guidance.
     expect(s).toContain("Report outcomes faithfully");
+    // End-of-task rule: finished and verified means stop, no adjacent work.
+    expect(s).toContain(
+      "When the requested change is made and verified, stop and report in a few lines",
+    );
+    expect(s).toContain("Do not start adjacent work the user did not ask for");
     // Code-style sub-bullets.
     expect(s).toContain("Default to writing no comments");
     // AgenC-specific slash-commands and bug-report bullets must be gone.
@@ -205,6 +210,9 @@ describe("static section emitters", () => {
     expect(s).toContain(
       "Reserve using the exec_command exclusively for system commands and terminal operations",
     );
+    // No re-reads: Edit/Write already fail on a stale file and confirm success.
+    expect(s).toContain("Do not re-read a file you just read or edited");
+    expect(s).toContain('fail with a "modified since read" error');
     // TodoWrite bullet (taskToolName → TodoWrite): a threshold and a
     // same-response rule instead of an open invitation to call it often.
     expect(s).toContain(

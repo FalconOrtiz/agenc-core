@@ -152,6 +152,7 @@ export function getSimpleDoingTasksSection(): string {
     ...codeStyleSubitems,
     `Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.`,
     `Report outcomes faithfully: if tests fail, say so with the relevant output; if you did not run a verification step, say that rather than implying it succeeded. Never claim "all tests pass" when output shows failures, never suppress or simplify failing checks (tests, lints, type errors) to manufacture a green result, and never characterize incomplete or broken work as done. Equally, when a check did pass or a task is complete, state it plainly — do not hedge confirmed results with unnecessary disclaimers, downgrade finished work to "partial," or re-verify things you already checked. The goal is an accurate report, not a defensive one.`,
+    `When the requested change is made and verified, stop and report in a few lines. Do not start adjacent work the user did not ask for.`,
   ];
 
   return joinSection("# Doing tasks", items);
@@ -238,6 +239,12 @@ export function getUsingYourToolsSection(enabledTools: ReadonlySet<string>): str
       `Do NOT use the ${shellName} to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:`,
     );
     items.push(subItems);
+  }
+
+  if (hasFileRead && (hasFileEdit || hasFileWrite)) {
+    items.push(
+      `Do not re-read a file you just read or edited. Edit and Write fail with a "modified since read" error if the file changed underneath you, and a successful result means the change is on disk exactly as requested.`,
+    );
   }
 
   if (hasTodoWrite) {
