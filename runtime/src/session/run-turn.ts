@@ -516,7 +516,10 @@ async function runAgenCAutoCompact(params: {
       { force: params.force === true },
     );
     if (!result.wasCompacted || !result.compactionResult) {
-      return compactionNotRun(result.consecutiveFailures);
+      // The reason the attempt declined rides along: without it the caller
+      // sees a bare "did not compact" and the turn ends mid-plan with
+      // nothing in the rollout to act on.
+      return compactionNotRun(result.consecutiveFailures, result.skippedReason);
     }
     const compactionResult = await toAgenCCompactionResult(
       result.compactionResult as AgenCCompactionResult,
@@ -1051,10 +1054,12 @@ function extractMessageText(
 
 function compactionNotRun(
   consecutiveFailures?: number,
+  skippedReason?: string,
 ): AgenCAutoCompactResult {
   return {
     wasCompacted: false,
     ...(consecutiveFailures !== undefined ? { consecutiveFailures } : {}),
+    ...(skippedReason !== undefined ? { skippedReason } : {}),
   };
 }
 
