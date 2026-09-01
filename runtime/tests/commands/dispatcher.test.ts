@@ -105,6 +105,14 @@ describe("parseSlashCommand — happy paths", () => {
     });
   });
 
+  it("treats a lowercase MCP marker as ordinary arguments", () => {
+    expect(parseSlashCommand("/mcp:tool (mcp) arg")).toEqual({
+      name: "mcp:tool",
+      argsRaw: "(mcp) arg",
+      isMcp: false,
+    });
+  });
+
   it("parses names with digits and dashes", () => {
     expect(parseSlashCommand("/enter-worktree my-slug-1")).toEqual({
       name: "enter-worktree",
