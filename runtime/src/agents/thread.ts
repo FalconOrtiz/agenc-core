@@ -29,7 +29,10 @@ import {
 } from "./delegate.js";
 import type { RunAgentProgressEvent, RunAgentResult } from "./run-agent.js";
 import type { AgentPath } from "./registry.js";
-import { runAgentProgressEventToAgentSummaryMessage } from "../services/AgentSummary/transcript.js";
+import {
+  AgentSummaryTranscript,
+  type AgentSummaryTranscriptLimitOverrides,
+} from "../services/AgentSummary/transcript-retention.js";
 import { validateAgentInvocationMessageSequence } from "../contracts/agent-invocation-envelope.js";
 
 export type MemoryEntry = AgentMemoryEntry;
@@ -41,6 +44,7 @@ export interface AgentThreadOpts {
   readonly worktree?: WorktreeHandle;
   readonly parentSessionId?: string;
   readonly taskPrompt: string;
+  readonly summaryTranscriptLimits?: AgentSummaryTranscriptLimitOverrides;
 }
 
 /**
@@ -101,7 +105,7 @@ export class AgentThread {
   private readonly summaryCacheSafeParamListeners = new Set<
     (params: CacheSafeParams) => void
   >();
-  private readonly summaryTranscriptMessages: Message[] = [];
+  private readonly summaryTranscript: AgentSummaryTranscript;
   private unsubscribeLiveStatus: (() => void) | null = null;
   private parentPathForChildren: AgentPath;
   private summaryCacheSafeParamsValue: CacheSafeParams | null = null;
@@ -117,6 +121,10 @@ export class AgentThread {
     this.taskPrompt = opts.taskPrompt;
     this.createdAtMs = Date.now();
     this.wiring = wiring;
+    this.summaryTranscript = new AgentSummaryTranscript(
+      opts.initialMessages,
+      opts.summaryTranscriptLimits,
+    );
     this.parentPathForChildren =
       (wiring.parentPath as AgentPath | undefined) ??
       (opts.live.agentPath as AgentPath);
@@ -156,7 +164,11 @@ export class AgentThread {
   }
 
   get summaryMessages(): ReadonlyArray<Message> {
-    return this.summaryTranscriptMessages;
+    return this.summaryTranscript.messages;
+  }
+
+  get summaryRevision(): number {
+    return this.summaryTranscript.revision;
   }
 
   get summaryCacheSafeParams(): CacheSafeParams | undefined {
@@ -184,22 +196,12 @@ export class AgentThread {
 
   /**
    * Record a progress event into this thread's agent-summary
-   * transcript. Initial-replay messages (kind="message" with
-   * isInitialReplay=true) ARE intentionally captured here — the
-   * summary needs the full fork-context history for downstream
-   * consumers to reconstruct what the agent saw at start. Do NOT add
-   * an isInitialReplay filter here; that filter belongs in the
-   * parent-TUI transport (background-agent-runner.ts), not the
-   * summary recorder.
+   * transcript. Immutable fork context is captured once by the transcript
+   * constructor, so replay events are ignored instead of duplicating it on
+   * every reusable-agent turn.
    */
   recordSummaryProgressEvent(event: RunAgentProgressEvent): void {
-    const message = runAgentProgressEventToAgentSummaryMessage(
-      event,
-      this.summaryTranscriptMessages.length,
-    );
-    if (message !== null) {
-      this.summaryTranscriptMessages.push(message);
-    }
+    this.summaryTranscript.record(event);
   }
 
   /** Resume metadata mirror from the current live handle. */
