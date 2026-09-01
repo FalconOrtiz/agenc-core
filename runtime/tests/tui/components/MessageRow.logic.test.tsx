@@ -49,7 +49,7 @@ vi.mock("./Message.js", () => ({
     ) ?? false,
 }));
 
-vi.mock("./Messages.js", () => ({
+vi.mock("./messageRenderPolicy.js", () => ({
   shouldRenderStatically: () => true,
 }));
 
