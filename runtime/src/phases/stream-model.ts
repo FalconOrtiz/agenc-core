@@ -822,6 +822,30 @@ export function emitThinkingChunkEvents(
   }
 }
 
+/**
+ * Emit a synthetic `assistant_thinking_block_stop` for every display still
+ * open, draining the sanitizer carry first (gaphunt3 #43) so a
+ * reasoning_summary stream with no explicit block_stop still surfaces its
+ * final held-back text. Idempotent per block.
+ */
+function closeOpenThinkingDisplays(
+  displays: Map<string, ThinkingDisplayState>,
+  session: Session,
+): void {
+  for (const state of displays.values()) {
+    if (state.closed) continue;
+    state.closed = true;
+    flushSanitizedThinkingDelta(state, session);
+    session.emit({
+      id: session.nextInternalSubId(),
+      msg: {
+        type: "assistant_thinking_block_stop",
+        payload: { index: state.index, kind: state.kind },
+      },
+    });
+  }
+}
+
 export type { ThinkingDisplayState };
 
 /**
@@ -1172,6 +1196,12 @@ export async function streamModel(
         ? await callProvider(startupPrewarmHandle, "prewarm")
         : await callProvider(session.services.provider, "primary");
   } catch (error) {
+    // A failed attempt leaves its thinking blocks open. Close them before the
+    // error propagates so a retried attempt (reconnect ladder or the prewarm
+    // fallback below) streams into fresh blocks instead of appending to, or
+    // duplicating, reasoning the UI already rendered.
+    closeOpenThinkingDisplays(thinkingDisplays, session);
+    thinkingDisplays.clear();
     if (
       startupPrewarmHandle !== undefined &&
       !receivedProviderChunk &&
@@ -1297,21 +1327,7 @@ export async function streamModel(
   // explicit block_stop event). Messages-API providers emit
   // content_block_stop so their blocks are already marked `closed: true`
   // by the chunk handler.
-  for (const state of thinkingDisplays.values()) {
-    if (state.closed) continue;
-    state.closed = true;
-    // gaphunt3 #43: drain the carry tail before the synthetic block_stop so a
-    // reasoning_summary stream (no explicit block_stop) still surfaces its
-    // final held-back text.
-    flushSanitizedThinkingDelta(state, session);
-    session.emit({
-      id: session.nextInternalSubId(),
-      msg: {
-        type: "assistant_thinking_block_stop",
-        payload: { index: state.index, kind: state.kind },
-      },
-    });
-  }
+  closeOpenThinkingDisplays(thinkingDisplays, session);
 
   // Full final assistant_message event for renderers that batch on
   // completion rather than consuming per-chunk deltas.

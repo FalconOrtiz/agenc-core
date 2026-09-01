@@ -566,6 +566,40 @@ describe("streamModel — live assistant text sanitization", () => {
     }
   });
 
+  test("closes thinking blocks left open by a failed attempt before the error propagates", async () => {
+    // A retried attempt (reconnect ladder) re-streams reasoning from scratch;
+    // without the synthetic block_stop the UI keeps the first attempt's block
+    // open and the second attempt's deltas duplicate what was already shown.
+    const ctx = mkCtx("chat");
+    const provider = mkProvider(async (_messages, onChunk) => {
+      onChunk({
+        content: "",
+        done: false,
+        reasoningSummaryDelta: { delta: "thinking about it", summaryIndex: 0 },
+      });
+      throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    });
+    const { session, events } = mkSession(provider);
+
+    await expect(
+      streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ),
+    ).rejects.toBeInstanceOf(StreamModelError);
+
+    const thinkingEvents = events
+      .map((event) => event.msg.type)
+      .filter((type) => type.startsWith("assistant_thinking_"));
+    expect(thinkingEvents).toEqual([
+      "assistant_thinking_block_start",
+      "assistant_thinking_delta",
+      "assistant_thinking_block_stop",
+    ]);
+  });
+
   test("keeps base instructions out of provider transcript messages", async () => {
     const ctx = mkCtx("chat");
     const seenMessages: LLMMessage[][] = [];

@@ -41,6 +41,7 @@
  */
 
 import {
+  classifyLLMFailure,
   LLMAuthenticationError,
   LLMContextWindowExceededError,
   LLMMessageValidationError,
@@ -154,7 +155,12 @@ import {
   isWithheld413Message,
   isWithheldMaxOutputTokens,
 } from "../recovery/api-errors.js";
-import { reconnectWithBackoff } from "../recovery/reconnection.js";
+import {
+  RECONNECT_INITIAL_MS,
+  RECONNECT_MAX_MS,
+  reconnectWithBackoff,
+  serverDirectedRetryAfter,
+} from "../recovery/reconnection.js";
 import {
   MAX_RECOVERY_REENTRIES,
   reserveRecoveryReentry,
@@ -1083,6 +1089,77 @@ function streamRetryErrorStatus(error: unknown): number | undefined {
 function streamRetryErrorMessage(error: unknown): string {
   const cause = streamRetryErrorCause(error);
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+const TRANSIENT_NETWORK_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EAI_AGAIN",
+]);
+
+function streamRetryFailureLabel(cause: unknown): string {
+  if (cause instanceof Error && cause.message.startsWith("stream_idle")) {
+    return "stream idle";
+  }
+  const code = (cause as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string" && TRANSIENT_NETWORK_ERROR_CODES.has(code)) {
+    return `connection lost (${code})`;
+  }
+  switch (classifyLLMFailure(cause)) {
+    case "rate_limited":
+      return "rate limited";
+    case "timeout":
+      return "request timed out";
+    case "provider_error": {
+      const status = streamRetryErrorStatus(cause);
+      return status !== undefined
+        ? `provider error (HTTP ${status})`
+        : "provider error";
+    }
+    default:
+      return "stream interruption";
+  }
+}
+
+function formatRetrySeconds(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 1000))} s`;
+}
+
+/**
+ * User-facing notice for one transient stream retry. Names the failure class
+ * and the delay the reconnect ladder will honour: the server's Retry-After
+ * when it sent one, otherwise the jittered exponential cap for this attempt
+ * (`calculateReconnectDelay` draws the real delay from `[0, cap]`). Before
+ * this every class, including a plain 429, was reported as "stream
+ * interruption" with no delay.
+ *
+ * `attempt` is the number of provider calls made so far; the notice counts
+ * the upcoming call against `maxAttempts`.
+ *
+ * @internal exported for unit tests.
+ */
+export function streamRetryNoticeMessage(
+  error: unknown,
+  attempt: number,
+  maxAttempts: number,
+): string {
+  const label = streamRetryFailureLabel(streamRetryErrorCause(error));
+  const directive = serverDirectedRetryAfter(error);
+  let delay: string;
+  if (directive.classification === "valid") {
+    delay = `retrying in ${formatRetrySeconds(directive.floorMs)}`;
+  } else if (directive.classification === "over_policy") {
+    delay = `server asked to wait ${formatRetrySeconds(directive.floorMs)}, above the retry policy`;
+  } else {
+    const capMs = Math.min(
+      RECONNECT_INITIAL_MS * 2 ** Math.max(0, attempt - 1),
+      RECONNECT_MAX_MS,
+    );
+    delay = `retrying in up to ${formatRetrySeconds(capMs)}`;
+  }
+  return `${label}, ${delay} (${attempt + 1}/${maxAttempts}): ${streamRetryErrorMessage(error)}`;
 }
 
 function streamInterruptedToolResult(
@@ -3486,7 +3563,11 @@ async function runSamplingRequest(
       cleanupInterruptedStreamAttempt(state, session, err);
       emitError(session, session.nextInternalSubId(), {
         cause: "stream_disconnected",
-        message: `Reconnecting after stream interruption (attempt ${attempt}): ${streamRetryErrorMessage(err)}`,
+        message: streamRetryNoticeMessage(
+          err,
+          attempt,
+          MAX_RECOVERY_REENTRIES + 1,
+        ),
         provider: session.services.provider.name,
         status: streamRetryErrorStatus(err),
         streamError: true,
