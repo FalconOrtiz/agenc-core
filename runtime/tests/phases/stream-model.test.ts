@@ -25,6 +25,8 @@ import type {
 } from "../budget/admission-client.js";
 import type { AdmissionLease } from "../budget/admission-types.js";
 import { WorkflowHandoffSpool } from "../agents/workflow-handoff-spool.js";
+import { defaultConfig } from "../config/schema.js";
+import { isRetryableStreamError } from "../session/run-turn.js";
 import { OpenAIProvider } from "../llm/providers/openai/adapter.js";
 
 const streamedDispatchCalls: string[] = [];
@@ -96,6 +98,7 @@ vi.mock("./execute-tools.js", () => ({
 import {
   streamModel,
   type StreamModelRequestContract,
+  StreamModelError,
 } from "./stream-model.js";
 
 const TEST_CONTEXT_WINDOW_TOKENS = 131_072;
@@ -505,6 +508,62 @@ describe("streamModel — live assistant text sanitization", () => {
     );
 
     expect(seenOptions[0]).toMatchObject({ promptCacheKey: "conv-stream" });
+  });
+
+  test("the default ten-minute stream watchdog aborts a stalled provider with a retryable stream_idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      // A provider that opened but never emits a chunk; it honours the abort
+      // signal the way the adapters do.
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      (session.services as { configStore?: unknown }).configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: defaultConfig().stream_watchdog_timeout_ms,
+        }),
+      };
+
+      const outcome = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(600_000 - 1);
+      expect(events.some((event) => event.msg.type === "stream_error")).toBe(
+        false,
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await outcome;
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          msg: {
+            type: "stream_error",
+            payload: expect.objectContaining({ cause: "stream_idle" }),
+          },
+        }),
+      );
+      expect(error).toBeInstanceOf(StreamModelError);
+      expect((error as Error).message).toMatch(/^stream_idle: no data for 600000ms/);
+      expect(isRetryableStreamError(error)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("keeps base instructions out of provider transcript messages", async () => {

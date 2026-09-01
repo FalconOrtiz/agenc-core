@@ -1,7 +1,8 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { LLMMessage, LLMTool } from "../../types.js";
-import { GrokProvider } from "./adapter.js";
+import { LLMTimeoutError } from "../../errors.js";
+import { DEFAULT_REQUEST_OPEN_TIMEOUT_MS, GrokProvider } from "./adapter.js";
 
 function buildXaiResponse(id: string, text: string): Record<string, unknown> {
   return {
@@ -898,6 +899,91 @@ describe("GrokProvider stream timeout semantics", () => {
         finishReason: "stop",
       });
       expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an unconfigured request whose headers never arrive aborts at the request-open default", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+      });
+      // The SDK request honours the abort signal but never produces headers:
+      // the shape of a half-open TCP connection.
+      const create = vi.fn(
+        (_params: Record<string, unknown>, requestOptions: { signal?: AbortSignal }) =>
+          new Promise<never>((_resolve, reject) => {
+            requestOptions.signal?.addEventListener(
+              "abort",
+              () => reject(requestOptions.signal?.reason ?? new Error("aborted")),
+              { once: true },
+            );
+          }),
+      );
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      let settled = false;
+      const outcome = resultPromise.then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+      void outcome.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_OPEN_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(LLMTimeoutError);
+      expect(error).toMatchObject({ timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS });
+      expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an explicit timeout_ms of 0 keeps the request-open phase unbounded", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+        timeoutMs: 0,
+      });
+      const headersGate = Promise.withResolvers<unknown>();
+      const create = vi.fn(() => headersGate.promise);
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      resultPromise.catch(() => {});
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60_000);
+
+      // A bare promise has no withResponse(); the adapter awaits it and uses
+      // the settled value as the stream itself.
+      headersGate.resolve(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse("resp_unbounded_open", "late but fine"),
+          },
+        ]),
+      );
+      await expect(resultPromise).resolves.toMatchObject({
+        content: "late but fine",
+        finishReason: "stop",
+      });
     } finally {
       vi.useRealTimers();
     }

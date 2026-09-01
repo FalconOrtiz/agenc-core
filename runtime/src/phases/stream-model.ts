@@ -10,10 +10,11 @@
  * Mirrors agenc `query.ts:561-1082`.
  *
  * Invariants wired here:
- *   I-11 (stream idle watchdog, operator opt-in) — installStreamWatchdog
- *        wraps the stream; `kick()` fires on every chunk. An explicitly
- *        configured idle expiry aborts the underlying fetch via the scoped
- *        AbortController; unconfigured streams are unbounded.
+ *   I-11 (stream idle watchdog) — installStreamWatchdog wraps the stream;
+ *        `kick()` fires on every chunk. The canonical config carries a
+ *        ten-minute default idle expiry (`stream_watchdog_timeout_ms`,
+ *        `0` disables) that aborts the underlying fetch via the scoped
+ *        AbortController; sessions without a config store stay unbounded.
  *   I-22 (token budget mid-stream) — per-chunk
  *        `budgetTracker.addEmitted(..., "estimate") + sampleMidStream`
  *        keeps a coarse estimate during streaming, but the actual
@@ -898,9 +899,9 @@ export async function streamModel(
 
   const planMode = isPlanMode(ctx);
 
-  // Scoped AbortController: always follows the external signal. An
-  // operator-configured stream watchdog may also abort it, but there is no
-  // implicit idle deadline.
+  // Scoped AbortController: always follows the external signal. The stream
+  // watchdog (canonical config default of ten minutes, `0` disables) may also
+  // abort it.
   const scoped = new AbortController();
   const onExternalAbort = () => {
     if (!scoped.signal.aborted) {
@@ -911,11 +912,12 @@ export async function streamModel(
     signal.addEventListener("abort", onExternalAbort, { once: true });
   }
 
-  // I-11 watchdog wiring is installed before the stream begins, but is a
-  // no-op unless the operator explicitly configures a positive idle timeout.
-  // Provider suggestions may raise an explicit value; they never invent one.
-  // A healthy provider can remain completely silent while reasoning or
-  // generating a large tool payload, so silence alone must not end a turn.
+  // I-11 watchdog wiring is installed before the stream begins and takes its
+  // idle timeout from the canonical config snapshot (default ten minutes,
+  // `0` disables). Provider suggestions may raise a configured value; they
+  // never invent one. xAI streams reasoning deltas continuously, so ten
+  // minutes of total silence is a dead socket rather than thinking; the
+  // watchdog warns at half time and the abort is retryable (`stream_idle`).
   const configuredWatchdogMs = (() => {
     const services = session.services as {
       configStore?: { current?: () => { stream_watchdog_timeout_ms?: number } };

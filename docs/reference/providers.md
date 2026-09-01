@@ -381,8 +381,10 @@ provider-neutral HTTP client:
 
 - request max retries: **4**
 - stream max retries: **5**
-- stream idle timeout: **unset** (0). Silence does not end a turn unless you
-  set `stream_watchdog_timeout_ms` or `AGENC_STREAM_IDLE_TIMEOUT_MS`
+- stream idle timeout: **unset** (0) at the transport level. The session
+  watchdog owns the idle deadline: `stream_watchdog_timeout_ms` defaults to
+  `600000` (warning at half, retryable `stream_idle` abort at the deadline);
+  set it or `AGENC_STREAM_IDLE_TIMEOUT_MS` to `0` to allow unbounded silence
 
 Model-provider streaming uses HTTP/SSE. The daemon, realtime connector, MCP,
 and gateway have separate WebSocket transports; they are not provider

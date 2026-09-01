@@ -265,6 +265,16 @@ interface RequestTimeoutResolution {
   readonly source: RequestTimeoutSource;
 }
 
+/**
+ * Request-open (headers) deadline applied when no operator timeout exists.
+ * A stream that has not even opened after two minutes is a dead or
+ * half-open socket, not a thinking model; the abort maps to a retryable
+ * LLMTimeoutError so the reconnect ladder replaces the connection instead of
+ * the turn hanging until the user cancels. An explicit `timeout_ms`
+ * (including `0` to disable) always wins over this default.
+ */
+export const DEFAULT_REQUEST_OPEN_TIMEOUT_MS = 120_000;
+
 function normalizeConfiguredTimeoutMs(
   timeoutMs: number | undefined,
 ): number | null {
@@ -1337,11 +1347,18 @@ export class GrokProvider implements LLMProvider {
       options?.timeoutMs,
     );
     const streamTimeout = resolvedStreamTimeout;
-    // There is no implicit request-open or inter-chunk deadline. A healthy
-    // xAI stream can emit zero bytes for hours while reasoning or generating
-    // one large function-call argument payload. When an operator explicitly
-    // configures timeout_ms, that value remains an inter-chunk idle timeout
-    // rather than a total-stream deadline.
+    // There is no implicit inter-chunk deadline. A healthy xAI stream can
+    // emit zero bytes for hours while reasoning or generating one large
+    // function-call argument payload, so idle policy belongs to the session
+    // watchdog. When an operator explicitly configures timeout_ms, that value
+    // remains an inter-chunk idle timeout rather than a total-stream deadline.
+    // The request-open phase is different: headers that never arrive are a
+    // dead socket, so it gets a bounded default unless the operator set a
+    // timeout (or disabled timeouts with 0) themselves.
+    const requestOpenTimeout: RequestTimeoutResolution =
+      streamTimeout.source === "provider_default"
+        ? { ...streamTimeout, timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS }
+        : streamTimeout;
 
     let consecutiveFallbackFailures = 0;
     while (true) {
@@ -1367,6 +1384,8 @@ export class GrokProvider implements LLMProvider {
       let streamIterator: AsyncIterator<any> | null = null;
       let responseTracePayload: Record<string, unknown> | undefined;
       let streamResponseMeta: ProviderResponseTraceMeta | undefined;
+      // Deadline in force for the current phase, reported on a mapped timeout.
+      let attemptPhaseTimeoutMs = requestOpenTimeout.timeoutMs;
       try {
       // OAuth pre-flight (same as the chat path): admitted turns stream with
       // singleWireAttempt, so the in-band 401 retry never runs here — the
@@ -1375,7 +1394,7 @@ export class GrokProvider implements LLMProvider {
       // Each wire attempt gets the full resolved timeout for the open phase;
       // a configured-fallback retry must not inherit a nearly-spent budget
       // from the previous attempt.
-      const requestAttemptTimeout = streamTimeout;
+      const requestAttemptTimeout = requestOpenTimeout;
       emitProviderTraceEvent(options, {
         kind: "request",
         transport: "chat_stream",
@@ -1442,6 +1461,7 @@ export class GrokProvider implements LLMProvider {
         }
       }
       const stream = result.data;
+      attemptPhaseTimeoutMs = streamTimeout.timeoutMs;
       streamResponseMeta = buildProviderResponseMeta({
         response: result.response,
         requestId: result.requestId,
@@ -1856,7 +1876,7 @@ export class GrokProvider implements LLMProvider {
       }
       consecutiveFallbackFailures = 0;
       this.notifyCapabilityDrift(err);
-      const mappedError = this.mapError(err, streamTimeout.timeoutMs);
+      const mappedError = this.mapError(err, attemptPhaseTimeoutMs);
       this.logPromptOverflowDiagnostics(mappedError, params);
       if (content.length > 0) {
         const partialToolCalls: LLMToolCall[] = Array.from(toolCallAccum.values());

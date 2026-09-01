@@ -308,11 +308,13 @@ otherwise.
 | `agent.retention.snapshot_max_count` | `10000` |
 | `agent.retention.snapshot_max_bytes` | `67108864` |
 
-`max_turns` and `stream_watchdog_timeout_ms` are unset by default. An unset
-turn cap does not impose a synthetic stop. An unset stream watchdog permits
-provider silence indefinitely; set the timeout to `0` to explicitly disable
-it as well. `[budget]`, `[heartbeat]`, `[browser]`, and
-`[transaction_guard]` apply their documented subsystem defaults when absent.
+`max_turns` is unset by default; an unset turn cap does not impose a
+synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
+minutes of provider silence): the runtime warns at half that time and aborts
+the stream with a retryable `stream_idle` error at the deadline. Set it to
+`0` to permit provider silence indefinitely. `[budget]`, `[heartbeat]`,
+`[browser]`, and `[transaction_guard]` apply their documented subsystem
+defaults when absent.
 
 On a keep-alive (interactive) session, hitting `max_turns`,
 `max_budget_usd`, the no-progress backstop, or `compact_failed` ends
@@ -367,7 +369,7 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `max_budget_usd` | Positive session cost cap. |
 | `autonomous_mode` | Boolean autonomous runtime mode. |
 | `coordinator_mode` | Boolean coordinator-only main-session behavior. |
-| `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; `0` disables. |
+| `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; default `600000`, `0` disables. |
 
 Project-root discovery happens before project and local configuration can be
 loaded. Its marker authority is therefore limited to the built-in/plugin/user

@@ -82,7 +82,7 @@ describe("schema: defaultConfig", () => {
     expect(cfg.max_turns).toBeUndefined();
     expect(cfg.agent_max_threads).toBeUndefined();
     expect(cfg.agent_max_depth).toBe(1);
-    expect(cfg.stream_watchdog_timeout_ms).toBeUndefined();
+    expect(cfg.stream_watchdog_timeout_ms).toBe(600_000);
     expect(cfg.auth?.backend).toBe("remote");
     expect(cfg.auth?.managedKeys?.enabled).toBe(true);
     expect(cfg.plugins?.enabled).toBe(false);
@@ -1720,7 +1720,8 @@ describe("env: resolvers", () => {
     );
     expect(out.max_turns).toBeUndefined();
     expect(out.coordinator_mode).toBeUndefined();
-    expect(out.stream_watchdog_timeout_ms).toBeUndefined();
+    // An invalid override leaves the ten-minute default in place.
+    expect(out.stream_watchdog_timeout_ms).toBe(600_000);
     expect(warnings).toEqual([
       '[agenc:config] invalid AGENC_MAX_TURNS="0"; expected a positive integer',
       '[agenc:config] invalid AGENC_COORDINATOR_MODE="sometimes"; expected boolean-like value',
