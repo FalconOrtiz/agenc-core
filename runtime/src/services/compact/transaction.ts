@@ -1101,9 +1101,17 @@ function assertExactToolPairs(
         pair.result_sha256 !== expected[index]?.result_sha256,
     )
   ) {
+    // Say which pairs were expected and which came back. Call ids and
+    // result digests are identifiers, not content; without them a live
+    // failure could not be told apart from a model that simply skipped one.
+    const render = (pairs: readonly CompactionToolPairV1[]): string =>
+      pairs
+        .map((pair) => `${pair.tool_call_id}:${pair.result_sha256.slice(0, 12)}`)
+        .join(",");
     throw new CompactionTransactionError(
       "provenance_invalid",
-      "compaction summary omitted, forged, duplicated, or reordered an immutable tool call/result pair",
+      "compaction summary omitted, forged, duplicated, or reordered an immutable tool call/result pair: " +
+        `expected ${expected.length} [${render(expected)}] got ${actual.length} [${render(actual)}]`,
     );
   }
 }

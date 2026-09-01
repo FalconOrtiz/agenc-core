@@ -226,6 +226,9 @@ function candidateFits(
       allowed_source_ref_ids: [
         `${ATTEMPT_ID}:span:${String(chunkIndex + 1).padStart(3, "0")}`,
       ],
+      required_tool_pairs: plan.units
+        .slice(start, end)
+        .flatMap((unit) => unit.tool_pairs),
       units: plan.units.slice(start, end).map((unit) => ({
         unit_id: unit.unit_id,
         messages: unit.messages,
