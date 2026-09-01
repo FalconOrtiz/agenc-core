@@ -43,6 +43,7 @@ import {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_READY_TIMEOUT_MS = 45_000;
+const MAX_TIMER_TIMEOUT_MS = 2_147_483_647;
 const READY_POLL_MS = 50;
 /** Mirrors the daemon transports' 16 MiB max-line bound. */
 const MAX_CLIENT_BUFFER_BYTES = 16 * 1024 * 1024;
@@ -373,7 +374,7 @@ export async function connect(
     DEFAULT_READY_TIMEOUT_MS;
   const requestTimeoutMs =
     options.requestTimeoutMs ??
-    positiveIntFromEnv(env.AGENC_DAEMON_REQUEST_TIMEOUT_MS) ??
+    requestTimeoutMsFromEnv(env.AGENC_DAEMON_REQUEST_TIMEOUT_MS) ??
     DEFAULT_REQUEST_TIMEOUT_MS;
 
   let authCookie = await readDaemonCookie(cookiePath);
@@ -503,6 +504,14 @@ function positiveIntFromEnv(raw: string | undefined): number | null {
   if (trimmed === undefined || trimmed.length === 0) return null;
   const value = Number.parseInt(trimmed, 10);
   return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function requestTimeoutMsFromEnv(raw: string | undefined): number | null {
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed.length === 0) return null;
+  if (!/^[1-9]\d*$/u.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isInteger(value) && value <= MAX_TIMER_TIMEOUT_MS ? value : null;
 }
 
 function sleep(ms: number): Promise<void> {

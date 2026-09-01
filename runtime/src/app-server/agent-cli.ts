@@ -22,6 +22,7 @@ import {
   resolveAgenCDaemonCookiePath,
   resolveAgenCDaemonSocketPath,
 } from "./daemon-cli.js";
+import { resolveAgenCDaemonRequestTimeoutMs } from "./daemon-request-policy.js";
 import {
   AGENC_DAEMON_PROTOCOL_VERSION,
   JSON_RPC_VERSION,
@@ -168,7 +169,6 @@ export interface AgenCJsonLineDaemonClientOptions {
 // invocation with AGENC_DAEMON_REQUEST_TIMEOUT_MS for read-only smoke checks
 // where a faster failure is preferable.
 const DEFAULT_DAEMON_REQUEST_TIMEOUT_MS = 30_000;
-const AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV = "AGENC_DAEMON_REQUEST_TIMEOUT_MS";
 const MAX_BUFFERED_SESSION_EVENT_SESSIONS = 50;
 // Must hold the full attach-time replay (user_message + early tool/stream
 // events) until the TUI calls subscribeToSessionEvents. The prior cap of 20
@@ -365,7 +365,11 @@ export function createAgenCJsonLineDaemonRequestClient(
     options.userHome,
   );
   const timeoutMs =
-    options.timeoutMs ?? resolveAgenCDaemonRequestTimeoutMs(options.env);
+    options.timeoutMs ??
+    resolveAgenCDaemonRequestTimeoutMs(
+      options.env ?? process.env,
+      DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+    );
   return {
     request: (method, params = {}, requestOptions = {}) =>
       requestDaemon(
@@ -390,7 +394,11 @@ export async function createConnectedAgenCJsonLineDaemonTuiClient(
     options.userHome,
   );
   const timeoutMs =
-    options.timeoutMs ?? resolveAgenCDaemonRequestTimeoutMs(options.env);
+    options.timeoutMs ??
+    resolveAgenCDaemonRequestTimeoutMs(
+      options.env ?? process.env,
+      DEFAULT_DAEMON_REQUEST_TIMEOUT_MS,
+    );
   const authCookie = await (options.authCookie ?? readDaemonCookie(cookiePath));
   return createReconnectableDaemonTuiClient({
     socketPath,
@@ -1456,26 +1464,6 @@ export function defaultEnsureDaemonReady(
       });
     }
   };
-}
-
-function resolveAgenCDaemonRequestTimeoutMs(
-  env: NodeJS.ProcessEnv = process.env,
-): number {
-  const configured = env[AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV]?.trim();
-  if (configured === undefined || configured.length === 0) {
-    return DEFAULT_DAEMON_REQUEST_TIMEOUT_MS;
-  }
-  const timeoutMs = Number.parseInt(configured, 10);
-  if (
-    !Number.isInteger(timeoutMs) ||
-    String(timeoutMs) !== configured ||
-    timeoutMs <= 0
-  ) {
-    throw new Error(
-      `${AGENC_DAEMON_REQUEST_TIMEOUT_MS_ENV} must be a positive integer`,
-    );
-  }
-  return timeoutMs;
 }
 
 /**
