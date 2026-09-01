@@ -304,6 +304,10 @@ describe("Edit tool", () => {
     expect(result.content).toContain(
       "matches of the string to replace, but replace_all is false",
     );
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+    });
     // File untouched.
     await expect(readFile(file, "utf8")).resolves.toBe("foo\nbar\nfoo\n");
   });
@@ -362,6 +366,43 @@ describe("Edit tool", () => {
     expect(result.content).toBe(
       "No changes to make: old_string and new_string are exactly the same.",
     );
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+    });
+  });
+
+  test("a stale old_string is a confirmed no-effect failure, not an unknown outcome", async () => {
+    // Regression: this was returned as a bare error result. The settlement
+    // supervisor treats an errored side-effecting call without a
+    // disposition as an unknown outcome and blocks every later Write and
+    // shell call for the rest of the session, even though the file was
+    // never touched.
+    const file = join(root, "stale.txt");
+    await writeFile(file, "current text\n", "utf8");
+    const fileStats = await stat(file);
+    recordSessionRead(SESSION_ID, file, {
+      content: "current text\n",
+      timestamp: fileStats.mtimeMs,
+      viewKind: "full",
+    });
+
+    const tool = createFileEditTool({ allowedPaths: [root] });
+    const result = await tool.execute({
+      file_path: file,
+      old_string: "text that is not there",
+      new_string: "replacement",
+      [SESSION_ID_ARG]: SESSION_ID,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("String to replace not found in file.");
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+      evidenceRef: `tool:${FILE_EDIT_TOOL_NAME}:pre-mutation`,
+    });
+    await expect(readFile(file, "utf8")).resolves.toBe("current text\n");
   });
 
   test("empty old_string on a nonexistent file creates the file", async () => {
@@ -1276,6 +1317,11 @@ describe("Edit tool", () => {
     expect(result.content).toContain("Edits 1..1 validated");
     expect(result.content).toContain("file was NOT written");
     expect(result.content).toContain("Re-emit the full edit list");
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "boundary_not_crossed",
+      evidenceRef: `tool:${FILE_MULTI_EDIT_TOOL_NAME}:pre-mutation`,
+    });
     await expect(readFile(file, "utf8")).resolves.toBe(original);
   });
 
