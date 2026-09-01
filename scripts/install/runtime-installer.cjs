@@ -479,9 +479,15 @@ function strictMarkerMatches(path) {
   } catch { return false; }
 }
 const PROVENANCE_RECEIPT_NAME = ".agenc-runtime-provenance-v1.json";
+function compareAsciiKeys(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
 function exactKeys(value, expected) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
-    Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
+    Object.keys(value).sort(compareAsciiKeys).join("\0") ===
+      [...expected].sort(compareAsciiKeys).join("\0");
 }
 function decodeProvenanceJson(encoded, label) {
   if (encoded === "" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {

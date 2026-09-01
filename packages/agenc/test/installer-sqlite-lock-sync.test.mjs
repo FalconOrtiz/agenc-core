@@ -70,6 +70,37 @@ function runSync(targetRoot, args) {
   );
 }
 
+test("canonical installer uses explicit ASCII ordering for exact keys", () => {
+  const canonicalInstaller = readFileSync(
+    join(repoRoot, canonicalInstallerRelativePath),
+    "utf8",
+  );
+  assert.match(
+    canonicalInstaller,
+    /function compareAsciiKeys\(left, right\) \{\n  if \(left < right\) return -1;\n  if \(left > right\) return 1;\n  return 0;\n\}/u,
+  );
+  assert.equal(
+    canonicalInstaller.match(/\.sort\(compareAsciiKeys\)/gu)?.length,
+    2,
+  );
+  assert.equal(canonicalInstaller.match(/\.sort\(\)/gu), null);
+  assert.deepEqual(
+    ["z", "a", "Z", "A", "9", "0"].sort((left, right) => {
+      if (left < right) return -1;
+      if (left > right) return 1;
+      return 0;
+    }),
+    ["0", "9", "A", "Z", "a", "z"],
+  );
+});
+
+test("Sonar excludes only canonical installer duplication", () => {
+  assert.equal(
+    readFileSync(join(repoRoot, ".sonarcloud.properties"), "utf8"),
+    "sonar.cpd.exclusions=scripts/install/runtime-installer.cjs\n",
+  );
+});
+
 test("standalone installers embed the exact canonical runtime program", () => {
   const canonicalInstaller = readFileSync(
     join(repoRoot, canonicalInstallerRelativePath),
