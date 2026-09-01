@@ -130,6 +130,7 @@ function testWithPhaseTimings(
   operation: (timings: PhaseTiming[]) => Promise<void>,
 ): void {
   test(name, async () => {
+    expect.hasAssertions();
     const timings: PhaseTiming[] = [];
     try {
       await operation(timings);
