@@ -1472,13 +1472,16 @@ export class StreamingToolExecutor {
       // no result overwrite, no status flip-back, no sibling cascade.
       const didFinalize = this.finalizeOnce(tool, result);
 
-      // Sibling-abort cascade for shell-style tools.
+      // Sibling-abort cascade for shell-style tools. Only meaningful when
+      // another tool in the batch is still pending; a lone failing shell
+      // call has nothing to cancel and the warning would be noise.
       if (
         didFinalize &&
         result.isError === true &&
         this.isSiblingAbortShellTool(tool.toolCall.name) &&
         !this.discarded &&
-        !this.hasBashErrored
+        !this.hasBashErrored &&
+        this.hasOtherPendingTools(tool)
       ) {
         this.hasBashErrored = true;
         this.onSiblingAbort?.(`bash_error:${tool.toolCall.name}`);
@@ -1500,7 +1503,8 @@ export class StreamingToolExecutor {
         didFinalize &&
         this.isSiblingAbortShellTool(tool.toolCall.name) &&
         !this.discarded &&
-        !this.hasBashErrored
+        !this.hasBashErrored &&
+        this.hasOtherPendingTools(tool)
       ) {
         this.hasBashErrored = true;
         this.onSiblingAbort?.(`bash_threw:${tool.toolCall.name}`);
@@ -1540,6 +1544,21 @@ export class StreamingToolExecutor {
 
   private isSiblingAbortShellTool(toolName: string): boolean {
     return toolName === this.bashToolName || toolName === "exec_command";
+  }
+
+  /**
+   * True when another tracked tool is still `queued` or `executing`. The
+   * shell sibling-abort cascade exists to cancel later calls in the same
+   * batch that may depend on the failed command; with nothing else in
+   * flight there is nothing to cancel, so neither the cascade nor its
+   * `sibling_tool_abort` warning should fire.
+   */
+  private hasOtherPendingTools(tool: TrackedTool): boolean {
+    return this.tools.some(
+      (other) =>
+        other !== tool &&
+        (other.status === "queued" || other.status === "executing"),
+    );
   }
 
   private buildRuntimeCallContext(

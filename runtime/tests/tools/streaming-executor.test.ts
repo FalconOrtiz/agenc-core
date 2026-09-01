@@ -227,6 +227,121 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
     );
   });
 
+  test("a single failing Bash call neither warns nor cascades", async () => {
+    const siblingReasons: string[] = [];
+    const exec = new StreamingToolExecutor({
+      ...mockGuardedDispatch(async () => ({
+        content: "exit 1",
+        isError: true,
+      })),
+      onSiblingAbort: (reason) => {
+        siblingReasons.push(reason);
+      },
+    });
+    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+    exec.addTool(
+      makeBlock("shell1", "exec_command"),
+      makeCall("shell1", "exec_command"),
+    );
+    exec.close();
+
+    const results = [];
+    for await (const r of exec.getRemainingResults()) {
+      results.push({ id: r.toolCall.id, status: r.status });
+    }
+
+    expect(results).toEqual([{ id: "shell1", status: "completed" }]);
+    expect(siblingReasons).toEqual([]);
+  });
+
+  test("[FileRead, bash(error)]: a read that already finished is not cancelled", async () => {
+    const siblingReasons: string[] = [];
+    const exec = new StreamingToolExecutor({
+      ...mockGuardedDispatch(async (call) => {
+        if (call.name === "exec_command") {
+          return { content: "exit 1", isError: true };
+        }
+        return { content: `read ${call.id}` };
+      }),
+      onSiblingAbort: (reason) => {
+        siblingReasons.push(reason);
+      },
+    });
+    exec.setConcurrencyClassFor("FileRead", SHARED_READ);
+    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+    exec.addTool(makeBlock("read1", "FileRead"), makeCall("read1", "FileRead"));
+    exec.addTool(
+      makeBlock("shell1", "exec_command"),
+      makeCall("shell1", "exec_command"),
+    );
+    exec.close();
+
+    const results: Array<{
+      readonly id: string;
+      readonly status: string;
+      readonly content: string;
+    }> = [];
+    for await (const r of exec.getRemainingResults()) {
+      results.push({
+        id: r.toolCall.id,
+        status: r.status,
+        content: String(r.result.content),
+      });
+    }
+
+    expect(results).toEqual([
+      { id: "read1", status: "completed", content: "read read1" },
+      { id: "shell1", status: "completed", content: "exit 1" },
+    ]);
+    expect(siblingReasons).toEqual([]);
+  });
+
+  test("[bash(error), FileRead]: a still-queued read is cancelled and warns once", async () => {
+    const dispatched: string[] = [];
+    const siblingReasons: string[] = [];
+    const exec = new StreamingToolExecutor({
+      ...mockGuardedDispatch(async (call) => {
+        dispatched.push(call.id);
+        if (call.name === "exec_command") {
+          return { content: "exit 1", isError: true };
+        }
+        return { content: `read ${call.id}` };
+      }),
+      onSiblingAbort: (reason) => {
+        siblingReasons.push(reason);
+      },
+    });
+    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+    exec.setConcurrencyClassFor("FileRead", SHARED_READ);
+    exec.addTool(
+      makeBlock("shell1", "exec_command"),
+      makeCall("shell1", "exec_command"),
+    );
+    exec.addTool(makeBlock("read1", "FileRead"), makeCall("read1", "FileRead"));
+    exec.close();
+
+    const results: Array<{
+      readonly id: string;
+      readonly status: string;
+      readonly content: string;
+    }> = [];
+    for await (const r of exec.getRemainingResults()) {
+      results.push({
+        id: r.toolCall.id,
+        status: r.status,
+        content: String(r.result.content),
+      });
+    }
+
+    expect(dispatched).toEqual(["shell1"]);
+    expect(siblingReasons).toEqual(["bash_error:exec_command"]);
+    expect(results[0]).toMatchObject({ id: "shell1", status: "completed" });
+    expect(results[1]).toMatchObject({ id: "read1", status: "synthetic_error" });
+    expect(results[1]?.content).toContain(
+      "sibling tool errored; this tool was cancelled",
+    );
+  });
+
   test.skipIf(process.platform === "win32")(
     "interrupted executor abort terminates an active exec_command PTY child",
     async () => {
