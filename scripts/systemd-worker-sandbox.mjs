@@ -27,6 +27,198 @@ export const LOCAL_GATE_COMBINED_LIMITS = Object.freeze({
   pidsMax: "16384",
 });
 
+function frozenSystemdProperty(property, values = []) {
+  return Object.freeze({
+    property,
+    values: Object.freeze([...values]),
+  });
+}
+
+export const SYSTEMD_HARDENING_BASELINE = Object.freeze({
+  type: frozenSystemdProperty("Type", ["exec"]),
+  exitType: frozenSystemdProperty("ExitType", ["main"]),
+  killMode: frozenSystemdProperty("KillMode", ["control-group"]),
+  sendSigkill: frozenSystemdProperty("SendSIGKILL", ["yes"]),
+  timeoutStopSec: frozenSystemdProperty("TimeoutStopSec", ["30s"]),
+  runtimeMaxSec: frozenSystemdProperty("RuntimeMaxSec"),
+  restart: frozenSystemdProperty("Restart", ["no"]),
+  bindsTo: frozenSystemdProperty("BindsTo"),
+  partOf: frozenSystemdProperty("PartOf"),
+  loadCredentialEncrypted: frozenSystemdProperty("LoadCredentialEncrypted"),
+  noNewPrivileges: frozenSystemdProperty("NoNewPrivileges", ["yes"]),
+  capabilityBoundingSet: frozenSystemdProperty("CapabilityBoundingSet", [""]),
+  ambientCapabilities: frozenSystemdProperty("AmbientCapabilities", [""]),
+  supplementaryGroups: frozenSystemdProperty("SupplementaryGroups"),
+  protectSystem: frozenSystemdProperty("ProtectSystem", ["strict"]),
+  protectHome: frozenSystemdProperty("ProtectHome", ["yes"]),
+  temporaryFileSystems: frozenSystemdProperty("TemporaryFileSystem"),
+  privateTmp: frozenSystemdProperty("PrivateTmp", ["yes"]),
+  privateDevices: frozenSystemdProperty("PrivateDevices", ["yes"]),
+  privateIpc: frozenSystemdProperty("PrivateIPC", ["yes"]),
+  protectHostname: frozenSystemdProperty("ProtectHostname", ["yes"]),
+  keyringMode: frozenSystemdProperty("KeyringMode", ["private"]),
+  protectKernelTunables: frozenSystemdProperty("ProtectKernelTunables", ["yes"]),
+  protectKernelModules: frozenSystemdProperty("ProtectKernelModules", ["yes"]),
+  protectKernelLogs: frozenSystemdProperty("ProtectKernelLogs", ["yes"]),
+  protectControlGroups: frozenSystemdProperty("ProtectControlGroups", ["yes"]),
+  protectClock: frozenSystemdProperty("ProtectClock", ["yes"]),
+  protectProc: frozenSystemdProperty("ProtectProc", ["invisible"]),
+  procSubset: frozenSystemdProperty("ProcSubset", ["pid"]),
+  privateNetwork: frozenSystemdProperty("PrivateNetwork"),
+  ipAddressDeny: frozenSystemdProperty("IPAddressDeny"),
+  restrictAddressFamilies: frozenSystemdProperty(
+    "RestrictAddressFamilies",
+    ["AF_UNIX AF_INET AF_INET6"],
+  ),
+  restrictNamespaces: frozenSystemdProperty("RestrictNamespaces", ["yes"]),
+  restrictSuidSgid: frozenSystemdProperty("RestrictSUIDSGID", ["yes"]),
+  lockPersonality: frozenSystemdProperty("LockPersonality", ["yes"]),
+  restrictRealtime: frozenSystemdProperty("RestrictRealtime", ["yes"]),
+  systemCallArchitectures: frozenSystemdProperty(
+    "SystemCallArchitectures",
+    ["native"],
+  ),
+  tasksMax: frozenSystemdProperty("TasksMax", ["64"]),
+  cpuQuota: frozenSystemdProperty("CPUQuota", ["100%"]),
+  memoryMax: frozenSystemdProperty("MemoryMax", ["512M"]),
+  memorySwapMax: frozenSystemdProperty("MemorySwapMax", ["0"]),
+  oomPolicy: frozenSystemdProperty("OOMPolicy", ["kill"]),
+  limitFsize: frozenSystemdProperty("LimitFSIZE", ["16M"]),
+  limitCore: frozenSystemdProperty("LimitCORE", ["0"]),
+  limitNofile: frozenSystemdProperty("LimitNOFILE", ["1024"]),
+  umask: frozenSystemdProperty("UMask", ["0077"]),
+  runTemporaryFileSystems: frozenSystemdProperty("TemporaryFileSystem"),
+  readOnlyPaths: frozenSystemdProperty("ReadOnlyPaths"),
+  inaccessiblePaths: frozenSystemdProperty("InaccessiblePaths"),
+  inaccessibleDockerPaths: frozenSystemdProperty("InaccessiblePaths", [
+    "-/var/run/docker.sock",
+    "-/run/docker.sock",
+  ]),
+  inaccessibleControlPaths: frozenSystemdProperty("InaccessiblePaths", [
+    "-/run/dbus/system_bus_socket",
+    "-/run/systemd/private",
+  ]),
+  readWritePaths: frozenSystemdProperty("ReadWritePaths"),
+  bindReadOnlyPaths: frozenSystemdProperty("BindReadOnlyPaths"),
+});
+
+const SYSTEMD_HARDENING_BASELINE_SLOT_ORDER = Object.freeze(
+  Object.keys(SYSTEMD_HARDENING_BASELINE),
+);
+const systemdPathSlotIndex =
+  SYSTEMD_HARDENING_BASELINE_SLOT_ORDER.indexOf("readOnlyPaths");
+const SYSTEMD_WORKER_HARDENING_SLOT_ORDER = Object.freeze([
+  ...SYSTEMD_HARDENING_BASELINE_SLOT_ORDER.slice(0, systemdPathSlotIndex),
+  "readOnlyPaths",
+  "inaccessibleControlPaths",
+  "inaccessiblePaths",
+  "readWritePaths",
+  "inaccessibleDockerPaths",
+  "bindReadOnlyPaths",
+]);
+
+export const SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS = Object.freeze({
+  worker: Object.freeze([
+    "runtimeMaxSec",
+    "bindsTo",
+    "partOf",
+    "supplementaryGroups",
+    "protectHome",
+    "temporaryFileSystems",
+    "privateTmp",
+    "privateNetwork",
+    "ipAddressDeny",
+    "restrictAddressFamilies",
+    "tasksMax",
+    "cpuQuota",
+    "memoryMax",
+    "limitFsize",
+    "limitNofile",
+    "runTemporaryFileSystems",
+    "inaccessiblePaths",
+    "inaccessibleDockerPaths",
+    "readWritePaths",
+    "bindReadOnlyPaths",
+  ]),
+  publisher: Object.freeze([
+    "runtimeMaxSec",
+    "bindsTo",
+    "partOf",
+    "loadCredentialEncrypted",
+    "supplementaryGroups",
+  ]),
+  "context-seed-credential": Object.freeze([
+    "runtimeMaxSec",
+    "bindsTo",
+    "partOf",
+    "loadCredentialEncrypted",
+    "supplementaryGroups",
+    "readOnlyPaths",
+    "inaccessiblePaths",
+  ]),
+});
+
+const SYSTEMD_HARDENING_PROFILE_REQUIRED_KEYS = Object.freeze({
+  worker: Object.freeze(
+    SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS.worker.filter(
+      (key) => key !== "inaccessibleDockerPaths",
+    ),
+  ),
+  publisher: SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS.publisher,
+  "context-seed-credential":
+    SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS["context-seed-credential"],
+});
+
+const SYSTEMD_HARDENING_PROFILE_SLOT_ORDER = Object.freeze({
+  worker: SYSTEMD_WORKER_HARDENING_SLOT_ORDER,
+  publisher: SYSTEMD_HARDENING_BASELINE_SLOT_ORDER,
+  "context-seed-credential": SYSTEMD_HARDENING_BASELINE_SLOT_ORDER,
+});
+
+export function buildSystemdHardeningProperties(profileName, overrides) {
+  if (!Object.hasOwn(SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS, profileName)) {
+    throw new TypeError(`unknown systemd hardening profile: ${String(profileName)}`);
+  }
+  if (overrides === null || typeof overrides !== "object" || Array.isArray(overrides)) {
+    throw new TypeError(`systemd ${profileName} hardening overrides must be an object`);
+  }
+  const allowedKeys = SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS[profileName];
+  const requiredKeys = SYSTEMD_HARDENING_PROFILE_REQUIRED_KEYS[profileName];
+  for (const key of Object.keys(overrides)) {
+    if (!allowedKeys.includes(key)) {
+      throw new TypeError(`systemd ${profileName} profile cannot override ${key}`);
+    }
+  }
+  for (const key of requiredKeys) {
+    if (!Object.hasOwn(overrides, key)) {
+      throw new TypeError(`systemd ${profileName} profile requires override ${key}`);
+    }
+  }
+
+  const normalizedOverrides = Object.create(null);
+  for (const [key, values] of Object.entries(overrides)) {
+    if (
+      !Array.isArray(values) ||
+      values.some((value) =>
+        typeof value !== "string" || value.includes("\0") || /[\r\n]/u.test(value))
+    ) {
+      throw new TypeError(`systemd ${profileName} override ${key} is invalid`);
+    }
+    normalizedOverrides[key] = Object.freeze([...values]);
+  }
+  Object.freeze(normalizedOverrides);
+
+  return Object.freeze(
+    SYSTEMD_HARDENING_PROFILE_SLOT_ORDER[profileName].flatMap((key) => {
+      const slot = SYSTEMD_HARDENING_BASELINE[key];
+      const values = Object.hasOwn(normalizedOverrides, key)
+        ? normalizedOverrides[key]
+        : slot.values;
+      return values.map((value) => `${slot.property}=${value}`);
+    }),
+  );
+}
+
 export function assertCgroupResourceProfile(records, expected) {
   if (!records || typeof records !== "object" || Array.isArray(records)) {
     throw new TypeError("cgroup resource records are invalid");
@@ -234,72 +426,35 @@ export function buildSystemdWorkerCommand({
     throw new TypeError("worker CPU quota is invalid");
   }
 
-  const properties = [
-    "Type=exec",
-    "ExitType=main",
-    "KillMode=control-group",
-    "SendSIGKILL=yes",
-    "TimeoutStopSec=30s",
-    `RuntimeMaxSec=${runtimeMaxSeconds}s`,
-    "Restart=no",
-    `BindsTo=${parentUnit}`,
-    `PartOf=${parentUnit}`,
-    "NoNewPrivileges=yes",
-    "CapabilityBoundingSet=",
-    "AmbientCapabilities=",
-    `SupplementaryGroups=${gid}`,
-    "ProtectSystem=strict",
-    `ProtectHome=${dockerAccess ? "tmpfs" : "yes"}`,
-    "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=512M,nr_inodes=65536,mode=1777",
-    "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=128M,nr_inodes=16384,mode=1777",
-    "PrivateDevices=yes",
-    "PrivateIPC=yes",
-    "ProtectHostname=yes",
-    "KeyringMode=private",
-    "ProtectKernelTunables=yes",
-    "ProtectKernelModules=yes",
-    "ProtectKernelLogs=yes",
-    "ProtectControlGroups=yes",
-    "ProtectClock=yes",
-    "ProtectProc=invisible",
-    "ProcSubset=pid",
-    ...(
-      networkAccess
-        ? ["RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"]
-        : [
-            "PrivateNetwork=yes",
-            "IPAddressDeny=any",
-            "RestrictAddressFamilies=AF_UNIX",
-          ]
-    ),
-    "RestrictNamespaces=yes",
-    "RestrictSUIDSGID=yes",
-    "LockPersonality=yes",
-    "RestrictRealtime=yes",
-    "SystemCallArchitectures=native",
-    `TasksMax=${tasksMax}`,
-    `CPUQuota=${cpuQuota}`,
-    `MemoryMax=${memoryMax}`,
-    "MemorySwapMax=0",
-    "OOMPolicy=kill",
-    "LimitFSIZE=128M",
-    "LimitCORE=0",
-    "LimitNOFILE=4096",
-    "UMask=0077",
-    ...(!networkAccess ? ["TemporaryFileSystem=/run:ro"] : []),
-    "InaccessiblePaths=-/run/dbus/system_bus_socket",
-    "InaccessiblePaths=-/run/systemd/private",
-    ...inaccessiblePaths.map((value) => `InaccessiblePaths=${value}`),
-    ...readWritePaths.map((value) => `ReadWritePaths=${value}`),
-    ...(
-      dockerAccess
-        ? [`BindReadOnlyPaths=${dockerSocketPath}`]
-        : [
-            "InaccessiblePaths=-/var/run/docker.sock",
-            "InaccessiblePaths=-/run/docker.sock",
-          ]
-    ),
-  ];
+  const properties = buildSystemdHardeningProperties("worker", {
+    runtimeMaxSec: [`${runtimeMaxSeconds}s`],
+    bindsTo: [parentUnit],
+    partOf: [parentUnit],
+    supplementaryGroups: [String(gid)],
+    protectHome: [dockerAccess ? "tmpfs" : "yes"],
+    temporaryFileSystems: [
+      "/tmp:rw,nosuid,nodev,size=512M,nr_inodes=65536,mode=1777",
+      "/var/tmp:rw,nosuid,nodev,size=128M,nr_inodes=16384,mode=1777",
+    ],
+    privateTmp: [],
+    privateNetwork: networkAccess ? [] : ["yes"],
+    ipAddressDeny: networkAccess ? [] : ["any"],
+    restrictAddressFamilies: [
+      networkAccess ? "AF_UNIX AF_INET AF_INET6" : "AF_UNIX",
+    ],
+    tasksMax: [String(tasksMax)],
+    cpuQuota: [cpuQuota],
+    memoryMax: [memoryMax],
+    limitFsize: ["128M"],
+    limitNofile: ["4096"],
+    runTemporaryFileSystems: networkAccess ? [] : ["/run:ro"],
+    inaccessiblePaths: [...inaccessiblePaths],
+    inaccessibleDockerPaths: dockerAccess
+      ? []
+      : ["-/var/run/docker.sock", "-/run/docker.sock"],
+    readWritePaths: [...readWritePaths],
+    bindReadOnlyPaths: dockerAccess ? [dockerSocketPath] : [],
+  });
 
   return Object.freeze({
     unitName: `${unitName}.service`,
@@ -392,6 +547,15 @@ export function buildSystemdPublisherCommand({
     assertAbsolutePath(value, label);
   }
   const unitName = `agenc-local-gate-publisher-${jobId}`;
+  const properties = buildSystemdHardeningProperties("publisher", {
+    runtimeMaxSec: ["300s"],
+    bindsTo: [parentUnit],
+    partOf: [parentUnit],
+    loadCredentialEncrypted: [
+      `github-app-private-key:${credentialPath}`,
+    ],
+    supplementaryGroups: ["0"],
+  });
   return Object.freeze({
     unitName: `${unitName}.service`,
     command: "/usr/bin/systemd-run",
@@ -409,53 +573,7 @@ export function buildSystemdPublisherCommand({
       "--uid=0",
       "--gid=0",
       `--working-directory=${cwd}`,
-      "--property=Type=exec",
-      "--property=ExitType=main",
-      "--property=KillMode=control-group",
-      "--property=SendSIGKILL=yes",
-      "--property=TimeoutStopSec=30s",
-      "--property=RuntimeMaxSec=300s",
-      "--property=Restart=no",
-      `--property=BindsTo=${parentUnit}`,
-      `--property=PartOf=${parentUnit}`,
-      `--property=LoadCredentialEncrypted=github-app-private-key:${credentialPath}`,
-      "--property=NoNewPrivileges=yes",
-      "--property=CapabilityBoundingSet=",
-      "--property=AmbientCapabilities=",
-      "--property=SupplementaryGroups=0",
-      "--property=ProtectSystem=strict",
-      "--property=ProtectHome=yes",
-      "--property=PrivateTmp=yes",
-      "--property=PrivateDevices=yes",
-      "--property=PrivateIPC=yes",
-      "--property=ProtectHostname=yes",
-      "--property=KeyringMode=private",
-      "--property=ProtectKernelTunables=yes",
-      "--property=ProtectKernelModules=yes",
-      "--property=ProtectKernelLogs=yes",
-      "--property=ProtectControlGroups=yes",
-      "--property=ProtectClock=yes",
-      "--property=ProtectProc=invisible",
-      "--property=ProcSubset=pid",
-      "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-      "--property=RestrictNamespaces=yes",
-      "--property=RestrictSUIDSGID=yes",
-      "--property=LockPersonality=yes",
-      "--property=RestrictRealtime=yes",
-      "--property=SystemCallArchitectures=native",
-      "--property=TasksMax=64",
-      "--property=CPUQuota=100%",
-      "--property=MemoryMax=512M",
-      "--property=MemorySwapMax=0",
-      "--property=OOMPolicy=kill",
-      "--property=LimitFSIZE=16M",
-      "--property=LimitCORE=0",
-      "--property=LimitNOFILE=1024",
-      "--property=UMask=0077",
-      "--property=InaccessiblePaths=-/var/run/docker.sock",
-      "--property=InaccessiblePaths=-/run/docker.sock",
-      "--property=InaccessiblePaths=-/run/dbus/system_bus_socket",
-      "--property=InaccessiblePaths=-/run/systemd/private",
+      ...properties.map((value) => `--property=${value}`),
       "--setenv=HOME=/nonexistent",
       "--setenv=LANG=C.UTF-8",
       "--setenv=LC_ALL=C.UTF-8",
