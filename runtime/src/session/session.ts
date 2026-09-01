@@ -157,6 +157,9 @@ import type { RolloutStore } from "./rollout-store.js";
 import type { LiveThread } from "../thread-store/live-thread.js";
 import type { RolloutTraceRecorder } from "./rollout-trace.js";
 import type { AppendOptions } from "./session-store.js";
+import {
+  serializedUtf8BytesOrZero as measureToolResultBytes,
+} from "./serialization-size.js";
 import { hitM4DurabilityFailpoint } from "../durability/failpoints.js";
 import {
   cloneLlmMessage,
@@ -5937,17 +5940,6 @@ export class Session {
     this.agentStatus.complete();
     this.lifecycleState = "closed";
     if (durableCloseError !== undefined) throw durableCloseError;
-  }
-}
-
-function measureToolResultBytes(payload: unknown): number {
-  if (typeof payload === "string") {
-    return Buffer.byteLength(payload, "utf8");
-  }
-  try {
-    return Buffer.byteLength(JSON.stringify(payload ?? ""), "utf8");
-  } catch {
-    return 0;
   }
 }
 
