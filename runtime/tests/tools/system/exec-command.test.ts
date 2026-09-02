@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -480,9 +480,11 @@ describe("exec_command tool", () => {
 
     test("refuses rm outside the workspace under bypassPermissions", async () => {
       const { tool, execCommand } = deletionTool();
-      // Neither in the workspace nor under the temp directory, whatever the
-      // test harness picked for either.
-      const outside = join(homedir(), "Documents", "outside.txt");
+      // Never touched: the policy refuses before anything spawns. Chosen
+      // outside the workspace, the temp directory and the hermetic home the
+      // test harness points HOME and AGENC_HOME at (the home is a protected
+      // path with its own message).
+      const outside = "/srv/agenc-outside-workspace/outside.txt";
 
       const result = await tool.execute(
         permissionArgs(`rm ${outside}`, { mode: "bypassPermissions" }),
