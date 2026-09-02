@@ -9,9 +9,6 @@ import { SessionStore } from "../../src/session/session-store.js";
  * which appends a live-sequenced event. Emitting that channel mid-flush
  * (before pending is drained) joins the diagnostic to the in-flight batch and
  * can corrupt the canonical journal sequence.
- *
- * Invariant: a diagnostic raised during a flush must not land in the batch
- * that flush is writing.
  */
 describe("session-store flush diagnostic reentry (#2032)", () => {
   let home = "";
@@ -44,16 +41,19 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
     return store;
   }
 
-  function wireLiveSequencedDiagnostic(store: SessionStore, nextSeq: {
-    value: number;
-  }): void {
+  function wireLiveSequencedDiagnostic(
+    store: SessionStore,
+    nextSeq: { value: number },
+    onCause?: (cause: string) => void,
+  ): void {
     store.setDiagnosticListener((d) => {
+      onCause?.(d.cause);
       nextSeq.value += 1;
       store.append({
         id: `live-diag-${nextSeq.value}`,
         seq: nextSeq.value,
         msg: {
-          type: d.level,
+          type: "warning",
           payload: {
             cause: d.cause,
             message: `live-${d.cause}`,
@@ -63,27 +63,20 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
     });
   }
 
-  function rolloutLines(store: SessionStore): Array<Record<string, unknown>> {
+  function liveDiagIds(store: SessionStore): string[] {
     return readFileSync(store.rolloutPath, "utf8")
       .trimEnd()
       .split("\n")
       .filter((line) => line.length > 0)
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-  }
-
-  function sequencedDiagnosticIds(
-    lines: Array<Record<string, unknown>>,
-  ): string[] {
-    return lines
-      .filter((line) => line.type === "event_msg")
-      .map((line) => line.payload as { id?: string; seq?: number })
+      .map((line) => JSON.parse(line) as { type?: string; payload?: { id?: string; seq?: number } })
       .filter(
-        (payload) =>
-          typeof payload.seq === "number" &&
-          typeof payload.id === "string" &&
-          payload.id.startsWith("live-diag-"),
+        (line) =>
+          line.type === "event_msg" &&
+          typeof line.payload?.seq === "number" &&
+          typeof line.payload?.id === "string" &&
+          line.payload.id.startsWith("live-diag-"),
       )
-      .map((payload) => payload.id as string);
+      .map((line) => line.payload!.id as string);
   }
 
   test("I-83 flush diagnostic does not join the in-flight batch", () => {
@@ -107,14 +100,13 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
 
     store.flushBatch(false);
 
-    const afterFlush = rolloutLines(store);
-    expect(sequencedDiagnosticIds(afterFlush)).toEqual([]);
-    expect(JSON.stringify(afterFlush)).toContain("event_log_batch_delayed");
-    expect(JSON.stringify(afterFlush)).toContain("before-suspend");
+    const afterFlush = readFileSync(store.rolloutPath, "utf8");
+    expect(liveDiagIds(store)).toEqual([]);
+    expect(afterFlush).toContain("event_log_batch_delayed");
+    expect(afterFlush).toContain("before-suspend");
 
     store.flushBatch(false);
-    const afterDrain = rolloutLines(store);
-    expect(sequencedDiagnosticIds(afterDrain)).toEqual(["live-diag-2"]);
+    expect(liveDiagIds(store)).toEqual(["live-diag-2"]);
     store.close();
   });
 
@@ -124,22 +116,8 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
     const committedPrefix = readFileSync(store.rolloutPath, "utf8");
     const delivered: string[] = [];
 
-    store.setDiagnosticListener((d) => {
-      delivered.push(d.cause);
-      nextSeq.value += 1;
-      // Non-durable warning mirrors a sequenced live append without nested
-      // durable flush against the still-failing write seam.
-      store.append({
-        id: `live-diag-${nextSeq.value}`,
-        seq: nextSeq.value,
-        msg: {
-          type: "warning",
-          payload: {
-            cause: d.cause,
-            message: `live-${d.cause}`,
-          },
-        },
-      });
+    wireLiveSequencedDiagnostic(store, nextSeq, (cause) => {
+      delivered.push(cause);
     });
     store.setWriteImplForTest(() => {
       throw Object.assign(new Error("injected ENOSPC"), { code: "ENOSPC" });
@@ -160,7 +138,7 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
     ).toBe(false);
 
     expect(readFileSync(store.rolloutPath, "utf8")).toBe(committedPrefix);
-    expect(sequencedDiagnosticIds(rolloutLines(store))).toEqual([]);
+    expect(liveDiagIds(store)).toEqual([]);
     expect(store.isDegraded).toBe(true);
     expect(delivered).toContain("rollout_degraded");
 
@@ -168,8 +146,7 @@ describe("session-store flush diagnostic reentry (#2032)", () => {
       writeSync(fd, buffer, offset, length),
     );
     store.flushBatch(false);
-    const afterDrain = rolloutLines(store);
-    expect(sequencedDiagnosticIds(afterDrain)).toEqual(["live-diag-2"]);
+    expect(liveDiagIds(store)).toEqual(["live-diag-2"]);
     store.close();
   });
 });
