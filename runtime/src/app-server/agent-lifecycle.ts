@@ -734,6 +734,7 @@ export class AgenCDaemonAgentManager {
           cwd,
           resumeSessionId,
           resumeProof,
+          this.#agencHome,
         );
         if (
           retainedAgent?.objective !== undefined &&
@@ -4215,14 +4216,19 @@ function describeError(error: unknown): string {
   return String(error);
 }
 
-function assertCanonicalRuntimeSettingsProjection(
+export function assertCanonicalRuntimeSettingsProjection(
   cwd: string,
   runId: string,
   proof: ResumeSourceProof,
+  agencHome: string,
 ): void {
   let driver: ReturnType<typeof openStateDatabases>;
   try {
-    driver = openStateDatabases({ cwd });
+    // The daemon's home is passed explicitly. Resolving it through the
+    // ambient current-session accessor refused with "Ambiguous runtime
+    // session" as soon as more than one session lived in the daemon, so no
+    // session could be resumed after a restart while others were open.
+    driver = openStateDatabases({ cwd, agencHome });
   } catch (error) {
     // Say why. A live resume failed for an hour with this sentence and
     // nothing else; the cause (a locked database, a schema mismatch, a bad
