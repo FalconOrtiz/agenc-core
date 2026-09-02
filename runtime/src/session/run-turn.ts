@@ -103,7 +103,6 @@ import {
 } from "../phases/continuation-nudge.js";
 import type { PhaseEvent } from "../phases/events.js";
 import { executeTools } from "../phases/execute-tools.js";
-import { drainPendingExtraction } from "../services/extractMemories/extractMemories.js";
 import { runMagicDocsPostSamplingHook } from "../services/MagicDocs/magicDocs.js";
 import { runSessionMemoryPostSamplingHook } from "../memory/session/sessionMemory.js";
 import { createAdmittedMemorySelector } from "../memory/admitted-selector.js";
@@ -5098,7 +5097,6 @@ async function* runTurnKernelInner(
         usage,
         stopReason,
       };
-      await drainPendingExtraction();
       return terminal;
     }
 
@@ -5223,7 +5221,6 @@ async function* runTurnKernelInner(
         usage,
         stopReason: "completed",
       };
-      await drainPendingExtraction();
       return terminal;
     }
     const drainedQueuedCommandEvents = drainQueuedCommandsAfterTools({

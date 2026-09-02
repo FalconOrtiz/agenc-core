@@ -3,6 +3,7 @@ import type { LLMMessage } from "../llm/types.js";
 import type { CompletedToolResultRecord } from "../session/turn-state.js";
 import {
   createMemoryExtractionTriggerState,
+  DEFAULT_MIN_ELIGIBLE_TURNS,
   hasSuccessfulMemoryWrite,
   isMainMemoryExtractionContext,
   isMemoryExtractionDisabledByEnv,
@@ -120,6 +121,20 @@ describe("memory extraction triggers", () => {
         AGENC_DISABLE_EXTRACT_MEMORIES: "1",
       }),
     ).toBe(true);
+  });
+
+  it("defers two eligible turns by default before the third runs", () => {
+    const state = createMemoryExtractionTriggerState();
+    expect(DEFAULT_MIN_ELIGIBLE_TURNS).toBe(3);
+    const outcomes = [0, 1, 2].map(() =>
+      shouldDeferForEligibleTurnCadence({
+        state,
+        minEligibleTurns: undefined,
+        isTrailingRun: false,
+      }),
+    );
+    expect(outcomes).toEqual([true, true, false]);
+    expect(state.turnsSinceLastExtraction).toBe(0);
   });
 
   it("applies eligible-turn cadence but never defers trailing runs", () => {

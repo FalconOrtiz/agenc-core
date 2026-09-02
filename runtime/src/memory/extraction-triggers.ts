@@ -110,8 +110,16 @@ export function isMemoryExtractionDisabledByEnv(
   return isEnvTruthy((env ?? process.env).AGENC_DISABLE_EXTRACT_MEMORIES);
 }
 
+/**
+ * Eligible terminating turns between extraction runs. One full-history child
+ * per turn is the most expensive thing the runtime does in the background, so
+ * by default the child runs on every third eligible turn; a trailing run that
+ * coalesced newer context never waits.
+ */
+export const DEFAULT_MIN_ELIGIBLE_TURNS = 3;
+
 function resolveMinEligibleTurns(value: number | undefined): number {
-  return Math.max(1, Math.trunc(value ?? 1));
+  return Math.max(1, Math.trunc(value ?? DEFAULT_MIN_ELIGIBLE_TURNS));
 }
 
 export function shouldDeferForEligibleTurnCadence(params: {

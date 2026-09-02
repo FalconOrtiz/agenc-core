@@ -140,6 +140,14 @@ dirs; extract/background helpers may run on interactive sessions (also gated by
 build features such as `EXTRACT_MEMORIES`). Session memory lives in conversation
 state, not a separate durable path contract.
 
+The extraction child (`services/extractMemories`) forks the full history on
+every third eligible terminating turn by default (`DEFAULT_MIN_ELIGIBLE_TURNS`),
+sees only the file read/write tools (`MEMORY_EXTRACTION_TOOL_ALLOWLIST`) inside
+the memory directory, and never blocks a turn: in-flight runs are drained at
+session shutdown. Every gate that stops a run and every failed run emits a
+`warning` event with cause `memory_extraction_skipped` or
+`memory_extraction_failed` (session log only; not shown in the transcript).
+
 Query-time recall of those files uses the full-corpus index below when a
 resolved `AGENC_HOME` is available. Session-start recall never uses the index.
 

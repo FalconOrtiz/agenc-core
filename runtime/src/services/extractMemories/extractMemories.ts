@@ -8,7 +8,11 @@
  *     the visible history, the next extraction falls back to the retained
  *     visible messages instead of permanently disabling extraction.
  *   - Child tool access is enforced by a `ChildToolPolicy` layered inside
- *     `run-agent.ts`, not by the older `canUseTool` hook.
+ *     `run-agent.ts`, not by the older `canUseTool` hook, and the child only
+ *     ever sees the read/write file tools through `toolAllowlist`.
+ *   - Every gate that stops a run and every failed run emits a `warning`
+ *     event (`memory_extraction_skipped` / `memory_extraction_failed`) so the
+ *     reason is visible in the session log instead of being swallowed.
  *
  * Scope boundaries:
  *   - remote feature-service lookups, team-memory routing, and shell access.
@@ -33,6 +37,7 @@ import { withSignedAllowedRoots } from "../../agents/_deps/filesystem-args.js";
 import type { AgentPath } from "../../agents/registry.js";
 import {
   createMemoryExtractionTriggerState,
+  DEFAULT_MIN_ELIGIBLE_TURNS,
   hasSuccessfulMemoryWrite,
   isMainMemoryExtractionContext,
   isMemoryExtractionDisabledByEnv,
@@ -54,8 +59,49 @@ import { buildExtractAutoOnlyPrompt } from "./prompts.js";
 
 const READ_TOOL_NAMES = new Set(["FileRead", "Grep", "Glob"]);
 const WRITE_TOOL_NAMES = new Set(["Edit", "MultiEdit", "Write"]);
+/** The only tools the extraction child is offered, before the path policy. */
+export const MEMORY_EXTRACTION_TOOL_ALLOWLIST: readonly string[] = [
+  ...READ_TOOL_NAMES,
+  ...WRITE_TOOL_NAMES,
+];
 const DEFAULT_MAX_TURNS = 5;
 const MAX_EXTRACTION_LANES = 256;
+
+type ExtractionWarningCause =
+  | "memory_extraction_skipped"
+  | "memory_extraction_failed";
+
+/**
+ * Record why an extraction run stopped. Warning causes outside the TUI's
+ * user-visible allow-list stay in the session log and observability sinks,
+ * so this is diagnostic, not chat noise. Test doubles may not carry an
+ * event bus, in which case the note is dropped.
+ */
+function emitExtractionWarning(
+  session: Session,
+  cause: ExtractionWarningCause,
+  message: string,
+): void {
+  const bus = session as Partial<Pick<Session, "emit" | "nextInternalSubId">>;
+  if (
+    typeof bus.emit !== "function" ||
+    typeof bus.nextInternalSubId !== "function"
+  ) {
+    return;
+  }
+  try {
+    bus.emit({
+      id: bus.nextInternalSubId(),
+      msg: { type: "warning", payload: { cause, message } },
+    });
+  } catch {
+    // Diagnostics must never break the turn.
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export interface ExtractMemoriesContext {
   readonly messages: readonly LLMMessage[];
@@ -346,6 +392,9 @@ async function defaultRunChild(
     runInBackground: false,
     forceSynchronous: true,
     silent: true,
+    // The catalog is filtered before the path policy runs, so the child
+    // never sees shell, network, or agent tools it would only be denied.
+    toolAllowlist: MEMORY_EXTRACTION_TOOL_ALLOWLIST,
     childToolPolicy: request.toolPolicy,
     maxTurns,
     externalSignal: request.signal,
@@ -423,12 +472,20 @@ export function initExtractMemories(
     lane: ExtractionLane,
     isTrailingRun = false,
   ): Promise<void> {
+    const session = queued.context.session;
     const range: VisibleRange = memoryExtractionVisibleRange(
       queued.context.messages,
       lane.trigger.processedVisibleCount,
     );
     const newMessageCount = range.unprocessedMessages.length;
-    if (newMessageCount === 0) return;
+    if (newMessageCount === 0) {
+      emitExtractionWarning(
+        session,
+        "memory_extraction_skipped",
+        "no new model-visible messages since the last extraction",
+      );
+      return;
+    }
 
     if (
       hasSuccessfulMemoryWrite({
@@ -440,6 +497,11 @@ export function initExtractMemories(
       })
     ) {
       lane.trigger.processedVisibleCount = range.currentVisibleCount;
+      emitExtractionWarning(
+        session,
+        "memory_extraction_skipped",
+        "main agent already wrote memory in this range",
+      );
       return;
     }
 
@@ -450,6 +512,11 @@ export function initExtractMemories(
         isTrailingRun,
       })
     ) {
+      emitExtractionWarning(
+        session,
+        "memory_extraction_skipped",
+        `deferred by eligible-turn cadence (${lane.trigger.turnsSinceLastExtraction}/${Math.max(1, Math.trunc(deps.minEligibleTurns ?? DEFAULT_MIN_ELIGIBLE_TURNS))} eligible turns)`,
+      );
       return;
     }
 
@@ -482,6 +549,17 @@ export function initExtractMemories(
       tracker.policyDenied ||
       tracker.failedWrite
     ) {
+      const detail =
+        childResult.outcome !== "completed"
+          ? `child outcome ${childResult.outcome}${childResult.error !== undefined ? `: ${errorText(childResult.error)}` : ""}`
+          : tracker.policyDenied
+            ? "child tool policy denied a call"
+            : "a memory write failed";
+      emitExtractionWarning(
+        session,
+        "memory_extraction_failed",
+        `${detail}; ${newMessageCount} message(s) stay queued for the next run`,
+      );
       return;
     }
 
@@ -498,8 +576,17 @@ export function initExtractMemories(
     context: ExtractMemoriesContext,
     appendSavedMemories?: AppendSavedMemoriesFn,
   ): Promise<void> {
+    // Subagent turns are structurally out of scope; no note, it would fire
+    // on every child turn.
     if (!isMainMemoryExtractionContext(context.ctx)) return;
-    if (isMemoryExtractionDisabledByEnv(deps.env)) return;
+    if (isMemoryExtractionDisabledByEnv(deps.env)) {
+      emitExtractionWarning(
+        context.session,
+        "memory_extraction_skipped",
+        "AGENC_DISABLE_EXTRACT_MEMORIES is set",
+      );
+      return;
+    }
 
     const queued: QueuedExtraction = {
       context: snapshotContext(context),
@@ -511,7 +598,14 @@ export function initExtractMemories(
       configStore: queued.context.session.services?.configStore,
       runtimeOptions: queued.context.session.services.runtimeOptions,
     });
-    if (!pathResult.enabled || !pathResult.path) return;
+    if (!pathResult.enabled || !pathResult.path) {
+      emitExtractionWarning(
+        queued.context.session,
+        "memory_extraction_skipped",
+        `memory directory unavailable (${pathResult.reason ?? "disabled"})`,
+      );
+      return;
+    }
 
     const memoryDir = pathResult.path;
     const lane = extractionLane(queued.context.session, memoryDir);
@@ -525,16 +619,26 @@ export function initExtractMemories(
     try {
       try {
         await runExtraction(queued, memoryDir, lane);
-      } catch {
-        // Best effort: extraction failures must never break the user turn.
+      } catch (error) {
+        // Best effort: extraction failures must never break the user turn,
+        // but they must not vanish either.
+        emitExtractionWarning(
+          queued.context.session,
+          "memory_extraction_failed",
+          errorText(error),
+        );
       }
       while (lane.pendingContext) {
         const trailing = lane.pendingContext;
         lane.pendingContext = undefined;
         try {
           await runExtraction(trailing, memoryDir, lane, true);
-        } catch {
-          // Best effort.
+        } catch (error) {
+          emitExtractionWarning(
+            trailing.context.session,
+            "memory_extraction_failed",
+            `trailing run: ${errorText(error)}`,
+          );
         }
       }
     } finally {

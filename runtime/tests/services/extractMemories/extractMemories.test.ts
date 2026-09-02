@@ -52,6 +52,22 @@ function extractionContext(opts: {
   };
 }
 
+function sessionWithBus(
+  warnings: Array<{ cause: string; message: string }>,
+): Session {
+  let subId = 0;
+  return {
+    conversationId: `bus-${Math.random().toString(36).slice(2)}`,
+    services: { runtimeOptions: defaultRuntimeOptions },
+    nextInternalSubId: () => String(subId++),
+    emit: (event: { msg: { type: string; payload: unknown } }) => {
+      if (event.msg.type === "warning") {
+        warnings.push(event.msg.payload as { cause: string; message: string });
+      }
+    },
+  } as unknown as Session;
+}
+
 async function eventually(assertion: () => void): Promise<void> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -270,6 +286,7 @@ describe("extract memories service", () => {
     );
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -324,6 +341,7 @@ describe("extract memories service", () => {
     const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -347,6 +365,7 @@ describe("extract memories service", () => {
     const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -390,6 +409,7 @@ describe("extract memories service", () => {
     const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -447,6 +467,7 @@ describe("extract memories service", () => {
       .mockResolvedValue({ outcome: "completed" });
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -484,6 +505,7 @@ describe("extract memories service", () => {
       .mockResolvedValue({ outcome: "completed" as const });
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -512,6 +534,7 @@ describe("extract memories service", () => {
       .mockResolvedValue({ outcome: "completed" as const });
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -568,6 +591,7 @@ describe("extract memories service", () => {
     });
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -607,6 +631,7 @@ describe("extract memories service", () => {
     }));
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       delegateFn: delegateFn as never,
       ensureAgentControl: ensureAgentControl as never,
@@ -641,12 +666,114 @@ describe("extract memories service", () => {
       runInBackground: false,
       silent: true,
     });
-    expect(delegateCall.toolAllowlist).toBeUndefined();
+    // The catalog is filtered to the file tools before the path policy runs.
+    expect(delegateCall.toolAllowlist).toEqual([
+      "FileRead",
+      "Grep",
+      "Glob",
+      "Edit",
+      "MultiEdit",
+      "Write",
+    ]);
     expect(
       delegateCall.childToolPolicy({ name: "system.bash" }, {}),
     ).toMatchObject({
       behavior: "deny",
       metadata: { reason: "tool_not_allowed" },
+    });
+  });
+
+  it("runs the child on every third eligible turn by default and reports each deferral", async () => {
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    initExtractMemories({
+      env: {},
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+    });
+
+    const messages: LLMMessage[] = [
+      { role: "user", content: "remember the cadence" },
+      { role: "assistant", content: "ok" },
+    ];
+    for (let turn = 0; turn < 3; turn += 1) {
+      await executeExtractMemories(
+        extractionContext({ cwd: root, messages, session }),
+      );
+    }
+
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(warnings.map((warning) => warning.cause)).toEqual([
+      "memory_extraction_skipped",
+      "memory_extraction_skipped",
+    ]);
+    expect(warnings[0]?.message).toContain("deferred by eligible-turn cadence (1/3");
+    expect(warnings[1]?.message).toContain("deferred by eligible-turn cadence (2/3");
+  });
+
+  it("reports why extraction was skipped or failed instead of swallowing it", async () => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    const messages: LLMMessage[] = [
+      { role: "user", content: "remember this" },
+      { role: "assistant", content: "ok" },
+    ];
+
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({
+        enabled: false,
+        reason: "disabled_by_settings",
+      }),
+      runChild: vi.fn(async () => ({ outcome: "completed" as const })),
+    });
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    expect(warnings.at(-1)).toEqual({
+      cause: "memory_extraction_skipped",
+      message: "memory directory unavailable (disabled_by_settings)",
+    });
+
+    initExtractMemories({
+      env: { AGENC_DISABLE_EXTRACT_MEMORIES: "1" },
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild: vi.fn(async () => ({ outcome: "completed" as const })),
+    });
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    expect(warnings.at(-1)).toEqual({
+      cause: "memory_extraction_skipped",
+      message: "AGENC_DISABLE_EXTRACT_MEMORIES is set",
+    });
+
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild: vi.fn(async () => ({
+        outcome: "rejected" as const,
+        error: "no capacity",
+      })),
+    });
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    expect(warnings.at(-1)).toEqual({
+      cause: "memory_extraction_failed",
+      message: "child outcome rejected: no capacity; 2 message(s) stay queued for the next run",
+    });
+
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild: vi.fn(async () => {
+        throw new Error("delegate exploded");
+      }),
+    });
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    expect(warnings.at(-1)).toEqual({
+      cause: "memory_extraction_failed",
+      message: "delegate exploded",
     });
   });
 
@@ -660,6 +787,7 @@ describe("extract memories service", () => {
     );
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
       runChild,
     });
@@ -700,6 +828,7 @@ describe("extract memories service", () => {
     const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
     initExtractMemories({
       env: {},
+      minEligibleTurns: 1,
       resolveMemoryDirectory: async ({ cwd }) => ({
         enabled: true,
         path: cwd.endsWith("project-b") ? memoryDirB : memoryDir,
