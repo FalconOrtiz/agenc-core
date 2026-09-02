@@ -208,6 +208,16 @@ function getAutoMemBase(): string {
 }
 
 /**
+ * The project root every memory key is built from: the canonical git root
+ * when there is one, otherwise the stable project root. Exported so a caller
+ * that already knows which memory base it wants can build the same project
+ * directory as `getProjectMemoryPath` without re-deriving the root.
+ */
+export function getMemoryProjectRoot(): string {
+  return getAutoMemBase()
+}
+
+/**
  * Build the project memory directory for one memory base and one project
  * root: `<baseDir>/projects/<sanitized-project-root>/memory/`. Shared by the
  * prompt/permission resolver below and by the extraction child's

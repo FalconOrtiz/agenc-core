@@ -1,10 +1,14 @@
 import { Buffer } from "node:buffer";
-import { isAbsolute, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize, sep } from "node:path";
 
 import {
   findRelevantMemories,
   formatRelevantMemoryHeader,
+  buildProjectMemoryDirectory,
   getGlobalMemoryPath,
+  getMemoryBaseDir,
+  getMemoryProjectRoot,
+  MEMORY_DIRNAME,
   getProjectMemoryPath,
   isAutoMemoryEnabled,
   readMemoryContent,
@@ -132,10 +136,30 @@ function selectRecallMode(
  */
 function durableMemorySearchDirs(agencHome: string | undefined): string[] {
   if (agencHome === undefined || agencHome.trim().length === 0) return [];
+  // The shared resolvers read the ambient memory base. When the request names
+  // that same base they are the right answer, because they also carry the
+  // trusted overrides (a Cowork path override, an `autoMemoryDirectory`
+  // setting, a remote root) that a plain join would drop.
+  //
+  // When the request names a different home, the ambient answer is the wrong
+  // one and searching it anyway would read another home's memories into this
+  // request. Build both roots from the home the request gave, through the
+  // same formula the writers use, so recall still lands where the extraction
+  // child and the memory prompt point.
+  if (normalizeDirectory(agencHome) === normalizeDirectory(getMemoryBaseDir())) {
+    return Array.from(
+      new Set([
+        normalizeDirectory(getGlobalMemoryPath()),
+        normalizeDirectory(getProjectMemoryPath()),
+      ]),
+    );
+  }
   return Array.from(
     new Set([
-      normalizeDirectory(getGlobalMemoryPath()),
-      normalizeDirectory(getProjectMemoryPath()),
+      normalizeDirectory(join(agencHome, MEMORY_DIRNAME)),
+      normalizeDirectory(
+        buildProjectMemoryDirectory(agencHome, getMemoryProjectRoot()),
+      ),
     ]),
   );
 }
