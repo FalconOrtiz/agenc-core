@@ -5166,7 +5166,7 @@ snapshot_max_bytes = 64
       expect(restoredOptions[0]?.deferSessionStartHooks).toBe(true);
       expect(restoredOptions[0]?.deferAgentStartupSideEffects).toBeUndefined();
 
-      await stopRunningDaemons([{ signalProcess: firstSignal, running: first }]);
+      await stopDaemon(firstSignal, first);
       firstStopped = true;
       await expect(first).resolves.toBe(0);
       const suspended = readCanonicalRunLifecycle(rolloutPath);
@@ -5867,7 +5867,7 @@ snapshot_max_bytes = 64
       1,
     );
 
-    await stopRunningDaemons([{ signalProcess: firstSignal, running: first }]);
+    await stopDaemon(firstSignal, first);
     await expect(first).resolves.toBe(0);
     // The harness can only stop gracefully; reset the row to simulate a crash
     // after proving agent.create produced the running row and session snapshot.
