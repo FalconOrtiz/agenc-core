@@ -93,6 +93,54 @@ function admissionRequest(
   };
 }
 
+/**
+ * Seed the durable runs, open epoch 1 for run-complete and write one canonical
+ * rollout under sessions/run-complete that carries its run_terminal event.
+ * Returns the rollout path.
+ */
+function seedCanonicalTerminalRollout(fileName: string, eventId: string): string {
+  seedDurableRuns();
+  new StateRunDurabilityRepository(driver).ensureInitialEpoch({
+    runId: "run-complete",
+    openedAt: NOW,
+  });
+  const sessionDir = join(paths.projectDir, "sessions", "run-complete");
+  mkdirSync(sessionDir, { recursive: true });
+  const rolloutPath = join(sessionDir, fileName);
+  writeFileSync(
+    rolloutPath,
+    serializeRolloutItem({
+      type: "event_msg",
+      payload: {
+        eventId,
+        id: eventId,
+        seq: 1,
+        msg: {
+          type: "run_terminal",
+          payload: {
+            runId: "run-complete",
+            epoch: 1,
+            status: "completed",
+            exitCode: 0,
+            stopReason: "turn_completed",
+            finalMessage: "Recovered from the journal",
+            usage: {
+              inputTokens: 5,
+              outputTokens: 3,
+              totalTokens: 8,
+              costUsd: 0.001,
+            },
+            lastSequenceBeforeTerminal: null,
+            finishedAt: "2026-07-18T12:05:00.000Z",
+          },
+        },
+      },
+    }),
+    "utf8",
+  );
+  return rolloutPath;
+}
+
 function seedDurableRuns(): readonly number[] {
   const admissions = new ExecutionAdmissionRepository(driver, {
     now: () => new Date(NOW),
@@ -600,45 +648,7 @@ describe("durable run inspection", () => {
   });
 
   it("rebuilds a missing terminal projection from the canonical JSONL event", () => {
-    seedDurableRuns();
-    new StateRunDurabilityRepository(driver).ensureInitialEpoch({
-      runId: "run-complete",
-      openedAt: NOW,
-    });
-    const sessionDir = join(paths.projectDir, "sessions", "run-complete");
-    mkdirSync(sessionDir, { recursive: true });
-    const rolloutPath = join(sessionDir, "rollout-terminal.jsonl");
-    writeFileSync(
-      rolloutPath,
-      serializeRolloutItem({
-        type: "event_msg",
-        payload: {
-          eventId: "terminal-from-jsonl",
-          id: "terminal-from-jsonl",
-          seq: 1,
-          msg: {
-            type: "run_terminal",
-            payload: {
-              runId: "run-complete",
-              epoch: 1,
-              status: "completed",
-              exitCode: 0,
-              stopReason: "turn_completed",
-              finalMessage: "Recovered from the journal",
-              usage: {
-                inputTokens: 5,
-                outputTokens: 3,
-                totalTokens: 8,
-                costUsd: 0.001,
-              },
-              lastSequenceBeforeTerminal: null,
-              finishedAt: "2026-07-18T12:05:00.000Z",
-            },
-          },
-        },
-      }),
-      "utf8",
-    );
+    seedCanonicalTerminalRollout("rollout-terminal.jsonl", "terminal-from-jsonl");
 
     expect(service.result({ runId: "run-complete" })).toMatchObject({
       status: "completed",
@@ -660,44 +670,9 @@ describe("durable run inspection", () => {
   // Review P1-7: an ordinary desktop refresh of a running session turned it
   // into an "operator action required" run at the next daemon restart.
   it("serves a live run's current projection without recording a recovery deferral", () => {
-    seedDurableRuns();
-    new StateRunDurabilityRepository(driver).ensureInitialEpoch({
-      runId: "run-complete",
-      openedAt: NOW,
-    });
-    const sessionDir = join(paths.projectDir, "sessions", "run-complete");
-    mkdirSync(sessionDir, { recursive: true });
-    const rolloutPath = join(sessionDir, "rollout-live.jsonl");
-    writeFileSync(
-      rolloutPath,
-      serializeRolloutItem({
-        type: "event_msg",
-        payload: {
-          eventId: "terminal-from-live-jsonl",
-          id: "terminal-from-live-jsonl",
-          seq: 1,
-          msg: {
-            type: "run_terminal",
-            payload: {
-              runId: "run-complete",
-              epoch: 1,
-              status: "completed",
-              exitCode: 0,
-              stopReason: "turn_completed",
-              finalMessage: "Recovered from the journal",
-              usage: {
-                inputTokens: 5,
-                outputTokens: 3,
-                totalTokens: 8,
-                costUsd: 0.001,
-              },
-              lastSequenceBeforeTerminal: null,
-              finishedAt: "2026-07-18T12:05:00.000Z",
-            },
-          },
-        },
-      }),
-      "utf8",
+    const rolloutPath = seedCanonicalTerminalRollout(
+      "rollout-live.jsonl",
+      "terminal-from-live-jsonl",
     );
     // The live writer's lease, held by this process.
     const lockPath = `${rolloutPath}.lock`;

@@ -53,6 +53,44 @@ function responseItem(id: string, text: string): RolloutItem {
   };
 }
 
+/**
+ * Two FileThreadStore instances over one project (the daemon's and the one
+ * bootstrap-services gives each session) with one live thread owned by the
+ * first: the shape behind the archive-while-live findings.
+ */
+function openForeignArchiveFixture(sessionId: string): {
+  readonly rollout: RolloutStore;
+  readonly originalPath: string;
+  readonly owner: FileThreadStore;
+  readonly daemon: FileThreadStore;
+  readonly close: () => void;
+} {
+  const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
+  const rollout = openStore({ cwd, sessionId });
+  const owner = new FileThreadStore({ cwd });
+  const daemon = new FileThreadStore({ cwd });
+  owner.createThread({ threadId: sessionId, rolloutStore: rollout });
+  owner.appendItems({ threadId: sessionId, items: [responseItem("a", "alpha")] });
+  return {
+    rollout,
+    originalPath: rollout.rolloutPath,
+    owner,
+    daemon,
+    close: () => {
+      daemon.close();
+      owner.close();
+      rollout.close();
+      rmSync(cwd, { recursive: true, force: true });
+    },
+  };
+}
+
+function rolloutLineCount(rolloutPath: string): number {
+  return readFileSync(rolloutPath, "utf8")
+    .split(/\r?\n/)
+    .filter((line) => line.length > 0).length;
+}
+
 beforeEach(() => {
   agencHome = mkdtempSync(join(tmpdir(), "agenc-thread-store-home-"));
   originalAgencHome = process.env.AGENC_HOME ?? "";
@@ -422,20 +460,10 @@ describe("FileThreadStore.archiveThread / listThreads", () => {
   // suspended run across two files and left a foreign session_meta line the
   // writer's offset bookkeeping never saw.
   it("does not rename or append to a rollout another store instance is still writing", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
-    const rollout = openStore({ cwd, sessionId: "foreign-archive" });
-    const originalPath = rollout.rolloutPath;
-    const owner = new FileThreadStore({ cwd });
-    const daemon = new FileThreadStore({ cwd });
+    const fixture = openForeignArchiveFixture("foreign-archive");
+    const { originalPath, owner, daemon } = fixture;
     try {
-      owner.createThread({ threadId: "foreign-archive", rolloutStore: rollout });
-      owner.appendItems({
-        threadId: "foreign-archive",
-        items: [responseItem("a", "alpha")],
-      });
-      const linesBefore = readFileSync(originalPath, "utf8")
-        .split(/\r?\n/)
-        .filter((line) => line.length > 0).length;
+      const linesBefore = rolloutLineCount(originalPath);
 
       // The second instance sees no live recorder for the thread, but the
       // owner's writer still holds `<rollout>.lock`.
@@ -445,10 +473,7 @@ describe("FileThreadStore.archiveThread / listThreads", () => {
       expect(
         existsSync(join(owner.getProjectDir(), "archived_sessions", "foreign-archive")),
       ).toBe(false);
-      const linesAfter = readFileSync(originalPath, "utf8")
-        .split(/\r?\n/)
-        .filter((line) => line.length > 0).length;
-      expect(linesAfter).toBe(linesBefore);
+      expect(rolloutLineCount(originalPath)).toBe(linesBefore);
       const archived = daemon.readThread({
         threadId: "foreign-archive",
         includeArchived: true,
@@ -480,25 +505,14 @@ describe("FileThreadStore.archiveThread / listThreads", () => {
         ),
       ).toBe(true);
     } finally {
-      daemon.close();
-      owner.close();
-      rollout.close();
-      rmSync(cwd, { recursive: true, force: true });
+      fixture.close();
     }
   });
 
   it("archives a rollout whose writer has gone away, appending the metadata line", () => {
-    const cwd = mkdtempSync(join(tmpdir(), "agenc-ts-cwd-"));
-    const rollout = openStore({ cwd, sessionId: "released-archive" });
-    const originalPath = rollout.rolloutPath;
-    const owner = new FileThreadStore({ cwd });
-    const daemon = new FileThreadStore({ cwd });
+    const fixture = openForeignArchiveFixture("released-archive");
+    const { originalPath, owner, daemon, rollout } = fixture;
     try {
-      owner.createThread({ threadId: "released-archive", rolloutStore: rollout });
-      owner.appendItems({
-        threadId: "released-archive",
-        items: [responseItem("a", "alpha")],
-      });
       owner.discardThread("released-archive");
       rollout.close(); // releases the lease
 
@@ -522,10 +536,7 @@ describe("FileThreadStore.archiveThread / listThreads", () => {
       // The lease taken for the append and the move was released again.
       expect(existsSync(`${originalPath}.lock`)).toBe(false);
     } finally {
-      daemon.close();
-      owner.close();
-      rollout.close();
-      rmSync(cwd, { recursive: true, force: true });
+      fixture.close();
     }
   });
 
