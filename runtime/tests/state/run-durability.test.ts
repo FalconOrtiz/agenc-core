@@ -492,6 +492,73 @@ describe("StateRunDurabilityRepository", () => {
     );
   });
 
+  it("lifts the run's admission lock when a cancelled run is explicitly reopened", () => {
+    // Live shape (a session whose turn a daemon restart had cancelled): the
+    // reopen created epoch 2 and moved the status to running, but the
+    // admission lock row survived and the first model step of the reopened
+    // run was denied with parent_cancel_locked.
+    runs.ensureInitialEpoch({ runId: "run-reopened-locked", openedAt: T0 });
+    runs.recordTerminalResult({
+      epoch: 1,
+      result: terminal({
+        runId: "run-reopened-locked",
+        status: "cancelled",
+        exitCode: null,
+        stopReason: "daemon_shutdown_not_idle",
+        finishedAt: T1,
+      }),
+      eventId: "event-terminal-locked",
+    });
+    driver
+      .prepareState(
+        `INSERT INTO execution_admission_cancellations (
+           run_id, reason, cancelled_at
+         ) VALUES (?, ?, ?)`,
+      )
+      .run("run-reopened-locked", "recovery_cascade_repair", T1);
+    driver
+      .prepareState(
+        `INSERT INTO agent_runs (
+           id, objective, status, started_at, last_active_at
+         ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run("run-reopened-locked", "continue", "cancelled", T0, T1);
+
+    const reopened = runs.reopenRun({
+      runId: "run-reopened-locked",
+      fromEpoch: 1,
+      openedAt: T2,
+      eventId: "event-reopen-locked",
+      reason: "user_session_continue",
+    });
+    expect(reopened.applied).toBe(true);
+    expect(
+      driver
+        .prepareState<[string], { readonly n: number }>(
+          `SELECT count(*) AS n FROM execution_admission_cancellations WHERE run_id = ?`,
+        )
+        .get("run-reopened-locked")?.n,
+    ).toBe(0);
+    expect(
+      driver
+        .prepareState<[string], { readonly status: string }>(
+          `SELECT status FROM agent_runs WHERE id = ?`,
+        )
+        .get("run-reopened-locked")?.status,
+    ).toBe("running");
+    // The reopened epoch crosses its next lifecycle boundary without conflict.
+    expect(
+      runs.recordRunSuspended({
+        runId: "run-reopened-locked",
+        epoch: 2,
+        eventId: "event-suspend-after-reopen",
+        eventSequence: 1,
+        reason: "daemon_shutdown_idle",
+        suspendedAt: T3,
+      }).applied,
+    ).toBe(true);
+  });
+
   it("keeps terminal results sticky and retains them across explicit reopen epochs", () => {
     const initial = runs.ensureInitialEpoch({
       runId: "run-1",

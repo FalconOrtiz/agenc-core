@@ -1041,6 +1041,12 @@ export class StateRunDurabilityRepository {
         // audited reopen is the one transition allowed to move it.
         reopeningLockedRun: true,
       });
+      // The same authorization lifts the run's own admission lock. Left in
+      // place, the lock still denied the reopened run's first model step
+      // (`execution admission deny: parent_cancel_locked`) and its pre-turn
+      // compaction, so a reopened session could never take a turn. Only the
+      // reopened run's row goes: descendants keep theirs.
+      this.liftSupersededCancellation(params.runId, true, false);
       const value: RunLifecycleEpoch = {
         runId: params.runId,
         epoch: nextEpoch,
