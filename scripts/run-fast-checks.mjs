@@ -9,6 +9,31 @@ import { fileURLToPath } from "node:url";
 const REPOSITORY_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
 
+/** Lexicographic path order (Sonar S2871: never rely on default Array#sort). */
+function sortPaths(items) {
+  return [...items].sort((left, right) => left.localeCompare(right));
+}
+
+/**
+ * Spawn env with a fixed PATH so `git` resolution cannot follow attacker-writable
+ * directories on PATH (Sonar S4036).
+ */
+function fixedPathEnv() {
+  const dirs = process.platform === "win32"
+    ? [
+      process.env.SystemRoot
+        ? path.join(process.env.SystemRoot, "System32")
+        : "C:\\Windows\\System32",
+      "C:\\Program Files\\Git\\cmd",
+      "C:\\Program Files\\Git\\bin",
+    ]
+    : ["/usr/bin", "/bin", "/usr/local/bin"];
+  return {
+    ...process.env,
+    PATH: dirs.join(path.delimiter),
+  };
+}
+
 function isDocumentationPath(file) {
   return file === "README.md" ||
     file === "memory_todo.md" ||
@@ -42,11 +67,11 @@ export function mappedRuntimeTestTargets(files) {
       targets.add("tests/conversation/realtime/prompt.contract.test.ts");
     }
   }
-  return [...targets].sort();
+  return sortPaths(targets);
 }
 
 export function classifyChangedFiles(files) {
-  const changedFiles = [...new Set(files)].sort();
+  const changedFiles = sortPaths(new Set(files));
   const documentationOnly = changedFiles.length > 0 && changedFiles.every(isDocumentationPath);
   if (documentationOnly || changedFiles.length === 0) {
     return {
@@ -112,6 +137,7 @@ function gitNames(args) {
   const result = spawnSync("git", ["diff", "--name-only", "-z", ...args], {
     cwd: REPOSITORY_ROOT,
     encoding: "buffer",
+    env: fixedPathEnv(),
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -125,6 +151,7 @@ function untrackedNames() {
   const result = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
     cwd: REPOSITORY_ROOT,
     encoding: "buffer",
+    env: fixedPathEnv(),
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -153,7 +180,7 @@ export function resolveBaseCommit(base) {
   const result = spawnSync(
     "git",
     ["rev-parse", "--verify", "--end-of-options", `${base}^{commit}`],
-    { cwd: REPOSITORY_ROOT, encoding: "utf8" },
+    { cwd: REPOSITORY_ROOT, encoding: "utf8", env: fixedPathEnv() },
   );
   if (result.error) throw result.error;
   const commit = result.stdout.trim();
@@ -225,7 +252,7 @@ export function deletedRuntimeFallbackPlan(runtimeInputs, {
       uncovered.push(file);
     }
   }
-  return { targets: [...targets].sort(), uncovered: uncovered.sort() };
+  return { targets: sortPaths(targets), uncovered: sortPaths(uncovered) };
 }
 
 export function commandsForPlan(plan, {
@@ -265,11 +292,11 @@ export function commandsForPlan(plan, {
       `mapped runtime tests do not exist: ${missingMappedRuntimeTests.join(", ")}`,
     );
   }
-  const runtimeTestTargets = [...new Set([
+  const runtimeTestTargets = sortPaths(new Set([
     ...plan.runtimeTests.filter(fileExists).map(runtimePath),
     ...plan.mappedRuntimeTests,
     ...deletedRuntime.targets,
-  ])].sort();
+  ]));
   if (runtimeTestTargets.length > 0) {
     commands.push({
       executable: process.execPath,
