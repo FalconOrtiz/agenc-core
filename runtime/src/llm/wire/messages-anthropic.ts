@@ -341,7 +341,9 @@ export function buildAnthropicMessagesRequest(
   if (systemHasCacheControl) {
     system = systemBlocks;
   } else if (systemBlocks.length > 0) {
-    system = systemBlocks.map((block) => String(block.text ?? "")).join("\n\n");
+    system = systemBlocks
+      .map((block) => (typeof block.text === "string" ? block.text : ""))
+      .join("\n\n");
   }
   if (system.length > 0) body.system = system;
   // Task 28: the Fable/Mythos 5 family removed sampling parameters —
