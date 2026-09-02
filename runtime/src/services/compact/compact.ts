@@ -402,14 +402,10 @@ export function nearestRecentHumanMessageIndex(
   keepCount: number,
 ): number {
   const reach = Math.max(keepCount, KEEP_RECENT_HUMAN_MESSAGE_WITHIN);
-  const bytesOf = (message: RuntimeMessage): number =>
-    Buffer.byteLength(
-      typeof message.content === "string"
-        ? message.content
-        : JSON.stringify(message.content ?? message.message?.content ?? ""),
-      "utf8",
-    );
-  const totalBytes = messages.reduce((sum, message) => sum + bytesOf(message), 0);
+  const totalBytes = messages.reduce(
+    (sum, message) => sum + messageContentBytes(message),
+    0,
+  );
   const tailBudget = Math.max(
     KEEP_RECENT_HUMAN_MESSAGE_MIN_BYTES,
     Math.floor(totalBytes * KEEP_RECENT_HUMAN_MESSAGE_BYTE_SHARE),
@@ -421,19 +417,32 @@ export function nearestRecentHumanMessageIndex(
     index -= 1
   ) {
     const message = messages[index]!;
-    tailBytes += bytesOf(message);
+    tailBytes += messageContentBytes(message);
     if (tailBytes > tailBudget) return messages.length;
-    if (message.role !== "user") continue;
-    if (message.originalRole !== undefined && message.originalRole !== "user") {
-      continue;
-    }
-    if (message.runtimeOnly?.compactionHistory !== undefined) continue;
-    if (isAgentInvocationMessage(message)) continue;
-    const text = typeof message.content === "string" ? message.content : "";
-    if (text.startsWith(COMPACTION_BOUNDARY_MARKER_V1)) continue;
-    return index;
+    if (isHumanTypedMessage(message)) return index;
   }
   return messages.length;
+}
+
+function messageContentBytes(message: RuntimeMessage): number {
+  return Buffer.byteLength(
+    typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content ?? message.message?.content ?? ""),
+    "utf8",
+  );
+}
+
+/** A user-role message the human typed, as opposed to one the runtime wrote. */
+function isHumanTypedMessage(message: RuntimeMessage): boolean {
+  if (message.role !== "user") return false;
+  if (message.originalRole !== undefined && message.originalRole !== "user") {
+    return false;
+  }
+  if (message.runtimeOnly?.compactionHistory !== undefined) return false;
+  if (isAgentInvocationMessage(message)) return false;
+  const text = typeof message.content === "string" ? message.content : "";
+  return !text.startsWith(COMPACTION_BOUNDARY_MARKER_V1);
 }
 
 /**
