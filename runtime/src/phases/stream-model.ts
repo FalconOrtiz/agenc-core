@@ -47,6 +47,7 @@ import {
   resolveSessionStreamIdleTimeoutMs,
   STREAM_IDLE_ABORT_REASON,
 } from "../llm/stream-watchdog.js";
+import { DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS } from "../config/schema.js";
 import {
   CitationStreamParser,
   ProposedPlanStreamParser,
@@ -949,6 +950,48 @@ function extractToolUseId(raw: unknown): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
+/** Canonical config key carrying the stream-idle deadline. */
+const STREAM_WATCHDOG_CONFIG_KEY = "stream_watchdog_timeout_ms";
+
+/**
+ * The slice of a config store this file reads. Duck-typed because embedders
+ * (and fixtures) supply their own store shapes; `provenance` is the
+ * ConfigStore surface that names the layer a key came from.
+ */
+type StreamWatchdogConfigStore = {
+  current?: () => { stream_watchdog_timeout_ms?: number };
+  provenance?: (key: string) => { scope?: string } | undefined;
+};
+
+/**
+ * Did an operator choose this stream-idle deadline, or is it just the built-in
+ * default?
+ *
+ * Only sessions that own their own deadline (the one-shot review delegate) ask.
+ * They opt out of the ambient default, not out of the documented setting: an
+ * operator who writes `stream_watchdog_timeout_ms` in config.toml, or sets
+ * `AGENC_STREAM_IDLE_TIMEOUT_MS`, must still get that deadline inside a review
+ * delegate, the way every session did before the default existed.
+ *
+ * A value that differs from the built-in default was necessarily chosen by
+ * someone. A value that equals it is explicit only when the config store can
+ * name the layer it came from and that layer is not `default` — stores without
+ * provenance (fixtures, embedder-supplied stubs) read as ambient, which is the
+ * conservative answer for a session that already has a deadline of its own.
+ */
+function isOperatorConfiguredStreamWatchdog(
+  store: StreamWatchdogConfigStore | undefined,
+  value: number,
+): boolean {
+  if (value !== DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS) return true;
+  try {
+    const scope = store?.provenance?.(STREAM_WATCHDOG_CONFIG_KEY)?.scope;
+    return scope !== undefined && scope !== "default";
+  } catch {
+    return false;
+  }
+}
+
 export async function streamModel(
   state: TurnState,
   ctx: TurnContext,
@@ -984,22 +1027,33 @@ export async function streamModel(
   // watchdog warns at half time and the abort is retryable (`stream_idle`).
   const configuredWatchdogMs = (() => {
     const services = session.services as {
-      configStore?: { current?: () => { stream_watchdog_timeout_ms?: number } };
+      configStore?: StreamWatchdogConfigStore;
       streamIdleWatchdogDisabled?: boolean;
     };
-    // One-shot review delegates carry their own deadline and their own
-    // classification of it; the ambient default must not add a second,
-    // worse-typed one on top. See SessionServices.streamIdleWatchdogDisabled.
-    if (services.streamIdleWatchdogDisabled === true) return undefined;
+    let value: number | undefined;
     try {
-      const value =
-        services.configStore?.current?.()?.stream_watchdog_timeout_ms;
-      return typeof value === "number" && Number.isFinite(value) && value > 0
-        ? value
-        : undefined;
+      const raw = services.configStore?.current?.()?.stream_watchdog_timeout_ms;
+      value =
+        typeof raw === "number" && Number.isFinite(raw) && raw > 0
+          ? raw
+          : undefined;
     } catch {
       return undefined;
     }
+    if (value === undefined) return undefined;
+    // One-shot review delegates carry their own deadline and their own
+    // classification of it, so the ambient *default* must not add a second,
+    // worse-typed one on top. See SessionServices.streamIdleWatchdogDisabled.
+    // The opt-out stops there: a `stream_watchdog_timeout_ms` the operator
+    // actually configured is documented as their idle deadline and still
+    // applies inside the delegate, as it did before the opt-out existed.
+    if (
+      services.streamIdleWatchdogDisabled === true &&
+      !isOperatorConfiguredStreamWatchdog(services.configStore, value)
+    ) {
+      return undefined;
+    }
+    return value;
   })();
   const watchdog = installStreamWatchdog({
     abortController: scoped,

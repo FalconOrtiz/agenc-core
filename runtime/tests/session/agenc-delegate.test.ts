@@ -1160,6 +1160,76 @@ describe("runAgenCReviewOneShot happy-path review", () => {
     expect(outcome.verdict).toBe("partial");
   });
 
+  it("classifies an operator-configured stream-idle abort as timeout, not a failed review", async () => {
+    // A review delegate opts out of the *ambient* stream-idle default but
+    // still honours a `stream_watchdog_timeout_ms` the operator configured.
+    // When that watchdog fires it aborts the provider call, not the delegate's
+    // controller, so the review sees a bare provider error. Classified as
+    // `fail`, a dead socket reaches the guardian approval reviewer as a failed
+    // review and is shown to the user as a high-risk denial of their own tool
+    // call. Silence past a deadline is a timeout, and `timeout` is the verdict
+    // callers already treat as "no answer, retryable".
+    const watchdogMs = 150;
+    const baseConfigStore = createTestConfigStore({ cwd: "/tmp" });
+    const configStore = new Proxy(baseConfigStore, {
+      get(target, property, _receiver) {
+        if (property === "current") {
+          return () => ({
+            ...target.current(),
+            stream_watchdog_timeout_ms: watchdogMs,
+          });
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    // First attempt: a socket that goes silent, which is what the watchdog is
+    // there to end. Later attempts fail outright so the reconnect ladder stops
+    // instead of spending its full backoff on a provider that never answers.
+    let attempts = 0;
+    const stalledCall = async (
+      _messages: LLMMessage[],
+      options?: LLMChatOptions,
+    ): Promise<never> => {
+      attempts += 1;
+      if (attempts > 1) throw new Error("provider unavailable");
+      await new Promise<never>((_resolve, reject) => {
+        options?.signal?.addEventListener(
+          "abort",
+          () => {
+            const aborted = new Error("aborted");
+            aborted.name = "AbortError";
+            reject(aborted);
+          },
+          { once: true },
+        );
+      });
+      throw new Error("unreachable");
+    };
+    const provider = {
+      name: "stalled-provider",
+      chat: stalledCall,
+      chatStream: (
+        messages: LLMMessage[],
+        _onChunk: unknown,
+        options?: LLMChatOptions,
+      ) => stalledCall(messages, options),
+      healthCheck: async () => true,
+    } as unknown as LLMProvider;
+    const session = mkSession(provider, {
+      configStore,
+    } as unknown as Partial<SessionServices>);
+
+    const outcome = await runAgenCReviewOneShot(
+      session,
+      mkOneShotRequest(session),
+    );
+
+    expect(outcome.verdict).toBe("timeout");
+    expect(outcome.rawText).toBeNull();
+    expect(outcome.error).not.toBeNull();
+  });
+
   it("drains the task from the active turn registry on completion", async () => {
     const provider = mkScriptedProvider({ content: "ok" });
     const session = mkSession(provider);

@@ -1461,7 +1461,9 @@ export interface SessionServices {
    * verdict. The ambient `stream_watchdog_timeout_ms` deadline would pre-empt
    * that with an untyped `stream_idle` abort, which the guardian reviewer can
    * only report as a review failure, so the child opts out and the delegate's
-   * deadline stays the single authority over how long a review may run.
+   * deadline stays the authority over how long a review may run. The opt-out
+   * covers the *default* only: a `stream_watchdog_timeout_ms` the operator
+   * configured is still honoured in the child, as it was before this flag.
    */
   readonly streamIdleWatchdogDisabled?: boolean;
   readonly querySource?: QuerySource;

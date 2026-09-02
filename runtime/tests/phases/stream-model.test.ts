@@ -26,6 +26,7 @@ import type {
 import type { AdmissionLease } from "../budget/admission-types.js";
 import { WorkflowHandoffSpool } from "../agents/workflow-handoff-spool.js";
 import { defaultConfig } from "../config/schema.js";
+import { STREAM_IDLE_ABORT_REASON } from "../llm/stream-watchdog.js";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -635,6 +636,130 @@ describe("streamModel — live assistant text sanitization", () => {
 
       await vi.advanceTimersByTimeAsync(1);
       await expect(outcome).resolves.toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an operator-configured watchdog still applies to a session that owns its deadline", async () => {
+    // `streamIdleWatchdogDisabled` opts a review delegate out of the ambient
+    // *default*, not out of the documented setting. An operator who sets
+    // `stream_watchdog_timeout_ms` (config.toml or AGENC_STREAM_IDLE_TIMEOUT_MS)
+    // asked for that idle deadline; before the opt-out existed the child
+    // inherited it through the parent's configStore, and it must keep doing so.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const configuredWatchdogMs = 60_000;
+      expect(configuredWatchdogMs).not.toBe(
+        defaultConfig().stream_watchdog_timeout_ms,
+      );
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+            // Never answers: a dead socket, which is what the watchdog is for.
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: configuredWatchdogMs,
+        }),
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const settled = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(configuredWatchdogMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+      expect(providerSignal?.aborted).toBe(true);
+      expect(providerSignal?.reason).toBe(STREAM_IDLE_ABORT_REASON);
+      expect(
+        events.some(
+          (event) =>
+            event.msg.type === "stream_error" &&
+            (event.msg.payload as { cause?: string }).cause ===
+              STREAM_IDLE_ABORT_REASON,
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a configured watchdog that matches the default value is honoured by provenance", async () => {
+    // The value alone cannot separate "operator wrote 600000" from "nobody
+    // wrote anything"; the config store's provenance can, and names the layer.
+    // A key attributed to a real layer is an operator choice and applies even
+    // inside a session that owns its own deadline.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const watchdogMs = defaultConfig().stream_watchdog_timeout_ms as number;
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+          }),
+      );
+      const { session } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({ stream_watchdog_timeout_ms: watchdogMs }),
+        provenance: (key: string) =>
+          key === "stream_watchdog_timeout_ms"
+            ? { scope: "user", label: "~/.agenc/config.toml" }
+            : undefined,
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const settled = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(watchdogMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+      expect(providerSignal?.reason).toBe(STREAM_IDLE_ABORT_REASON);
     } finally {
       vi.useRealTimers();
     }

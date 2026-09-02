@@ -95,6 +95,15 @@ export interface GuardianApprovalReviewResult {
 }
 
 export interface GuardianApprovalReviewer {
+  /**
+   * Deadline this reviewer puts on one approval review, in milliseconds.
+   * `undefined` means the review is unbounded, which is a deliberate
+   * embedder choice and never the production wiring's: an approval review
+   * blocks a tool call the user is waiting on, so bootstrap passes
+   * {@link PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS}. Declared on the
+   * interface so the wiring is assertable and readable from a diagnostic.
+   */
+  readonly reviewTimeoutMs?: number;
   reviewApprovalRequest(
     opts: GuardianApprovalReviewOptions,
   ): Promise<GuardianApprovalReviewResult>;
@@ -121,8 +130,38 @@ export interface GuardianApprovalReviewSession extends AgenCDelegateSessionLike 
 }
 
 export interface DefaultGuardianApprovalReviewerOptions {
+  /**
+   * Deadline for one approval review. Omitted means unbounded — the factory
+   * keeps that shape so an embedder can own the deadline elsewhere, but every
+   * caller that fronts an interactive approval must pass one.
+   */
   readonly timeoutMs?: number;
 }
+
+/**
+ * Deadline the production reviewer runs under (passed by
+ * `buildBootstrapSessionServices`).
+ *
+ * A guardian approval review is one bounded model call standing between the
+ * user and a tool call they are waiting on, so it must not be able to hang:
+ * without a deadline a dead provider socket parks the approval until the user
+ * cancels.
+ *
+ * Ten minutes is chosen to match the magnitude of the session-turn watchdog
+ * (`stream_watchdog_timeout_ms`, `DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS`), but it
+ * is not the same kind of budget and does not bound the same set of runs: the
+ * watchdog is a per-chunk idle deadline that resets on every chunk, while this
+ * is a total wall-clock budget for the review. A review that keeps streaming
+ * past ten minutes is therefore deliberately cut short here where the ambient
+ * watchdog would have let it continue. That is a chosen trade: an approval the
+ * user is waiting on should be bounded in absolute time.
+ *
+ * Expiry lands on the reviewer's own `timed_out` decision — fails closed,
+ * tells the agent it may retry once or ask the user, and does not count
+ * against the rejection circuit breaker — instead of a `fail` verdict
+ * rendered as a high-risk denial.
+ */
+export const PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS = 600_000;
 
 export function newGuardianReviewId(): string {
   return randomUUID();
@@ -162,6 +201,10 @@ export function createDefaultGuardianApprovalReviewer(
 
 class DefaultGuardianApprovalReviewer implements GuardianApprovalReviewer {
   constructor(private readonly timeoutMs?: number) {}
+
+  get reviewTimeoutMs(): number | undefined {
+    return this.timeoutMs;
+  }
 
   async reviewApprovalRequest(
     opts: GuardianApprovalReviewOptions,
