@@ -3243,7 +3243,7 @@ async function runAgenCDaemonForegroundLocked(
       runner,
       startupRecovery,
       {
-        recordReplayToolResult: (result) =>
+        recordReplayToolResult: (result) => {
           snapshotPolicies.recordSessionEvent(result.sessionId, {
             method: "event.session_event",
             params: {
@@ -3266,7 +3266,13 @@ async function runAgenCDaemonForegroundLocked(
                 },
               },
             },
-          }),
+          });
+          // A recovery outcome is written at once. The replay or poison of a
+          // stale tool call is a startup event, not part of a live tool
+          // burst: the latest snapshot must show it the moment the call's
+          // in-flight row turns terminal, not after the coalesce window.
+          snapshotPolicies.flushSession(result.sessionId);
+        },
       },
     );
     if (host.startupGuardReceiver?.wasRequested() === true) return 1;
@@ -4374,6 +4380,9 @@ class AgenCDaemonSnapshotPolicyRegistry {
   }
 
   hydrateStartupRecovery(report: DaemonStartupRecoveryReport): void {
+    const reconciledSessionIds = new Set(
+      report.recoveredToolCalls.map((call) => call.sessionId),
+    );
     for (const run of report.recoveredRuns) {
       if (run.currentSessionId === undefined) continue;
       const policy = this.#policyForProjectDir(run.projectDir);
@@ -4387,6 +4396,14 @@ class AgenCDaemonSnapshotPolicyRegistry {
           toolState: run.latestSnapshot.toolState,
           mcpConnectionState: run.latestSnapshot.mcpConnectionState,
         });
+        // Startup recovery reconciled this session's stale tool calls
+        // (replayed, poisoned or cancelled) into the hydrated state: write
+        // that outcome now, before the daemon advertises readiness, instead
+        // of leaving it to the first periodic tick. A session recovery left
+        // untouched keeps its rows exactly as startup pruning left them.
+        if (reconciledSessionIds.has(run.currentSessionId)) {
+          policy.policy.flushSession(run.currentSessionId);
+        }
       }
     }
   }
@@ -4445,6 +4462,12 @@ class AgenCDaemonSnapshotPolicyRegistry {
   recordSessionEvent(sessionId: string, event: JsonObject): void {
     const entry = this.#policyForSession(sessionId);
     entry.policy.recordSessionEvent(sessionId, event);
+  }
+
+  /** Write the session's snapshot now if it has unflushed changes. */
+  flushSession(sessionId: string): void {
+    const entry = this.#policyForSession(sessionId);
+    entry.policy.flushSession(sessionId);
   }
 
   registerSession(session: AgenCDaemonSnapshotSessionRoute): void {

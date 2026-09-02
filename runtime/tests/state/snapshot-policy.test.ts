@@ -738,6 +738,133 @@ describe("AgenCSessionSnapshotPolicy", () => {
     );
   });
 
+  // The daemon's hydrateStartupRecovery makes these calls per recovered run:
+  // trackSession, hydrateSession, and flushSession when startup recovery
+  // reconciled stale tool calls for the session (here one poisoned call).
+  // The flush writes the reconciled state at once, before the daemon
+  // advertises readiness; the periodic tick then finds nothing to write.
+  it("writes a reconciled recovered state once when flushed after hydration", () => {
+    seedRun("run-recovered", "session-recovered");
+    driver
+      .prepareState(
+        `INSERT INTO session_state_snapshots (
+          session_id, snapshot_at, conversation_json, tool_state_json, mcp_connection_state_json
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "session-recovered",
+        "2026-05-01T00:06:00.000Z",
+        JSON.stringify([{ role: "assistant", content: "state" }]),
+        JSON.stringify({ pending: ["tool-recovered"] }),
+        JSON.stringify({ connected: true }),
+      );
+    recordInFlightToolCallStart(driver, {
+      sessionId: "session-recovered",
+      agentId: "run-recovered",
+      toolCallId: "tool-recovered",
+      toolName: "FileWrite",
+      args: { path: "a.txt" },
+      startedAt: "2026-05-01T00:05:00.000Z",
+      recoveryCategory: "side-effecting",
+      agencHome: home,
+    });
+    const recovery = recoverDaemonStateOnStartup(driver, {
+      now: () => "2026-05-01T00:10:00.000Z",
+    });
+    const run = recovery.recoveredRuns.find((candidate) => candidate.id === "run-recovered");
+    expect(run?.latestSnapshot).toBeDefined();
+    expect(recovery.recoveredToolCalls).toEqual([
+      expect.objectContaining({
+        sessionId: "session-recovered",
+        toolCallId: "tool-recovered",
+        recoveryAction: "poison",
+      }),
+    ]);
+
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:10:01.000Z",
+      agencHome: home,
+    });
+    policy.trackSession("session-recovered", "run-recovered");
+    policy.hydrateSession({
+      sessionId: "session-recovered",
+      snapshotAt: run!.latestSnapshot!.snapshotAt,
+      conversation: run!.latestSnapshot!.conversation,
+      toolState: run!.latestSnapshot!.toolState,
+      mcpConnectionState: run!.latestSnapshot!.mcpConnectionState,
+    });
+    // Hydration only marks the session dirty.
+    expect(snapshotCount("session-recovered")).toBe(1);
+
+    const flushed = policy.flushSession("session-recovered");
+    expect(flushed?.trigger).toBe("periodic");
+    expect(snapshotCount("session-recovered")).toBe(2);
+    expect(latestSnapshot("session-recovered").toolState).toMatchObject({
+      lastTrigger: "periodic",
+      pending: [],
+      completed: { "tool-recovered": { status: "poisoned", recoveryAction: "poison" } },
+    });
+    expect(runLastSnapshotAt("run-recovered")).toBe("2026-05-01T00:10:01.000Z");
+    // Nothing is dirty afterwards: the tick and a second flush write nothing.
+    expect(policy.flushPeriodic()).toEqual([]);
+    expect(policy.flushSession("session-recovered")).toBeUndefined();
+    expect(snapshotCount("session-recovered")).toBe(2);
+  });
+
+  // The daemon-cli contract test seeded its recovered row at 2026-05-01 and
+  // waited for a second row per session. The write that lands the hydrated
+  // state (the flush for a reconciled session, or the first periodic tick)
+  // uses the daemon's real clock, and the per-write retention (snapshot_days
+  // 3 by default) then prunes the seeded row as older than the window, so
+  // the count stayed at one. The evidence that recovery wrote is a row newer
+  // than the recovered one, never a row count.
+  it("replaces a recovered row older than the retention window instead of adding to it", () => {
+    seedRun("run-stale", "session-stale");
+    driver
+      .prepareState(
+        `INSERT INTO session_state_snapshots (
+          session_id, snapshot_at, conversation_json, tool_state_json, mcp_connection_state_json
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "session-stale",
+        "2026-05-01T00:06:00.000Z",
+        JSON.stringify([{ role: "assistant", content: "state" }]),
+        JSON.stringify({ pending: [] }),
+        JSON.stringify({ connected: true }),
+      );
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-09-02T00:00:00.000Z",
+      agencHome: home,
+      snapshotRetention: {
+        snapshot_days: 3,
+        snapshot_max_count: 10_000,
+        snapshot_max_bytes: 67_108_864,
+      },
+    });
+    policy.trackSession("session-stale", "run-stale");
+    policy.hydrateSession({
+      sessionId: "session-stale",
+      snapshotAt: "2026-05-01T00:06:00.000Z",
+      conversation: [{ role: "assistant", content: "state" }],
+      toolState: { pending: [] },
+      mcpConnectionState: { connected: true },
+    });
+    expect(snapshotTimes("session-stale")).toEqual(["2026-05-01T00:06:00.000Z"]);
+    policy.flushSession("session-stale");
+
+    // One row: the flushed hydration write, dated now. The seeded row fell
+    // out of the three-day window on that same write.
+    expect(snapshotTimes("session-stale")).toEqual(["2026-09-02T00:00:00.000Z"]);
+    expect(latestSnapshot("session-stale").toolState).toMatchObject({
+      lastTrigger: "periodic",
+      pending: [],
+    });
+    expect(runLastSnapshotAt("run-stale")).toBe("2026-09-02T00:00:00.000Z");
+    expect(policy.flushPeriodic()).toEqual([]);
+    expect(snapshotTimes("session-stale")).toEqual(["2026-09-02T00:00:00.000Z"]);
+  });
+
   it("drops array-shaped hydrated tool-state maps before flushing", () => {
     seedRun("run-hydrate-arrays", "session-hydrate-arrays");
     const policy = new AgenCSessionSnapshotPolicy(driver, {
@@ -1251,6 +1378,18 @@ function seedRun(runId: string, sessionId: string): void {
       "client-1",
       null,
     );
+}
+
+function snapshotTimes(sessionId: string): string[] {
+  return driver
+    .prepareState<[string], { snapshot_at: string }>(
+      `SELECT snapshot_at
+       FROM session_state_snapshots
+       WHERE session_id = ?
+       ORDER BY snapshot_at ASC`,
+    )
+    .all(sessionId)
+    .map((row) => row.snapshot_at);
 }
 
 function snapshotCount(sessionId: string): number {
