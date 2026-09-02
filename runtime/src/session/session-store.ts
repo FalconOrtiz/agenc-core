@@ -1421,6 +1421,13 @@ export class SessionStore {
   private readonly diagnosticsBuffer: SessionStoreDiagnostic[] = [];
   private onDiagnostic?: (d: SessionStoreDiagnostic) => void;
   /**
+   * Fired after a batch is written to the rollout file. Used by
+   * `FileThreadStore` to keep the `thread_rollout_items` mirror current
+   * when sessions append through the live recorder rather than
+   * `ThreadStore.appendItems` (#2028).
+   */
+  private onRolloutCommitted?: (rolloutPath: string) => void;
+  /**
    * I-38 async fsync retries currently in flight. Tracked so `close()`
    * can wait for them to settle (or so tests can await completion).
    * Each entry is the Promise returned by `scheduleFsyncRetry()`.
@@ -1812,6 +1819,16 @@ export class SessionStore {
     for (const d of buffered) listener(d);
   }
 
+  /**
+   * Register (or clear) a listener for successful rollout appends.
+   * `undefined` clears a previously registered listener.
+   */
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.onRolloutCommitted = listener;
+  }
+
   private emitDiagnostic(d: SessionStoreDiagnostic): void {
     if (this.onDiagnostic) {
       this.onDiagnostic(d);
@@ -2094,6 +2111,9 @@ export class SessionStore {
       }
       this.fileSize += Buffer.byteLength(lines, "utf8");
       this.trajectoryExport.writeItems(toWrite);
+      // Bytes are on disk even when a durable fsync proof later fails, so
+      // mirror consumers must see the append regardless of `committed`.
+      this.onRolloutCommitted?.(this.rolloutPath);
     } catch (err) {
       const safeToRequeue = !(err instanceof AppendRollbackError);
       if (!routeToDegraded(err, safeToRequeue)) {

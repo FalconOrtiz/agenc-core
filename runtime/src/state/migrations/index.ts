@@ -29,6 +29,7 @@ import { runSuspensionSchemaMigration } from "./027_run_suspension_schema.js";
 import { runtimeSettingsCanonicalValuesMigration } from "./028_runtime_settings_canonical_values.js";
 import { terminalAgentRunReconciliationMigration } from "./029_terminal_agent_run_reconciliation.js";
 import { runtimeSettingsPermissionCapabilitiesMigration } from "./030_runtime_settings_permission_capabilities.js";
+import { dropThreadsLastItemIndexMigration } from "./031_drop_threads_last_item_index.js";
 import type { SqlMigration } from "./types.js";
 
 /**
@@ -65,6 +66,7 @@ export const STATE_DB_MIGRATIONS: readonly SqlMigration[] = [
   runtimeSettingsCanonicalValuesMigration,
   terminalAgentRunReconciliationMigration,
   runtimeSettingsPermissionCapabilitiesMigration,
+  dropThreadsLastItemIndexMigration,
 ];
 
 export const LOGS_DB_MIGRATIONS: readonly SqlMigration[] = [

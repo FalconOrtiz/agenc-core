@@ -423,7 +423,7 @@ export class FileThreadStore implements ThreadStore {
       params.source === undefined
         ? undefined
         : canonicalizeThreadSource(params.source);
-    this.liveRecorders.set(threadId, params.rolloutStore);
+    this.bindLiveRecorder(threadId, params.rolloutStore);
 
     this.updateRegistry((registry) => {
       const now = new Date().toISOString();
@@ -489,7 +489,7 @@ export class FileThreadStore implements ThreadStore {
         );
       }
 
-      this.liveRecorders.set(threadId, params.rolloutStore);
+      this.bindLiveRecorder(threadId, params.rolloutStore);
 
       const now = new Date().toISOString();
       const entry: RegistryEntry = {
@@ -556,7 +556,7 @@ export class FileThreadStore implements ThreadStore {
     this.assertOpen();
     const recorder = this.liveRecorderOrThrow(threadId);
     recorder.flushDurable();
-    this.liveRecorders.delete(threadId);
+    this.unbindLiveRecorder(threadId, recorder);
     this.updateRegistry((registry) => {
       const existing = registry.get(threadId);
       if (
@@ -580,10 +580,11 @@ export class FileThreadStore implements ThreadStore {
     this.assertOpen();
     // Source runtime drops the live entry without flushing. Matches that
     // contract here: we do NOT call flushDurable.
-    if (!this.liveRecorders.has(threadId)) {
+    const recorder = this.liveRecorders.get(threadId);
+    if (recorder === undefined) {
       throw new ThreadNotFoundError(threadId);
     }
-    this.liveRecorders.delete(threadId);
+    this.unbindLiveRecorder(threadId, recorder);
   }
 
   loadHistory(params: LoadThreadHistoryParams): StoredThreadHistory {
@@ -904,6 +905,9 @@ export class FileThreadStore implements ThreadStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    for (const recorder of this.liveRecorders.values()) {
+      recorder.setOnRolloutCommitted(undefined);
+    }
     this.liveRecorders.clear();
     this.stateDriver.close();
   }
@@ -1125,6 +1129,34 @@ export class FileThreadStore implements ThreadStore {
       rolloutPath,
       threads: this.threadIndex,
     });
+  }
+
+  /**
+   * Register a live recorder and keep the SQLite mirror current as it
+   * flushes. Sessions normally append via `RolloutStore` directly, so
+   * without this hook the mirror only updates on explicit store calls
+   * (`appendItems`, metadata patches, path lookups).
+   */
+  private bindLiveRecorder(threadId: ThreadId, rolloutStore: RolloutStore): void {
+    this.liveRecorders.set(threadId, rolloutStore);
+    rolloutStore.setOnRolloutCommitted((rolloutPath) => {
+      if (this.closed) return;
+      if (this.liveRecorders.get(threadId) !== rolloutStore) return;
+      this.indexRolloutFile(rolloutPath);
+    });
+    if (existsSync(rolloutStore.rolloutPath)) {
+      this.indexRolloutFile(rolloutStore.rolloutPath);
+    }
+  }
+
+  private unbindLiveRecorder(
+    threadId: ThreadId,
+    rolloutStore: RolloutStore,
+  ): void {
+    if (this.liveRecorders.get(threadId) === rolloutStore) {
+      this.liveRecorders.delete(threadId);
+    }
+    rolloutStore.setOnRolloutCommitted(undefined);
   }
 
   private archiveRolloutFile(entry: RegistryEntry): string | undefined {
