@@ -19,7 +19,7 @@
  * @module
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 
@@ -192,6 +192,25 @@ function summarizeProviderResponse(
   };
 }
 
+
+const TRACE_FILE_RE = /^llm-(\d{5,})\.jsonl$/;
+
+/** Highest `llm-<seq>.jsonl` sequence already present, or 0. */
+export function highestExistingTraceSeq(directory: string): number {
+  let highest = 0;
+  try {
+    for (const name of readdirSync(directory)) {
+      const match = TRACE_FILE_RE.exec(name);
+      if (match === null) continue;
+      const value = Number.parseInt(match[1] as string, 10);
+      if (Number.isSafeInteger(value) && value > highest) highest = value;
+    }
+  } catch {
+    // No directory yet: numbering starts at 1.
+  }
+  return highest;
+}
+
 export function createProviderTraceSink(params: {
   readonly agencHome: string;
   readonly conversationId: string;
@@ -205,7 +224,11 @@ export function createProviderTraceSink(params: {
   );
   const now = params.now ?? (() => performance.now());
   const wallClock = params.wallClock ?? (() => new Date().toISOString());
-  let seq = 0;
+  // Continue after the files already in the directory: a resumed session
+  // (daemon restart) creates a new sink for the same conversation, and a
+  // counter that restarted at zero appended the new epoch's records into the
+  // first epoch's files.
+  let seq = highestExistingTraceSeq(directory);
   let inFlight: InFlightRequest | undefined;
   let disabled = false;
   let directoryReady = false;

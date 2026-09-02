@@ -193,6 +193,27 @@ describe("provider trace sink", () => {
     });
   });
 
+  test("a new sink for the same conversation continues the file numbering", () => {
+    // Live shape: after a daemon restart the resumed session's sink restarted
+    // at llm-00001 and appended the new epoch's records into the first
+    // epoch's files.
+    const home = mkdtempSync(join(tmpdir(), "agenc-trace-seq-"));
+    try {
+      const first = createProviderTraceSink({ agencHome: home, conversationId: "conv-seq" });
+      for (let i = 0; i < 3; i += 1) {
+        first.onProviderTraceEvent({ kind: "request", provider: "grok", model: "m", transport: "chat_stream", payload: { model: "m", input: [] } } as unknown as LLMProviderTraceEvent);
+        first.onProviderTraceEvent({ kind: "response", provider: "grok", model: "m", transport: "chat_stream", payload: { id: `resp_${i}`, status: "completed", model: "m", output: [] } } as unknown as LLMProviderTraceEvent);
+      }
+      const second = createProviderTraceSink({ agencHome: home, conversationId: "conv-seq" });
+      second.onProviderTraceEvent({ kind: "request", provider: "grok", model: "m", transport: "chat_stream", payload: { model: "m", input: [] } } as unknown as LLMProviderTraceEvent);
+      const names = readdirSync(first.directory).sort();
+      expect(names).toEqual(["llm-00001.jsonl", "llm-00002.jsonl", "llm-00003.jsonl", "llm-00004.jsonl"]);
+      expect(readFileSync(join(first.directory, "llm-00001.jsonl"), "utf8").trim().split("\n")).toHaveLength(2);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("summarizeProviderRequestParams records prefix and tool digests without bodies", () => {
     const payload = {
       model: "grok-4.6",
