@@ -148,6 +148,22 @@ function selectMemory(name: string): void {
   selectedMemoryTitle = name.replace(/\.md$/u, "");
 }
 
+/**
+ * Enough extra matches to exceed MAX_RELEVANT_MEMORIES so the model-based
+ * selector is consulted; below that bound recall stays lexical and skips the
+ * main-model round trip.
+ */
+function writeFillerMemories(dir: string, term: string, count = 5): void {
+  for (let index = 0; index < count; index += 1) {
+    writeMemory(
+      dir,
+      `filler-${index}.md`,
+      `${term} filler ${index}`,
+      `Filler ${index} for ${term}.`,
+    );
+  }
+}
+
 describe("relevantMemoriesProducer", () => {
   test("skips without an AgenC home", async () => {
     installMemoryAuthority();
@@ -160,7 +176,7 @@ describe("relevantMemoriesProducer", () => {
     expect(selectorCall).not.toHaveBeenCalled();
   });
 
-  test("recalls a matching memory for a one-word prompt", async () => {
+  test("recalls a matching memory for a one-word prompt without a selector round trip", async () => {
     installMemoryAuthority();
     const memoryPath = writeMemory(
       join(agencHome, "memory"),
@@ -174,6 +190,32 @@ describe("relevantMemoriesProducer", () => {
       makeOpts({ userInput: "browser" }),
       trackingState,
     );
+    // One candidate already fits the attachment limit: no main-model call.
+    expect(out).toMatchObject([
+      {
+        kind: "relevant_memories",
+        memories: [{ path: memoryPath, selectionSource: "lexical" }],
+      },
+    ]);
+    expect(selectorCall).not.toHaveBeenCalled();
+  });
+
+  test("reranks through the selector only when more than five candidates match", async () => {
+    installMemoryAuthority();
+    const memoryDir = join(agencHome, "memory");
+    const memoryPath = writeMemory(
+      memoryDir,
+      "browser.md",
+      "Browser guidance",
+      "Use the browser workflow.",
+    );
+    writeFillerMemories(memoryDir, "browser");
+    selectMemory("browser.md");
+    const trackingState = getAttachmentTrackingState({});
+    const out = await relevantMemoriesProducer(
+      makeOpts({ userInput: "browser" }),
+      trackingState,
+    );
     expect(out).toMatchObject([
       {
         kind: "relevant_memories",
@@ -181,6 +223,7 @@ describe("relevantMemoriesProducer", () => {
       },
     ]);
     expect(selectorCall).toHaveBeenCalledTimes(1);
+    expect(selectorCall.mock.calls[0]?.[0].candidates).toHaveLength(6);
   });
 
   test("skips when auto-memory is disabled", async () => {
@@ -201,6 +244,7 @@ describe("relevantMemoriesProducer", () => {
       "Browser automation guidance",
       "Use the browser automation workflow.",
     );
+    writeFillerMemories(memoryDir, "browser automation");
     selectMemory("browser.md");
     const trackingState = getAttachmentTrackingState({});
 

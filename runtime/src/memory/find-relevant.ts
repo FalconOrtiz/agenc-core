@@ -99,9 +99,13 @@ export async function findRelevantMemories(
   if (ranked.length === 0) return [];
 
   const lexicalFallback = selectLexicalFallback(ranked);
+  // The selector can only drop candidates. When every ranked candidate
+  // already fits the attachment limit there is nothing for a rerank to
+  // change, so skip the extra main-model round trip on the request path.
   if (
     options.admittedMemorySelector === undefined ||
-    options.mode === "session_start"
+    options.mode === "session_start" ||
+    ranked.length <= MAX_RELEVANT_MEMORIES
   ) {
     return lexicalFallback;
   }

@@ -70,6 +70,16 @@ describe("C3b production memory recall wiring", () => {
       memoryPath,
       "---\nname: Browser warning\ndescription: uniquebrowserfailure recovery\ntype: user\n---\nUse the safe browser recovery sequence.\n",
     );
+    // More matches than the five-memory attachment limit, so the admitted
+    // selector is consulted instead of the lexical shortcut.
+    await Promise.all(
+      Array.from({ length: 5 }, (_, index) =>
+        writeFile(
+          join(agencHome, "memory", `browser-variant-${index}.md`),
+          `---\nname: Browser variant ${index}\ndescription: uniquebrowserfailure variant ${index}\ntype: user\n---\nVariant.\n`,
+        ),
+      ),
+    );
     await Promise.all(
       Array.from({ length: 220 }, (_, index) =>
         writeFile(
@@ -125,13 +135,23 @@ describe("C3b production memory recall wiring", () => {
     } as unknown as ExecutionAdmissionClient;
     const chat = vi.fn(
       async (
-        _messages: LLMMessage[],
+        messages: LLMMessage[],
         _options?: LLMChatOptions,
-      ): Promise<LLMResponse> => ({
-        content: JSON.stringify({ selected_candidate_ids: ["candidate-1"] }),
+      ): Promise<LLMResponse> => {
+        // The selector request is the JSON-serialized candidate list; pick
+        // the "Browser warning" memory by title like a model would.
+        const request = JSON.parse(String(messages[0]?.content)) as {
+          candidates: ReadonlyArray<{ id: string; title: string }>;
+        };
+        const chosen = request.candidates.find(
+          (candidate) => candidate.title === "Browser warning",
+        );
+        const selected = chosen === undefined ? [] : [chosen.id];
+        return {
+        content: JSON.stringify({ selected_candidate_ids: selected }),
         structuredOutput: {
           type: "json_schema",
-          parsed: { selected_candidate_ids: ["candidate-1"] },
+          parsed: { selected_candidate_ids: selected },
         },
         toolCalls: [],
         usage: {
@@ -143,7 +163,8 @@ describe("C3b production memory recall wiring", () => {
         },
         model: "grok-4.5",
         finishReason: "stop",
-      }),
+        };
+      },
     );
     const provider = {
       name: "grok",

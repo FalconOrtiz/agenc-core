@@ -185,9 +185,12 @@ On a non-empty user query (`mode: "query"`):
 3. If the index is missing, closed, FTS-less, or
    `query_resource_limited` / `unavailable`, recall falls back to a bounded
    filesystem scan (`scanMemoryRoots` + `rankMemoryHeaders`).
-4. An optional admitted memory selector may rerank; failure returns the
-   lexical top `MAX_RELEVANT_MEMORIES` (5). Each surfaced file is then
-   truncated to 200 lines / 4 KiB for the prompt.
+4. An optional admitted memory selector may rerank, but only when more than
+   `MAX_RELEVANT_MEMORIES` (5) candidates ranked: with five or fewer there is
+   nothing to drop, so the main-model round trip is skipped. The selector has
+   a 5 s deadline (`MAX_MEMORY_SELECTOR_MS`); failure or timeout returns the
+   lexical top 5. Each surfaced file is then truncated to 200 lines / 4 KiB
+   for the prompt.
 
 `mode: "session_start"` (first empty-query turn, not a subagent) always
 scans. It never opens the index.
