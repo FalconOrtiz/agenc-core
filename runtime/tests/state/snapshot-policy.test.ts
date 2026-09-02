@@ -865,6 +865,80 @@ describe("AgenCSessionSnapshotPolicy", () => {
     expect(snapshotTimes("session-stale")).toEqual(["2026-09-02T00:00:00.000Z"]);
   });
 
+  // Live follow-up: a recovered session (conv-mtjbjxk8, one "ready" turn,
+  // idle since) received one periodic row every 30 s, byte-identical to the
+  // previous one, for 24 minutes. Every daemon instance that wrote such rows
+  // was built before the dirty check landed in the integration branch
+  // (00:13:35Z on 2026-09-02); no instance built after it wrote an idle row
+  // (32 idle minutes, zero rows, on the current build). This pins what the
+  // current code does for exactly that session shape: hydrated at startup,
+  // then nothing but same-status heartbeats and periodic ticks.
+  it("writes a recovered idle session once and ignores unchanged status heartbeats", () => {
+    seedRun("run-idle-recovered", "session-idle-recovered");
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-09-02T00:00:00.000Z",
+      agencHome: home,
+    });
+    policy.trackSession("session-idle-recovered", "run-idle-recovered");
+    policy.hydrateSession({
+      sessionId: "session-idle-recovered",
+      snapshotAt: "2026-09-01T23:49:25.916Z",
+      conversation: [
+        { role: "user", messageId: "message-ready", payload: { message: "ready?" } },
+        { role: "assistant", eventId: "chunk-ready", delta: "ready" },
+      ],
+      toolState: {
+        inFlight: {},
+        completed: {},
+        statusTransitions: [
+          {
+            agentId: "run-idle-recovered",
+            status: "running",
+            transitionAt: "2026-09-01T23:49:21.120Z",
+          },
+          {
+            agentId: "run-idle-recovered",
+            status: "idle",
+            transitionAt: "2026-09-01T23:49:25.916Z",
+            reason: "ready",
+          },
+        ],
+      },
+      mcpConnectionState: { status: "unknown", events: [] },
+    });
+    // The first tick lands the hydrated state, once.
+    expect(policy.flushPeriodic()).toEqual([
+      expect.objectContaining({ trigger: "periodic" }),
+    ]);
+    expect(snapshotCount("session-idle-recovered")).toBe(1);
+
+    // 48 ticks (24 minutes at 30 s), each preceded by the two heartbeat
+    // shapes the daemon can deliver for an unchanged status: the forwarded
+    // event.agent_status and the lifecycle's own transition record.
+    for (let tick = 0; tick < 48; tick++) {
+      policy.recordSessionEvent("session-idle-recovered", {
+        method: "event.agent_status",
+        params: { agentId: "run-idle-recovered", status: "idle", message: "ready" },
+      });
+      policy.recordAgentStatusTransition({
+        sessionId: "session-idle-recovered",
+        agentId: "run-idle-recovered",
+        status: "idle",
+        transitionAt: `2026-09-02T00:${String(tick).padStart(2, "0")}:00.000Z`,
+      });
+      expect(policy.flushPeriodic()).toEqual([]);
+    }
+    expect(snapshotCount("session-idle-recovered")).toBe(1);
+    expect(policy.flushSession("session-idle-recovered")).toBeUndefined();
+    expect(latestSnapshot("session-idle-recovered").toolState).toMatchObject({
+      lastTrigger: "periodic",
+      statusTransitions: [
+        expect.objectContaining({ status: "running" }),
+        expect.objectContaining({ status: "idle", reason: "ready" }),
+      ],
+    });
+  });
+
   it("drops array-shaped hydrated tool-state maps before flushing", () => {
     seedRun("run-hydrate-arrays", "session-hydrate-arrays");
     const policy = new AgenCSessionSnapshotPolicy(driver, {
