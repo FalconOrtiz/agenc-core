@@ -232,7 +232,11 @@ describe("provider trace sink", () => {
   });
 
   test("summarizeProviderRequestParams reports absent routing fields as null", () => {
-    expect(summarizeProviderRequestParams({ model: "grok-4.6", input: [] })).toEqual({
+    const summary = summarizeProviderRequestParams({ model: "grok-4.6", input: [] });
+    expect(summary.input_prefix_sha256).toEqual([]);
+    expect(typeof summary.input_sha256).toBe("string");
+    const { input_prefix_sha256: _prefix, input_sha256: _body, ...routing } = summary;
+    expect(routing).toEqual({
       model: "grok-4.6",
       prompt_cache_key: null,
       previous_response_id: null,
