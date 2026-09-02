@@ -642,14 +642,6 @@ async function loadMarkdownFiles(dir: string): Promise<
       throw e
     }
   }
-  // Ripgrep can also fail by returning nothing: a spawn that dies before it
-  // writes, a sandbox that blocks it, a retry that exhausts itself. The
-  // directory is small, so confirming an empty answer with the native walk
-  // costs little and turns a silent disappearance into a correct listing.
-  if (!useNative && files.length === 0) {
-    files = await findMarkdownFilesNative(dir, signal)
-  }
-
   const results = await Promise.all(
     files.map(async filePath => {
       let handle: Awaited<ReturnType<typeof open>> | undefined
