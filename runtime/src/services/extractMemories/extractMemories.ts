@@ -576,16 +576,21 @@ export function initExtractMemories(
       tracker.policyDenied ||
       tracker.failedWrite
     ) {
-      const detail =
-        childResult.outcome !== "completed"
-          ? `child outcome ${childResult.outcome}${childResult.error !== undefined ? `: ${errorText(childResult.error)}` : ""}`
-          : tracker.policyDenied
-            ? "child tool policy denied a call"
-            : "a memory write failed";
+      let detail: string;
+      if (childResult.outcome !== "completed") {
+        detail = "child outcome " + childResult.outcome;
+        if (childResult.error !== undefined) {
+          detail += ": " + errorText(childResult.error);
+        }
+      } else if (tracker.policyDenied) {
+        detail = "child tool policy denied a call";
+      } else {
+        detail = "a memory write failed";
+      }
       emitExtractionWarning(
         session,
         "memory_extraction_failed",
-        `${detail}; ${newMessageCount} message(s) stay queued for the next run`,
+        detail + "; " + newMessageCount + " message(s) stay queued for the next run",
       );
       return;
     }

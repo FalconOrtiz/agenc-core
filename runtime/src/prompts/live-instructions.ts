@@ -126,7 +126,7 @@ const PERSISTENT_MEMORY_CONTEXT_PROMPT =
 function escapePersistentMemoryContext(content: string): string {
   return content.replace(
     /<\/persistent_memory_context>/gi,
-    "<\\/persistent_memory_context>",
+    String.raw`<\/persistent_memory_context>`,
   );
 }
 

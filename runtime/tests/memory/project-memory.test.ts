@@ -115,7 +115,7 @@ describe('project-memory API', () => {
         detectSessionFileType(
           join(tempRoot, 'other', 'session-memory', 'summary.md'),
         ),
-      ).toBe(null)
+      ).toBeNull()
     })
   })
 })
