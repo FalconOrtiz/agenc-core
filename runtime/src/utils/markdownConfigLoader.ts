@@ -12,7 +12,7 @@ import type { FrontmatterData } from './frontmatterParser.js'
 import { parseFrontmatter } from './frontmatterParser.js'
 import { findCanonicalGitRoot, findGitRoot } from './git.js'
 import { parseToolListFromCLI } from './permissions/toolListParser.js'
-import { ripGrep } from './ripgrep.js'
+import { isRipgrepUnavailable, ripGrep } from './ripgrep.js'
 import {
   isSettingSourceEnabled,
   type SettingSource,
@@ -623,11 +623,31 @@ async function loadMarkdownFiles(dir: string): Promise<
           signal,
         )
   } catch (e: unknown) {
-    // Handle missing/inaccessible dir directly instead of pre-checking
-    // existence (TOCTOU). findMarkdownFilesNative already catches internally;
-    // ripGrep rejects on inaccessible target paths.
-    if (isFsInaccessible(e)) return []
-    throw e
+    // A search tool that cannot start is not an empty directory. `ripGrep`
+    // reports an unavailable binary with `code: "ENOENT"`, which errno alone
+    // cannot tell apart from "the directory is gone", so the check below
+    // swallowed it and every markdown-defined agent, command and hook
+    // silently disappeared wherever ripgrep could not run — a machine with
+    // no `rg` on PATH, a build without the packaged binary, a container that
+    // cannot spawn it. The native walk is documented above as the fallback
+    // for exactly this and needs no external binary, so use it.
+    if (!useNative && isRipgrepUnavailable(e)) {
+      files = await findMarkdownFilesNative(dir, signal)
+    } else if (isFsInaccessible(e)) {
+      // Handle missing/inaccessible dir directly instead of pre-checking
+      // existence (TOCTOU). findMarkdownFilesNative already catches
+      // internally; ripGrep rejects on inaccessible target paths.
+      return []
+    } else {
+      throw e
+    }
+  }
+  // Ripgrep can also fail by returning nothing: a spawn that dies before it
+  // writes, a sandbox that blocks it, a retry that exhausts itself. The
+  // directory is small, so confirming an empty answer with the native walk
+  // costs little and turns a silent disappearance into a correct listing.
+  if (!useNative && files.length === 0) {
+    files = await findMarkdownFilesNative(dir, signal)
   }
 
   const results = await Promise.all(
