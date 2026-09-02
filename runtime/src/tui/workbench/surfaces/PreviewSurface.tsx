@@ -20,6 +20,29 @@ import { wheelInputIsInsideNode } from "./wheelInput.js";
 
 const PAGE_SIZE = 80;
 
+type PreviewState = {
+  readonly path: string | null;
+  readonly initialStartLine: number;
+  readonly startLine: number;
+  readonly totalLines: number | null;
+  readonly content: string;
+  readonly error: string | null;
+};
+
+function createPreviewState(
+  activePath: string | null,
+  initialStartLine: number,
+): PreviewState {
+  return {
+    path: activePath,
+    initialStartLine,
+    startLine: initialStartLine,
+    totalLines: null,
+    content: "",
+    error: null,
+  };
+}
+
 export function PreviewSurface({
   focused,
   pathOverride = null,
@@ -35,16 +58,36 @@ export function PreviewSurface({
   const workbench = useWorkbenchState();
   const dispatch = useWorkbenchDispatch();
   const contentRef = useRef<DOMElement | null>(null);
-  const [startLine, setStartLine] = useState(() => Math.max(0, (workbench.activeFileLine ?? 1) - 1));
-  const [totalLines, setTotalLines] = useState<number | null>(null);
-  const [content, setContent] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const readGenerationRef = useRef(0);
+  const activePath = pathOverride ?? workbench.activeFilePath;
+  const initialStartLine = pathOverride === null
+    ? Math.max(0, (workbench.activeFileLine ?? 1) - 1)
+    : 0;
+  const [previewState, setPreviewState] = useState<PreviewState>(() =>
+    createPreviewState(activePath, initialStartLine)
+  );
+  const activePreviewState = previewState.path === activePath &&
+      previewState.initialStartLine === initialStartLine
+    ? previewState
+    : createPreviewState(activePath, initialStartLine);
+  const { startLine, totalLines, content, error } = activePreviewState;
+  const setStartLine = useCallback((update: React.SetStateAction<number>) => {
+    setPreviewState((current) => {
+      const activeState = current.path === activePath &&
+          current.initialStartLine === initialStartLine
+        ? current
+        : createPreviewState(activePath, initialStartLine);
+      const nextStartLine = typeof update === "function"
+        ? update(activeState.startLine)
+        : update;
+      return { ...activeState, startLine: nextStartLine };
+    });
+  }, [activePath, initialStartLine]);
   const [gitStateState, setGitStateState] = useState<{
     readonly path: string | null;
     readonly status: string | null;
   }>({ path: null, status: null });
   const tasks = useAppState((state) => state.tasks);
-  const activePath = pathOverride ?? workbench.activeFilePath;
   const gitState = gitStateState.path === activePath ? gitStateState.status : null;
   const inFlightAgent = useMemo(
     () => Object.values(tasks).find((task: any) =>
@@ -69,20 +112,26 @@ export function PreviewSurface({
   // file's colors"): same shiki pipeline the BUFFER uses, mapped per line so
   // the dim line-number gutter stays. Falls back to plain text when the
   // highlighter is unavailable or the language is unknown.
-  const [highlightedLines, setHighlightedLines] = useState<ReadonlyMap<number, string>>(new Map());
+  const [highlightState, setHighlightState] = useState<{
+    readonly path: string | null;
+    readonly lines: ReadonlyMap<number, string>;
+  }>({ path: null, lines: new Map() });
+  const highlightedLines = highlightState.path === activePath
+    ? highlightState.lines
+    : new Map<number, string>();
   useEffect(() => {
     if (!activePath || lines.length === 0) {
-      setHighlightedLines(new Map());
+      setHighlightState({ path: activePath, lines: new Map() });
       return;
     }
     let cancelled = false;
     const visible = lines.map((text, index) => ({ number: startLine + index + 1, text }));
     void highlightBufferVisibleLines(activePath, visible)
       .then((map) => {
-        if (!cancelled) setHighlightedLines(map);
+        if (!cancelled) setHighlightState({ path: activePath, lines: map });
       })
       .catch(() => {
-        if (!cancelled) setHighlightedLines(new Map());
+        if (!cancelled) setHighlightState({ path: activePath, lines: new Map() });
       });
     return () => {
       cancelled = true;
@@ -90,44 +139,52 @@ export function PreviewSurface({
   }, [activePath, content]);
 
   useEffect(() => {
-    setStartLine(Math.max(0, (workbench.activeFileLine ?? 1) - 1));
-    setTotalLines(null);
-    setContent("");
-    setError(null);
-  }, [workbench.activeFileLine, workbench.activeFilePath]);
+    setPreviewState(createPreviewState(activePath, initialStartLine));
+  }, [activePath, initialStartLine]);
 
   useEffect(() => {
+    const readGeneration = ++readGenerationRef.current;
     if (!absolutePath) {
-      setContent("");
-      setError(null);
       setGitStateState({ path: null, status: null });
-      setTotalLines(null);
       return;
     }
     const controller = new AbortController();
     readFileInRange(absolutePath, startLine, PAGE_SIZE, undefined, controller.signal)
       .then((result) => {
-        if (controller.signal.aborted) return;
+        if (
+          controller.signal.aborted ||
+          readGeneration !== readGenerationRef.current
+        ) return;
         const nextTotalLines = Math.max(0, result.totalLines ?? result.lineCount ?? 0);
         const maxStartLine = maxPreviewStartLine(nextTotalLines);
-        setTotalLines(nextTotalLines);
         if (startLine > maxStartLine) {
-          setContent("");
-          setError(null);
-          setStartLine(maxStartLine);
+          setPreviewState({
+            ...createPreviewState(activePath, initialStartLine),
+            startLine: maxStartLine,
+            totalLines: nextTotalLines,
+          });
           return;
         }
-        setContent(result.content);
-        setError(null);
+        setPreviewState({
+          ...createPreviewState(activePath, initialStartLine),
+          startLine,
+          totalLines: nextTotalLines,
+          content: result.content,
+        });
       })
       .catch((err) => {
-        if (controller.signal.aborted) return;
-        setContent("");
-        setTotalLines(null);
-        setError(err instanceof Error ? err.message : String(err));
+        if (
+          controller.signal.aborted ||
+          readGeneration !== readGenerationRef.current
+        ) return;
+        setPreviewState({
+          ...createPreviewState(activePath, initialStartLine),
+          startLine,
+          error: err instanceof Error ? err.message : String(err),
+        });
       });
     return () => controller.abort();
-  }, [absolutePath, startLine]);
+  }, [absolutePath, activePath, initialStartLine, startLine]);
 
   useEffect(() => {
     if (!activePath) {
