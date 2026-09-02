@@ -560,35 +560,16 @@ async function waitForPid(pidPath: string): Promise<number> {
   throw new Error("timed out waiting for daemon pid");
 }
 
-/**
- * How long {@link stopRunningDaemons} waits for the runs to settle once its
- * SIGTERM loop has given up. Bounded so a daemon that never stops fails with a
- * named error instead of the case dying on the vitest deadline.
- */
 const DAEMON_STOP_GRACE_MS = 2_000;
 
-/**
- * Shuts foreground daemons down without depending on when they installed
- * their signal handlers.
- *
- * runAgenCDaemonCli only calls installAgenCShutdownSignalHandlers after its
- * services are constructed. The test signal process has no default action, so
- * a single SIGTERM emitted before that point is dropped, the daemon keeps
- * running, and the awaited run promise never settles -- the test then dies on
- * the vitest deadline with no indication of what it was waiting for. Repeating
- * the signal until the runs settle closes that window; the handler's own
- * `settled` guard makes the extra signals no-ops.
- *
- * Every wait here is bounded. Falling through to an unbounded await on runs
- * that never settle would reintroduce exactly the content-free
- * "Test timed out" this helper exists to remove, only later, against the
- * widened case timeout.
- */
+type ForegroundDaemon = {
+  readonly signalProcess: ReturnType<typeof createSignalProcess>;
+  readonly running: Promise<number>;
+};
+
+/** Retry SIGTERM until runs settle; a single emit can be lost pre-handler. */
 async function stopRunningDaemons(
-  daemons: readonly {
-    readonly signalProcess: ReturnType<typeof createSignalProcess>;
-    readonly running: Promise<number>;
-  }[],
+  daemons: readonly ForegroundDaemon[],
 ): Promise<void> {
   let running = true;
   let signalsSent = 0;
@@ -618,6 +599,20 @@ async function stopRunningDaemons(
     }
   }
   await settled;
+}
+
+async function stopDaemon(
+  signalProcess: ReturnType<typeof createSignalProcess>,
+  running: Promise<number>,
+): Promise<void> {
+  await stopDaemon(signalProcess, running);
+}
+
+async function stopDaemonQuiet(
+  signalProcess: ReturnType<typeof createSignalProcess>,
+  running: Promise<number>,
+): Promise<void> {
+  await stopDaemon(signalProcess, running).catch(() => {});
 }
 
 async function availableLoopbackPort(): Promise<number> {
@@ -1426,12 +1421,12 @@ describe("AgenC daemon CLI", () => {
       expect(out).toMatch(/memory: rss=[\d.]+ MiB/);
       expect(out).toMatch(/sessions: active=\d+, closed=\d+, total=\d+/);
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -2719,15 +2714,13 @@ describe("AgenC daemon CLI", () => {
       });
       expect(spawnCount).toBe(0);
 
-      await stopRunningDaemons([{ signalProcess, running: foreground }]);
+      await stopDaemon(signalProcess, foreground);
       stopped = true;
       await expect(foreground).resolves.toBe(0);
     } finally {
       publishForeground();
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running: foreground }]).catch(
-          () => {},
-        );
+        await stopDaemonQuiet(signalProcess, foreground);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -3100,12 +3093,12 @@ token_cap = 123
       );
       expect(io.stderrText()).toContain("AgenC daemon config reloaded");
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
       updateRuntimeConfig.mockRestore();
@@ -3204,12 +3197,12 @@ workspace = ${JSON.stringify(workspaceB)}
       );
       expect(workspaceARead.body).toContain("ADMISSION_IDENTITY_REQUIRED");
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await Promise.all([
         rm(agencHome, { recursive: true, force: true }),
@@ -3315,12 +3308,12 @@ workspace = ${JSON.stringify(process.cwd())}
       expect(host.terminatedPids).toEqual([]);
       await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4100);
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -3494,7 +3487,7 @@ workspace = ${JSON.stringify(process.cwd())}
       ).toEqual(replacement);
     } finally {
       await releaseLifecycleLock?.();
-      await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+      await stopDaemonQuiet(signalProcess, running);
       await rm(agencHome, { recursive: true, force: true });
     }
   });
@@ -3589,7 +3582,7 @@ workspace = ${JSON.stringify(process.cwd())}
       ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       if ((await readAgenCDaemonPid(pidPath)) !== null) {
-        await stopRunningDaemons([{ signalProcess, running }]);
+        await stopDaemon(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -3700,7 +3693,7 @@ workspace = ${JSON.stringify(process.cwd())}
       reloadSocket?.destroy();
       shutdownSocket?.destroy();
       if ((await readAgenCDaemonPid(pidPath)) !== null) {
-        await stopRunningDaemons([{ signalProcess, running }]);
+        await stopDaemon(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -3918,7 +3911,7 @@ backend = "local"
       ).identity?.daemon,
     );
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -3968,7 +3961,7 @@ backend = "local"
     expect(line.error?.data?.code).toBe("CONNECTION_AUTHENTICATION_FAILED");
     await expect(waitForSocketClose(socket)).resolves.toBe("closed");
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -4108,7 +4101,7 @@ backend = "local"
       expect(resolvedThreadIds).toEqual([]);
       socket.end();
     } finally {
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       await expect(running).resolves.toBe(0);
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -4201,7 +4194,7 @@ backend = "local"
 
     socket.close();
     await waitForWebSocketClose(socket);
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -4296,12 +4289,12 @@ backend = "local"
         initialSnapshots,
       );
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -4394,12 +4387,12 @@ backend = "local"
       });
       expect(permissionAgentIds).toEqual([created.agentId]);
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -4447,7 +4440,7 @@ backend = "local"
     await expect(waitForPid(pidPath)).resolves.toBe(4100);
 
     expect(io.stdoutText()).toContain("AgenC daemon running");
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
@@ -4482,7 +4475,7 @@ port = 0
       "daemon MCP autostart requires an explicit absolute mcp.server.workspace",
     );
     expect(io.stderrText()).not.toContain("AgenC MCP server listening");
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
@@ -4517,7 +4510,7 @@ workspace = ${JSON.stringify(process.cwd())}
     expect(io.stderrText()).toMatch(
       /AgenC MCP server listening on http:\/\/127\.0\.0\.1:\d+\/mcp/,
     );
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
@@ -4619,12 +4612,12 @@ snapshot_max_bytes = 64
         readSnapshotTimes(agencHome, process.cwd(), "session-retention-bytes"),
       ).toEqual(["2026-05-06T00:00:01.000Z"]);
 
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       stopped = true;
       await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
-        await stopRunningDaemons([{ signalProcess, running }]).catch(() => {});
+        await stopDaemonQuiet(signalProcess, running);
       }
       await rm(agencHome, { recursive: true, force: true });
     }
@@ -4884,7 +4877,7 @@ snapshot_max_bytes = 64
       expect.objectContaining({ displayUserMessage: "continue" }),
     );
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     expect(
       readRecoveredToolStatus(agencHome, process.cwd(), "tool-restart"),
@@ -4964,7 +4957,7 @@ snapshot_max_bytes = 64
       ],
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -5074,7 +5067,7 @@ snapshot_max_bytes = 64
     expect(readAgentRunStatus(agencHome, process.cwd(), runId)).toBe(
       "cancelled",
     );
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -5417,7 +5410,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
     expect(
       readRecoveredToolStatus(agencHome, process.cwd(), "tool-replay"),
@@ -5544,7 +5537,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -5654,7 +5647,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -5807,7 +5800,7 @@ snapshot_max_bytes = 64
       ],
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(agencHome, { recursive: true, force: true });
@@ -6086,7 +6079,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
     await expect(running).resolves.toBe(0);
 
     await rm(otherCwd, { recursive: true, force: true });
@@ -6109,7 +6102,7 @@ snapshot_max_bytes = 64
     );
     await expect(waitForPid(pidPath)).resolves.toBe(4100);
 
-    await stopRunningDaemons([{ signalProcess, running }]);
+    await stopDaemon(signalProcess, running);
 
     await expect(running).resolves.toBe(1);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
@@ -6772,7 +6765,7 @@ describe("daemon startup proxy isolation", () => {
     try {
       await waitForDaemonWebSocketUrl(io);
     } finally {
-      await stopRunningDaemons([{ signalProcess, running }]);
+      await stopDaemon(signalProcess, running);
       await rm(agencHome, { recursive: true, force: true });
     }
   }
