@@ -683,6 +683,7 @@ describe("embedded Neovim BUFFER provider boundary", () => {
     }));
 
     expect(controller.getVisibleLines()).toEqual([]);
+    expect(controller.getOrdinaryInputOwnership()).toBe("none");
     await expect(controller.save()).resolves.toBe(false);
     await expect(controller.revert()).resolves.toBeUndefined();
     await expect(controller.close()).resolves.toBe(true);
@@ -696,6 +697,82 @@ describe("embedded Neovim BUFFER provider boundary", () => {
     expect(controller.click(1, 1)).toBe(false);
     controller.focus(true);
     await expect(controller.reopen()).resolves.toBeUndefined();
+  });
+
+  it("consumes ordinary input while provider open is in flight", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const provider = createFakeProvider("inline");
+    const controller = new BufferProviderController(async () => {
+      await gate;
+      return {
+        kind: "inline",
+        provider,
+        discovery: null,
+        reason: "deferred",
+      };
+    });
+
+    const opening = controller.open("deferred.ts", 1);
+    expect(controller.getOrdinaryInputOwnership()).toBe("transition");
+    expect(controller.handleInput("q", baseKey(), { rows: 1, columns: 1 })).toBe(
+      true,
+    );
+    expect(provider.handleInput).not.toHaveBeenCalled();
+
+    release();
+    await opening;
+    expect(controller.getOrdinaryInputOwnership()).toBe("provider");
+    expect(controller.handleInput("x", baseKey(), { rows: 1, columns: 1 })).toBe(
+      true,
+    );
+    expect(provider.handleInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("consumes ordinary input during provider replacement", async () => {
+    const first = createFakeProvider("inline");
+    const controller = new BufferProviderController(async () => ({
+      kind: "inline",
+      provider: first,
+      discovery: null,
+      reason: "first",
+    }));
+    await controller.open("a.ts", 1);
+    first.handleInput.mockClear();
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const second = createFakeProvider("neovim");
+    controller.setSelectionFactoryForTesting(async () => {
+      await gate;
+      return {
+        kind: "neovim",
+        provider: second,
+        discovery: usableDiscovery,
+      };
+    });
+
+    const replacing = controller.open("b.ts", 1);
+    expect(controller.getOrdinaryInputOwnership()).toBe("transition");
+    expect(controller.handleInput("x", baseKey(), { rows: 1, columns: 1 })).toBe(
+      true,
+    );
+    expect(first.handleInput).not.toHaveBeenCalled();
+    expect(second.handleInput).not.toHaveBeenCalled();
+
+    release();
+    await replacing;
+    expect(controller.getOrdinaryInputOwnership()).toBe("provider");
+    expect(controller.getSnapshot().provider.kind).toBe("neovim");
+    expect(controller.handleInput("y", baseKey(), { rows: 1, columns: 1 })).toBe(
+      true,
+    );
+    expect(second.handleInput).toHaveBeenCalledTimes(1);
+    expect(first.handleInput).not.toHaveBeenCalled();
   });
 
   it("keeps the last open request when the active provider refuses close", async () => {

@@ -30,6 +30,7 @@ import {
   getWorkbenchBufferProviderController,
   resetWorkbenchBufferProviderControllerForTesting,
 } from "../../../src/tui/workbench/buffer/providers/BufferProviderController.js";
+import { InlineBufferProvider } from "../../../src/tui/workbench/buffer/providers/inline/InlineBufferProvider.js";
 import { createNeovimRenderSnapshot } from "../../../src/tui/workbench/buffer/neovim/NeovimGrid.js";
 import {
   emptyProviderSnapshot,
@@ -1072,8 +1073,30 @@ describe("BufferSurface", () => {
     }
   });
 
-  it("captures focused vim insert text before later input handlers", async () => {
+  it("consumes focused BUFFER input while the provider is still opening", async () => {
     await writeFile(join(dir, "target.ts"), "const value = 1;\n", "utf8");
+
+    let releaseOpen!: () => void;
+    const openGate = new Promise<void>((resolve) => {
+      releaseOpen = resolve;
+    });
+    const provider = new InlineBufferProvider({
+      reason: "deferred open test",
+      store: getWorkbenchBufferStore(),
+    });
+    const handleInput = vi.spyOn(provider, "handleInput");
+    getWorkbenchBufferProviderController().setSelectionFactoryForTesting(
+      async () => {
+        await openGate;
+        return {
+          kind: "inline" as const,
+          provider,
+          discovery: null,
+          reason: "deferred open test",
+        };
+      },
+    );
+
     const { stdin, stdout } = createStreams();
     const root = await createRoot({
       patchConsole: false,
@@ -1102,22 +1125,49 @@ describe("BufferSurface", () => {
             </KeybindingSetup>
           </AppStateProvider>,
         );
-        await sleep();
+        await flush();
       });
 
-      stdin.write("q");
-      await sleep();
+      expect(
+        getWorkbenchBufferProviderController().getOrdinaryInputOwnership(),
+      ).toBe("transition");
 
-      expect(getWorkbenchBufferStore().getText()).toBe("const value = 1;\n");
-      stdin.write("i");
-      await sleep();
       stdin.write("q");
-      await sleep();
+      stdin.write("i");
+      stdin.write("q");
+      stdin.write("\x1b[200~paste\x1b[201~");
+      stdin.write("j");
+      await flush();
+
+      expect(leaked).toEqual([]);
+      expect(handleInput).not.toHaveBeenCalled();
+      expect(getWorkbenchBufferStore().getText()).toBe("");
+
+      releaseOpen();
+      await vi.waitFor(() =>
+        expect(
+          getWorkbenchBufferProviderController().getOrdinaryInputOwnership(),
+        ).toBe("provider"),
+      );
+      await vi.waitFor(() =>
+        expect(getWorkbenchBufferStore().getText()).toBe("const value = 1;\n"),
+      );
+
+      expect(leaked).toEqual([]);
+      expect(handleInput).not.toHaveBeenCalled();
+      expect(getWorkbenchBufferStore().getSnapshot().vimMode).toBe("NORMAL");
+
+      stdin.write("i");
+      await flush();
+      stdin.write("q");
+      await flush();
 
       expect(getWorkbenchBufferStore().getText()).toBe("qconst value = 1;\n");
       expect(getWorkbenchBufferStore().getSnapshot().vimMode).toBe("INSERT");
       expect(leaked).toEqual([]);
+      expect(handleInput).toHaveBeenCalled();
     } finally {
+      releaseOpen();
       root.unmount();
       stdin.end();
       stdout.end();
