@@ -14,6 +14,10 @@ import {
 import { resolveHomeContext } from '../../../src/config/home.js'
 import { secureStorageIdentityKey } from '../../../src/utils/secureStorage/home.js'
 import { resolveSessionTempRoot } from '../../../src/session/runtime-options.js'
+import {
+  MAX_MCP_TOOL_RESULT_CONTENT_BLOCKS,
+  MCP_TOOL_RESULT_HARD_LIMIT_BYTES,
+} from '../../../src/mcp-client/tool-output.js'
 import { resetProjectForTesting } from '../../../src/utils/sessionStorage.js'
 import { getToolResultsDir } from '../../../src/utils/toolResultStorage.js'
 import {
@@ -187,6 +191,41 @@ async function configureIsolatedSession(): Promise<{ toolResultsDir: string }> {
   switchSession(isolatedSessionId as never, null)
 
   return { toolResultsDir: getToolResultsDir() }
+}
+
+async function callAgentMcpTool(
+  serverName: string,
+  rawResult: unknown,
+): Promise<unknown> {
+  const config = {
+    type: 'stdio',
+    command: serverName,
+    scope: 'local',
+  } as const
+  const client = connectedClient({
+    name: serverName,
+    capabilities: { tools: {} },
+    config,
+    client: {
+      request: async () => ({
+        tools: [{ name: 'adversarial', inputSchema: { type: 'object' } }],
+      }),
+      callTool: async () => rawResult,
+    } as never,
+  })
+  seedConnectionCache(serverName, config, client)
+
+  const [tool] = await fetchToolsForClient(client)
+  assert.ok(tool)
+  return await tool.call(
+    {},
+    {
+      abortController: new AbortController(),
+      setAppState: value => value({ elicitation: { queue: [] } } as never),
+    } as never,
+    undefined as never,
+    { message: { content: [] } } as never,
+  )
 }
 
 test('cleanupFailedConnection awaits transport close before resolving', async () => {
@@ -785,6 +824,96 @@ test('MCP tool call passes metadata, progress, structured content, and result me
       progressMessage: 'working',
     },
   })
+})
+
+test('agent MCP tool rejects oversized base64 before legacy binary transformation', async () => {
+  const { toolResultsDir } = await configureIsolatedSession()
+  await mkdir(toolResultsDir, { recursive: true })
+  const oversizedBase64 = 'A'.repeat(MCP_TOOL_RESULT_HARD_LIMIT_BYTES + 4)
+
+  const result = await callAgentMcpTool('oversized-binary-server', {
+    content: [
+      {
+        type: 'image',
+        data: oversizedBase64,
+        mimeType: 'image/png',
+      },
+    ],
+  })
+  const serialized = JSON.stringify(result)
+
+  assert.match(serialized, /Invalid or oversized MCP binary content omitted/)
+  assert.equal(serialized.includes(oversizedBase64.slice(0, 1_024)), false)
+  assert.deepEqual(await readdir(toolResultsDir), [])
+})
+
+test('agent MCP tool caps aggregate content blocks before legacy transformation', async () => {
+  const result = (await callAgentMcpTool('many-blocks-server', {
+    content: Array.from(
+      { length: MAX_MCP_TOOL_RESULT_CONTENT_BLOCKS + 1 },
+      () => ({ type: 'text', text: 'bounded-block' }),
+    ),
+  })) as { data: Array<{ type: string; text?: string }> }
+
+  assert.ok(Array.isArray(result.data))
+  assert.equal(
+    result.data.filter(block => block.text === 'bounded-block').length,
+    MAX_MCP_TOOL_RESULT_CONTENT_BLOCKS,
+  )
+  assert.match(
+    result.data.at(-1)?.text ?? '',
+    /aggregate safety budget exhausted/,
+  )
+})
+
+test('agent MCP tool bounds deep structured content and oversized metadata before egress', async () => {
+  let structuredContent: Record<string, unknown> = {
+    value: 'deep-structured-sentinel',
+  }
+  for (let depth = 0; depth < 80; depth++) {
+    structuredContent = { nested: structuredContent }
+  }
+
+  const result = (await callAgentMcpTool('deep-json-server', {
+    content: [{ type: 'text', text: 'visible' }],
+    structuredContent,
+    _meta: {
+      value: `deep-meta-sentinel-${'m'.repeat(65 * 1_024)}`,
+    },
+  })) as {
+    data: unknown
+    mcpMeta?: Record<string, unknown>
+  }
+  const serialized = JSON.stringify(result)
+
+  assert.equal(serialized.includes('deep-structured-sentinel'), false)
+  assert.equal(serialized.includes('deep-meta-sentinel'), false)
+  assert.ok(result.mcpMeta)
+  assert.equal('_meta' in result.mcpMeta, false)
+  assert.ok('structuredContent' in result.mcpMeta)
+})
+
+test('agent MCP tool bounds error metadata before throwing', async () => {
+  await assert.rejects(
+    callAgentMcpTool('error-metadata-server', {
+      isError: true,
+      content: [{ type: 'text', text: 'bounded failure' }],
+      _meta: { value: 'm'.repeat(65 * 1_024) },
+    }),
+    (error: unknown) => {
+      assert.equal(
+        error instanceof McpToolCallError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        true,
+      )
+      assert.equal((error as Error).message, 'bounded failure')
+      assert.equal(
+        (error as McpToolCallError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS)
+          .mcpMeta,
+        undefined,
+      )
+      return true
+    },
+  )
 })
 
 test('MCP tool call wraps generic and protocol errors with log-safe errors', async () => {

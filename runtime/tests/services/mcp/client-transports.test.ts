@@ -2393,15 +2393,18 @@ test('MCP tool calls persist large non-image output and fall back when disabled'
   const persisted: Array<{ content: unknown; id: string }> = []
   const needsTruncationEnvironments: Array<Readonly<Record<string, string | undefined>>> = []
   const truncationEnvironments: Array<Readonly<Record<string, string | undefined>>> = []
-  const pngBase64 =
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
   vi.doMock('../../../src/utils/mcpValidation.js', () => ({
     mcpContentNeedsTruncation: async (
-      _content: unknown,
+      content: unknown,
       environment: Readonly<Record<string, string | undefined>>,
     ) => {
       needsTruncationEnvironments.push(environment)
-      return true
+      if (
+        environment.MAX_MCP_OUTPUT_TOKENS === String(Number.MAX_SAFE_INTEGER)
+      ) {
+        return false
+      }
+      return JSON.stringify(content).includes('huge result')
     },
     truncateMcpContentIfNeeded: async (
       _content: unknown,
@@ -2451,7 +2454,6 @@ test('MCP tool calls persist large non-image output and fall back when disabled'
 	          { name: 'dump', inputSchema: { type: 'object' } },
 	          { name: 'plain', inputSchema: { type: 'object' } },
 	          { name: 'empty', inputSchema: { type: 'object' } },
-	          { name: 'image', inputSchema: { type: 'object' } },
 	          { name: 'fail-persist', inputSchema: { type: 'object' } },
 	        ],
 	      }),
@@ -2462,17 +2464,6 @@ test('MCP tool calls persist large non-image output and fall back when disabled'
 	        if (request.name === 'empty') {
 	          return { toolResult: '' }
 	        }
-	        if (request.name === 'image') {
-	          return {
-	            content: [
-              {
-                type: 'image',
-                data: pngBase64,
-                mimeType: 'image/png',
-              },
-            ],
-          }
-        }
         return {
           content: [{ type: 'text', text: 'huge result' }],
         }
@@ -2530,17 +2521,6 @@ test('MCP tool calls persist large non-image output and fall back when disabled'
     { message: { content: [] } } as never,
   )
   assert.deepEqual(emptyResult, { data: '' })
-
-  const imageResult = await toolByName.get('image')!.call(
-    {},
-    {
-      abortController: new AbortController(),
-      setAppState: value => value({ elicitation: { queue: [] } } as never),
-    } as never,
-    undefined as never,
-    { message: { content: [] } } as never,
-  )
-  assert.deepEqual(imageResult, { data: 'truncated fallback' })
 
   const persistErrorResult = await toolByName.get('fail-persist')!.call(
     {},

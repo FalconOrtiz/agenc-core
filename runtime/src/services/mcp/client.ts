@@ -119,6 +119,7 @@ import {
   sanitizeMcpSearchHint,
   sanitizeOptionalMcpModelFacingText,
 } from '../../mcp-client/model-facing-sanitization.js'
+import { normalizeMcpToolOutput } from '../../mcp-client/tool-output.js'
 import {
   buildMcpHostClientCapabilities,
   configureMcpHostRequestHandlers,
@@ -2699,14 +2700,78 @@ async function callMCPTool({
       signal.removeEventListener('abort', forwardCallerAbort)
     }
 
-    if ('isError' in result && result.isError) {
+    let boundedResult = result
+    if (name !== 'ide') {
+      const hasLegacyToolResult = 'toolResult' in result
+      const legacyToolResult = hasLegacyToolResult
+        ? typeof result.toolResult === 'string'
+          ? result.toolResult
+          : result.toolResult === null ||
+              typeof result.toolResult === 'boolean' ||
+              typeof result.toolResult === 'number' ||
+              typeof result.toolResult === 'bigint' ||
+              typeof result.toolResult === 'undefined'
+            ? String(result.toolResult)
+            : '[Unsupported MCP toolResult value omitted]'
+        : undefined
+      const normalized = await normalizeMcpToolOutput({
+        raw: hasLegacyToolResult
+          ? {
+              content: [{ type: 'text', text: legacyToolResult }],
+              isError: result.isError === true,
+              ...(result.structuredContent !== undefined
+                ? { structuredContent: result.structuredContent }
+                : {}),
+              ...(result._meta !== undefined ? { _meta: result._meta } : {}),
+            }
+          : result,
+        serverName: name,
+        toolName: tool,
+        callId: `mcp-${normalizeNameForMCP(name)}-${normalizeNameForMCP(tool)}-${toolStartTime}`,
+        // The canonical pass owns the hard work envelope. The legacy result
+        // processor below still owns the configured token persistence policy.
+        environment: {
+          ...environment,
+          MAX_MCP_OUTPUT_TOKENS: String(Number.MAX_SAFE_INTEGER),
+        },
+        logger: {
+          debug: message => logMCPDebug(name, message),
+          info: message => logMCPDebug(name, message),
+          warn: message => logMCPError(name, message),
+          error: message => logMCPError(name, message),
+        },
+      })
+      const codeModeResult = normalized.codeModeResult as Record<
+        string,
+        unknown
+      >
+      const firstCodeModeBlock = Array.isArray(codeModeResult.content)
+        ? codeModeResult.content[0]
+        : undefined
+      boundedResult = {
+        ...codeModeResult,
+        ...(hasLegacyToolResult
+          ? {
+              toolResult:
+                firstCodeModeBlock &&
+                typeof firstCodeModeBlock === 'object' &&
+                'text' in firstCodeModeBlock &&
+                typeof firstCodeModeBlock.text === 'string'
+                  ? firstCodeModeBlock.text
+                  : normalized.content,
+            }
+          : {}),
+      } as Awaited<ReturnType<typeof client.callTool>>
+    }
+
+    if ('isError' in boundedResult && boundedResult.isError) {
       let errorDetails = 'Unknown error'
       if (
-        'content' in result &&
-        Array.isArray(result.content) &&
-        result.content.length > 0
+        'content' in boundedResult &&
+        Array.isArray(boundedResult.content) &&
+        boundedResult.content.length > 0
       ) {
-        const firstContent = result.content[0]
+        const firstContent = boundedResult.content[0]
         if (
           firstContent &&
           typeof firstContent === 'object' &&
@@ -2714,9 +2779,9 @@ async function callMCPTool({
         ) {
           errorDetails = firstContent.text
         }
-      } else if ('error' in result) {
+      } else if ('error' in boundedResult) {
         // Fallback for compatibility error format
-        errorDetails = String(result.error)
+        errorDetails = String(boundedResult.error)
       }
       logMCPError(name, errorDetails)
       // Include server and tool name in logs for debugging, but keep
@@ -2725,7 +2790,9 @@ async function callMCPTool({
       throw new McpToolCallError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS(
         errorDetails,
         `MCP tool [${name}] ${tool}: ${errorDetails}`,
-        '_meta' in result && result._meta ? { _meta: result._meta } : undefined,
+        '_meta' in boundedResult && boundedResult._meta
+          ? { _meta: boundedResult._meta }
+          : undefined,
       )
     }
     const elapsed = Date.now() - toolStartTime
@@ -2738,11 +2805,16 @@ async function callMCPTool({
 
     logMCPDebug(name, `Tool '${tool}' completed successfully in ${duration}`)
 
-    const content = await processMCPResult(result, tool, name, environment)
+    const content = await processMCPResult(
+      boundedResult,
+      tool,
+      name,
+      environment,
+    )
     return {
       content,
-      _meta: result._meta as Record<string, unknown> | undefined,
-      structuredContent: result.structuredContent as
+      _meta: boundedResult._meta as Record<string, unknown> | undefined,
+      structuredContent: boundedResult.structuredContent as
         | Record<string, unknown>
         | undefined,
     }
