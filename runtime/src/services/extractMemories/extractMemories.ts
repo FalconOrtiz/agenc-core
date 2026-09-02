@@ -43,7 +43,6 @@ import {
   isMemoryExtractionDisabledByEnv,
   memoryExtractionVisibleRange,
   parseMemoryToolArguments,
-  eligibleTurnsInRange,
   shouldDeferForEligibleTurnCadence,
   type MemoryExtractionTriggerState,
 } from "../../memory/extraction-triggers.js";
@@ -174,6 +173,12 @@ interface ExtractionLane {
   inProgress: boolean;
   lastAccessedAt: number;
   pendingContext: QueuedExtraction | undefined;
+  /**
+   * True until this process has made one cadence decision for this lane. The
+   * counter inside `trigger` starts at zero in every new process, so the
+   * first decision is the only one allowed to read the backlog instead.
+   */
+  coldDecisionPending: boolean;
 }
 
 interface ChildWriteTracker {
@@ -542,6 +547,9 @@ export function initExtractMemories(
       inProgress: false,
       lastAccessedAt: Date.now(),
       pendingContext: undefined,
+      // A lane this process has not decided for yet: the conversation may
+      // predate the process.
+      coldDecisionPending: true,
     };
     lanes.set(key, created);
     return created;
@@ -598,19 +606,23 @@ export function initExtractMemories(
       return;
     }
 
-    if (
-      shouldDeferForEligibleTurnCadence({
-        state: lane.trigger,
-        minEligibleTurns: deps.minEligibleTurns,
-        isTrailingRun,
-        // Survives a daemon restart, which the in-process counter does not.
-        unprocessedEligibleTurns: eligibleTurnsInRange(range.unprocessedMessages),
-      })
-    ) {
+    // The first decision this process makes for this lane may consider the
+    // backlog: a daemon restart leaves the counter at zero while the
+    // conversation it paces is still on disk.
+    const laneIsCold = lane.coldDecisionPending;
+    lane.coldDecisionPending = false;
+    const cadence = shouldDeferForEligibleTurnCadence({
+      state: lane.trigger,
+      minEligibleTurns: deps.minEligibleTurns,
+      isTrailingRun,
+      laneIsCold,
+      unprocessedVisibleCount: range.unprocessedMessages.length,
+    });
+    if (cadence.defer) {
       emitExtractionWarning(
         session,
         "memory_extraction_skipped",
-        `deferred by eligible-turn cadence (${lane.trigger.turnsSinceLastExtraction}/${Math.max(1, Math.trunc(deps.minEligibleTurns ?? DEFAULT_MIN_ELIGIBLE_TURNS))} eligible turns)`,
+        `deferred by eligible-turn cadence (${cadence.waiting}/${Math.max(1, Math.trunc(deps.minEligibleTurns ?? DEFAULT_MIN_ELIGIBLE_TURNS))} eligible turns)`,
       );
       return;
     }

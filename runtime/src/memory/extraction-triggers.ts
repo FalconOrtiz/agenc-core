@@ -123,45 +123,48 @@ function resolveMinEligibleTurns(value: number | undefined): number {
 }
 
 /**
- * Eligible turns waiting in a range, counted as the human messages in it.
- * This is the history-derived twin of `turnsSinceLastExtraction`: the counter
- * lives in process memory and a daemon restart sets it back to zero, while
- * the range is recomputed from the conversation and survives.
+ * Unprocessed messages that mean "this process inherited a conversation it did
+ * not build". One turn's own output is a handful of messages; a backlog this
+ * size only accumulates across a restart or a dropped lane.
  */
-export function eligibleTurnsInRange(
-  unprocessedMessages: readonly LLMMessage[],
-): number {
-  return unprocessedMessages.filter((message) => message.role === "user").length;
-}
+export const COLD_LANE_BACKLOG_MESSAGES = 8;
 
 /**
  * Whether to hold this extraction back for the cadence.
  *
- * The counter alone was not restart-safe: it lives in the in-process lane
- * map, so every daemon restart began the wait again. In the live 15-prompt
- * run three restarts meant the extraction ran once in thirteen turns, each
- * restart logging "deferred by eligible-turn cadence (1/3 eligible turns)".
- * The waiting turns are recoverable from the conversation itself, so the
- * decision now takes whichever is larger: what this process has counted, or
- * what the unprocessed range shows is already waiting. A fresh session is
- * unaffected — on its first turn both are 1 — and a resumed session no
- * longer pays another full cadence before its memory is written.
+ * The counter is process-local: it lives in the in-process lane map, so a
+ * daemon restart begins the wait again while the conversation it is pacing
+ * stays on disk. A process that inherits a session mid-conversation would
+ * make it wait a further full cadence before writing any memory.
+ *
+ * The first decision a process makes for a lane is therefore allowed to look
+ * at the backlog instead of the counter: an unprocessed range far larger than
+ * one turn's output means this process did not build this conversation, and
+ * that extraction runs now. It fires at most once per lane per process, so a
+ * failing extraction still retries on the ordinary cadence rather than on
+ * every turn — the cursor only advances when a run succeeds, so a backlog
+ * that stays large must not keep re-triggering.
  */
 export function shouldDeferForEligibleTurnCadence(params: {
   readonly state: MemoryExtractionTriggerState;
   readonly minEligibleTurns: number | undefined;
   readonly isTrailingRun: boolean;
-  readonly unprocessedEligibleTurns?: number;
-}): boolean {
-  if (params.isTrailingRun) return false;
+  /** First cadence decision this process makes for this lane. */
+  readonly laneIsCold?: boolean;
+  readonly unprocessedVisibleCount?: number;
+}): { readonly defer: boolean; readonly waiting: number } {
+  if (params.isTrailingRun) return { defer: false, waiting: 0 };
   params.state.turnsSinceLastExtraction += 1;
-  const waiting = Math.max(
-    params.state.turnsSinceLastExtraction,
-    params.unprocessedEligibleTurns ?? 0,
-  );
-  if (waiting < resolveMinEligibleTurns(params.minEligibleTurns)) {
-    return true;
+  const minimum = resolveMinEligibleTurns(params.minEligibleTurns);
+  if (
+    params.laneIsCold === true &&
+    (params.unprocessedVisibleCount ?? 0) >= COLD_LANE_BACKLOG_MESSAGES
+  ) {
+    params.state.turnsSinceLastExtraction = 0;
+    return { defer: false, waiting: minimum };
   }
+  const waiting = params.state.turnsSinceLastExtraction;
+  if (waiting < minimum) return { defer: true, waiting };
   params.state.turnsSinceLastExtraction = 0;
-  return false;
+  return { defer: false, waiting: minimum };
 }
