@@ -40,6 +40,7 @@ import type {
   RolloutItem,
   TurnContextItem,
 } from "./rollout-item.js";
+import { withoutResponseIds } from "./rollout-item.js";
 import { isAgentInvocationTurnBoundary } from "../contracts/agent-invocation-envelope.js";
 import {
   reduce,
@@ -248,23 +249,6 @@ function validateRawCheckpointBeforeReplay(params: {
     status: validation.status,
     reason: validation.failure.reason,
   };
-}
-
-/**
- * Replacement history as the live session projects it. Compaction commits
- * written before the transaction stopped persisting the runtime uuid carry an
- * `id` on the compaction messages; LLMMessages never do, and the durable
- * checkpoint hash covers `response-id`, so the id must not reach the
- * reconstructed history or every post-compaction checkpoint fails to verify.
- */
-function withoutResponseIds(
-  items: ReadonlyArray<ResponseItem>,
-): ReadonlyArray<ResponseItem> {
-  return items.map((item) => {
-    if (item.id === undefined) return item;
-    const { id: _id, ...rest } = item;
-    return rest;
-  });
 }
 
 function turnIdsCompatible(active?: string, item?: string): boolean {
