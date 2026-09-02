@@ -146,6 +146,7 @@ import type {
   Session,
 } from "../session/session.js";
 import type { Event } from "../session/event-log.js";
+import { turnLifecycleTerminalFromEvent } from "../session/turn-lifecycle-terminal.js";
 import type { RolloutItem } from "../session/rollout-item.js";
 import { reconstructFromRollout } from "../session/rollout-reconstruction.js";
 import type { TurnContext } from "../session/turn-context.js";
@@ -4882,9 +4883,17 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         active.status = "idle";
         active.activeToolCallIds.clear();
         return;
-      case "error":
+      case "turn_failed":
         active.status = "error";
         active.activeToolCallIds.clear();
+        return;
+      case "error":
+        // Diagnostic only when not a bounded legacy terminal. New writers
+        // emit turn_failed; session_only projection already skips most errors.
+        if (turnLifecycleTerminalFromEvent(event)?.kind === "failed") {
+          active.status = "error";
+          active.activeToolCallIds.clear();
+        }
         return;
       case "run_reopened": {
         const epoch = positiveSequence(payload?.epoch);
@@ -5631,26 +5640,24 @@ function messageTerminalFromDaemonEvent(
   ) {
     return undefined;
   }
-  if (event.type === "turn_complete") {
+  const terminal = turnLifecycleTerminalFromEvent(event);
+  if (terminal === undefined) return undefined;
+  if (terminal.kind === "completed") {
     return {
       code: 0,
-      ...(typeof event.payload?.lastAgentMessage === "string"
-        ? { message: event.payload.lastAgentMessage }
-        : {}),
+      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
     };
   }
-  if (event.type === "turn_aborted") {
+  if (terminal.kind === "aborted") {
     return {
       code: 130,
-      ...(typeof event.payload?.reason === "string"
-        ? { message: event.payload.reason }
-        : {}),
+      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
     };
   }
-  // `error` is session telemetry, not a turn closer. Stop-hook throws and
-  // similar sites emit it while the turn continues and later writes
-  // turn_complete / turn_aborted.
-  return undefined;
+  return {
+    code: 1,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
 }
 
 function assistantMessageId(turnId: string, ordinal: number): string {
@@ -5934,35 +5941,31 @@ function messageTerminalFromEvent(
   event: Event["msg"],
   expectedTurnId: string | undefined,
 ): AgenCBackgroundAgentMessageTerminal | undefined {
-  if (event.type === "turn_complete") {
-    if (
-      expectedTurnId !== undefined &&
-      event.payload.turnId !== expectedTurnId
-    ) {
-      return undefined;
-    }
+  const terminal = turnLifecycleTerminalFromEvent(event);
+  if (terminal === undefined) return undefined;
+  if (
+    expectedTurnId !== undefined &&
+    terminal.turnId !== undefined &&
+    terminal.turnId !== expectedTurnId
+  ) {
+    return undefined;
+  }
+  if (terminal.kind === "completed") {
     return {
       code: 0,
-      ...(event.payload.lastAgentMessage !== undefined
-        ? { message: event.payload.lastAgentMessage }
-        : {}),
+      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
     };
   }
-  if (event.type === "turn_aborted") {
-    if (
-      expectedTurnId !== undefined &&
-      event.payload.turnId !== undefined &&
-      event.payload.turnId !== expectedTurnId
-    ) {
-      return undefined;
-    }
-    return { code: 130, message: event.payload.reason };
+  if (terminal.kind === "aborted") {
+    return {
+      code: 130,
+      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+    };
   }
-  // Same contract as the live bridge: only turn_complete / turn_aborted
-  // close a submission. A mid-turn `error` must not make an idempotent
-  // retry report completed-with-failure while turn_complete is still
-  // ahead in the journal.
-  return undefined;
+  return {
+    code: 1,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
 }
 
 function clientMessageIdConflict(
@@ -6041,9 +6044,15 @@ function closedTurnResult(
   },
   open: OpenTurnAccumulator,
 ): SessionTranscriptV2TurnResult {
-  const outcome = msg.type === "turn_aborted" ? "aborted" : "completed";
+  const terminal = turnLifecycleTerminalFromEvent(msg);
+  const outcome =
+    terminal?.kind === "aborted"
+      ? "aborted"
+      : terminal?.kind === "failed"
+        ? "errored"
+        : "completed";
   let durationMs: number | undefined;
-  if (msg.type === "turn_complete") {
+  if (terminal?.kind === "completed" || terminal?.kind === "failed") {
     durationMs = nonNegativeFinite(msg.payload.durationMs);
     if (durationMs === undefined) {
       const completedAt = nonNegativeFinite(msg.payload.completedAt);
@@ -6258,7 +6267,10 @@ export function sessionTranscriptV2FromRollout(
     }
     if (
       event.msg.type === "turn_complete" ||
-      event.msg.type === "turn_aborted"
+      event.msg.type === "turn_aborted" ||
+      event.msg.type === "turn_failed" ||
+      (event.msg.type === "error" &&
+        turnLifecycleTerminalFromEvent(event.msg) !== undefined)
     ) {
       const terminalTurnId =
         "turnId" in event.msg.payload &&
@@ -6567,7 +6579,9 @@ export function notificationFromDaemonEvent(
     (event.type === "turn_started" ||
       event.type === "turn_complete" ||
       event.type === "turn_aborted" ||
-      event.type === "error") &&
+      event.type === "turn_failed" ||
+      (event.type === "error" &&
+        turnLifecycleTerminalFromEvent(event)?.kind === "failed")) &&
     event.statusProjection !== "session_only" &&
     isJsonObject(payload)
   ) {
@@ -6658,6 +6672,7 @@ function agentStatusFromEventType(type: string): DaemonAgentStatus {
     case "turn_started":
       return "running";
     case "error":
+    case "turn_failed":
       return "error";
     case "turn_aborted":
       return "idle";
@@ -6698,6 +6713,7 @@ function agentRunStatusFromEventType(type: string): AgentRunStatus {
     case "turn_started":
       return "running";
     case "error":
+    case "turn_failed":
       return "errored";
     case "turn_aborted":
       return "completed";
@@ -7231,6 +7247,7 @@ const CANONICAL_CORE_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
   "turn_started",
   "turn_complete",
   "turn_aborted",
+  "turn_failed",
   "warning",
   "error",
   "stream_error",
@@ -9564,11 +9581,14 @@ function eventFromThreadStatus(
     case "errored":
       return {
         id: status.turnId,
-        type: "error",
+        type: "turn_failed",
         payload: {
+          turnId: status.turnId,
           cause: "background_agent_error",
           message: status.error,
-          turnId: status.turnId,
+          ...(status.endedAtMs !== undefined
+            ? { completedAt: status.endedAtMs }
+            : {}),
         },
       };
     case "interrupted":
