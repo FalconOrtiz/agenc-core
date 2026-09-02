@@ -54,7 +54,7 @@ import {
   SESSION_ID_ARG,
   type SessionReadViewKind,
 } from "./filesystem.js";
-import { checkMemorySecrets } from "../../memory/index.js";
+import { checkMemorySecrets } from "../../memory/privacy.js";
 import {
   agentNamespacePathHint,
   denyAgentNamespacePath,

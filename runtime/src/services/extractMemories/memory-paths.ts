@@ -26,7 +26,7 @@ import {
   sep,
 } from "node:path";
 import { findGitRoot as findCanonicalGitRoot } from "../../agents/worktree.js";
-import { buildProjectMemoryDirectory } from "../../memory/index.js";
+import { buildProjectMemoryDirectory } from "../../memory/paths.js";
 import type { AgenCConfig } from "../../config/schema.js";
 import type { ConfigStore } from "../../config/store.js";
 import {
