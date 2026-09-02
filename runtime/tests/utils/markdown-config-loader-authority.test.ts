@@ -97,6 +97,36 @@ describe('markdown discovery authority', () => {
     expect(prompt(filesB)).toBe('Home B prompt.')
   })
 
+  test('still finds markdown when the search binary cannot run', async () => {
+    // ripGrep reports an unavailable binary with code "ENOENT", which errno
+    // alone cannot tell apart from "the directory is gone", so the loader
+    // swallowed it and every markdown-defined agent, command and hook
+    // silently vanished wherever ripgrep could not start. CI is exactly such
+    // a machine: with `rg` off PATH this reproduced as a catalog holding only
+    // the five built-in agents. The native walk is the documented fallback.
+    const workspace = temporaryRoot('workspace-no-rg')
+    const home = temporaryRoot('home-no-rg')
+    writeAgent(home, 'Found without ripgrep.')
+    const authority = await createAuthority(home, workspace)
+
+    const previousBuiltin = process.env.USE_BUILTIN_RIPGREP
+    const previousPath = process.env.PATH
+    process.env.USE_BUILTIN_RIPGREP = 'false'
+    // A PATH with no `rg` on it, which is what makes ripGrep reject.
+    process.env.PATH = temporaryRoot('empty-bin')
+    try {
+      const files = await runWithCanonicalSettingsAuthority(authority, () =>
+        loadMarkdownFilesForSubdirFresh('agents', workspace),
+      )
+      expect(prompt(files)).toBe('Found without ripgrep.')
+    } finally {
+      if (previousBuiltin === undefined) delete process.env.USE_BUILTIN_RIPGREP
+      else process.env.USE_BUILTIN_RIPGREP = previousBuiltin
+      if (previousPath === undefined) delete process.env.PATH
+      else process.env.PATH = previousPath
+    }
+  })
+
   test('isolates same-home snapshots and clears only the active ConfigStore partition', async () => {
     const workspace = temporaryRoot('shared-workspace')
     const home = temporaryRoot('shared-home')

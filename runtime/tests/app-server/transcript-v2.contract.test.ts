@@ -101,6 +101,121 @@ describe("session.transcript.v2 durable projection", () => {
     expect(afterAppend.messages).toEqual(first.messages);
   });
 
+  it("keeps the whole conversation when a compaction commits without an epoch", () => {
+
+    // Compaction changes what the model sees, not what the person reading
+
+    // the transcript sent. Live: a 13-turn session came back as two turns
+
+    // after an app relaunch, because its rollout carried two compaction
+
+    // commits and no explicit epoch event, and the summary itself was
+
+    // rendered as one of those turns.
+
+    const items: RolloutItem[] = [
+
+      event(10, "user-1", {
+
+        type: "user_message",
+
+        payload: { message: "first question", messageId: "client-1" },
+
+      }),
+
+      event(11, "turn-1", {
+
+        type: "turn_started",
+
+        payload: { turnId: "turn-1" },
+
+      }),
+
+      event(12, "answer-1", {
+
+        type: "agent_message",
+
+        payload: { message: "first answer" },
+
+      }),
+
+      {
+
+        type: "compaction_committed",
+
+        payload: {
+
+          attempt_id: "compact-auto-1",
+
+          replacement_history: [
+
+            { role: "developer", content: "agenc_compaction_boundary_v1: untrusted" },
+
+            { role: "user", content: "a summary of the work so far" },
+
+          ],
+
+        },
+
+      } as unknown as RolloutItem,
+
+      event(20, "user-2", {
+
+        type: "user_message",
+
+        payload: { message: "second question", messageId: "client-2" },
+
+      }),
+
+      event(21, "turn-2", {
+
+        type: "turn_started",
+
+        payload: { turnId: "turn-2" },
+
+      }),
+
+      event(22, "answer-2", {
+
+        type: "agent_message",
+
+        payload: { message: "second answer" },
+
+      }),
+
+    ];
+
+
+    const snapshot = sessionTranscriptV2FromRollout(items, "session-1", "run-1");
+
+
+    expect(snapshot.messages.map((message) => message.text)).toEqual([
+
+      "first question",
+
+      "first answer",
+
+      "second question",
+
+      "second answer",
+
+    ]);
+
+    // The model's compacted view never appears as something the user said.
+
+    expect(snapshot.messages.some((message) => message.text.includes("summary of the work"))).toBe(
+
+      false,
+
+    );
+
+    // Nothing truncated, so the epoch is the initial one.
+
+    expect(snapshot.historyEpoch).toBe("history:run-1:initial");
+
+  });
+
+
   it("rebuilds from each compact/rewind replacement and advances a stable epoch", () => {
     const compacted: RolloutItem[] = [
       {

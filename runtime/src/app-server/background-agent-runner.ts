@@ -5667,7 +5667,7 @@ function historyEpochFromRollout(
 ): string {
   return historyEpochForBoundary(
     runId,
-    latestTranscriptBoundary(items, runId)?.id ?? "initial",
+    latestTranscriptBoundary(items)?.id ?? "initial",
   );
 }
 
@@ -5680,7 +5680,6 @@ interface TranscriptBoundary {
 
 function latestTranscriptBoundary(
   items: readonly RolloutItem[],
-  runId: string,
 ): TranscriptBoundary | undefined {
   let latest: TranscriptBoundary | undefined;
   for (const [index, item] of items.entries()) {
@@ -5700,35 +5699,19 @@ function latestTranscriptBoundary(
       };
       continue;
     }
-    if (
-      item.type === "compacted" &&
-      item.payload.replacementHistory !== undefined
-    ) {
-      latest = {
-        index,
-        id: `compacted:${index}:${hashStable(JSON.stringify(item.payload.replacementHistory))}`,
-        kind: "replaced",
-      };
-      continue;
-    }
-    if (item.type === "compaction_committed") {
-      latest = {
-        index,
-        id: `compaction:${item.payload.attempt_id}`,
-        kind: "replaced",
-      };
-      continue;
-    }
-    if (
-      item.type === "compaction_rollback_committed" &&
-      item.payload.target_session_id === runId
-    ) {
-      latest = {
-        index,
-        id: `compaction-rollback:${item.payload.attempt_id}`,
-        kind: "replaced",
-      };
-    }
+    // Compaction is deliberately NOT a transcript boundary.
+    //
+    // It changes what the MODEL sees; the person reading the transcript still
+    // sent every earlier message and expects to find them. Treating a commit
+    // as a boundary truncated the reloaded transcript to the compacted view
+    // and rendered the summary itself as a user message: live, a 13-turn
+    // session came back as two turns after an app relaunch, because that
+    // rollout contained two compaction commits and no explicit epoch event.
+    //
+    // A user-facing reset still truncates, and is still the only thing that
+    // does: `history_cleared` and `transcript_epoch` above. A partial compact
+    // or a rewind that means to reset the transcript emits `transcript_epoch`
+    // alongside its `compacted` item, so those keep working unchanged.
   }
   return latest;
 }
@@ -6092,7 +6075,7 @@ export function sessionTranscriptV2FromRollout(
   runId: string,
   activeTurn?: { readonly turnId: string; readonly clientMessageId: string },
 ): SessionTranscriptV2Result {
-  const boundary = latestTranscriptBoundary(items, runId);
+  const boundary = latestTranscriptBoundary(items);
   const boundaryIndex = boundary?.index ?? -1;
   const boundaryId = boundary?.id ?? "initial";
   let asOfSequence = 0;
