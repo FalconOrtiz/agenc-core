@@ -3663,6 +3663,19 @@ export class Session {
   /**
    * Mirrors agenc runtime `Session::next_internal_sub_id` — monotonic id allocation.
    */
+  /**
+   * Move the internal sub-id counter past ids that already exist durably.
+   * A resumed session starts the counter at zero; without this its first
+   * turn reused `sub-<conversation>-2` and the admission journal refused
+   * the model step ("admission step identity already exists with different
+   * request data"). Never moves the counter backwards.
+   */
+  seedInternalSubId(next: number): void {
+    if (Number.isSafeInteger(next) && next > this.nextInternalSubIdValue) {
+      this.nextInternalSubIdValue = next;
+    }
+  }
+
   nextInternalSubId(): string {
     const id = this.nextInternalSubIdValue;
     this.nextInternalSubIdValue += 1;

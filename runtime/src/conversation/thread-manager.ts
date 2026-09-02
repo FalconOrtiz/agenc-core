@@ -357,6 +357,12 @@ export class ConversationThreadManager extends ThreadManager {
     session.rolloutStore?.acknowledgeCompactionReconstruction(
       reconstruction.activeCompactionAttemptIds,
     );
+    // The durable journal already holds turn and event ids up to the
+    // highest sub-id in the rollout; the resumed session must number its
+    // new turns after them or admission rejects the first model step.
+    session.seedInternalSubId(
+      highestInternalSubId(rolloutItems, session.conversationId) + 1,
+    );
 
     // GOAL #4b Stage 1 — stash the reconstruction so the prewarm hook can
     // consult its `resumableTurns` and resume-continue an orphaned in-flight
@@ -1368,4 +1374,34 @@ function cloneResponseHistory(
 
 function cloneLlmHistory(history: ReadonlyArray<ResponseItem>) {
   return history.map(responseItemToLlmMessage);
+}
+
+/**
+ * Highest `sub-<conversationId>-N` id recorded in a rollout, from event ids
+ * and turn ids alike; -1 when none. Ids of other conversations are ignored.
+ */
+export function highestInternalSubId(
+  rolloutItems: ReadonlyArray<RolloutItem>,
+  conversationId: string,
+): number {
+  const prefix = `sub-${conversationId}-`;
+  let highest = -1;
+  const consider = (value: unknown): void => {
+    if (typeof value !== "string" || !value.startsWith(prefix)) return;
+    const ordinal = Number(value.slice(prefix.length));
+    if (Number.isSafeInteger(ordinal) && ordinal > highest) highest = ordinal;
+  };
+  for (const item of rolloutItems) {
+    if (item.type !== "event_msg") continue;
+    const payload = item.payload as {
+      readonly id?: unknown;
+      readonly msg?: { readonly payload?: unknown };
+    };
+    consider(payload.id);
+    const inner = payload.msg?.payload;
+    if (inner !== null && typeof inner === "object") {
+      consider((inner as { readonly turnId?: unknown }).turnId);
+    }
+  }
+  return highest;
 }
