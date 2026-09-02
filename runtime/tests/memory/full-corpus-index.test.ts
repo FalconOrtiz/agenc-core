@@ -653,6 +653,22 @@ describe("C3b persistent full-corpus index", () => {
     expect(recovered.candidates[0]?.canonicalPath).toBe(createdPath);
   });
 
+  it("garbage-collects idle roots once per index instance, not on every refresh", async () => {
+    const fixture = await createFixture();
+    await writeMemory(join(fixture.globalRoot, "note.md"), "Note", "cleanup_once_term");
+    const cleanup = vi.spyOn(index!, "cleanupUnusedRoots");
+
+    await index!.refresh(fixture.rootSpecs, new AbortController().signal, {
+      explicit: true,
+    });
+    await index!.refresh(fixture.rootSpecs, new AbortController().signal);
+    await index!.refresh(fixture.rootSpecs, new AbortController().signal, {
+      explicit: true,
+    });
+
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
   it("repairs a missed equal-size/equal-mtime external change through the bounded audit", async () => {
     const fixture = await createFixture();
     const databasePath = join(temporaryRoot, "state", "memory.sqlite");

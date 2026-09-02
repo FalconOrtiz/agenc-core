@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import {
   MAX_RELEVANT_MEMORIES,
   buildMemorySelectorRequest,
@@ -213,6 +215,12 @@ async function tryFullCorpusRanking(
   }
   const normalizedQuery = normalizeMemoryQuery(options.query);
   if (normalizedQuery.terms.length === 0) return [];
+  // With no memory directory on disk there is nothing to index. Skip the
+  // open/refresh (root upsert, watcher setup, fsync'd WAL traffic) that would
+  // otherwise run on every turn and let the bounded scan report nothing.
+  if (!options.memoryDirs.some((directory) => existsSync(directory))) {
+    return null;
+  }
   const index = getFullCorpusIndex(options.memoryIndexDatabasePath);
   const roots: MemoryIndexRootSpec[] = options.memoryDirs.map((path, rootIndex) => ({
     path,

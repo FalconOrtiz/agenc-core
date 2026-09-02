@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -236,6 +237,22 @@ describe("C3a relevant memory selection", () => {
         admittedMemorySelector: selector,
       }),
     ).rejects.toBe(reason);
+  });
+
+  it("does not open the full-corpus index when no memory directory exists", async () => {
+    temporaryRoot = await mkdtemp(join(tmpdir(), "agenc-c3a-find-"));
+    const databasePath = join(temporaryRoot, "state", "memory-v1.sqlite");
+    await mkdir(join(temporaryRoot, "state"));
+
+    const result = await findRelevantMemories({
+      query: "browser",
+      memoryDirs: [join(temporaryRoot, "missing-global"), join(temporaryRoot, "missing-project")],
+      signal: new AbortController().signal,
+      memoryIndexDatabasePath: databasePath,
+    });
+
+    expect(result).toEqual([]);
+    expect(existsSync(databasePath)).toBe(false);
   });
 
   it("clamps both lexical and selector paths to five memories", async () => {
