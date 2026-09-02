@@ -550,14 +550,65 @@ async function tempAgencHome(): Promise<string> {
   return mkdtemp(join(tmpdir(), "agenc-daemon-cli-"));
 }
 
-async function waitForPid(pidPath: string): Promise<number> {
+/**
+ * Default poll budget for a single foreground daemon reaching a milestone.
+ * Sized for one daemon on an idle machine; a case that starts more than one
+ * at a time has to pass a budget that clears
+ * {@link DEFAULT_DAEMON_READY_TIMEOUT_MS} instead of racing it.
+ */
+const DAEMON_MILESTONE_BUDGET_MS = 2_000;
+
+async function waitForPid(
+  pidPath: string,
+  budgetMs: number = DAEMON_MILESTONE_BUDGET_MS,
+): Promise<number> {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 2_000) {
+  while (Date.now() - startedAt < budgetMs) {
     const pid = await readAgenCDaemonPid(pidPath);
     if (pid !== null) return pid;
     await delay(10);
   }
   throw new Error("timed out waiting for daemon pid");
+}
+
+/**
+ * Poll budget for a case that starts more than one foreground daemon at once.
+ * The daemon's own cold-start allowance is DEFAULT_DAEMON_READY_TIMEOUT_MS, so
+ * a test that starts two of them concurrently has to grant at least that much
+ * or it is asserting how fast the runner is rather than what the daemon does.
+ */
+const CONCURRENT_DAEMON_MILESTONE_BUDGET_MS = DEFAULT_DAEMON_READY_TIMEOUT_MS;
+
+/**
+ * Shuts foreground daemons down without depending on when they installed
+ * their signal handlers.
+ *
+ * runAgenCDaemonCli only calls installAgenCShutdownSignalHandlers after its
+ * services are constructed. The test signal process has no default action, so
+ * a single SIGTERM emitted before that point is dropped, the daemon keeps
+ * running, and the awaited run promise never settles -- the test then dies on
+ * the vitest deadline with no indication of what it was waiting for. Repeating
+ * the signal until the runs settle closes that window; the handler's own
+ * `settled` guard makes the extra signals no-ops.
+ */
+async function stopRunningDaemons(
+  daemons: readonly {
+    readonly signalProcess: ReturnType<typeof createSignalProcess>;
+    readonly running: Promise<number>;
+  }[],
+): Promise<void> {
+  let running = true;
+  const settled = Promise.allSettled(
+    daemons.map((daemon) => daemon.running),
+  ).finally(() => {
+    running = false;
+  });
+  const deadline = Date.now() + DEFAULT_DAEMON_READY_TIMEOUT_MS;
+  while (running && Date.now() < deadline) {
+    for (const daemon of daemons) daemon.signalProcess.emit("SIGTERM");
+    await Promise.race([settled, delay(25)]);
+  }
+  await settled;
 }
 
 async function availableLoopbackPort(): Promise<number> {
@@ -749,9 +800,10 @@ function waitForWebSocketClose(socket: WebSocket): Promise<void> {
 
 async function waitForDaemonWebSocketUrl(
   io: ReturnType<typeof createIo>,
+  budgetMs: number = DAEMON_MILESTONE_BUDGET_MS,
 ): Promise<string> {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < 2_000) {
+  while (Date.now() - startedAt < budgetMs) {
     const match = /AgenC daemon websocket listening on (ws:\/\/\S+)/.exec(
       io.stderrText(),
     );
@@ -1003,24 +1055,36 @@ describe("AgenC daemon CLI", () => {
       await expect(
         waitForPid(
           resolveAgenCDaemonPidPath(firstHost.env, firstHost.userHome),
+          CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
         ),
       ).resolves.toBe(4100);
       await expect(
         waitForPid(
           resolveAgenCDaemonPidPath(secondHost.env, secondHost.userHome),
+          CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
         ),
       ).resolves.toBe(4100);
-      const firstUrl = await waitForDaemonWebSocketUrl(firstIo);
-      const secondUrl = await waitForDaemonWebSocketUrl(secondIo);
+      const firstUrl = await waitForDaemonWebSocketUrl(
+        firstIo,
+        CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+      );
+      const secondUrl = await waitForDaemonWebSocketUrl(
+        secondIo,
+        CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+      );
       expect(firstUrl).not.toBe(secondUrl);
     } finally {
-      firstSignalProcess.emit("SIGTERM");
-      secondSignalProcess.emit("SIGTERM");
-      await Promise.allSettled([firstRunning, secondRunning]);
+      await stopRunningDaemons([
+        { signalProcess: firstSignalProcess, running: firstRunning },
+        { signalProcess: secondSignalProcess, running: secondRunning },
+      ]);
       await rm(firstHome, { recursive: true, force: true });
       await rm(secondHome, { recursive: true, force: true });
     }
-  });
+    // Two foreground daemons start concurrently here, so the budgets above
+    // clear DEFAULT_DAEMON_READY_TIMEOUT_MS instead of racing it, and this
+    // case needs its own bound to hold them.
+  }, 120_000);
 
   it("creates a private daemon cookie and reuses it", async () => {
     const agencHome = await tempAgencHome();
