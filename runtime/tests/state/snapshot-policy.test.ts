@@ -365,6 +365,66 @@ describe("AgenCSessionSnapshotPolicy", () => {
     );
   });
 
+  // A completed message exchange is a turn boundary: health.stats and the
+  // desktop read state right after message.stream returns, so it must not
+  // wait for the trailing coalesce timer. Only chunks and tool/status bursts
+  // coalesce.
+  it("writes a completed message exchange at once even inside the coalescing window", () => {
+    seedRun("run-exchange", "session-exchange");
+    const timers: (() => void)[] = [];
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => "2026-05-01T00:00:00.000Z",
+      agencHome: home,
+      setTimeout: (callback) => {
+        timers.push(callback);
+        return { unref: vi.fn() };
+      },
+      clearTimeout: vi.fn(),
+    });
+
+    policy.recordSessionEvent("session-exchange", {
+      method: "event.agent_status",
+      params: { agentId: "run-exchange", status: "running" },
+    });
+    expect(snapshotCount("session-exchange")).toBe(1);
+    policy.recordSessionEvent("session-exchange", {
+      method: "event.tool_request",
+      params: {
+        agentId: "run-exchange",
+        eventId: "evt-exchange",
+        requestId: "tool-exchange",
+        toolName: "FileRead",
+      },
+    });
+    // The tool event lands inside the window and is coalesced.
+    expect(snapshotCount("session-exchange")).toBe(1);
+    expect(timers).toHaveLength(1);
+
+    const record = policy.recordMessageExchange({
+      sessionId: "session-exchange",
+      agentId: "run-exchange",
+      content: "hello",
+      messageId: "message-exchange",
+      streamId: "stream-exchange",
+      acceptedAt: "2026-05-01T00:00:00.000Z",
+    });
+
+    expect(record?.trigger).toBe("message_exchange");
+    expect(snapshotCount("session-exchange")).toBe(2);
+    const latest = latestSnapshot("session-exchange");
+    expect(latest.conversation).toEqual([
+      expect.objectContaining({ role: "user", messageId: "message-exchange" }),
+    ]);
+    // The coalesced tool state rode along with the exchange write.
+    expect(latest.toolState).toMatchObject({
+      lastTrigger: "message_exchange",
+      inFlight: { "tool-exchange": { status: "running" } },
+    });
+    // The trailing timer finds nothing left to write.
+    timers[0]?.();
+    expect(snapshotCount("session-exchange")).toBe(2);
+  });
+
   it("bounds tool inputs and keeps at most 20 completed calls in the snapshot", () => {
     seedRun("run-inputs", "session-inputs");
     const policy = new AgenCSessionSnapshotPolicy(driver, {

@@ -964,10 +964,15 @@ export class AgenCSessionSnapshotPolicy {
       state.lastWriteMs === undefined || !Number.isFinite(nowMs)
         ? Number.POSITIVE_INFINITY
         : nowMs - state.lastWriteMs;
-    // A zero window means "never coalesce". The gap can be negative when the
-    // previous snapshot timestamp had to be bumped past a clock that did not
-    // advance; that still counts as inside the window.
+    // A completed message exchange is a turn boundary: it is written at once
+    // (carrying any coalesced tool state with it) so a client that reads state
+    // right after message.stream returns sees it. Only streaming chunks and
+    // tool/status bursts coalesce. A zero window means "never coalesce". The
+    // gap can be negative when the previous snapshot timestamp had to be
+    // bumped past a clock that did not advance; that still counts as inside
+    // the window.
     if (
+      trigger === "message_exchange" ||
       this.#coalesceIntervalMs === 0 ||
       sinceLastWriteMs >= this.#coalesceIntervalMs
     ) {
