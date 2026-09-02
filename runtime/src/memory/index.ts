@@ -88,6 +88,7 @@ export {
   getGlobalMemoryEntrypoint,
   getGlobalMemoryPath,
   getMemoryBaseDir,
+  getMemoryProjectRoot,
   getProjectInstructionPath,
   getProjectMemoryEntrypoint,
   getProjectMemoryPath,

@@ -126,12 +126,13 @@ describe("memory extraction triggers", () => {
   it("defers two eligible turns by default before the third runs", () => {
     const state = createMemoryExtractionTriggerState();
     expect(DEFAULT_MIN_ELIGIBLE_TURNS).toBe(3);
-    const outcomes = [0, 1, 2].map(() =>
-      shouldDeferForEligibleTurnCadence({
-        state,
-        minEligibleTurns: undefined,
-        isTrailingRun: false,
-      }),
+    const outcomes = [0, 1, 2].map(
+      () =>
+        shouldDeferForEligibleTurnCadence({
+          state,
+          minEligibleTurns: undefined,
+          isTrailingRun: false,
+        }).defer,
     );
     expect(outcomes).toEqual([true, true, false]);
     expect(state.turnsSinceLastExtraction).toBe(0);
@@ -144,14 +145,14 @@ describe("memory extraction triggers", () => {
         state,
         minEligibleTurns: 2,
         isTrailingRun: false,
-      }),
+      }).defer,
     ).toBe(true);
     expect(
       shouldDeferForEligibleTurnCadence({
         state,
         minEligibleTurns: 2,
         isTrailingRun: false,
-      }),
+      }).defer,
     ).toBe(false);
     expect(state.turnsSinceLastExtraction).toBe(0);
     expect(
@@ -159,8 +160,43 @@ describe("memory extraction triggers", () => {
         state,
         minEligibleTurns: 99,
         isTrailingRun: true,
-      }),
+      }).defer,
     ).toBe(false);
+  });
+
+  it("gives a lane no head start for being new to this process", () => {
+    // An earlier version let the first decision in a process read the
+    // unprocessed backlog, so a restart would not wait a further cadence. A
+    // single turn with tool calls and attachments produces more messages than
+    // any threshold that heuristic could use, so it fired on the first turn of
+    // every new session and ran a full-history child there. The cadence is
+    // turn-based only; a fresh lane waits like any other.
+    const fresh = createMemoryExtractionTriggerState();
+    const decisions = [1, 2, 3].map(() =>
+      shouldDeferForEligibleTurnCadence({
+        state: fresh,
+        minEligibleTurns: undefined,
+        isTrailingRun: false,
+      }),
+    );
+    expect(decisions.map((decision) => decision.defer)).toEqual([
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it("reports the waiting count it actually used", () => {
+    // The warning used to print the counter after the call, which is 0 on the
+    // turn a run is allowed; it now prints what the decision was made on.
+    const state = createMemoryExtractionTriggerState();
+    expect(
+      shouldDeferForEligibleTurnCadence({
+        state,
+        minEligibleTurns: undefined,
+        isTrailingRun: false,
+      }),
+    ).toEqual({ defer: true, waiting: 1 });
   });
 
   it("parses invalid tool arguments as an empty object", () => {

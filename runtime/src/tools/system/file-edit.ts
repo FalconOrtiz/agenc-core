@@ -48,7 +48,7 @@ import {
   resolveSessionId,
   safePathAllowingSessionPlanFile,
 } from "./filesystem.js";
-import { checkMemorySecrets } from "../../memory/index.js";
+import { checkMemorySecrets } from "../../memory/privacy.js";
 import {
   agentNamespacePathHint,
   denyAgentNamespacePath,

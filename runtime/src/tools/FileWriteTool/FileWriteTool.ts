@@ -5,7 +5,7 @@ import { clearDeliveredDiagnosticsForFile } from '../../services/lsp/LSPDiagnost
 import { getLspServerManager } from '../../services/lsp/manager.js'
 import { peekAmbientRuntimeSession } from '../../session/current-session.js'
 import type { SandboxExecutionBrokerLike } from '../../sandbox/execution-broker.js'
-import { checkMemorySecrets } from '../../memory/index.js'
+import { checkMemorySecrets } from '../../memory/privacy.js'
 import type { ToolUseContext } from '../Tool.js'
 import { buildTool, type ToolDef } from '../Tool.js'
 import { logForDebugging } from 'src/utils/debug.js'

@@ -197,6 +197,72 @@ describe("auto memory child tool policy", () => {
     });
   });
 
+  // Live (session 2763eb6e, 2026-09-02): the child opened the shared root the
+  // main agent uses, was denied, and the run was recorded as a failed
+  // extraction with its messages re-queued.
+  describe("the shared memory root", () => {
+    const policy = () =>
+      createAutoMemoryToolPolicy("/tmp/project-memory/", ["/tmp/global-memory/"]);
+
+    it("is readable, so the child can check what is already recorded", () => {
+      expect(
+        policy()({ name: "FileRead" }, { file_path: "/tmp/global-memory/MEMORY.md" }),
+      ).toMatchObject({
+        behavior: "allow",
+        updatedInput: {
+          file_path: "/tmp/global-memory/MEMORY.md",
+          __agencSessionAllowedRoots: ["/tmp/project-memory/", "/tmp/global-memory/"],
+        },
+      });
+      expect(
+        policy()({ name: "Grep" }, { pattern: "style", path: "/tmp/global-memory/" }),
+      ).toMatchObject({ behavior: "allow" });
+      expect(
+        policy()({ name: "Glob" }, { pattern: "*.md", path: "/tmp/global-memory/" }),
+      ).toMatchObject({ behavior: "allow" });
+    });
+
+    it("is not writable, and says so", () => {
+      // The child summarizes untrusted conversation content, and this root is
+      // shared by every project on the machine.
+      const denial = policy()(
+        { name: "Write" },
+        { file_path: "/tmp/global-memory/user.md", content: "x" },
+      );
+      expect(denial).toMatchObject({
+        behavior: "deny",
+        metadata: { reason: "write_outside_memory" },
+      });
+      expect((denial as { message: string }).message).toContain(
+        "may only write to this session's project memory directory",
+      );
+    });
+
+    it("still writes to the project root and still denies everything else", () => {
+      expect(
+        policy()({ name: "Write" }, { file_path: "notes.md", content: "hello" }),
+      ).toMatchObject({
+        behavior: "allow",
+        updatedInput: {
+          file_path: "/tmp/project-memory/notes.md",
+          __agencSessionAllowedRoots: ["/tmp/project-memory/"],
+        },
+      });
+      expect(
+        policy()({ name: "FileRead" }, { file_path: "/tmp/elsewhere/secrets.md" }),
+      ).toMatchObject({ behavior: "deny" });
+    });
+
+    it("without a shared root the policy is unchanged", () => {
+      expect(
+        createAutoMemoryToolPolicy("/tmp/project-memory/")(
+          { name: "FileRead" },
+          { file_path: "/tmp/global-memory/MEMORY.md" },
+        ),
+      ).toMatchObject({ behavior: "deny" });
+    });
+  });
+
   it("denies reads outside the memory directory", async () => {
     const policy = createAutoMemoryToolPolicy("/tmp/memory/");
     expect(

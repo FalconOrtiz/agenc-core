@@ -45,7 +45,12 @@ import {
 } from "node:fs";
 import { resolve, dirname, basename, join } from "node:path";
 import { resolveHomeContext } from "../../config/home.js";
-import { getDurableMemoryRoots } from "../../memory/index.js";
+// Imported from the defining module rather than the `memory/index.js` barrel.
+// The barrel re-exports the recall pipeline, which reaches `utils/ide.ts` and
+// `utils/envDynamic.ts`; that module calls `stat` at import time on Linux, so
+// pulling the barrel in here made the filesystem tool fail to load in any
+// suite that mocks `node:fs/promises`.
+import { getDurableMemoryRoots } from "../../memory/paths.js";
 import { getCurrentRuntimeSession } from "../../session/current-session.js";
 import {
   getSessionTempNamespaceName,
