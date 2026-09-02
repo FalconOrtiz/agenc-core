@@ -740,6 +740,81 @@ describe("extract memories service", () => {
       expect.stringContaining("~2 model-visible"),
     ]);
   });
+
+  it("continues eligible-turn cadence across a re-init from restored session state", async () => {
+    type TriggerBag = {
+      memoryExtractionTrigger?: {
+        processedVisibleCount: number;
+        turnsSinceLastExtraction: number;
+      };
+    };
+    const recorded: Array<{ type: string; payload: Record<string, unknown> }> =
+      [];
+    const stateBag: TriggerBag = {};
+    const session = {
+      conversationId: "cadence-session",
+      services: {
+        runtimeOptions: defaultRuntimeOptions,
+        rollout: {
+          rolloutPath: () => "/tmp/rollout",
+          record: async (item: { type: string; payload: Record<string, unknown> }) => {
+            recorded.push({
+              type: item.type,
+              payload: structuredClone(item.payload),
+            });
+          },
+          flushAndSync: async () => {},
+          setWindowGeneration: () => {},
+        },
+      },
+      state: {
+        with: async <T>(fn: (s: TriggerBag) => T): Promise<T> => fn(stateBag),
+      },
+    } as unknown as Session;
+
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    initExtractMemories({
+      env: {},
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+      minEligibleTurns: 3,
+    });
+
+    const turn = async (n: number) => {
+      const messages: LLMMessage[] = [];
+      for (let i = 1; i <= n; i += 1) {
+        messages.push({ role: "user", content: `fact ${i}` });
+        messages.push({ role: "assistant", content: `ack ${i}` });
+      }
+      await executeExtractMemories(
+        extractionContext({ cwd: root, messages, session }),
+      );
+    };
+
+    await turn(1);
+    await turn(2);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(stateBag.memoryExtractionTrigger?.turnsSinceLastExtraction).toBe(2);
+
+    // Simulate daemon restart: fresh extractor, same restored session bag.
+    initExtractMemories({
+      env: {},
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+      minEligibleTurns: 3,
+    });
+
+    await turn(3);
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(
+      recorded.some(
+        (item) =>
+          item.type === "session_state" &&
+          item.payload.memoryExtractionTrigger !== undefined &&
+          !Object.hasOwn(item.payload, "agentTask"),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("memory manifest scan", () => {

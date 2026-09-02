@@ -249,6 +249,17 @@ const isSessionAgentTask = objectShape({
   registeredAt: isString,
 });
 
+const isMemoryExtractionTriggerPersisted = objectShape({
+  processedVisibleCount: isNumber,
+  turnsSinceLastExtraction: isNumber,
+});
+
+const isSessionAgentTaskOrNull: Validator<unknown> = (value) =>
+  value === null || isSessionAgentTask(value);
+
+const isMemoryExtractionTriggerOrNull: Validator<unknown> = (value) =>
+  value === null || isMemoryExtractionTriggerPersisted(value);
+
 const isFileSystemSandboxPolicy = objectShape({
   allowWrite: isStringArray,
   denyWrite: isStringArray,
@@ -1434,7 +1445,13 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
 
 const ROLLOUT_PAYLOAD_VALIDATORS = defineRolloutPayloadValidators({
   session_meta: EVENT_PAYLOAD_VALIDATORS.session_meta,
-  session_state: objectShape({}, { agentTask: isSessionAgentTask }),
+  session_state: objectShape(
+    {},
+    {
+      agentTask: isSessionAgentTaskOrNull,
+      memoryExtractionTrigger: isMemoryExtractionTriggerOrNull,
+    },
+  ),
   response_item: isResponseItem,
   compacted: objectShape(
     { message: isString },
