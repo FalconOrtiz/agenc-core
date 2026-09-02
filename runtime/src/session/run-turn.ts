@@ -2915,6 +2915,44 @@ export function insertContextMessagesAfterLeadingSystem(
 }
 
 /**
+ * Insert per-turn attachment messages immediately before the current human
+ * message instead of right after the leading system prompt. Attachments
+ * differ from one model call to the next (one-shot producers such as the
+ * skills listing and memory recall appear on the first call of a turn only),
+ * so a message at position two shifted every later item and left nothing but
+ * the system prompt for the provider's prompt cache to reuse. Placed at the
+ * tail, the whole prior history stays a stable, cacheable prefix; only the
+ * tail changes. The human message itself is any user message that is not a
+ * context attachment. Without one the leading-system placement is kept.
+ */
+export function insertContextMessagesBeforeCurrentUser(
+  messages: ReadonlyArray<LLMMessage>,
+  contextMessages: ReadonlyArray<LLMMessage>,
+): LLMMessage[] {
+  if (contextMessages.length === 0) return [...messages];
+  let insertAt = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      message?.role === "user" &&
+      message.runtimeOnly?.mergeBoundary === undefined &&
+      message.runtimeOnly?.agentInvocation === undefined
+    ) {
+      insertAt = index;
+      break;
+    }
+  }
+  if (insertAt < 0) {
+    return insertContextMessagesAfterLeadingSystem(messages, contextMessages);
+  }
+  return [
+    ...messages.slice(0, insertAt),
+    ...contextMessages,
+    ...messages.slice(insertAt),
+  ];
+}
+
+/**
  * Port of agenc runtime `built_tools` (turn.rs:1130-1268). Assembles the
  * tool list visible to the model. agenc runtime threads through connectors,
  * MCP tools, skill injections, plan-mode restrictions, etc. AgenC's
@@ -3264,7 +3302,7 @@ async function prepareSamplingRequestBoundary(
     );
     const attachmentMessages = attachmentsToMessages(attachments);
     if (attachmentMessages.length > 0) {
-      state.messagesForQuery = insertContextMessagesAfterLeadingSystem(
+      state.messagesForQuery = insertContextMessagesBeforeCurrentUser(
         state.messagesForQuery,
         attachmentMessages,
       );
