@@ -3915,8 +3915,7 @@ backend = "local"
       ).identity?.daemon,
     );
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -3965,8 +3964,7 @@ backend = "local"
     expect(line.error?.data?.code).toBe("CONNECTION_AUTHENTICATION_FAILED");
     await expect(waitForSocketClose(socket)).resolves.toBe("closed");
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -4105,8 +4103,7 @@ backend = "local"
       expect(resolvedThreadIds).toEqual([]);
       socket.end();
     } finally {
-      await stopDaemon(signalProcess, running);
-      await expect(running).resolves.toBe(0);
+      await stopDaemonExpectZero(signalProcess, running);
       await rm(agencHome, { recursive: true, force: true });
     }
   });
@@ -4198,8 +4195,7 @@ backend = "local"
 
     socket.close();
     await waitForWebSocketClose(socket);
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -4436,8 +4432,7 @@ backend = "local"
     await expect(waitForPid(pidPath)).resolves.toBe(4100);
 
     expect(io.stdoutText()).toContain("AgenC daemon running");
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
     await rm(agencHome, { recursive: true, force: true });
@@ -4471,8 +4466,7 @@ port = 0
       "daemon MCP autostart requires an explicit absolute mcp.server.workspace",
     );
     expect(io.stderrText()).not.toContain("AgenC MCP server listening");
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
     await rm(agencHome, { recursive: true, force: true });
@@ -4506,8 +4500,7 @@ workspace = ${JSON.stringify(process.cwd())}
     expect(io.stderrText()).toMatch(
       /AgenC MCP server listening on http:\/\/127\.0\.0\.1:\d+\/mcp/,
     );
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     await expect(readAgenCDaemonPid(pidPath)).resolves.toBeNull();
 
     await rm(agencHome, { recursive: true, force: true });
@@ -4869,8 +4862,7 @@ snapshot_max_bytes = 64
       expect.objectContaining({ displayUserMessage: "continue" }),
     );
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     expect(
       readRecoveredToolStatus(agencHome, process.cwd(), "tool-restart"),
     ).toBe("poisoned");
@@ -4949,8 +4941,7 @@ snapshot_max_bytes = 64
       ],
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     await rm(agencHome, { recursive: true, force: true });
   });
 
@@ -5059,8 +5050,7 @@ snapshot_max_bytes = 64
     expect(readAgentRunStatus(agencHome, process.cwd(), runId)).toBe(
       "cancelled",
     );
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     await rm(agencHome, { recursive: true, force: true });
   });
 
@@ -5158,9 +5148,8 @@ snapshot_max_bytes = 64
       expect(restoredOptions[0]?.deferSessionStartHooks).toBe(true);
       expect(restoredOptions[0]?.deferAgentStartupSideEffects).toBeUndefined();
 
-      await stopDaemon(firstSignal, first);
+      await stopDaemonExpectZero(firstSignal, first);
       firstStopped = true;
-      await expect(first).resolves.toBe(0);
       const suspended = readCanonicalRunLifecycle(rolloutPath);
       expect(readAgentRunStatus(agencHome, process.cwd(), runId)).toBe(
         "suspended",
@@ -5402,8 +5391,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
     expect(
       readRecoveredToolStatus(agencHome, process.cwd(), "tool-replay"),
     ).toBe("completed");
@@ -5529,8 +5517,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -5639,8 +5626,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -5792,8 +5778,7 @@ snapshot_max_bytes = 64
       ],
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(agencHome, { recursive: true, force: true });
   });
@@ -5859,8 +5844,7 @@ snapshot_max_bytes = 64
       1,
     );
 
-    await stopDaemon(firstSignal, first);
-    await expect(first).resolves.toBe(0);
+    await stopDaemonExpectZero(firstSignal, first);
     // The harness can only stop gracefully; reset the row to simulate a crash
     // after proving agent.create produced the running row and session snapshot.
     markAgentRunRunning(agencHome, process.cwd(), createdAgentId, sessionId);
@@ -6071,8 +6055,7 @@ snapshot_max_bytes = 64
       },
     });
 
-    await stopDaemon(signalProcess, running);
-    await expect(running).resolves.toBe(0);
+    await stopDaemonExpectZero(signalProcess, running);
 
     await rm(otherCwd, { recursive: true, force: true });
     await rm(agencHome, { recursive: true, force: true });
