@@ -68,6 +68,13 @@ export const MEMORY_EXTRACTION_TOOL_ALLOWLIST: readonly string[] = [
   ...READ_TOOL_NAMES,
   ...WRITE_TOOL_NAMES,
 ];
+/**
+ * Delegate agent names must be lowercase letters, digits and underscores
+ * (assertValidAgentName); the hyphenated name was rejected at spawn and the
+ * extraction never ran.
+ */
+export const MEMORY_EXTRACTION_AGENT_NAME = "memory_extraction";
+
 const DEFAULT_MAX_TURNS = 5;
 const MAX_EXTRACTION_LANES = 256;
 
@@ -414,7 +421,7 @@ async function defaultRunChild(
     taskPrompt: request.prompt,
     forkMode: { kind: "full_history" },
     parentMessagesOverride: request.messages,
-    agentName: "memory-extraction",
+    agentName: MEMORY_EXTRACTION_AGENT_NAME,
     isolation: "none",
     runInBackground: false,
     forceSynchronous: true,
