@@ -5639,8 +5639,9 @@ function messageTerminalFromLifecycle(
   ) {
     return undefined;
   }
-  const code =
-    terminal.kind === "completed" ? 0 : terminal.kind === "aborted" ? 130 : 1;
+  let code = 1;
+  if (terminal.kind === "completed") code = 0;
+  else if (terminal.kind === "aborted") code = 130;
   return {
     code,
     ...(terminal.message !== undefined ? { message: terminal.message } : {}),
@@ -6033,12 +6034,9 @@ function closedTurnResult(
   open: OpenTurnAccumulator,
 ): SessionTranscriptV2TurnResult {
   const terminal = turnLifecycleTerminalFromEvent(msg);
-  const outcome =
-    terminal?.kind === "aborted"
-      ? "aborted"
-      : terminal?.kind === "failed"
-        ? "errored"
-        : "completed";
+  let outcome: SessionTranscriptV2TurnResult["outcome"] = "completed";
+  if (terminal?.kind === "aborted") outcome = "aborted";
+  else if (terminal?.kind === "failed") outcome = "errored";
   let durationMs: number | undefined;
   if (terminal?.kind === "completed" || terminal?.kind === "failed") {
     durationMs = nonNegativeFinite(msg.payload.durationMs);

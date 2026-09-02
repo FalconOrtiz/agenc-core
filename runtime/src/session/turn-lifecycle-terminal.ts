@@ -59,10 +59,6 @@ function payloadNumber(
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-/**
- * Classify a durable or daemon event as a turn lifecycle terminal, or
- * undefined when the event must not close the turn.
- */
 function withTurnId(
   turnId: string | undefined,
   terminal: TurnLifecycleTerminal,
@@ -70,6 +66,64 @@ function withTurnId(
   return turnId !== undefined ? { ...terminal, turnId } : terminal;
 }
 
+function optionalFields(
+  fields: Readonly<Partial<Pick<TurnLifecycleTerminal, "message" | "completedAt" | "durationMs">>>,
+): Partial<TurnLifecycleTerminal> {
+  const out: Partial<TurnLifecycleTerminal> = {};
+  if (fields.message !== undefined) out.message = fields.message;
+  if (fields.completedAt !== undefined) out.completedAt = fields.completedAt;
+  if (fields.durationMs !== undefined) out.durationMs = fields.durationMs;
+  return out;
+}
+
+function fromTurnComplete(
+  payload: unknown,
+  turnId: string | undefined,
+): TurnLifecycleTerminal {
+  return withTurnId(turnId, {
+    kind: "completed",
+    ...optionalFields({
+      message: payloadString(payload, "lastAgentMessage"),
+      completedAt: payloadNumber(payload, "completedAt"),
+      durationMs: payloadNumber(payload, "durationMs"),
+    }),
+  });
+}
+
+function fromTurnAborted(
+  payload: unknown,
+  turnId: string | undefined,
+): TurnLifecycleTerminal {
+  const reason = payloadString(payload, "reason") ?? "aborted";
+  return withTurnId(turnId, {
+    kind: "aborted",
+    reason,
+    ...optionalFields({
+      message: payloadString(payload, "reason") !== undefined ? reason : undefined,
+    }),
+  });
+}
+
+function fromTurnFailed(
+  payload: unknown,
+  turnId: string | undefined,
+  defaults: { readonly cause: string },
+): TurnLifecycleTerminal {
+  return withTurnId(turnId, {
+    kind: "failed",
+    cause: payloadString(payload, "cause") ?? defaults.cause,
+    message: payloadString(payload, "message") ?? "turn failed",
+    ...optionalFields({
+      completedAt: payloadNumber(payload, "completedAt"),
+      durationMs: payloadNumber(payload, "durationMs"),
+    }),
+  });
+}
+
+/**
+ * Classify a durable or daemon event as a turn lifecycle terminal, or
+ * undefined when the event must not close the turn.
+ */
 export function turnLifecycleTerminalFromEvent(event: {
   readonly type: string;
   readonly payload?: unknown;
@@ -77,50 +131,19 @@ export function turnLifecycleTerminalFromEvent(event: {
   const payload = event.payload;
   const turnId = payloadTurnId(payload);
 
-  if (event.type === "turn_complete") {
-    const message = payloadString(payload, "lastAgentMessage");
-    const completedAt = payloadNumber(payload, "completedAt");
-    const durationMs = payloadNumber(payload, "durationMs");
-    return withTurnId(turnId, {
-      kind: "completed",
-      ...(message !== undefined ? { message } : {}),
-      ...(completedAt !== undefined ? { completedAt } : {}),
-      ...(durationMs !== undefined ? { durationMs } : {}),
-    });
+  switch (event.type) {
+    case "turn_complete":
+      return fromTurnComplete(payload, turnId);
+    case "turn_aborted":
+      return fromTurnAborted(payload, turnId);
+    case "turn_failed":
+      return fromTurnFailed(payload, turnId, { cause: "turn_failed" });
+    case "error":
+      if (!isLegacyTurnFailureErrorPayload(payload)) return undefined;
+      return fromTurnFailed(payload, turnId, { cause: "legacy_terminal_error" });
+    default:
+      return undefined;
   }
-
-  if (event.type === "turn_aborted") {
-    const reason = payloadString(payload, "reason") ?? "aborted";
-    return withTurnId(turnId, {
-      kind: "aborted",
-      reason,
-      ...(payloadString(payload, "reason") !== undefined
-        ? { message: reason }
-        : {}),
-    });
-  }
-
-  if (event.type === "turn_failed") {
-    const completedAt = payloadNumber(payload, "completedAt");
-    const durationMs = payloadNumber(payload, "durationMs");
-    return withTurnId(turnId, {
-      kind: "failed",
-      cause: payloadString(payload, "cause") ?? "turn_failed",
-      message: payloadString(payload, "message") ?? "turn failed",
-      ...(completedAt !== undefined ? { completedAt } : {}),
-      ...(durationMs !== undefined ? { durationMs } : {}),
-    });
-  }
-
-  if (event.type === "error" && isLegacyTurnFailureErrorPayload(payload)) {
-    return withTurnId(turnId, {
-      kind: "failed",
-      cause: payloadString(payload, "cause") ?? "legacy_terminal_error",
-      message: payloadString(payload, "message") ?? "turn failed",
-    });
-  }
-
-  return undefined;
 }
 
 export function isTurnLifecycleTerminalEvent(event: {

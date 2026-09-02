@@ -732,30 +732,20 @@ export function reconstructFromRollout(
             const payload = (
               inner as unknown as { payload: { turnId: string } }
             ).payload;
-            if (active.turnId === undefined) active.turnId = payload.turnId;
+            active.turnId ??= payload.turnId;
             seenTerminated.add(payload.turnId);
             break;
           }
-          case "turn_aborted": {
-            if (!active) active = emptySegment();
-            const payload = (
-              inner as unknown as { payload: { turnId?: string } }
-            ).payload;
-            if (active.turnId === undefined && payload.turnId) {
-              active.turnId = payload.turnId;
-            }
-            if (payload.turnId) seenTerminated.add(payload.turnId);
-            break;
-          }
+          case "turn_aborted":
           case "turn_failed": {
             if (!active) active = emptySegment();
             const payload = (
               inner as unknown as { payload: { turnId?: string } }
             ).payload;
-            if (active.turnId === undefined && payload.turnId) {
-              active.turnId = payload.turnId;
+            if (payload.turnId) {
+              active.turnId ??= payload.turnId;
+              seenTerminated.add(payload.turnId);
             }
-            if (payload.turnId) seenTerminated.add(payload.turnId);
             break;
           }
           case "user_message": {
