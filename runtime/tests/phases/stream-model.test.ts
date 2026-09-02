@@ -26,6 +26,9 @@ import type {
 import type { AdmissionLease } from "../budget/admission-types.js";
 import { WorkflowHandoffSpool } from "../agents/workflow-handoff-spool.js";
 import { defaultConfig } from "../config/schema.js";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isRetryableStreamError } from "../session/run-turn.js";
 import { OpenAIProvider } from "../llm/providers/openai/adapter.js";
 
@@ -598,6 +601,80 @@ describe("streamModel — live assistant text sanitization", () => {
       "assistant_thinking_delta",
       "assistant_thinking_block_stop",
     ]);
+  });
+
+  test("AGENC_PROVIDER_TRACE=1 writes the adapter's trace events under agent-logs/<conv>", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agenc-provider-trace-"));
+    vi.stubEnv("AGENC_PROVIDER_TRACE", "1");
+    try {
+      const ctx = mkCtx("chat");
+      const provider = mkProvider(async (_messages, _onChunk, options) => {
+        // The Grok adapter emits these through options.trace; a stub provider
+        // stands in for it here.
+        options?.trace?.onProviderTraceEvent?.({
+          kind: "request",
+          transport: "chat_stream",
+          provider: "stub-provider",
+          model: "test-model",
+          payload: {
+            model: "test-model",
+            input: [{ role: "user", content: "hello" }],
+            prompt_cache_key: options.promptCacheKey,
+            reasoning: { effort: options.reasoningEffort ?? "high" },
+          },
+        });
+        options?.trace?.onProviderTraceEvent?.({
+          kind: "response",
+          transport: "chat_stream",
+          provider: "stub-provider",
+          model: "test-model",
+          payload: { id: "resp_1", usage: { input_tokens: 5, output_tokens: 2 } },
+        });
+        return {
+          content: "ok",
+          toolCalls: [],
+          usage: { promptTokens: 5, completionTokens: 2, totalTokens: 7 },
+          model: "test-model",
+          finishReason: "stop",
+        };
+      });
+      const { session } = mkSession(provider);
+      (session.services as { configStore?: unknown }).configStore = {
+        current: () => ({}),
+        homeContext: { path: home },
+      };
+
+      await streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      );
+
+      const directory = join(home, "agent-logs", "conv-stream");
+      expect(readdirSync(directory)).toEqual(["llm-00001.jsonl"]);
+      const lines = readFileSync(join(directory, "llm-00001.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatchObject({
+        kind: "request",
+        seq: 1,
+        conversationId: "conv-stream",
+        params: { prompt_cache_key: "conv-stream", input_items: 1 },
+      });
+      expect(JSON.stringify(lines[0])).not.toContain('"content":"hello"');
+      expect(lines[1]).toMatchObject({
+        kind: "response",
+        seq: 1,
+        response: { id: "resp_1", usage: { input_tokens: 5, output_tokens: 2 } },
+      });
+      expect(typeof lines[1]?.elapsedMs).toBe("number");
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("keeps base instructions out of provider transcript messages", async () => {

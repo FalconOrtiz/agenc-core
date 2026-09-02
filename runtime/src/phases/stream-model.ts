@@ -62,6 +62,12 @@ import {
 } from "./execute-tools.js";
 import { isPlanMode } from "../session/plan-mode.js";
 import {
+  createProviderTraceSink,
+  providerTraceEnabled,
+  type ProviderTraceSink,
+} from "../llm/provider-trace-sink.js";
+import { getAgencHomeDir } from "../session/session-store.js";
+import {
   effortValueToReasoningEffort,
   getInitialEffortSetting,
 } from "../utils/effort.js";
@@ -250,6 +256,36 @@ function resolveSessionPromptCacheKey(session: Session): string | undefined {
   return conversationId.length > 0 ? conversationId : undefined;
 }
 
+/**
+ * One trace sink per session so the request sequence numbers the files of a
+ * whole conversation. `null` caches "tracing is off" for the session; the env
+ * gate is read once per session, not once per call.
+ */
+const providerTraceSinks = new WeakMap<Session, ProviderTraceSink | null>();
+
+function resolveProviderTraceSink(session: Session): ProviderTraceSink | undefined {
+  const cached = providerTraceSinks.get(session);
+  if (cached !== undefined) return cached ?? undefined;
+  let sink: ProviderTraceSink | null = null;
+  if (providerTraceEnabled()) {
+    try {
+      const configuredHome = (
+        session.services as {
+          configStore?: { homeContext?: { path?: string } };
+        }
+      ).configStore?.homeContext?.path;
+      sink = createProviderTraceSink({
+        agencHome: getAgencHomeDir(configuredHome),
+        conversationId: String(session.conversationId),
+      });
+    } catch {
+      sink = null;
+    }
+  }
+  providerTraceSinks.set(session, sink);
+  return sink ?? undefined;
+}
+
 function buildProviderOptions(
   request: StreamModelRequestContract,
   ctx: TurnContext,
@@ -260,12 +296,16 @@ function buildProviderOptions(
   const planMode = isPlanMode(ctx);
   const systemPrompt = request.baseInstructions.trim();
   const promptCacheKey = resolveSessionPromptCacheKey(session);
+  const traceSink = resolveProviderTraceSink(session);
   return {
     signal,
     tools: cloneProviderTools(request.tools),
     parallelToolCalls: request.parallelToolCalls,
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
     ...(promptCacheKey !== undefined ? { promptCacheKey } : {}),
+    ...(traceSink !== undefined
+      ? { trace: { onProviderTraceEvent: traceSink.onProviderTraceEvent } }
+      : {}),
     ...(request.contextWindowTokens !== undefined
       ? { contextWindowTokens: request.contextWindowTokens }
       : {}),
