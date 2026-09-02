@@ -41,6 +41,9 @@ export function tokenizeShellCommand(command: string): string[] {
     readonly delimiter: string;
     readonly stripTabs: boolean;
   }> = [];
+  // Characters before this index were consumed by a heredoc delimiter or
+  // body and are skipped by the main loop without touching its counter.
+  let skipUntil = 0;
 
   const pushCurrent = (): void => {
     if (current.length > 0) {
@@ -120,6 +123,7 @@ export function tokenizeShellCommand(command: string): string[] {
   };
 
   for (let i = 0; i < command.length; i += 1) {
+    if (i < skipUntil) continue;
     const ch = command[i] as string;
 
     if (escaping) {
@@ -154,7 +158,7 @@ export function tokenizeShellCommand(command: string): string[] {
     if (ch === "\n") {
       pushOperator(";");
       if (pendingHeredocs.length > 0) {
-        i = skipHeredocBodies(i + 1) - 1;
+        skipUntil = skipHeredocBodies(i + 1);
       }
       continue;
     }
@@ -183,7 +187,7 @@ export function tokenizeShellCommand(command: string): string[] {
           tokens.push(delimiter);
           pendingHeredocs.push({ delimiter, stripTabs: operator === "<<-" });
         }
-        i = end - 1;
+        skipUntil = end;
         continue;
       }
       if (
