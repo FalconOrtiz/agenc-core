@@ -218,7 +218,7 @@ export function latestPersistedSessionStateSlot<
 ): { value: SessionStateUpdate[K] } | undefined {
   for (let i = rolloutItems.length - 1; i >= 0; i -= 1) {
     const item = rolloutItems[i];
-    if (!item || item.type !== "session_state") continue;
+    if (item?.type !== "session_state") continue;
     if (!Object.hasOwn(item.payload, slot)) continue;
     return { value: item.payload[slot] };
   }
