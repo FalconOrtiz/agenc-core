@@ -485,7 +485,7 @@ describe("extract memories service", () => {
     expect(runChild).toHaveBeenCalledOnce();
   });
 
-  it("does not advance the cursor when child policy denied a tool", async () => {
+  it("does not advance the cursor when child policy denied a memory write", async () => {
     const runChild = vi
       .fn(
         async (_request: ExtractMemoriesChildRequest) =>
@@ -494,8 +494,8 @@ describe("extract memories service", () => {
       .mockImplementationOnce(async (request) => {
         request.onProgress({
           kind: "tool_result",
-          callId: "read-1",
-          toolName: "FileRead",
+          callId: "write-1",
+          toolName: "Write",
           result: "{}",
           isError: true,
           metadata: { childPolicyDenied: true },
@@ -519,6 +519,63 @@ describe("extract memories service", () => {
 
     expect(runChild).toHaveBeenCalledTimes(2);
     expect(runChild.mock.calls[1]![0].prompt).toContain("~2 model-visible");
+  });
+
+  it("completes and advances the cursor when only reads outside the memory directory were denied", async () => {
+    // Live shape: the child probed two sibling memory directories the prompt
+    // never named (both denied), then read the right one and finished with
+    // "No new memory". That was recorded as a failed extraction and the
+    // messages were re-queued for the next run.
+    const emitted: unknown[] = [];
+    const runChild = vi
+      .fn(
+        async (_request: ExtractMemoriesChildRequest) =>
+          ({ outcome: "completed" as const }),
+      )
+      .mockImplementationOnce(async (request) => {
+        for (const callId of ["read-1", "read-2"]) {
+          request.onProgress({
+            kind: "tool_result",
+            callId,
+            toolName: "FileRead",
+            result: "{}",
+            isError: true,
+            metadata: { childPolicyDenied: true },
+          });
+        }
+        return { outcome: "completed" };
+      })
+      .mockResolvedValue({ outcome: "completed" });
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+    });
+
+    const messages: LLMMessage[] = [
+      { role: "user", content: "remember this" },
+      { role: "assistant", content: "ok" },
+    ];
+    const context = extractionContext({ cwd: root, messages });
+    (context.session as unknown as { emit: (event: unknown) => void }).emit = (
+      event,
+    ) => {
+      emitted.push(event);
+    };
+    (context.session as unknown as { nextInternalSubId: () => string }).nextInternalSubId =
+      () => "sub-test-1";
+    await executeExtractMemories(context);
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+
+    // The second run has nothing new to process: the cursor advanced.
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(runChild.mock.calls[0]![0].prompt).toContain(memoryDir);
+    const warnings = emitted
+      .map((event) => (event as { msg?: { payload?: { cause?: string; message?: string } } }).msg?.payload)
+      .filter((payload) => payload !== undefined);
+    expect(warnings.some((payload) => payload?.cause === "memory_extraction_denied_read")).toBe(true);
+    expect(warnings.some((payload) => payload?.cause === "memory_extraction_failed")).toBe(false);
   });
 
   it("does not advance the cursor when a tracked child write fails", async () => {

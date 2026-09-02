@@ -80,7 +80,8 @@ const MAX_EXTRACTION_LANES = 256;
 
 type ExtractionWarningCause =
   | "memory_extraction_skipped"
-  | "memory_extraction_failed";
+  | "memory_extraction_failed"
+  | "memory_extraction_denied_read";
 
 /**
  * Record why an extraction run stopped. Warning causes outside the TUI's
@@ -175,7 +176,15 @@ interface ExtractionLane {
 
 interface ChildWriteTracker {
   readonly savedPaths: Set<string>;
-  policyDenied: boolean;
+  /** A memory write the child wanted was refused by the path policy. */
+  policyDeniedWrite: boolean;
+  /**
+   * Reads outside the memory directory that the policy refused. The child
+   * usually probes a wrong directory first (live: two sibling project memory
+   * roots the prompt never named) and then finishes correctly; that is not a
+   * failed extraction and must not re-queue the messages.
+   */
+  deniedReads: number;
   failedWrite: boolean;
   onProgress(event: RunAgentProgressEvent): void;
 }
@@ -373,7 +382,8 @@ function createChildWriteTracker(memoryDir: string): ChildWriteTracker {
   const savedPaths = new Set<string>();
   return {
     savedPaths,
-    policyDenied: false,
+    policyDeniedWrite: false,
+    deniedReads: 0,
     failedWrite: false,
     onProgress(event) {
       if (event.kind === "tool_call" && WRITE_TOOL_NAMES.has(event.toolName)) {
@@ -386,7 +396,11 @@ function createChildWriteTracker(memoryDir: string): ChildWriteTracker {
       }
       if (event.kind !== "tool_result") return;
       if (event.metadata?.childPolicyDenied === true) {
-        this.policyDenied = true;
+        if (WRITE_TOOL_NAMES.has(event.toolName)) {
+          this.policyDeniedWrite = true;
+        } else {
+          this.deniedReads += 1;
+        }
       }
       const writtenPath = pathsByCallId.get(event.callId);
       if (!writtenPath) return;
@@ -565,6 +579,7 @@ export function initExtractMemories(
       newMessageCount,
       existingMemories,
       deps.omitIndexFile ?? false,
+      memoryDir,
     );
     const maxTurns = deps.maxTurns ?? DEFAULT_MAX_TURNS;
     const childResult = await (deps.runChild ??
@@ -580,7 +595,7 @@ export function initExtractMemories(
 
     if (
       childResult.outcome !== "completed" ||
-      tracker.policyDenied ||
+      tracker.policyDeniedWrite ||
       tracker.failedWrite
     ) {
       let detail: string;
@@ -589,8 +604,8 @@ export function initExtractMemories(
         if (childResult.error !== undefined) {
           detail += ": " + errorText(childResult.error);
         }
-      } else if (tracker.policyDenied) {
-        detail = "child tool policy denied a call";
+      } else if (tracker.policyDeniedWrite) {
+        detail = "child tool policy denied a memory write";
       } else {
         detail = "a memory write failed";
       }
@@ -602,6 +617,13 @@ export function initExtractMemories(
       return;
     }
 
+    if (tracker.deniedReads > 0) {
+      emitExtractionWarning(
+        session,
+        "memory_extraction_denied_read",
+        `child tool policy denied ${tracker.deniedReads} read(s) outside the memory directory; the extraction completed`,
+      );
+    }
     lane.trigger.processedVisibleCount = range.currentVisibleCount;
     const savedPaths = [...tracker.savedPaths].filter(
       (path) => basename(path) !== AUTO_MEMORY_INDEX_FILE,

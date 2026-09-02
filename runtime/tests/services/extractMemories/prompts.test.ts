@@ -26,6 +26,12 @@ describe("memory extraction prompt", () => {
     expect(prompt).not.toMatch(/https?:\/\//iu);
   });
 
+  it("names the memory directory the child may use", () => {
+    const prompt = buildExtractAutoOnlyPrompt(1, "", false, "/home/u/.agenc/projects/p/memory");
+    expect(prompt).toContain("The memory directory is /home/u/.agenc/projects/p/memory");
+    expect(buildExtractAutoOnlyPrompt(1, "")).not.toContain("The memory directory is");
+  });
+
   it("omits index instructions when the memory index is disabled", () => {
     const prompt = buildExtractAutoOnlyPrompt(1, "", true);
 
