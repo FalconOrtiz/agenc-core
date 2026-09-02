@@ -97,22 +97,31 @@ describe("agenc skills CLI", () => {
     const agencHome = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-skills-cli-cap-ws-"));
     const userRoot = join(agencHome, "skills");
-    for (let i = 0; i < 505; i++) {
-      await writeSkill(userRoot, `cap-${String(i).padStart(3, "0")}`);
+    // The cap is configurable so a real catalog loads whole; set it low here
+    // rather than writing thousands of files to reach the default.
+    const previousCap = process.env.AGENC_MAX_SKILL_FILES_PER_ROOT;
+    process.env.AGENC_MAX_SKILL_FILES_PER_ROOT = "10";
+    try {
+      for (let i = 0; i < 15; i++) {
+        await writeSkill(userRoot, `cap-${String(i).padStart(3, "0")}`);
+      }
+
+      const inventory = await buildSkillsInventory({
+        agencHome,
+        pluginStorageRoot: join(agencHome, "plugins"),
+        workspaceRoot,
+        env: { AGENC_HOME: agencHome },
+      });
+
+      expect(
+        inventory.skills.filter((skill) => skill.name.startsWith("cap-")),
+      ).toHaveLength(10);
+      expect(inventory.errors).toContain(
+        `5 SKILL.md files under ${userRoot} were not loaded: the per-root cap was reached after 10`,
+      );
+    } finally {
+      if (previousCap === undefined) delete process.env.AGENC_MAX_SKILL_FILES_PER_ROOT;
+      else process.env.AGENC_MAX_SKILL_FILES_PER_ROOT = previousCap;
     }
-
-    const inventory = await buildSkillsInventory({
-      agencHome,
-      pluginStorageRoot: join(agencHome, "plugins"),
-      workspaceRoot,
-      env: { AGENC_HOME: agencHome },
-    });
-
-    expect(
-      inventory.skills.filter((skill) => skill.name.startsWith("cap-")),
-    ).toHaveLength(500);
-    expect(inventory.errors).toContain(
-      `5 SKILL.md files under ${userRoot} were not loaded: the per-root cap was reached after 500`,
-    );
   });
 });

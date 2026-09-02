@@ -57,6 +57,112 @@ describe("skillListingProducer", () => {
     }
   });
 
+  describe("the per-turn diagnostic", () => {
+    const manySkills = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        name: `filler-${String(i).padStart(4, "0")}`,
+        description: "a skill with a description long enough to consume budget",
+        loadedFrom: "skills" as const,
+        scope: "user" as const,
+      }));
+
+    function collect(partial?: Partial<GetAttachmentsOptions>) {
+      const diagnostics: { cause: string; message: string }[] = [];
+      const opts = makeOpts({
+        emitDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+        ...partial,
+      });
+      return { opts, diagnostics };
+    }
+
+    test("reports what the model was shown when the budget cut the listing", async () => {
+      // The listing is an attachment, so it never reaches the rollout, and the
+      // provider trace keeps no bodies. Without this, a run where the model
+      // ignored every skill is indistinguishable from one where it was shown
+      // none of the right ones.
+      const { opts, diagnostics } = collect({
+        contextWindowTokens: 20_000,
+        skillsManager: {
+          skillsForConfig: async () => ({
+            invokedSkills: [],
+            availableSkills: manySkills(200),
+          }),
+        },
+      });
+
+      await skillListingProducer(opts, getAttachmentTrackingState(opts.sessionKey));
+
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]?.cause).toBe("skill_listing_truncated");
+      // The count includes whatever else the harness offers alongside them.
+      expect(diagnostics[0]?.message).toMatch(/listed \d+ of \d+ invocable skills/);
+      const [, listed, invocable] =
+        /listed (\d+) of (\d+) invocable skills/.exec(diagnostics[0]?.message ?? "") ?? [];
+      expect(Number(invocable)).toBeGreaterThanOrEqual(200);
+      expect(Number(listed)).toBeLessThan(Number(invocable));
+      expect(diagnostics[0]?.message).toContain("chars");
+      expect(diagnostics[0]?.message).toContain("unranked");
+    });
+
+    test("says the listing was ranked when the request drove the order", async () => {
+      const { opts, diagnostics } = collect({
+        contextWindowTokens: 20_000,
+        userInput: "write unit tests for the parser",
+        skillsManager: {
+          skillsForConfig: async () => ({
+            invokedSkills: [],
+            availableSkills: manySkills(200),
+          }),
+        },
+      });
+
+      await skillListingProducer(opts, getAttachmentTrackingState(opts.sessionKey));
+
+      expect(diagnostics[0]?.message).toContain("ranked by this request");
+    });
+
+    test("names roots whose skills were never loaded at all", async () => {
+      const { opts, diagnostics } = collect({
+        contextWindowTokens: 20_000,
+        skillsManager: {
+          skillsForConfig: async () => ({
+            invokedSkills: [],
+            availableSkills: manySkills(200),
+            truncatedSkillRoots: [
+              { root: "/home/u/.agents/skills", droppedCount: 1_320 },
+            ],
+          }),
+        },
+      });
+
+      await skillListingProducer(opts, getAttachmentTrackingState(opts.sessionKey));
+
+      expect(diagnostics[0]?.message).toContain("1320 more were never loaded");
+      expect(diagnostics[0]?.message).toContain("/home/u/.agents/skills holds 1320 past the per-root cap");
+    });
+
+    test("stays quiet when every skill fit", async () => {
+      const { opts, diagnostics } = collect();
+      await skillListingProducer(opts, getAttachmentTrackingState(opts.sessionKey));
+      expect(diagnostics).toEqual([]);
+    });
+
+    test("never throws when no sink is provided", async () => {
+      const opts = makeOpts({
+        contextWindowTokens: 20_000,
+        skillsManager: {
+          skillsForConfig: async () => ({
+            invokedSkills: [],
+            availableSkills: manySkills(200),
+          }),
+        },
+      });
+      await expect(
+        skillListingProducer(opts, getAttachmentTrackingState(opts.sessionKey)),
+      ).resolves.toHaveLength(1);
+    });
+  });
+
   test("stays quiet when a message already carries the rendered listing", async () => {
     const rendered =
       `<system-reminder>\n${SKILL_LISTING_REMINDER_HEADER}\n\n- repo-docs: Explain the repository docs\n</system-reminder>`;

@@ -2,7 +2,7 @@ import type { LLMMessage } from "../../llm/types.js";
 import type { AttachmentProducer } from "./orchestrator.js";
 import { SKILL_LISTING_REMINDER_HEADER } from "./messages.js";
 import {
-  formatSkillListingWithinBudget,
+  buildSkillListingWithinBudget,
   type SkillListingEntry,
 } from "../../skills/local-loader.js";
 
@@ -66,14 +66,41 @@ export const skillListingProducer: AttachmentProducer = async (opts) => {
 
   const outcome = await opts.skillsManager.skillsForConfig(opts.config ?? {}, null);
   const skills = outcome.availableSkills ?? [];
+  // Roots that hold more skills than the per-root cap loaded: those never
+  // reached the listing at all, so a truncated listing is only half the story.
+  const truncatedRoots = (outcome.truncatedSkillRoots ?? []).filter(
+    (root) => root.droppedCount > 0,
+  );
   const known = new Set(skills.map((skill) => skill.name));
   const bundled = (await bundledRegistrySkills()).filter(
     (skill) => !known.has(skill.name),
   );
-  const listing = formatSkillListingWithinBudget(
+  const { listing, stats } = buildSkillListingWithinBudget(
     [...skills, ...bundled],
     opts.contextWindowTokens,
+    // What the user just asked for decides which skills get the budget when
+    // the installed catalog does not fit.
+    opts.userInput,
   );
+  // What the model was shown is otherwise unrecoverable: the listing is an
+  // attachment, so it never reaches the rollout, and the provider trace keeps
+  // no message bodies. A run where the model ignored every skill could not be
+  // told apart from one where it was shown none of the right ones.
+  if (stats.hidden > 0 || truncatedRoots.length > 0) {
+    opts.emitDiagnostic?.({
+      cause: "skill_listing_truncated",
+      message:
+        `listed ${stats.listed} of ${stats.invocable} invocable skills ` +
+        `(${stats.usedChars}/${stats.budgetChars} chars, ` +
+        `${stats.ranked ? "ranked by this request" : "unranked"})` +
+        (truncatedRoots.length > 0
+          ? `; ${truncatedRoots.reduce((sum, root) => sum + root.droppedCount, 0)} more were never loaded: ` +
+            truncatedRoots
+              .map((root) => `${root.root} holds ${root.droppedCount} past the per-root cap`)
+              .join(", ")
+          : ""),
+    });
+  }
   if (listing.length === 0) return [];
 
   return [
