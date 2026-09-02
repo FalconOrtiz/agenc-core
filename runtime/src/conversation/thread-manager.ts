@@ -367,7 +367,11 @@ export class ConversationThreadManager extends ThreadManager {
     session.seedInternalSubId(
       highestInternalSubId(rolloutItems, session.conversationId) + 1,
     );
-    appliedState = await closeTrailingDanglingToolCalls(session, appliedState);
+    appliedState = await closeTrailingDanglingToolCalls(
+      session,
+      appliedState,
+      opts.emitSynthesized === true,
+    );
 
     // GOAL #4b Stage 1 — stash the reconstruction so the prewarm hook can
     // consult its `resumableTurns` and resume-continue an orphaned in-flight
@@ -717,6 +721,7 @@ export function interruptedToolCallResultContent(call: {
 async function closeTrailingDanglingToolCalls(
   session: Session,
   appliedState: SessionState,
+  emitWarning: boolean,
 ): Promise<SessionState> {
   const dangling = trailingDanglingToolCalls(appliedState.history);
   if (dangling.length === 0) return appliedState;
@@ -746,6 +751,10 @@ async function closeTrailingDanglingToolCalls(
     };
     return { next: updated, result: updated };
   });
+  // Like the other synthesized recovery events, the warning is emitted only
+  // when the caller replays with `emitSynthesized`: a bootstrap replay that
+  // has not seeded the live event sequence yet must not append events.
+  if (!emitWarning) return next;
   session.emit({
     id: session.nextInternalSubId(),
     msg: {

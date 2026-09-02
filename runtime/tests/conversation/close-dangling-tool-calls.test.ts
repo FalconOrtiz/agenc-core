@@ -83,7 +83,9 @@ describe("replayRolloutIntoSession closes trailing dangling tool calls", () => {
     const { session, appendRollout } = makeSession();
     const manager = new ConversationThreadManager();
 
-    const replay = await manager.replayRolloutIntoSession(session, [user, assistantWithCalls]);
+    const replay = await manager.replayRolloutIntoSession(session, [user, assistantWithCalls], {
+      emitSynthesized: true,
+    });
 
     const history = replay.appliedState.history;
     expect(history).toHaveLength(4);
@@ -122,6 +124,17 @@ describe("replayRolloutIntoSession closes trailing dangling tool calls", () => {
     expect(warnings[0].msg.payload.cause).toBe(DANGLING_TOOL_CALLS_CLOSED_CAUSE);
     expect(warnings[0].msg.payload.message).toContain("Glob call-53");
     expect(warnings[0].msg.payload.message).toContain("FileRead call-54");
+  });
+
+  it("repairs the history without emitting when the caller does not replay synthesized events", async () => {
+    const { session, appendRollout } = makeSession();
+    const manager = new ConversationThreadManager();
+
+    const replay = await manager.replayRolloutIntoSession(session, [user, assistantWithCalls]);
+
+    expect(replay.appliedState.history).toHaveLength(4);
+    expect(appendRollout).toHaveBeenCalledTimes(2);
+    expect(session.emit.mock.calls.some(([event]) => event.msg?.type === "warning")).toBe(false);
   });
 
   it("leaves a fully resolved history untouched", async () => {
