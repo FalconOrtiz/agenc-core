@@ -197,7 +197,37 @@ interface BundledSkillDefinition {
 }
 
 const SKILL_FILE_NAME = "SKILL.md";
-const MAX_SKILL_FILES = 500;
+/**
+ * Per-root ceiling on skills loaded from disk. The walk keeps counting past
+ * it (`droppedCount`) so the snapshot can say what it skipped, but a dropped
+ * skill is invisible to the listing, to ranking and to the Skill tool.
+ *
+ * 500 was set when a catalog meant a handful of hand-written skills. A shared
+ * catalog is now the normal case: the machine this was measured on holds
+ * 1,820 skills in `~/.agents/skills`, so 1,320 of them — including three of
+ * the four that matched the work in a live 15-turn run — were dropped before
+ * any ranking or budget logic could see them, in readdir order. The ceiling
+ * stays, because it is what stops a pathological directory from being walked
+ * forever, but it is now above a real installation rather than inside one.
+ * The cost of the higher bound is a cold scan reading the frontmatter of each
+ * file once (7.7 MB across those 1,820), behind the snapshot's change
+ * detector; the listing budget, not this cap, is what bounds what the model
+ * is shown.
+ *
+ * Overridable with `AGENC_MAX_SKILL_FILES_PER_ROOT` so an operator with an
+ * unusual catalog can tune it, and so tests can exercise truncation without
+ * writing thousands of files.
+ */
+const DEFAULT_MAX_SKILL_FILES = 5_000;
+
+export function maxSkillFilesPerRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = Number(env.AGENC_MAX_SKILL_FILES_PER_ROOT);
+  return Number.isFinite(raw) && raw > 0
+    ? Math.floor(raw)
+    : DEFAULT_MAX_SKILL_FILES;
+}
 const MAX_SCAN_DEPTH = 12;
 const MAX_ACTIVE_PATHS = 256;
 const INVOKED_MAIN_AGENT_ID = "__main__";
@@ -430,6 +460,7 @@ interface SkillFileScan {
 interface MutableSkillFileScan {
   readonly files: string[];
   droppedCount: number;
+  readonly maxFiles: number;
 }
 
 interface ScanFrame {
@@ -466,7 +497,7 @@ async function markVisited(path: string, visited: Set<string>): Promise<boolean>
 function recordSkillFile(scan: MutableSkillFileScan, file: string): void {
   // Past the cap the walk keeps going but only counts, so the snapshot can
   // say how many skills this root holds that were never loaded.
-  if (scan.files.length >= MAX_SKILL_FILES) scan.droppedCount += 1;
+  if (scan.files.length >= scan.maxFiles) scan.droppedCount += 1;
   else scan.files.push(file);
 }
 
@@ -488,7 +519,11 @@ async function scanSkillDir(
 }
 
 async function findSkillFiles(root: string): Promise<SkillFileScan> {
-  const scan: MutableSkillFileScan = { files: [], droppedCount: 0 };
+  const scan: MutableSkillFileScan = {
+    files: [],
+    droppedCount: 0,
+    maxFiles: maxSkillFilesPerRoot(),
+  };
   const queue = await topLevelScanFrames(root);
   const visitedDirs = new Set<string>();
   while (queue.length > 0) {
@@ -987,9 +1022,67 @@ function formatHiddenSkillsLine(count: number): string {
   return `- ...and ${count} more skill${count === 1 ? "" : "s"} not shown; ask the user to run /skills <search> to find one`;
 }
 
+/**
+ * Words too common to say anything about which skill fits a request.
+ */
+const SKILL_MATCH_STOPWORDS: ReadonlySet<string> = new Set([
+  "the", "and", "for", "with", "that", "this", "you", "your", "are", "was",
+  "not", "but", "all", "any", "can", "has", "have", "how", "its", "let",
+  "make", "made", "new", "now", "one", "out", "run", "see", "use", "using",
+  "add", "into", "from", "when", "what", "where", "which", "will", "would",
+  "please", "should", "then", "them", "they", "there", "here", "just", "like",
+  "file", "files", "code", "line", "lines",
+]);
+
+/** Content words of the current request, lowercased and de-duplicated. */
+function requestMatchTokens(request: string | null | undefined): readonly string[] {
+  if (typeof request !== "string" || request.length === 0) return [];
+  const tokens = new Set<string>();
+  for (const raw of request.toLowerCase().split(/[^a-z0-9+#.]+/u)) {
+    const token = raw.replace(/^[.]+|[.]+$/gu, "");
+    if (token.length < 3) continue;
+    if (SKILL_MATCH_STOPWORDS.has(token)) continue;
+    tokens.add(token);
+  }
+  return [...tokens];
+}
+
+/** Cap so one long description cannot outweigh a real name match. */
+const SKILL_DESCRIPTION_MATCH_CAP = 6;
+
+/**
+ * How well a skill answers the current request. A name match counts most: a
+ * skill called `generating-unit-tests` is what "write unit tests" wants, and
+ * its description only corroborates that.
+ */
+function skillRelevance(
+  skill: SkillListingEntry,
+  tokens: readonly string[],
+): number {
+  if (tokens.length === 0) return 0;
+  const nameParts = new Set(skill.name.toLowerCase().split(/[^a-z0-9]+/u));
+  const name = skill.name.toLowerCase();
+  const description = `${skill.description ?? ""} ${skill.whenToUse ?? ""}`.toLowerCase();
+  let score = 0;
+  let fromDescription = 0;
+  for (const token of tokens) {
+    if (nameParts.has(token)) {
+      score += 4;
+    } else if (name.includes(token)) {
+      score += 2;
+    }
+    if (fromDescription < SKILL_DESCRIPTION_MATCH_CAP && description.includes(token)) {
+      score += 1;
+      fromDescription += 1;
+    }
+  }
+  return score;
+}
+
 export function formatSkillListingWithinBudget(
   skills: readonly SkillListingEntry[],
   contextWindowTokens?: number,
+  request?: string | null,
 ): string {
   const commands = skills.filter((skill) => !skill.disableModelInvocation);
   if (commands.length === 0) return "";
@@ -1005,10 +1098,27 @@ export function formatSkillListingWithinBudget(
   // so the skills that do not fit are counted in one closing line instead
   // of being listed by name.
   const bundled = commands.filter((skill) => skill.loadedFrom === "bundled");
+  // Over budget, insertion order inside a scope is alphabetical, so a large
+  // shared catalog fills the whole listing with whatever sorts first. Live
+  // measurement on a machine with 1,823 installed skills: 101 fit, the list
+  // stopped at "apollo-core-workflow-a", and every skill matching the work at
+  // hand — canvas-design, frontend-design, generating-unit-tests,
+  // javascript-typescript — was never shown, which is why 15 turns of exactly
+  // that work produced zero Skill invocations. What the request is about now
+  // decides who gets the space; scope rank breaks ties, as before.
+  const tokens = requestMatchTokens(request);
   const rest = commands
-    .map((skill, index) => ({ skill, index, rank: skillListingRank(skill) }))
+    .map((skill, index) => ({
+      skill,
+      index,
+      rank: skillListingRank(skill),
+      relevance: skillRelevance(skill, tokens),
+    }))
     .filter((entry) => entry.skill.loadedFrom !== "bundled")
-    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .sort(
+      (a, b) =>
+        b.relevance - a.relevance || a.rank - b.rank || a.index - b.index,
+    )
     .map((entry) => entry.skill);
   const lines = bundled.map(formatSkillListingLine);
   let used = lines.reduce((sum, line) => sum + line.length + 1, 0);

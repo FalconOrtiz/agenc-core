@@ -73,6 +73,9 @@ export const skillListingProducer: AttachmentProducer = async (opts) => {
   const listing = formatSkillListingWithinBudget(
     [...skills, ...bundled],
     opts.contextWindowTokens,
+    // What the user just asked for decides which skills get the budget when
+    // the installed catalog does not fit.
+    opts.userInput,
   );
   if (listing.length === 0) return [];
 

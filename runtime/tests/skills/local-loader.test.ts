@@ -15,6 +15,7 @@ import {
   discoverSkillRoots,
   formatSkillListingWithinBudget,
   loadLocalSkillsSnapshot,
+  maxSkillFilesPerRoot,
 } from "./local-loader.js";
 import { substituteArguments } from "../tui/slash/argument-substitution.js";
 
@@ -53,6 +54,112 @@ async function flushPromises(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+describe("per-root skill scan cap", () => {
+  it("defaults above a real shared catalog and honors an operator override", () => {
+    // Measured: 1,820 skills in ~/.agents/skills. The old 500 dropped 1,320
+    // of them in readdir order, before any ranking could see them.
+    expect(maxSkillFilesPerRoot({})).toBeGreaterThan(1_820);
+    expect(maxSkillFilesPerRoot({ AGENC_MAX_SKILL_FILES_PER_ROOT: "10" })).toBe(10);
+    // Nonsense falls back to the default rather than disabling the guard.
+    for (const raw of ["0", "-5", "abc", ""]) {
+      expect(
+        maxSkillFilesPerRoot({ AGENC_MAX_SKILL_FILES_PER_ROOT: raw }),
+      ).toBe(maxSkillFilesPerRoot({}));
+    }
+  });
+});
+
+describe("skill listing relevance", () => {
+  // Live measurement on the reviewer's machine (1,823 skills installed under
+  // ~/.agents/skills, 500k context window): the 20,000-char budget fit 101 of
+  // them, the list stopped at "apollo-core-workflow-a", and every skill that
+  // matched the work at hand was never shown. Fifteen turns of exactly that
+  // work produced zero Skill invocations.
+  const catalog = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      name: `a-filler-${String(i).padStart(4, "0")}`,
+      description: "filler skill that matches nothing in particular",
+      scope: "user" as const,
+      loadedFrom: "skills" as const,
+    }));
+
+  const matching = {
+    name: "generating-unit-tests",
+    description:
+      "Automatically generate comprehensive unit tests from source code. Use when creating test coverage for functions, classes, or modules.",
+    scope: "user" as const,
+    loadedFrom: "skills" as const,
+  };
+
+  const skills = [...catalog(400), matching];
+  // A window whose 1-percent listing budget fits roughly a dozen lines, far
+  // fewer than the catalog — the same shape as the live machine.
+  const BUDGET_TOKENS = 25_000;
+
+  it("lists the skill the request is about, even when it sorts last", () => {
+    const listing = formatSkillListingWithinBudget(
+      skills,
+      BUDGET_TOKENS,
+      "Write unit tests with node:test for the pure logic only",
+    );
+    expect(listing).toContain("- generating-unit-tests");
+    expect(listing).toContain("more skill");
+  });
+
+  it("without the request the same skill never fits", () => {
+    const listing = formatSkillListingWithinBudget(skills, BUDGET_TOKENS);
+    expect(listing).not.toContain("- generating-unit-tests");
+    expect(listing).toContain("- a-filler-0000");
+  });
+
+  it("an unrelated request does not promote it", () => {
+    const listing = formatSkillListingWithinBudget(
+      skills,
+      BUDGET_TOKENS,
+      "rename the deployment pipeline variables",
+    );
+    expect(listing).not.toContain("- generating-unit-tests");
+  });
+
+  it("a name match outranks a description-only match", () => {
+    const descriptionOnly = {
+      name: "z-unrelated-name",
+      description: "helps you write unit tests and coverage reports",
+      scope: "user" as const,
+      loadedFrom: "skills" as const,
+    };
+    const listing = formatSkillListingWithinBudget(
+      [...catalog(400), descriptionOnly, matching],
+      BUDGET_TOKENS,
+      "write unit tests",
+    );
+    const nameFirst = listing.indexOf("- generating-unit-tests");
+    const descriptionSecond = listing.indexOf("- z-unrelated-name");
+    expect(nameFirst).toBeGreaterThanOrEqual(0);
+    expect(descriptionSecond).toBeGreaterThan(nameFirst);
+  });
+
+  it("leaves a listing that already fits completely alone", () => {
+    const few = [matching, ...catalog(2)];
+    const ranked = formatSkillListingWithinBudget(few, 100_000, "write unit tests");
+    const plain = formatSkillListingWithinBudget(few, 100_000);
+    expect(ranked).toBe(plain);
+    expect(ranked.split("\n")).toHaveLength(3);
+  });
+
+  it("keeps bundled skills regardless of the request", () => {
+    const listing = formatSkillListingWithinBudget(
+      [
+        { name: "browser-automation", description: "drive a browser", loadedFrom: "bundled" as const },
+        ...catalog(400),
+      ],
+      BUDGET_TOKENS,
+      "write unit tests",
+    );
+    expect(listing).toContain("- browser-automation");
+  });
+});
 
 describe("local skills loader", () => {
   it("discovers AgenC, agent, user, and plugin skill roots", async () => {
@@ -895,21 +1002,31 @@ All=$ARGUMENTS
     const agencHome = tmpRoot("skills-home");
     const workspaceRoot = tmpRoot("skills-workspace");
     const userRoot = join(agencHome, "skills");
-    for (let i = 0; i < 600; i++) {
-      const name = `skill-${String(i).padStart(3, "0")}`;
-      writeSkill(
-        userRoot,
-        name,
-        `---\ndescription: ${name} does a specific job\n---\nBody\n`,
-      );
-    }
+    // The cap is configurable; set it low here instead of writing thousands of
+    // files to reach the default, which is now above a real catalog.
+    const previousCap = process.env.AGENC_MAX_SKILL_FILES_PER_ROOT;
+    process.env.AGENC_MAX_SKILL_FILES_PER_ROOT = "500";
+    let snapshot;
+    try {
+      for (let i = 0; i < 600; i++) {
+        const name = `skill-${String(i).padStart(3, "0")}`;
+        writeSkill(
+          userRoot,
+          name,
+          `---\ndescription: ${name} does a specific job\n---\nBody\n`,
+        );
+      }
 
-    const snapshot = await loadLocalSkillsSnapshot({
-      agencHome,
-      pluginStorageRoot: join(agencHome, "plugins"),
-      workspaceRoot,
-      env: {},
-    });
+      snapshot = await loadLocalSkillsSnapshot({
+        agencHome,
+        pluginStorageRoot: join(agencHome, "plugins"),
+        workspaceRoot,
+        env: {},
+      });
+    } finally {
+      if (previousCap === undefined) delete process.env.AGENC_MAX_SKILL_FILES_PER_ROOT;
+      else process.env.AGENC_MAX_SKILL_FILES_PER_ROOT = previousCap;
+    }
 
     expect(snapshot.truncatedRoots).toEqual([
       { root: userRoot, loadedCount: 500, droppedCount: 100 },
