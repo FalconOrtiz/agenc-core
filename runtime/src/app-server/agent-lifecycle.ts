@@ -4208,6 +4208,13 @@ function interactivePermissionModeFromRuntimeSettings(
   return mode;
 }
 
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.length > 0 ? error.message : error.name;
+  }
+  return String(error);
+}
+
 function assertCanonicalRuntimeSettingsProjection(
   cwd: string,
   runId: string,
@@ -4216,10 +4223,13 @@ function assertCanonicalRuntimeSettingsProjection(
   let driver: ReturnType<typeof openStateDatabases>;
   try {
     driver = openStateDatabases({ cwd });
-  } catch {
+  } catch (error) {
+    // Say why. A live resume failed for an hour with this sentence and
+    // nothing else; the cause (a locked database, a schema mismatch, a bad
+    // cwd) is what the operator needs to see.
     throw new AgenCDaemonAgentLifecycleError(
       "INVALID_ARGUMENT",
-      `canonical session ${runId} runtime settings projection is unavailable`,
+      `canonical session ${runId} runtime settings projection is unavailable: ${describeError(error)}`,
     );
   }
   let projected: ReturnType<
@@ -4242,7 +4252,7 @@ function assertCanonicalRuntimeSettingsProjection(
   if (primaryError !== undefined) {
     throw new AgenCDaemonAgentLifecycleError(
       "INVALID_ARGUMENT",
-      `canonical session ${runId} runtime settings projection could not be verified`,
+      `canonical session ${runId} runtime settings projection could not be verified: ${describeError(primaryError)}`,
     );
   }
   if (projected === undefined) {
