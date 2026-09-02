@@ -43,6 +43,9 @@ describe("compaction with runtime-owned tool pairs", () => {
     const result = await compactConversation(source, harness.context);
     const committed = result.transaction?.committed;
     expect(committed?.replacement_history.length).toBeGreaterThan(0);
+    // The persisted replacement history is the live projection: no message
+    // carries a response id, or the durable checkpoint hash can never match.
+    expect(committed?.replacement_history.every((message) => message.id === undefined)).toBe(true);
     const serialized = JSON.stringify(committed);
     for (const index of [0, 1, TOOL_CALLS / 2, TOOL_CALLS - 1]) {
       expect(serialized).toContain(`"call-${index}"`);

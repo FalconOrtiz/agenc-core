@@ -1440,7 +1440,10 @@ function toProjectionMessage(message: RuntimeMessage): CompactionProjectionMessa
     ...(message.toolCalls !== undefined ? { toolCalls: message.toolCalls } : {}),
     ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
-    ...(message.uuid !== undefined ? { id: message.uuid } : {}),
+    // No `id`: the live history holds LLMMessages, which never carry one, and
+    // the durable checkpoint hash covers `response-id`. Persisting the runtime
+    // uuid here made every post-compaction checkpoint unverifiable after a
+    // restart ("checkpoint prefix digest does not match persisted history").
     ...(message.phase !== undefined ? { phase: message.phase } : {}),
     ...(message.runtimeOnly?.toolResultIntegrity !== undefined
       ? {
