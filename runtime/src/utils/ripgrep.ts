@@ -182,6 +182,11 @@ export function getRipgrepInstallHint(platform = process.platform): string {
   }
 }
 
+/** True when the failure means the search binary could not run at all. */
+export function isRipgrepUnavailable(error: unknown): boolean {
+  return error instanceof RipgrepUnavailableError
+}
+
 export function wrapRipgrepUnavailableError(
   error: RipgrepErrorLike,
   config = getRipgrepConfig(),
