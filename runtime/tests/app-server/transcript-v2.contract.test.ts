@@ -472,27 +472,10 @@ describe("session.transcript.v2 durable projection", () => {
     });
   });
 
-  it("closes the turn as errored on turn_failed with no later completion", () => {
-    const items: RolloutItem[] = [
-      event(10, "user-1", {
-        type: "user_message",
-        payload: { message: "question", messageId: "client-1" },
-      }),
-      event(11, "turn-1", {
-        type: "turn_started",
-        payload: { turnId: "turn-1", startedAt: 1_000 },
-      }),
-      event(12, "tokens", {
-        type: "token_count",
-        payload: {
-          promptTokens: 50,
-          completionTokens: 10,
-          totalTokens: 60,
-          model: "grok-4.6",
-          provider: "grok",
-        },
-      }),
-      event(13, "fail-1", {
+  it.each([
+    {
+      name: "turn_failed",
+      closer: event(13, "fail-1", {
         type: "turn_failed",
         payload: {
           turnId: "turn-1",
@@ -501,11 +484,8 @@ describe("session.transcript.v2 durable projection", () => {
           completedAt: 1_400,
         },
       }),
-    ];
-
-    const snapshot = sessionTranscriptV2FromRollout(items, "session-1", "run-1");
-    expect(snapshot.turnResults).toEqual([
-      {
+      withTokens: true,
+      expected: {
         turnId: "turn-1",
         committedSequence: 13,
         outcome: "errored",
@@ -516,20 +496,10 @@ describe("session.transcript.v2 durable projection", () => {
         model: "grok-4.6",
         provider: "grok",
       },
-    ]);
-  });
-
-  it("treats legacy background_agent_error as a terminal failure", () => {
-    const items: RolloutItem[] = [
-      event(10, "user-1", {
-        type: "user_message",
-        payload: { message: "question", messageId: "client-1" },
-      }),
-      event(11, "turn-1", {
-        type: "turn_started",
-        payload: { turnId: "turn-1", startedAt: 1_000 },
-      }),
-      event(12, "legacy-fail", {
+    },
+    {
+      name: "legacy background_agent_error",
+      closer: event(12, "legacy-fail", {
         type: "error",
         payload: {
           cause: "background_agent_error",
@@ -537,17 +507,50 @@ describe("session.transcript.v2 durable projection", () => {
           turnId: "turn-1",
         },
       }),
-    ];
-
-    const snapshot = sessionTranscriptV2FromRollout(items, "session-1", "run-1");
-    expect(snapshot.turnResults).toEqual([
-      {
+      withTokens: false,
+      expected: {
         turnId: "turn-1",
         committedSequence: 12,
         outcome: "errored",
       },
-    ]);
-  });
+    },
+  ] as const)(
+    "closes the turn as errored on $name with no later completion",
+    ({ closer, withTokens, expected }) => {
+      const items: RolloutItem[] = [
+        event(10, "user-1", {
+          type: "user_message",
+          payload: { message: "question", messageId: "client-1" },
+        }),
+        event(11, "turn-1", {
+          type: "turn_started",
+          payload: { turnId: "turn-1", startedAt: 1_000 },
+        }),
+        ...(withTokens
+          ? [
+              event(12, "tokens", {
+                type: "token_count",
+                payload: {
+                  promptTokens: 50,
+                  completionTokens: 10,
+                  totalTokens: 60,
+                  model: "grok-4.6",
+                  provider: "grok",
+                },
+              }),
+            ]
+          : []),
+        closer,
+      ];
+
+      const snapshot = sessionTranscriptV2FromRollout(
+        items,
+        "session-1",
+        "run-1",
+      );
+      expect(snapshot.turnResults).toEqual([expected]);
+    },
+  );
 
   it("omits turnResults entirely when the rollout closed no turns", () => {
     const snapshot = sessionTranscriptV2FromRollout(

@@ -146,7 +146,10 @@ import type {
   Session,
 } from "../session/session.js";
 import type { Event } from "../session/event-log.js";
-import { turnLifecycleTerminalFromEvent } from "../session/turn-lifecycle-terminal.js";
+import {
+  turnLifecycleTerminalFromEvent,
+  type TurnLifecycleTerminal,
+} from "../session/turn-lifecycle-terminal.js";
 import type { RolloutItem } from "../session/rollout-item.js";
 import { reconstructFromRollout } from "../session/rollout-reconstruction.js";
 import type { TurnContext } from "../session/turn-context.js";
@@ -5624,6 +5627,26 @@ function correlateDaemonEvent(
   };
 }
 
+function messageTerminalFromLifecycle(
+  terminal: TurnLifecycleTerminal | undefined,
+  expectedTurnId: string | undefined,
+): AgenCBackgroundAgentMessageTerminal | undefined {
+  if (terminal === undefined) return undefined;
+  if (
+    expectedTurnId !== undefined &&
+    terminal.turnId !== undefined &&
+    terminal.turnId !== expectedTurnId
+  ) {
+    return undefined;
+  }
+  const code =
+    terminal.kind === "completed" ? 0 : terminal.kind === "aborted" ? 130 : 1;
+  return {
+    code,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
+}
+
 function messageTerminalFromDaemonEvent(
   event: BackgroundAgentDaemonEvent,
   expectedTurnId: string | undefined,
@@ -5640,24 +5663,10 @@ function messageTerminalFromDaemonEvent(
   ) {
     return undefined;
   }
-  const terminal = turnLifecycleTerminalFromEvent(event);
-  if (terminal === undefined) return undefined;
-  if (terminal.kind === "completed") {
-    return {
-      code: 0,
-      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-    };
-  }
-  if (terminal.kind === "aborted") {
-    return {
-      code: 130,
-      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-    };
-  }
-  return {
-    code: 1,
-    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-  };
+  return messageTerminalFromLifecycle(
+    turnLifecycleTerminalFromEvent(event),
+    expectedTurnId,
+  );
 }
 
 function assistantMessageId(turnId: string, ordinal: number): string {
@@ -5941,31 +5950,10 @@ function messageTerminalFromEvent(
   event: Event["msg"],
   expectedTurnId: string | undefined,
 ): AgenCBackgroundAgentMessageTerminal | undefined {
-  const terminal = turnLifecycleTerminalFromEvent(event);
-  if (terminal === undefined) return undefined;
-  if (
-    expectedTurnId !== undefined &&
-    terminal.turnId !== undefined &&
-    terminal.turnId !== expectedTurnId
-  ) {
-    return undefined;
-  }
-  if (terminal.kind === "completed") {
-    return {
-      code: 0,
-      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-    };
-  }
-  if (terminal.kind === "aborted") {
-    return {
-      code: 130,
-      ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-    };
-  }
-  return {
-    code: 1,
-    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
-  };
+  return messageTerminalFromLifecycle(
+    turnLifecycleTerminalFromEvent(event),
+    expectedTurnId,
+  );
 }
 
 function clientMessageIdConflict(

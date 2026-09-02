@@ -63,6 +63,13 @@ function payloadNumber(
  * Classify a durable or daemon event as a turn lifecycle terminal, or
  * undefined when the event must not close the turn.
  */
+function withTurnId(
+  turnId: string | undefined,
+  terminal: TurnLifecycleTerminal,
+): TurnLifecycleTerminal {
+  return turnId !== undefined ? { ...terminal, turnId } : terminal;
+}
+
 export function turnLifecycleTerminalFromEvent(event: {
   readonly type: string;
   readonly payload?: unknown;
@@ -71,57 +78,46 @@ export function turnLifecycleTerminalFromEvent(event: {
   const turnId = payloadTurnId(payload);
 
   if (event.type === "turn_complete") {
-    return {
+    const message = payloadString(payload, "lastAgentMessage");
+    const completedAt = payloadNumber(payload, "completedAt");
+    const durationMs = payloadNumber(payload, "durationMs");
+    return withTurnId(turnId, {
       kind: "completed",
-      ...(turnId !== undefined ? { turnId } : {}),
-      ...(payloadString(payload, "lastAgentMessage") !== undefined
-        ? { message: payloadString(payload, "lastAgentMessage") }
-        : {}),
-      ...(payloadNumber(payload, "completedAt") !== undefined
-        ? { completedAt: payloadNumber(payload, "completedAt") }
-        : {}),
-      ...(payloadNumber(payload, "durationMs") !== undefined
-        ? { durationMs: payloadNumber(payload, "durationMs") }
-        : {}),
-    };
+      ...(message !== undefined ? { message } : {}),
+      ...(completedAt !== undefined ? { completedAt } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    });
   }
 
   if (event.type === "turn_aborted") {
-    return {
+    const reason = payloadString(payload, "reason") ?? "aborted";
+    return withTurnId(turnId, {
       kind: "aborted",
-      ...(turnId !== undefined ? { turnId } : {}),
-      reason: payloadString(payload, "reason") ?? "aborted",
+      reason,
       ...(payloadString(payload, "reason") !== undefined
-        ? { message: payloadString(payload, "reason") }
+        ? { message: reason }
         : {}),
-    };
+    });
   }
 
   if (event.type === "turn_failed") {
-    return {
+    const completedAt = payloadNumber(payload, "completedAt");
+    const durationMs = payloadNumber(payload, "durationMs");
+    return withTurnId(turnId, {
       kind: "failed",
-      ...(turnId !== undefined ? { turnId } : {}),
       cause: payloadString(payload, "cause") ?? "turn_failed",
       message: payloadString(payload, "message") ?? "turn failed",
-      ...(payloadNumber(payload, "completedAt") !== undefined
-        ? { completedAt: payloadNumber(payload, "completedAt") }
-        : {}),
-      ...(payloadNumber(payload, "durationMs") !== undefined
-        ? { durationMs: payloadNumber(payload, "durationMs") }
-        : {}),
-    };
+      ...(completedAt !== undefined ? { completedAt } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    });
   }
 
-  if (
-    event.type === "error" &&
-    isLegacyTurnFailureErrorPayload(payload)
-  ) {
-    return {
+  if (event.type === "error" && isLegacyTurnFailureErrorPayload(payload)) {
+    return withTurnId(turnId, {
       kind: "failed",
-      ...(turnId !== undefined ? { turnId } : {}),
       cause: payloadString(payload, "cause") ?? "legacy_terminal_error",
       message: payloadString(payload, "message") ?? "turn failed",
-    };
+    });
   }
 
   return undefined;
