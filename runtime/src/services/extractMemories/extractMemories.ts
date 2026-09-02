@@ -173,12 +173,6 @@ interface ExtractionLane {
   inProgress: boolean;
   lastAccessedAt: number;
   pendingContext: QueuedExtraction | undefined;
-  /**
-   * True until this process has made one cadence decision for this lane. The
-   * counter inside `trigger` starts at zero in every new process, so the
-   * first decision is the only one allowed to read the backlog instead.
-   */
-  coldDecisionPending: boolean;
 }
 
 interface ChildWriteTracker {
@@ -547,9 +541,6 @@ export function initExtractMemories(
       inProgress: false,
       lastAccessedAt: Date.now(),
       pendingContext: undefined,
-      // A lane this process has not decided for yet: the conversation may
-      // predate the process.
-      coldDecisionPending: true,
     };
     lanes.set(key, created);
     return created;
@@ -606,17 +597,10 @@ export function initExtractMemories(
       return;
     }
 
-    // The first decision this process makes for this lane may consider the
-    // backlog: a daemon restart leaves the counter at zero while the
-    // conversation it paces is still on disk.
-    const laneIsCold = lane.coldDecisionPending;
-    lane.coldDecisionPending = false;
     const cadence = shouldDeferForEligibleTurnCadence({
       state: lane.trigger,
       minEligibleTurns: deps.minEligibleTurns,
       isTrailingRun,
-      laneIsCold,
-      unprocessedVisibleCount: range.unprocessedMessages.length,
     });
     if (cadence.defer) {
       emitExtractionWarning(

@@ -5297,6 +5297,13 @@ describe("runTurn — D1 isRetryableStreamError type-based discrimination", () =
 
   test("LP-07 clears failed streamed tool state before retrying", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.5);
+    // This test counts sampling attempts to prove the retry path does not
+    // re-send a dropped streamed tool. Memory extraction runs a background
+    // child on this same provider once a lane reaches its eligible-turn
+    // cadence, which lands inside the settle window below and is counted as a
+    // third attempt. That child has nothing to do with retry behaviour, so it
+    // is switched off here rather than being folded into the expected count.
+    vi.stubEnv("AGENC_DISABLE_EXTRACT_MEMORIES", "1");
 
     let attempts = 0;
     let staleInvocations = 0;

@@ -123,46 +123,31 @@ function resolveMinEligibleTurns(value: number | undefined): number {
 }
 
 /**
- * Unprocessed messages that mean "this process inherited a conversation it did
- * not build". One turn's own output is a handful of messages; a backlog this
- * size only accumulates across a restart or a dropped lane.
- */
-export const COLD_LANE_BACKLOG_MESSAGES = 8;
-
-/**
  * Whether to hold this extraction back for the cadence.
  *
  * The counter is process-local: it lives in the in-process lane map, so a
  * daemon restart begins the wait again while the conversation it is pacing
- * stays on disk. A process that inherits a session mid-conversation would
- * make it wait a further full cadence before writing any memory.
+ * stays on disk. That gap is tracked separately; the cadence state belongs in
+ * persisted session state, and until it is there a restart costs at most one
+ * further cadence before memory is written again.
  *
- * The first decision a process makes for a lane is therefore allowed to look
- * at the backlog instead of the counter: an unprocessed range far larger than
- * one turn's output means this process did not build this conversation, and
- * that extraction runs now. It fires at most once per lane per process, so a
- * failing extraction still retries on the ordinary cadence rather than on
- * every turn — the cursor only advances when a run succeeds, so a backlog
- * that stays large must not keep re-triggering.
+ * An earlier version tried to close that gap by letting the first decision in
+ * a process read the unprocessed backlog instead of the counter, on the theory
+ * that a large backlog means the process inherited a conversation it did not
+ * build. One turn with tool calls and attachments produces more messages than
+ * any threshold that heuristic could use, so it fired on the first turn of a
+ * new session and launched a full-history child there. Message counts cannot
+ * tell "inherited a conversation" from "just built one", so it is gone rather
+ * than retuned.
  */
 export function shouldDeferForEligibleTurnCadence(params: {
   readonly state: MemoryExtractionTriggerState;
   readonly minEligibleTurns: number | undefined;
   readonly isTrailingRun: boolean;
-  /** First cadence decision this process makes for this lane. */
-  readonly laneIsCold?: boolean;
-  readonly unprocessedVisibleCount?: number;
 }): { readonly defer: boolean; readonly waiting: number } {
   if (params.isTrailingRun) return { defer: false, waiting: 0 };
   params.state.turnsSinceLastExtraction += 1;
   const minimum = resolveMinEligibleTurns(params.minEligibleTurns);
-  if (
-    params.laneIsCold === true &&
-    (params.unprocessedVisibleCount ?? 0) >= COLD_LANE_BACKLOG_MESSAGES
-  ) {
-    params.state.turnsSinceLastExtraction = 0;
-    return { defer: false, waiting: minimum };
-  }
   const waiting = params.state.turnsSinceLastExtraction;
   if (waiting < minimum) return { defer: true, waiting };
   params.state.turnsSinceLastExtraction = 0;

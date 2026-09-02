@@ -10,7 +10,6 @@ import {
   memoryExtractionVisibleRange,
   parseMemoryToolArguments,
   shouldDeferForEligibleTurnCadence,
-  COLD_LANE_BACKLOG_MESSAGES,
 } from "./extraction-triggers.js";
 
 describe("memory extraction triggers", () => {
@@ -165,58 +164,26 @@ describe("memory extraction triggers", () => {
     ).toBe(false);
   });
 
-  it("lets a process that inherited a conversation extract without waiting again", () => {
-    // The counter is process-local; a daemon restart sets it to zero while
-    // the conversation it paces stays on disk. The first decision this
-    // process makes for the lane may look at the backlog instead.
-    const inherited = createMemoryExtractionTriggerState();
-    expect(
-      shouldDeferForEligibleTurnCadence({
-        state: inherited,
-        minEligibleTurns: undefined,
-        isTrailingRun: false,
-        laneIsCold: true,
-        unprocessedVisibleCount: COLD_LANE_BACKLOG_MESSAGES,
-      }),
-    ).toEqual({ defer: false, waiting: 3 });
-    expect(inherited.turnsSinceLastExtraction).toBe(0);
-  });
-
-  it("only does that once, so a failing extraction still paces itself", () => {
-    // A failed run leaves the cursor where it was, so the backlog stays large.
-    // If the backlog kept deciding, every turn would relaunch a full-history
-    // child. Only the first decision per lane is allowed to use it.
-    const state = createMemoryExtractionTriggerState();
-    shouldDeferForEligibleTurnCadence({
-      state,
-      minEligibleTurns: undefined,
-      isTrailingRun: false,
-      laneIsCold: true,
-      unprocessedVisibleCount: 40,
-    });
-    const afterwards = [1, 2, 3].map(() =>
-      shouldDeferForEligibleTurnCadence({
-        state,
-        minEligibleTurns: undefined,
-        isTrailingRun: false,
-        laneIsCold: false,
-        unprocessedVisibleCount: 40,
-      }),
-    );
-    expect(afterwards.map((result) => result.defer)).toEqual([true, true, false]);
-  });
-
-  it("does not fire for a fresh session, whose backlog is one turn", () => {
+  it("gives a lane no head start for being new to this process", () => {
+    // An earlier version let the first decision in a process read the
+    // unprocessed backlog, so a restart would not wait a further cadence. A
+    // single turn with tool calls and attachments produces more messages than
+    // any threshold that heuristic could use, so it fired on the first turn of
+    // every new session and ran a full-history child there. The cadence is
+    // turn-based only; a fresh lane waits like any other.
     const fresh = createMemoryExtractionTriggerState();
-    expect(
+    const decisions = [1, 2, 3].map(() =>
       shouldDeferForEligibleTurnCadence({
         state: fresh,
         minEligibleTurns: undefined,
         isTrailingRun: false,
-        laneIsCold: true,
-        unprocessedVisibleCount: 2,
       }),
-    ).toEqual({ defer: true, waiting: 1 });
+    );
+    expect(decisions.map((decision) => decision.defer)).toEqual([
+      true,
+      true,
+      false,
+    ]);
   });
 
   it("reports the waiting count it actually used", () => {
