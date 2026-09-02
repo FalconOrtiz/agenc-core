@@ -240,6 +240,39 @@ describe("Glob tool", () => {
     expect(protectedResult.content).not.toContain("ignored.ts");
   });
 
+  test("protected-workspace validation keeps every match and the mtime order", async () => {
+    // Matches are validated 16 at a time through the directory helper; the
+    // result must still list every file, newest first, exactly as the
+    // sequential path did.
+    const scoped = join(root, "many");
+    await mkdir(scoped);
+    const names: string[] = [];
+    const base = Date.now() - 60 * 60 * 1000;
+    for (let i = 0; i < 40; i += 1) {
+      const name = `file-${String(i).padStart(2, "0")}.ts`;
+      const file = join(scoped, name);
+      await writeFile(file, `export const v${i} = ${i};\n`, "utf8");
+      const stamp = new Date(base + i * 1000);
+      await utimes(file, stamp, stamp);
+      names.push(name);
+    }
+    workspaceMutationCoordinators.getOrCreate(root).acquire({
+      workspaceRoot: root,
+      editorInstanceId: "glob-bounded-validation-editor",
+    });
+
+    const tool = createGlobTool({ allowedPaths: [root] });
+    const result = await tool.execute({ pattern: "*.ts", path: scoped });
+
+    expect(result.isError).toBeUndefined();
+    const listed = result.content
+      .split("\n")
+      .filter((line) => line.includes("file-"))
+      .map((line) => line.trim().replace(/^.*\//, ""));
+    expect(listed).toEqual([...names].reverse());
+    expect(result.metadata).toMatchObject({ numFiles: 40, truncated: false });
+  });
+
   test.runIf(process.platform !== "win32")(
     "uses snapshotted root ignore bytes after the admitted pathname becomes a symlink",
     async () => {
