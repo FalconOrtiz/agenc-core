@@ -1079,18 +1079,64 @@ function skillRelevance(
   return score;
 }
 
+/** What a listing pass decided, for the operator-facing diagnostic. */
+export interface SkillListingStats {
+  /** Skills offered to the listing (already excludes non-invocable ones). */
+  readonly invocable: number;
+  /** Skills whose full line fit the budget. */
+  readonly listed: number;
+  /** Skills the budget had no room for. */
+  readonly hidden: number;
+  readonly budgetChars: number;
+  readonly usedChars: number;
+  /** True when the request reordered the listing. */
+  readonly ranked: boolean;
+}
+
 export function formatSkillListingWithinBudget(
   skills: readonly SkillListingEntry[],
   contextWindowTokens?: number,
   request?: string | null,
 ): string {
+  return buildSkillListingWithinBudget(skills, contextWindowTokens, request)
+    .listing;
+}
+
+export function buildSkillListingWithinBudget(
+  skills: readonly SkillListingEntry[],
+  contextWindowTokens?: number,
+  request?: string | null,
+): { readonly listing: string; readonly stats: SkillListingStats } {
   const commands = skills.filter((skill) => !skill.disableModelInvocation);
-  if (commands.length === 0) return "";
+  const tokensForStats = requestMatchTokens(request);
+  const emptyStats = (budgetChars: number): SkillListingStats => ({
+    invocable: commands.length,
+    listed: 0,
+    hidden: commands.length,
+    budgetChars,
+    usedChars: 0,
+    ranked: false,
+  });
+  if (commands.length === 0) {
+    return { listing: "", stats: emptyStats(getListingCharBudget(contextWindowTokens)) };
+  }
   const budget = getListingCharBudget(contextWindowTokens);
   const fullLines = commands.map(formatSkillListingLine);
   const fullTotal =
     fullLines.reduce((sum, line) => sum + line.length, 0) + fullLines.length - 1;
-  if (fullTotal <= budget) return fullLines.join("\n");
+  if (fullTotal <= budget) {
+    return {
+      listing: fullLines.join("\n"),
+      stats: {
+        invocable: commands.length,
+        listed: commands.length,
+        hidden: 0,
+        budgetChars: budget,
+        usedChars: fullTotal,
+        ranked: false,
+      },
+    };
+  }
 
   // Over budget: bundled skills always stay (they describe the runtime's own
   // surfaces), then full lines in rank order until the budget is spent. A
@@ -1106,7 +1152,7 @@ export function formatSkillListingWithinBudget(
   // javascript-typescript — was never shown, which is why 15 turns of exactly
   // that work produced zero Skill invocations. What the request is about now
   // decides who gets the space; scope rank breaks ties, as before.
-  const tokens = requestMatchTokens(request);
+  const tokens = tokensForStats;
   const rest = commands
     .map((skill, index) => ({
       skill,
@@ -1135,7 +1181,18 @@ export function formatSkillListingWithinBudget(
   }
   const hidden = rest.length - shown;
   if (hidden > 0) lines.push(formatHiddenSkillsLine(hidden));
-  return lines.join("\n");
+  const listing = lines.join("\n");
+  return {
+    listing,
+    stats: {
+      invocable: commands.length,
+      listed: bundled.length + shown,
+      hidden,
+      budgetChars: budget,
+      usedChars: listing.length,
+      ranked: tokensForStats.length > 0,
+    },
+  };
 }
 
 function getListingCharBudget(contextWindowTokens?: number): number {
