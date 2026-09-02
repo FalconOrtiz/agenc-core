@@ -30,11 +30,13 @@ vi.mock("../../src/utils/windows-system-path.js", () => ({
 }));
 
 import {
+  isPreparedSpawnCleanupUnproven,
   isProcessTreeAlive,
   runSupervisedProcess,
   signalProcessTree,
   spawnContainedProcess,
   terminateProcessTreeAndWait,
+  throwIfPreparedSpawnCleanupUnproven,
 } from "../../src/utils/supervisedProcess.js";
 import {
   SandboxExecutionBroker,
@@ -317,8 +319,71 @@ async function withFakeWindowsTaskkill(
 }
 
 describe("runSupervisedProcess", () => {
+  it("treats backstop expiry and unproven trees as prepared-spawn cleanup failure", () => {
+    expect(
+      isPreparedSpawnCleanupUnproven({
+        backstopExpired: true,
+        processTreeCleanupProven: true,
+      }),
+    ).toBe(true);
+    expect(
+      isPreparedSpawnCleanupUnproven({
+        backstopExpired: false,
+        processTreeCleanupProven: false,
+      }),
+    ).toBe(true);
+    expect(
+      isPreparedSpawnCleanupUnproven({
+        backstopExpired: false,
+        processTreeCleanupProven: true,
+      }),
+    ).toBe(false);
+    expect(() =>
+      throwIfPreparedSpawnCleanupUnproven({
+        exitCode: null,
+        signal: null,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+        forced: true,
+        backstopExpired: true,
+        processTreeCleanupProven: false,
+      }),
+    ).toThrow(/backstop/u);
+  });
+
+  it("poisons broker authority when prepared-spawn cleanup is unproven", async () => {
+    const broker = new SandboxExecutionBroker({
+      mode: "danger_full_access",
+      cwd: process.cwd(),
+    });
+    const prepared = broker.prepareSpawn(
+      "hook",
+      nodeCommand("process.exit(0)"),
+    );
+
+    await expect(
+      runSupervisedProcess(prepared, {
+        maxOutputBytes: 1_024,
+        deterministicSettlement: {
+          backstopExpired: true,
+          processTreeCleanupProven: false,
+          stopReason: "timeout",
+          forced: true,
+        },
+      }),
+    ).rejects.toBeInstanceOf(SandboxExecutionLeaseCleanupError);
+
+    expect(broker.isClosedAfterLifecycleAuthorityFailure()).toBe(true);
+    expect(() =>
+      broker.prepareSpawn("hook", nodeCommand("process.exit(0)")),
+    ).toThrow(/cleanup was unproven/u);
+    await expect(
+      transitionSandboxExecutionBrokerMode(broker, "read_only"),
+    ).rejects.toThrow(/closed after an authority failure/u);
+  });
+
   it.runIf(process.platform !== "win32")(
-    "poisons broker authority when an ordinary timeout reaches the cleanup backstop",
+    "keeps broker authority after an ordinary forced timeout with proven cleanup",
     async () => {
       const broker = new SandboxExecutionBroker({
         mode: "danger_full_access",
@@ -331,22 +396,23 @@ describe("runSupervisedProcess", () => {
         ),
       );
 
-      await expect(
-        runSupervisedProcess(prepared, {
-          timeoutMs: 250,
-          maxOutputBytes: 1_024,
-          terminateGraceMs: 0,
-          settleBackstopMs: 0,
-        }),
-      ).rejects.toBeInstanceOf(SandboxExecutionLeaseCleanupError);
+      const result = await runSupervisedProcess(prepared, {
+        timeoutMs: 250,
+        maxOutputBytes: 1_024,
+        terminateGraceMs: 0,
+        settleBackstopMs: 1_000,
+      });
 
-      expect(broker.isClosedAfterLifecycleAuthorityFailure()).toBe(true);
-      expect(() =>
-        broker.prepareSpawn("hook", nodeCommand("process.exit(0)")),
-      ).toThrow(/cleanup was unproven/u);
+      expect(result).toMatchObject({
+        stopReason: "timeout",
+        forced: true,
+        backstopExpired: false,
+        processTreeCleanupProven: true,
+      });
+      expect(broker.isClosedAfterLifecycleAuthorityFailure()).toBe(false);
       await expect(
-        transitionSandboxExecutionBrokerMode(broker, "read_only"),
-      ).rejects.toThrow(/closed after an authority failure/u);
+        transitionSandboxExecutionBrokerMode(broker, "danger_full_access"),
+      ).resolves.toBeUndefined();
     },
   );
 
