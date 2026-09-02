@@ -45,6 +45,7 @@ describe("memory public access surface", () => {
   it("exports the MM-07 public access contract", () => {
     for (const name of [
       "clearMemoryFileCaches",
+      "checkMemorySecrets",
       "checkTeamMemSecrets",
       "detectSessionFileType",
       "detectSessionPatternType",

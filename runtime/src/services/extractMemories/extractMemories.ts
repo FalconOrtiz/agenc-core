@@ -46,7 +46,11 @@ import {
   shouldDeferForEligibleTurnCadence,
   type MemoryExtractionTriggerState,
 } from "../../memory/extraction-triggers.js";
-import { formatMemoryManifest, scanMemoryFiles } from "../../memory/index.js";
+import {
+  formatMemoryManifest,
+  scanForSecrets,
+  scanMemoryFiles,
+} from "../../memory/index.js";
 import {
   AUTO_MEMORY_INDEX_FILE,
   isPathInsideMemoryDir,
@@ -323,6 +327,15 @@ export function createAutoMemoryToolPolicy(memoryDir: string): ChildToolPolicy {
           "write_outside_memory",
         );
       }
+      // The child reads the whole conversation including tool output; never
+      // let a token it saw there land in plain-text memory.
+      const secrets = scanForSecrets(writtenContent(input));
+      if (secrets.length > 0) {
+        return deny(
+          `Content contains potential secrets (${secrets.map((match) => match.label).join(", ")}) and cannot be written to memory. Remove the sensitive content and try again.`,
+          "secret_in_memory_write",
+        );
+      }
       return allowWithMemoryRoot({ ...input, file_path: filePath }, memoryDir);
     }
 
@@ -333,6 +346,20 @@ export function createAutoMemoryToolPolicy(memoryDir: string): ChildToolPolicy {
   };
 }
 
+
+/** Every string a Write, Edit or MultiEdit call would put on disk. */
+function writtenContent(input: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof input.content === "string") parts.push(input.content);
+  if (typeof input.new_string === "string") parts.push(input.new_string);
+  if (Array.isArray(input.edits)) {
+    for (const edit of input.edits) {
+      const candidate = (edit as { new_string?: unknown } | null)?.new_string;
+      if (typeof candidate === "string") parts.push(candidate);
+    }
+  }
+  return parts.join("\n");
+}
 
 function createChildWriteTracker(memoryDir: string): ChildWriteTracker {
   const pathsByCallId = new Map<string, string>();

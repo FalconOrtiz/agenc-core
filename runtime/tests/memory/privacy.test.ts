@@ -28,6 +28,7 @@ import {
   getProjectMemoryPath,
 } from './paths.js'
 import {
+  checkMemorySecrets,
   checkTeamMemSecrets,
   detectSessionFileType,
   detectSessionPatternType,
@@ -179,6 +180,27 @@ describe('memory privacy', () => {
     expect(checkTeamMemSecrets(teamMemoryFile, fakeGitHubPat)).toContain(
       'GitHub PAT',
     )
+  })
+
+  it('rejects secret-bearing writes inside any durable memory directory', () => {
+    installMemoryAuthority()
+    const projectMemoryFile = join(getProjectMemoryPath(), 'notes.md')
+    const globalMemoryFile = join(getGlobalMemoryPath(), 'profile.md')
+    const teamMemoryFile = join(getProjectMemoryPath(), 'team', 'shared.md')
+    const repoFile = join(tempRoot, 'repo', 'config.md')
+
+    expect(checkMemorySecrets(projectMemoryFile, 'safe note')).toBeNull()
+    expect(checkMemorySecrets(projectMemoryFile, fakeGitHubPat)).toContain(
+      'cannot be written to memory',
+    )
+    expect(checkMemorySecrets(globalMemoryFile, fakeGitHubPat)).toContain(
+      'GitHub PAT',
+    )
+    expect(checkMemorySecrets(teamMemoryFile, fakeGitHubPat)).toContain(
+      'GitHub PAT',
+    )
+    // Ordinary repository files keep the normal write path.
+    expect(checkMemorySecrets(repoFile, fakeGitHubPat)).toBeNull()
   })
 })
 

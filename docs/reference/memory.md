@@ -333,6 +333,12 @@ Related mentions: memory mention aliases / `@` syntax from project-memory helper
 - Secret scanning / redaction before write or sync paths (`scanForSecrets`, `redactSecrets`, `checkTeamMemSecrets`)
 - Auto-managed memory files are distinct from operator instruction files such as `AGENC.md`
 
+Durable memory writes are screened for secrets: `checkMemorySecrets` denies a
+`Write` into any global or project memory file whose content matches a secret
+rule, and the extraction child's tool policy denies `Write`/`Edit`/`MultiEdit`
+content the same way. Recalled memory content and the loaded `MEMORY.md`
+indexes pass through `redactSecrets` before they reach the prompt.
+
 Persistent memory in the prompt is labeled untrusted: stale or model-authored
 content must not override current user instructions, permission gates, or live
 repo state.

@@ -158,6 +158,17 @@ describe("live instructions memory indexes", () => {
     expect(envelope.memoryText.match(/<persistent_memory_context /g)).toHaveLength(1);
   });
 
+  it("redacts secrets that leaked into an index", async () => {
+    installAuthority();
+    const token = `ghp_${"A".repeat(36)}`;
+    await writeEntrypoints(`- [Bot](bot.md): staging bot token=${token}\n`, null);
+
+    const envelope = await resolveEnvelope();
+
+    expect(envelope.memoryText).toContain("token=[REDACTED]");
+    expect(envelope.memoryText).not.toContain(token);
+  });
+
   it("adds nothing when no index exists", async () => {
     installAuthority();
     const envelope = await resolveEnvelope();

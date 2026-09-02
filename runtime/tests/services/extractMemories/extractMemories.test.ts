@@ -248,6 +248,44 @@ describe("auto memory child tool policy", () => {
     });
   });
 
+  it("denies memory writes that carry secrets and allows clean ones", async () => {
+    const memoryDir = "/memory/";
+    const policy = createAutoMemoryToolPolicy(memoryDir);
+    const token = `ghp_${"A".repeat(36)}`;
+
+    expect(
+      policy({ name: "Write" }, { file_path: "notes.md", content: `token=${token}` }),
+    ).toMatchObject({
+      behavior: "deny",
+      message: expect.stringContaining("GitHub PAT"),
+      metadata: { reason: "secret_in_memory_write" },
+    });
+    expect(
+      policy(
+        { name: "Edit" },
+        { file_path: "notes.md", old_string: "x", new_string: `key ${token}` },
+      ),
+    ).toMatchObject({ behavior: "deny", metadata: { reason: "secret_in_memory_write" } });
+    expect(
+      policy(
+        { name: "MultiEdit" },
+        {
+          file_path: "notes.md",
+          edits: [
+            { old_string: "a", new_string: "safe" },
+            { old_string: "b", new_string: `leak ${token}` },
+          ],
+        },
+      ),
+    ).toMatchObject({ behavior: "deny", metadata: { reason: "secret_in_memory_write" } });
+    expect(
+      policy(
+        { name: "Write" },
+        { file_path: "notes.md", content: "user prefers terse replies" },
+      ),
+    ).toMatchObject({ behavior: "allow" });
+  });
+
   it("allows Glob patterns rooted inside memory subdirectories", async () => {
     const policy = createAutoMemoryToolPolicy("/tmp/memory/");
     expect(

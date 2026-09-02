@@ -106,6 +106,7 @@ export {
 export {
   detectSessionFileType,
   detectSessionPatternType,
+  checkMemorySecrets,
   checkTeamMemSecrets,
   getSecretLabel,
   isAutoManagedMemoryFile,

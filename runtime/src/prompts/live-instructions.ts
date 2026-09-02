@@ -8,6 +8,7 @@ import {
   getGlobalMemoryEntrypoint,
   getProjectMemoryEntrypoint,
   isAutoMemoryEnabled,
+  redactSecrets,
 } from "../memory/index.js";
 import { truncateEntrypointContent } from "../memory/memdir.js";
 import {
@@ -142,7 +143,7 @@ async function readMemoryEntrypoint(path: string): Promise<string | null> {
   } catch {
     return null;
   }
-  const { content } = truncateEntrypointContent(raw);
+  const { content } = truncateEntrypointContent(redactSecrets(raw));
   return content.length > 0 ? content : null;
 }
 

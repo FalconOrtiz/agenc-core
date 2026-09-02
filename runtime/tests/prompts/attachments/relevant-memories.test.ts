@@ -465,6 +465,27 @@ describe("relevantMemoriesProducer", () => {
     expect(second).toEqual([]);
   });
 
+  test("redacts secrets in recalled memory content", async () => {
+    installMemoryAuthority();
+    const token = `ghp_${"A".repeat(36)}`;
+    writeMemory(
+      join(agencHome, "memory"),
+      "browser.md",
+      "Browser automation guidance",
+      `Use the browser workflow with token=${token} for the staging bot.`,
+    );
+    const trackingState = getAttachmentTrackingState({});
+
+    const out = await relevantMemoriesProducer(makeOpts(), trackingState);
+
+    expect(out[0]?.kind).toBe("relevant_memories");
+    if (out[0]?.kind !== "relevant_memories") {
+      throw new Error("expected relevant_memories");
+    }
+    expect(out[0].memories[0]?.content).toContain("token=[REDACTED]");
+    expect(out[0].memories[0]?.content).not.toContain(token);
+  });
+
   test("truncates large selected memories before attachment emission", async () => {
     installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");

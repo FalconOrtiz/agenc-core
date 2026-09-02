@@ -8,6 +8,7 @@ import {
   getProjectMemoryPath,
   isAutoMemoryEnabled,
   readMemoryContent,
+  redactSecrets,
   resolveMemoryIndexDatabasePath,
   type MemoryRecallMode,
   type RelevantMemory,
@@ -162,13 +163,16 @@ async function readMemoriesForAttachment(
         perFileByteLimit,
         MAX_MEMORY_LINES,
       );
+      // Memory files are model- or user-authored plain text; a token that
+      // slipped into one must not ride back into the prompt.
+      const redactedContent = redactSecrets(result.content);
       const unboundedContent = result.truncated
         ? [
-            result.content,
+            redactedContent,
             "",
             `> This memory file was truncated at the bounded recall limit. Read the complete file directly before relying on omitted details: ${selectedMemory.path}`,
           ].join("\n")
-        : result.content;
+        : redactedContent;
       const content = truncateUtf8(unboundedContent, remaining);
       const lineEnd = Math.max(1, result.lineCount);
       memories.push({
