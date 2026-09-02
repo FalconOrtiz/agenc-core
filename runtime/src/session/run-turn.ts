@@ -3659,6 +3659,7 @@ export async function drainInFlight(
         metadata?: Record<string, unknown>;
       };
       status: "completed" | "synthetic_error";
+      durationMs?: number;
     }>;
   } | null;
   if (!exec || typeof exec.close !== "function") {
@@ -3696,6 +3697,9 @@ export async function drainInFlight(
                 isError: result.isError === true,
                 ...(result.metadata !== undefined
                   ? { metadata: result.metadata }
+                  : {}),
+                ...(drained.durationMs !== undefined
+                  ? { durationMs: drained.durationMs }
                   : {}),
               },
             },

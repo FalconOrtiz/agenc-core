@@ -114,6 +114,13 @@ export interface TrackedTool {
    */
   executingSinceMs?: number;
   /**
+   * Wall time from `executingSinceMs` to the terminal write, captured in
+   * `finalizeOnce`. Reported on the yielded result and on
+   * `tool_call_completed` so latency is observable without reconstructing
+   * it from admission timestamps. 0 for tools that never started executing.
+   */
+  durationMs?: number;
+  /**
    * Per-tool, listener-free cancel controller created in runOne. Composed into
    * the dispatch signal via `AbortSignal.any`. The drain backstop fires THIS
    * (never childAbort, never siblingAbortController) to cancel exactly one
@@ -711,7 +718,7 @@ export class StreamingToolExecutor {
           result: tool.result,
           additionalContexts: tool.additionalContexts ?? [],
           status: tool.error ? "synthetic_error" : "completed",
-          durationMs: 0,
+          durationMs: tool.durationMs ?? 0,
         };
       } else if (tool.status === "executing" && !tool.isConcurrencySafe) {
         // Head-of-line break (AgenC :436-438). A still-running
@@ -748,7 +755,7 @@ export class StreamingToolExecutor {
             result: tool.result,
             additionalContexts: tool.additionalContexts ?? [],
             status: tool.error ? "synthetic_error" : "completed",
-            durationMs: 0,
+            durationMs: tool.durationMs ?? 0,
           },
         };
       } else if (tool.status === "executing" && !tool.isConcurrencySafe) {
@@ -1068,6 +1075,10 @@ export class StreamingToolExecutor {
     if (error !== undefined) tool.error = error;
     tool.result = result;
     tool.status = "completed";
+    tool.durationMs =
+      tool.executingSinceMs === undefined
+        ? 0
+        : Math.max(0, performance.now() - tool.executingSinceMs);
     return true;
   }
 

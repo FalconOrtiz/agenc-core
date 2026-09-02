@@ -227,6 +227,32 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
     );
   });
 
+  test("results carry the real execution duration", async () => {
+    const exec = new StreamingToolExecutor({
+      ...mockGuardedDispatch(async (call) => {
+        if (call.id === "slow") {
+          await new Promise<void>((resolve) => setTimeout(resolve, 15));
+        }
+        return { content: `ok-${call.id}` };
+      }),
+    });
+    exec.setConcurrencyClassFor("FileRead", SHARED_READ);
+    exec.addTool(makeBlock("slow", "FileRead"), makeCall("slow", "FileRead"));
+    exec.addTool(makeBlock("fast", "FileRead"), makeCall("fast", "FileRead"));
+    exec.close();
+
+    const durations = new Map<string, number>();
+    for await (const r of exec.getRemainingResults()) {
+      durations.set(r.toolCall.id, r.durationMs);
+    }
+
+    expect(durations.get("slow")).toBeGreaterThanOrEqual(10);
+    expect(Number.isFinite(durations.get("fast"))).toBe(true);
+    expect(durations.get("fast")).toBeGreaterThanOrEqual(0);
+    // The slow read is not charged for the fast one and vice versa.
+    expect(durations.get("fast")!).toBeLessThan(durations.get("slow")!);
+  });
+
   test("a single failing Bash call neither warns nor cascades", async () => {
     const siblingReasons: string[] = [];
     const exec = new StreamingToolExecutor({

@@ -646,6 +646,7 @@ function recordCompletedToolCall(
   session: Session,
   toolCall: LLMToolCall,
   result: ToolDispatchResult,
+  durationMs?: number,
 ): CompletedToolResultRecord {
   const registryTool = session.services.registry.tools.find(
     (tool) => tool.name === toolCall.name,
@@ -683,6 +684,7 @@ function recordCompletedToolCall(
           result: result.content,
           isError: result.isError === true,
           ...(metadata !== undefined ? { metadata } : {}),
+          ...(durationMs !== undefined ? { durationMs } : {}),
         },
       },
     },
@@ -986,6 +988,7 @@ export async function executeTools(
     toolCall,
     result,
     additionalContexts: contexts,
+    durationMs,
   } of executor.getRemainingResults()) {
     const checkedResult =
       ctx.editorInteraction !== undefined &&
@@ -1001,6 +1004,7 @@ export async function executeTools(
       session,
       toolCall,
       checkedResult,
+      durationMs,
     );
     completedThisPass.set(completed.callId, completed);
     additionalContexts.push(...(contexts ?? []));
