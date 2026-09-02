@@ -830,6 +830,7 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       toolName: isString,
       editorInteractionId: isString,
       metadata: isRecord,
+      durationMs: isNumber,
     },
   ),
   tool_progress: objectShape(
