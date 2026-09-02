@@ -13,6 +13,7 @@ import {
   REPEATED_FAILURE_BLOCK_THRESHOLD,
   REPEATED_FAILURE_BLOCKED_METADATA_KEY,
   repeatedFailingCallStopExplanation,
+  failureSignature,
 } from "../../src/phases/repeat-tool-advisory.js";
 
 function call(name: string, args: unknown, id = "c"): LLMToolCall {
@@ -282,6 +283,116 @@ describe("blockRepeatedFailingCall", () => {
           "Write refused: identical call failed 3 times with the same error in this turn",
       },
     ]);
+  });
+
+  // Live incident (session conv-mtjdmlfc, 2026-09-02): one `npm start` was
+  // denied by the sandbox 21 times over 412 s and the guard never fired.
+  // Two independent reasons, both reproduced here.
+  describe("the live sandbox-denial loop", () => {
+    const EPERM_BODY = (wallTime: string) =>
+      "\n> start\n> node server.js\n\nError: listen EPERM: operation not permitted 0.0.0.0:8080\n" +
+      `\n[exec exit_code=1 wall_time=${wallTime}s tokens=212]`;
+
+    const npmStart = (overrides: Record<string, unknown> = {}) => ({
+      cmd: "npm start",
+      workdir: "/w/arcade15",
+      timeoutMs: 15_000,
+      yield_time_ms: 4_000,
+      ...overrides,
+    });
+
+    test("a reworded justification and a nudged timeout do not split the failure run", () => {
+      const { session } = mkSessionStub();
+      const failures = [
+        completed(
+          call("exec_command", npmStart({ justification: "May I bind the port?" }), "e-0"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+        completed(
+          call("exec_command", npmStart({ justification: "Do you want to allow the server?", timeoutMs: 20_000 }), "e-1"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+        completed(
+          call("exec_command", npmStart({ prefix_rule: ["npm", "start"], yield_time_ms: 3_000 }), "e-2"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+      ];
+      const retry = call("exec_command", npmStart({ justification: "One more time?" }), "e-3");
+      const blocked = blockRepeatedFailingCall(mkState(failures), session, retry);
+      expect(blocked).not.toBeNull();
+      expect(blocked?.metadata).toMatchObject({ repeatedFailures: 3 });
+    });
+
+    test("a volatile wall time in the result does not reset the failure run", () => {
+      const { session } = mkSessionStub();
+      // 13 of the incident's 14 bodies were distinct; only the wall time moved.
+      const failures = ["0.2630", "0.1990", "0.3120"].map((wallTime, i) =>
+        completed(call("exec_command", npmStart(), `e-${i}`), EPERM_BODY(wallTime), true),
+      );
+      const blocked = blockRepeatedFailingCall(
+        mkState(failures),
+        session,
+        call("exec_command", npmStart(), "e-3"),
+      );
+      expect(blocked).not.toBeNull();
+      expect(blocked?.metadata).toMatchObject({ repeatedFailures: 3 });
+      // The model still sees the raw last error, wall time included.
+      expect(JSON.parse(blocked!.content).error).toContain("wall_time=0.3120s");
+    });
+
+    test("a session id in the result does not reset the failure run", () => {
+      const { session } = mkSessionStub();
+      const failures = [10, 11, 12].map((sessionId, i) =>
+        completed(
+          call("exec_command", npmStart(), `e-${i}`),
+          `blocked\n\n[exec exit_code=1 wall_time=0.1000s tokens=4 session_id=${sessionId}]`,
+          true,
+        ),
+      );
+      expect(
+        blockRepeatedFailingCall(mkState(failures), session, call("exec_command", npmStart(), "e-3")),
+      ).not.toBeNull();
+    });
+
+    test("a genuinely different error still resets the run", () => {
+      const { session } = mkSessionStub();
+      const failures = [
+        completed(call("exec_command", npmStart(), "e-0"), EPERM_BODY("0.2630"), true),
+        completed(call("exec_command", npmStart(), "e-1"), EPERM_BODY("0.1990"), true),
+        completed(
+          call("exec_command", npmStart(), "e-2"),
+          "\nError: Cannot find module './server.js'\n\n[exec exit_code=1 wall_time=0.1120s tokens=9]",
+          true,
+        ),
+      ];
+      expect(
+        blockRepeatedFailingCall(mkState(failures), session, call("exec_command", npmStart(), "e-3")),
+      ).toBeNull();
+    });
+
+    test("a different command still starts its own count", () => {
+      const { session } = mkSessionStub();
+      const failures = Array.from({ length: 3 }, (_, i) =>
+        completed(call("exec_command", npmStart(), `e-${i}`), EPERM_BODY("0.2630"), true),
+      );
+      expect(
+        blockRepeatedFailingCall(
+          mkState(failures),
+          session,
+          call("exec_command", npmStart({ cmd: "npm test" }), "e-3"),
+        ),
+      ).toBeNull();
+    });
+
+    test("failureSignature elides only the volatile runtime values", () => {
+      expect(failureSignature(EPERM_BODY("0.2630"))).toBe(failureSignature(EPERM_BODY("9.9999")));
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("listen EPERM");
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("exit_code=1");
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("tokens=212");
+    });
   });
 
   test("the refusal's turn stop is worded like the behavioral backstop", () => {

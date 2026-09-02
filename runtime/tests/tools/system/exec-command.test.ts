@@ -93,6 +93,152 @@ describe("exec_command tool", () => {
     root = "";
   });
 
+  // Live incident (session conv-mtjdmlfc, 2026-09-02): 21 `npm start` calls
+  // over 412 s, each denied by the sandbox, each answered only by the child's
+  // own errno text and an escalation request the parser silently discarded.
+  describe("a sandbox denial answers the model definitively", () => {
+    function sandboxedArgs(
+      overrides: Record<string, unknown>,
+      approvalPolicy = "never",
+    ): Record<string, unknown> {
+      const args: Record<string, unknown> = { ...overrides };
+      attachToolRuntimeContext(args, {
+        callId: "call-sandbox-denial",
+        toolName: "exec_command",
+        runtimeKind: "function",
+        classification: "exclusive",
+        supportsParallelToolCalls: false,
+        source: { type: "model" },
+        submittedAtMs: 0,
+        approvalPolicy,
+        requestedSandboxMode: "read_only",
+        sandboxMode: "read_only",
+        approvalResolved: true,
+        rawArgs: "{}",
+        invocation: {
+          session: { services: { runtimeOptions: { sessionTempRoot: root } } },
+          payload: { kind: "function", arguments: "{}" },
+          turn: {
+            subId: "turn-sandbox-denial",
+            cwd: root,
+            agencLinuxSandboxExe: "/bin/true",
+          },
+        },
+      } as never);
+      return args;
+    }
+
+    function toolWith(output: ExecCommandToolOutput) {
+      const execCommand = vi.fn<UnifiedExecProcessManagerLike["execCommand"]>(
+        async () => output,
+      );
+      const manager: UnifiedExecProcessManagerLike = {
+        maxTimeoutMs: 30_000,
+        execCommand,
+        writeStdin: vi.fn<UnifiedExecProcessManagerLike["writeStdin"]>(
+          async () => completedExecOutput(""),
+        ),
+        closeAll: vi.fn<UnifiedExecProcessManagerLike["closeAll"]>(async () => {}),
+      };
+      return {
+        execCommand,
+        tool: createExecCommandTool({
+          cwd: root,
+          allowedPaths: [root],
+          unifiedExecManager: manager,
+        }),
+      };
+    }
+
+    const BIND_DENIED = failedExecOutput(
+      "Error: listen EPERM: operation not permitted 0.0.0.0:8080",
+      1,
+    );
+
+    test("a denied bind says the sandbox did it and that retrying is pointless", async () => {
+      const { tool } = toolWith(BIND_DENIED);
+      const result = await tool.execute(sandboxedArgs({ cmd: "npm start", workdir: root }));
+
+      expect(result.isError).toBe(true);
+      // The child's own text is still there, unchanged.
+      expect(result.content).toContain("listen EPERM");
+      // And now so is the verdict.
+      expect(result.content).toContain("[sandbox]");
+      expect(result.content).toContain("Do not run this command again");
+      expect(result.content).toContain("give them the exact command to run in their own terminal");
+    });
+
+    test("under a policy with a human it asks for one escalated retry instead", async () => {
+      const { tool } = toolWith(BIND_DENIED);
+      const result = await tool.execute(
+        sandboxedArgs({ cmd: "npm start", workdir: root }, "on_request"),
+      );
+      expect(result.content).toContain("require_escalated");
+      expect(result.content).not.toContain("Do not run this command again");
+    });
+
+    test("an ordinary failure is left alone", async () => {
+      const { tool } = toolWith(failedExecOutput("npm ERR! missing script: start", 1));
+      const result = await tool.execute(sandboxedArgs({ cmd: "npm start", workdir: root }));
+      expect(result.content).not.toContain("[sandbox]");
+    });
+
+    test("an unreadable escalation request is refused instead of dropped", async () => {
+      // The schema used to invite `{type:"object"}` here and the parser threw
+      // every object away, so the model could not tell a refused request from
+      // an unread one.
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "npm start",
+          workdir: root,
+          sandbox_permissions: { network: "full" },
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content as string).error).toContain(
+        'sandbox_permissions must be one of "default", "require_escalated" or "with_additional_permissions"',
+      );
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_no_effect",
+      });
+      // Refused means not run.
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("a malformed additional_permissions is refused too", async () => {
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "npm start",
+          workdir: root,
+          sandbox_permissions: "with_additional_permissions",
+          additional_permissions: { network: "full" },
+        }),
+      );
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content as string).error).toContain(
+        "additional_permissions has an unsupported shape",
+      );
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("the documented escalation values still run", async () => {
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "echo hi",
+          workdir: root,
+          sandbox_permissions: "require_escalated",
+          justification: "needs the network",
+        }),
+      );
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+  });
+
   test("threads network policy interfaces into runtime sandbox requests", () => {
     const policyDecider = { decide: () => ({ decision: "allow" as const }) };
     const blockedRequestObserver = { onBlockedRequest: () => undefined };

@@ -83,19 +83,88 @@ interface RepeatRun {
 const repeatRuns = new WeakMap<object, RepeatRun>();
 
 /**
+ * Argument fields that do not change what a call DOES. Two calls differing
+ * only in these are the same repeated call, so they are dropped from the
+ * identity key. `justification` is free text addressed to a human and
+ * `prefix_rule` is a suggested approval rule: neither reaches the command.
+ * Live shape: a model retried one denied `npm start` 13 times, rewording the
+ * justification and nudging the timeouts each round, and the guard saw 13
+ * different calls.
+ */
+const NON_SEMANTIC_ARGUMENT_KEYS: ReadonlySet<string> = new Set([
+  "justification",
+  "prefix_rule",
+]);
+
+/** Per-tool additions to {@link NON_SEMANTIC_ARGUMENT_KEYS}. */
+const TOOL_NON_SEMANTIC_ARGUMENT_KEYS: ReadonlyMap<
+  string,
+  ReadonlySet<string>
+> = new Map([
+  // How long the runtime waits for the process, not what it runs.
+  ["exec_command", new Set(["timeoutMs", "yield_time_ms"])],
+  ["write_stdin", new Set(["yield_time_ms"])],
+]);
+
+function semanticArguments(
+  toolName: string,
+  parsed: unknown,
+): unknown {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return parsed;
+  }
+  const perTool = TOOL_NON_SEMANTIC_ARGUMENT_KEYS.get(toolName);
+  const semantic: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (NON_SEMANTIC_ARGUMENT_KEYS.has(name)) continue;
+    if (perTool?.has(name) === true) continue;
+    semantic[name] = value;
+  }
+  return semantic;
+}
+
+/**
  * Canonical identity of one call: tool name plus arguments with object keys
- * sorted, so `{"a":1,"b":2}` and `{"b":2,"a":1}` belong to the same run.
- * Arguments that fail to parse as JSON participate verbatim — byte-identical
- * malformed arguments are still the same repeated call.
+ * sorted and non-semantic fields dropped, so `{"a":1,"b":2}` and
+ * `{"b":2,"a":1}` belong to the same run, and so do two calls that differ
+ * only in their justification or timeout. Arguments that fail to parse as
+ * JSON participate verbatim — byte-identical malformed arguments are still
+ * the same repeated call.
  */
 function canonicalCallKey(call: LLMToolCall): string {
   let canonicalArguments = call.arguments;
   try {
-    canonicalArguments = stableStringify(JSON.parse(call.arguments));
+    canonicalArguments = stableStringify(
+      semanticArguments(call.name, JSON.parse(call.arguments)),
+    );
   } catch {
     // Verbatim fallback keeps unparseable-argument repeats detectable.
   }
   return `${call.name}\n${canonicalArguments}`;
+}
+
+/**
+ * Values a runtime writes into every tool result that differ between two
+ * otherwise identical runs. Compared raw, they make every failure look new:
+ * `exec_command` closes each result with
+ * `[exec exit_code=1 wall_time=0.2630s tokens=212]`, and the live incident's
+ * 14 identical `npm start` denials produced 13 distinct bodies, differing
+ * only in that wall time. Used for comparison only; the model is always
+ * shown the raw error.
+ */
+const VOLATILE_RESULT_PATTERNS: readonly RegExp[] = [
+  /\bwall_time=\d+(?:\.\d+)?s/g,
+  /\bsession_id=\d+/g,
+  /\bprocess_id=\d+/g,
+];
+
+/** Comparison form of a failing result: volatile runtime values elided. */
+export function failureSignature(content: string): string {
+  let signature = content;
+  for (const pattern of VOLATILE_RESULT_PATTERNS) {
+    signature = signature.replace(pattern, "");
+  }
+  return signature;
 }
 
 function completedRecordKey(record: CompletedToolResultRecord): string {
@@ -120,6 +189,7 @@ export function identicalFailureRun(
   const key = canonicalCallKey(call);
   let count = 0;
   let lastError = "";
+  let lastSignature = "";
   for (const record of state.completedToolResults) {
     if (record.metadata?.[REPEATED_FAILURE_BLOCKED_METADATA_KEY] === true) {
       continue;
@@ -128,14 +198,18 @@ export function identicalFailureRun(
     if (!record.isError) {
       count = 0;
       lastError = "";
+      lastSignature = "";
       continue;
     }
-    if (count > 0 && record.content === lastError) {
+    const signature = failureSignature(record.content);
+    if (count > 0 && signature === lastSignature) {
       count += 1;
     } else {
       count = 1;
-      lastError = record.content;
     }
+    // The model is shown the raw error; only the comparison is normalized.
+    lastError = record.content;
+    lastSignature = signature;
   }
   return { count, lastError };
 }
