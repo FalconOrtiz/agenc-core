@@ -1,5 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -406,6 +406,155 @@ describe("exec_command tool", () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain("shell_workspace_file_write_disallowed");
     expect(writeStdin).not.toHaveBeenCalled();
+  });
+
+  describe("workspace deletions", () => {
+    /** The command the live refactor session retried 14 times. */
+    const REFACTOR_CLEANUP =
+      "rm arcade15/game.js && ls -la arcade15 && node --check arcade15/main.js";
+
+    function permissionArgs(
+      cmd: string,
+      permission: {
+        readonly mode: string;
+        readonly approvalResolved?: boolean;
+        readonly approvalPolicy?: "on_request" | "never";
+      },
+    ): Record<string, unknown> {
+      const args: Record<string, unknown> = { cmd, workdir: root };
+      attachToolRuntimeContext(args, {
+        callId: "call-delete",
+        toolName: "exec_command",
+        runtimeKind: "function",
+        classification: "exclusive",
+        supportsParallelToolCalls: false,
+        source: { type: "model" },
+        submittedAtMs: 0,
+        approvalPolicy: permission.approvalPolicy ?? "on_request",
+        requestedSandboxMode: "danger_full_access",
+        sandboxMode: "danger_full_access",
+        approvalResolved: permission.approvalResolved ?? false,
+        rawArgs: "{}",
+        invocation: {
+          session: {
+            permissionModeRegistry: { current: () => ({ mode: permission.mode }) },
+            services: { runtimeOptions: { sessionTempRoot: root } },
+          },
+          payload: { kind: "function", arguments: "{}" },
+          turn: { subId: "turn-delete", cwd: root },
+        },
+      } as never);
+      return args;
+    }
+
+    function deletionTool() {
+      const execCommand = vi.fn<UnifiedExecProcessManagerLike["execCommand"]>(
+        async () => completedExecOutput("ran"),
+      );
+      const tool = createExecCommandTool({
+        cwd: root,
+        allowedPaths: [root],
+        unifiedExecManager: {
+          maxTimeoutMs: 30_000,
+          execCommand,
+          writeStdin: vi.fn<UnifiedExecProcessManagerLike["writeStdin"]>(
+            async () => completedExecOutput(""),
+          ),
+          closeAll: vi.fn<UnifiedExecProcessManagerLike["closeAll"]>(async () => {}),
+        },
+      });
+      return { tool, execCommand };
+    }
+
+    test("runs rm on a workspace file under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(execCommand.mock.calls[0]?.[0]).toMatchObject({ cmd: REFACTOR_CLEANUP });
+    });
+
+    test("refuses rm outside the workspace under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+      // Neither in the workspace nor under the temp directory, whatever the
+      // test harness picked for either.
+      const outside = join(homedir(), "Documents", "outside.txt");
+
+      const result = await tool.execute(
+        permissionArgs(`rm ${outside}`, { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_delete_disallowed");
+      expect(result.content).toContain("only inside the workspace");
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_no_effect",
+        evidenceRef: "tool:system.exec-command:workspace-write-policy",
+      });
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("refuses rm of a protected path under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs("rm .git/config", { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_delete_disallowed");
+      expect(result.content).toContain("protected paths");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("still refuses a redirect write into a source file under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs("cat > src/x.js <<'EOF'\nexport const x = 1;\nEOF", {
+          mode: "bypassPermissions",
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_write_disallowed");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("a deletion under a prompting mode runs only after the approval path", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const unapproved = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default" }),
+      );
+      expect(unapproved.isError).toBe(true);
+      expect(unapproved.content).toContain(
+        "shell_workspace_file_delete_requires_approval",
+      );
+      expect(unapproved.content).toContain("ask the user to approve this exact command");
+      expect(execCommand).not.toHaveBeenCalled();
+
+      const approved = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default", approvalResolved: true }),
+      );
+      expect(approved.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+
+    test("a session that never asks may delete without a resolver decision", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default", approvalPolicy: "never" }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
   });
 
   test(
