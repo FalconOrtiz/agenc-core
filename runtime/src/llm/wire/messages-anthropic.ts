@@ -191,17 +191,21 @@ function buildOptionSystemBlocks(
  * lands after every breakpoint and never enters a cached prefix. Tool
  * results keep their leading position, which the Messages API requires.
  */
+function contentBlocksOf(content: unknown): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ type: "text", text: content }] : [];
+  }
+  if (Array.isArray(content)) {
+    return [...(content as Array<Record<string, unknown>>)];
+  }
+  return [];
+}
+
 function appendDynamicTailBlock(
   message: Record<string, unknown>,
   dynamicTail: string,
 ): void {
-  const content = message.content;
-  const blocks: Array<Record<string, unknown>> =
-    typeof content === "string"
-      ? content.length > 0 ? [{ type: "text", text: content }] : []
-      : Array.isArray(content)
-      ? [...(content as Array<Record<string, unknown>>)]
-      : [];
+  const blocks = contentBlocksOf(message.content);
   blocks.push({
     type: "text",
     text: `<system-reminder>\n${dynamicTail}\n</system-reminder>`,
@@ -304,9 +308,7 @@ export function buildAnthropicMessagesRequest(
   const lastWireMessage = wireMessages.at(-1);
   const dynamicTail = optionSplit?.dynamicTail;
   const tailOnLastUserMessage =
-    dynamicTail !== undefined &&
-    lastWireMessage !== undefined &&
-    lastWireMessage.role === "user";
+    dynamicTail !== undefined && lastWireMessage?.role === "user";
   if (tailOnLastUserMessage) {
     appendDynamicTailBlock(lastWireMessage, dynamicTail);
   }
@@ -335,12 +337,12 @@ export function buildAnthropicMessagesRequest(
   const systemHasCacheControl = systemBlocks.some((block) =>
     Object.prototype.hasOwnProperty.call(block, "cache_control")
   );
-  const system =
-    systemBlocks.length === 0
-      ? ""
-      : systemHasCacheControl
-      ? systemBlocks
-      : systemBlocks.map((block) => String(block.text ?? "")).join("\n\n");
+  let system: string | Array<Record<string, unknown>> = "";
+  if (systemHasCacheControl) {
+    system = systemBlocks;
+  } else if (systemBlocks.length > 0) {
+    system = systemBlocks.map((block) => String(block.text ?? "")).join("\n\n");
+  }
   if (system.length > 0) body.system = system;
   // Task 28: the Fable/Mythos 5 family removed sampling parameters —
   // sending `temperature` returns a 400 (provider docs, verified

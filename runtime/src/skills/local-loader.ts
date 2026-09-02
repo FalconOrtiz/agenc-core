@@ -427,49 +427,80 @@ interface SkillFileScan {
   readonly droppedCount: number;
 }
 
-async function findSkillFiles(root: string): Promise<SkillFileScan> {
-  const out: string[] = [];
-  let droppedCount = 0;
-  const topLevelEntries = await readDirEntries(root);
-  const queue: Array<{ path: string; depth: number }> = [];
+interface MutableSkillFileScan {
+  readonly files: string[];
+  droppedCount: number;
+}
 
-  for (const entry of topLevelEntries) {
+interface ScanFrame {
+  readonly path: string;
+  readonly depth: number;
+}
+
+type DirEntry = Awaited<ReturnType<typeof readDirEntries>>[number];
+
+async function isScannableDir(entry: DirEntry, path: string): Promise<boolean> {
+  if (!entry.isDirectory() && !entry.isSymbolicLink()) return false;
+  if (SKIP_DIRS.has(entry.name)) return false;
+  return isDirectoryEntry(path, entry.isSymbolicLink());
+}
+
+async function topLevelScanFrames(root: string): Promise<ScanFrame[]> {
+  const frames: ScanFrame[] = [];
+  for (const entry of await readDirEntries(root)) {
     const next = join(root, entry.name);
-    if (
-      (entry.isDirectory() || entry.isSymbolicLink()) &&
-      !SKIP_DIRS.has(entry.name) &&
-      (await isDirectoryEntry(next, entry.isSymbolicLink()))
-    ) {
-      queue.push({ path: next, depth: 1 });
-    }
+    if (await isScannableDir(entry, next)) frames.push({ path: next, depth: 1 });
   }
+  return frames;
+}
 
-  const visitedDirs = new Set<string>();
-  while (queue.length > 0) {
-    const frame = queue.shift()!;
-    const dirId = await getFileIdentity(frame.path);
-    if (dirId && visitedDirs.has(dirId)) continue;
-    if (dirId) visitedDirs.add(dirId);
+/** Returns false when the directory (by real path) was already scanned. */
+async function markVisited(path: string, visited: Set<string>): Promise<boolean> {
+  const dirId = await getFileIdentity(path);
+  if (dirId === null) return true;
+  if (visited.has(dirId)) return false;
+  visited.add(dirId);
+  return true;
+}
 
-    const entries = await readDirEntries(frame.path);
-    for (const entry of entries) {
-      const next = join(frame.path, entry.name);
-      if (entry.isFile() && isSkillFile(next)) {
-        // Past the cap the walk keeps going but only counts, so the snapshot
-        // can say how many skills this root holds that were never loaded.
-        if (out.length >= MAX_SKILL_FILES) droppedCount += 1;
-        else out.push(next);
-        continue;
-      }
-      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-      if (SKIP_DIRS.has(entry.name)) continue;
-      if (frame.depth + 1 > MAX_SCAN_DEPTH) continue;
-      if (!(await isDirectoryEntry(next, entry.isSymbolicLink()))) continue;
+function recordSkillFile(scan: MutableSkillFileScan, file: string): void {
+  // Past the cap the walk keeps going but only counts, so the snapshot can
+  // say how many skills this root holds that were never loaded.
+  if (scan.files.length >= MAX_SKILL_FILES) scan.droppedCount += 1;
+  else scan.files.push(file);
+}
+
+async function scanSkillDir(
+  frame: ScanFrame,
+  scan: MutableSkillFileScan,
+  queue: ScanFrame[],
+): Promise<void> {
+  for (const entry of await readDirEntries(frame.path)) {
+    const next = join(frame.path, entry.name);
+    if (entry.isFile()) {
+      if (isSkillFile(next)) recordSkillFile(scan, next);
+      continue;
+    }
+    if (frame.depth < MAX_SCAN_DEPTH && (await isScannableDir(entry, next))) {
       queue.push({ path: next, depth: frame.depth + 1 });
     }
   }
+}
 
-  return { files: out.sort((a, b) => a.localeCompare(b)), droppedCount };
+async function findSkillFiles(root: string): Promise<SkillFileScan> {
+  const scan: MutableSkillFileScan = { files: [], droppedCount: 0 };
+  const queue = await topLevelScanFrames(root);
+  const visitedDirs = new Set<string>();
+  while (queue.length > 0) {
+    const frame = queue.shift()!;
+    if (await markVisited(frame.path, visitedDirs)) {
+      await scanSkillDir(frame, scan, queue);
+    }
+  }
+  return {
+    files: scan.files.toSorted((a, b) => a.localeCompare(b)),
+    droppedCount: scan.droppedCount,
+  };
 }
 
 function isSkillFile(filePath: string): boolean {
@@ -948,8 +979,7 @@ function skillListingRank(skill: SkillListingEntry): number {
   const scopeRank = SKILL_LISTING_SCOPE_RANK[skill.scope ?? ""] ?? 5;
   const sharedCatalog =
     skill.scope === "user" &&
-    skill.root !== undefined &&
-    skill.root.endsWith(SHARED_AGENTS_SKILLS_SUFFIX);
+    skill.root?.endsWith(SHARED_AGENTS_SKILLS_SUFFIX) === true;
   return scopeRank * 2 + (sharedCatalog ? 1 : 0);
 }
 
