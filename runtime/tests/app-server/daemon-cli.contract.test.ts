@@ -6040,6 +6040,22 @@ snapshot_max_bytes = 64
     if (sessionId === undefined) throw new Error("session id missing");
     expect(binding?.sessionId).toBe(sessionId);
     expect(snapshotCount(agencHome, process.cwd(), sessionId)).toBe(0);
+    // agent.create writes the running status first; the attach-time tool
+    // event lands inside the one-second coalescing window and is written by
+    // the trailing timer, so wait for it before reading the routed row.
+    await waitForCondition(() => {
+      try {
+        const toolState = latestSnapshotToolState(
+          agencHome,
+          otherCwd,
+          sessionId,
+        ) as { readonly inFlight?: Record<string, unknown> };
+        return toolState.inFlight?.["tool-early-route"] !== undefined;
+      } catch {
+        return false;
+      }
+    }, "the attach-time tool event in the non-default project snapshot");
+    expect(snapshotCount(agencHome, process.cwd(), sessionId)).toBe(0);
     expect(
       latestSnapshotToolState(agencHome, otherCwd, sessionId),
     ).toMatchObject({
