@@ -558,14 +558,81 @@ async function tempAgencHome(): Promise<string> {
  */
 const DAEMON_MILESTONE_BUDGET_MS = 2_000;
 
+/**
+ * A foreground daemon run that a poll is waiting on: the promise
+ * runAgenCDaemonCli returned, and the stderr that run captured.
+ */
+type DaemonRunUnderTest = {
+  readonly running: Promise<number>;
+  readonly stderrText?: () => string;
+};
+
+type SettledDaemonRun =
+  | { readonly kind: "exit"; readonly exitCode: number }
+  | { readonly kind: "throw"; readonly error: unknown };
+
+/**
+ * Records how a foreground daemon run ended, without consuming its result.
+ *
+ * The polls below otherwise have no view of the daemon they are waiting for,
+ * so a run that already exited costs them their entire budget. That is not
+ * hypothetical: under a long TMPDIR the control socket path exceeds the
+ * 104-byte sun_path limit, runAgenCDaemonCli refuses to start and returns
+ * immediately, and a blind poll still sleeps to its deadline before reporting
+ * a timeout that names nothing. Watching the run lets a poll give up as soon
+ * as the daemon it needs is gone, and report the exit code and stderr that
+ * explain why it will never appear.
+ */
+function watchDaemonRun(
+  run: DaemonRunUnderTest,
+): () => SettledDaemonRun | null {
+  let settled: SettledDaemonRun | null = null;
+  void run.running.then(
+    (exitCode) => {
+      settled = { kind: "exit", exitCode };
+    },
+    (error: unknown) => {
+      settled = { kind: "throw", error };
+    },
+  );
+  return () => settled;
+}
+
+function describeSettledDaemonRun(
+  settled: SettledDaemonRun,
+  stderrText: (() => string) | undefined,
+): string {
+  const outcome =
+    settled.kind === "exit"
+      ? `exit code ${settled.exitCode}`
+      : `thrown error ${String(settled.error)}`;
+  const stderr = stderrText?.().trim() ?? "";
+  return stderr === ""
+    ? `${outcome}, no stderr captured`
+    : `${outcome}, stderr: ${stderr}`;
+}
+
 async function waitForPid(
   pidPath: string,
   budgetMs: number = DAEMON_MILESTONE_BUDGET_MS,
+  run?: DaemonRunUnderTest,
 ): Promise<number> {
+  const settledRun = run === undefined ? () => null : watchDaemonRun(run);
   const startedAt = Date.now();
   while (Date.now() - startedAt < budgetMs) {
     const pid = await readAgenCDaemonPid(pidPath);
     if (pid !== null) return pid;
+    const settled = settledRun();
+    if (settled !== null) {
+      // The run may have written the pid on its way out, so re-read before
+      // blaming it: only a wait that can no longer succeed fails here.
+      const finalPid = await readAgenCDaemonPid(pidPath);
+      if (finalPid !== null) return finalPid;
+      const detail = describeSettledDaemonRun(settled, run?.stderrText);
+      throw new Error(
+        `daemon exited before writing its pid file: ${detail}`,
+      );
+    }
     await delay(10);
   }
   throw new Error("timed out waiting for daemon pid");
@@ -580,6 +647,13 @@ async function waitForPid(
 const CONCURRENT_DAEMON_MILESTONE_BUDGET_MS = DEFAULT_DAEMON_READY_TIMEOUT_MS;
 
 /**
+ * How long {@link stopRunningDaemons} waits for the runs to settle once its
+ * SIGTERM loop has given up. Bounded so a daemon that never stops fails with a
+ * named error instead of the case dying on the vitest deadline.
+ */
+const DAEMON_STOP_GRACE_MS = DAEMON_MILESTONE_BUDGET_MS;
+
+/**
  * Shuts foreground daemons down without depending on when they installed
  * their signal handlers.
  *
@@ -590,6 +664,11 @@ const CONCURRENT_DAEMON_MILESTONE_BUDGET_MS = DEFAULT_DAEMON_READY_TIMEOUT_MS;
  * the vitest deadline with no indication of what it was waiting for. Repeating
  * the signal until the runs settle closes that window; the handler's own
  * `settled` guard makes the extra signals no-ops.
+ *
+ * Every wait here is bounded. Falling through to an unbounded await on runs
+ * that never settle would reintroduce exactly the content-free
+ * "Test timed out" this helper exists to remove, only later, against the
+ * widened case timeout.
  */
 async function stopRunningDaemons(
   daemons: readonly {
@@ -598,15 +677,31 @@ async function stopRunningDaemons(
   }[],
 ): Promise<void> {
   let running = true;
+  let signalsSent = 0;
+  const startedAt = Date.now();
   const settled = Promise.allSettled(
     daemons.map((daemon) => daemon.running),
   ).finally(() => {
     running = false;
   });
-  const deadline = Date.now() + DEFAULT_DAEMON_READY_TIMEOUT_MS;
+  const deadline = startedAt + DEFAULT_DAEMON_READY_TIMEOUT_MS;
   while (running && Date.now() < deadline) {
     for (const daemon of daemons) daemon.signalProcess.emit("SIGTERM");
+    signalsSent += daemons.length;
     await Promise.race([settled, delay(25)]);
+  }
+  if (running) {
+    const stopped = await Promise.race([
+      settled.then(() => true),
+      delay(DAEMON_STOP_GRACE_MS).then(() => false),
+    ]);
+    if (!stopped) {
+      throw new Error(
+        `daemon did not stop after ${signalsSent} SIGTERM${
+          signalsSent === 1 ? "" : "s"
+        } over ${Date.now() - startedAt} ms`,
+      );
+    }
   }
   await settled;
 }
@@ -801,13 +896,33 @@ function waitForWebSocketClose(socket: WebSocket): Promise<void> {
 async function waitForDaemonWebSocketUrl(
   io: ReturnType<typeof createIo>,
   budgetMs: number = DAEMON_MILESTONE_BUDGET_MS,
+  run?: DaemonRunUnderTest,
 ): Promise<string> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < budgetMs) {
+  const readUrl = (): string | undefined => {
     const match = /AgenC daemon websocket listening on (ws:\/\/\S+)/.exec(
       io.stderrText(),
     );
-    if (match?.[1] !== undefined) return match[1];
+    return match?.[1];
+  };
+  const settledRun = run === undefined ? () => null : watchDaemonRun(run);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < budgetMs) {
+    const url = readUrl();
+    if (url !== undefined) return url;
+    const settled = settledRun();
+    if (settled !== null) {
+      // Same ordering guard as waitForPid: the URL may have been announced
+      // between the last read and the run settling.
+      const finalUrl = readUrl();
+      if (finalUrl !== undefined) return finalUrl;
+      const detail = describeSettledDaemonRun(
+        settled,
+        run?.stderrText ?? io.stderrText,
+      );
+      throw new Error(
+        `daemon exited before announcing its websocket URL: ${detail}`,
+      );
+    }
     await delay(10);
   }
   throw new Error("timed out waiting for daemon websocket URL");
@@ -1051,26 +1166,39 @@ describe("AgenC daemon CLI", () => {
       { host: secondHost, io: secondIo, signalProcess: secondSignalProcess },
     );
 
+    const firstRun = {
+      running: firstRunning,
+      stderrText: firstIo.stderrText,
+    } as const;
+    const secondRun = {
+      running: secondRunning,
+      stderrText: secondIo.stderrText,
+    } as const;
+
     try {
       await expect(
         waitForPid(
           resolveAgenCDaemonPidPath(firstHost.env, firstHost.userHome),
           CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+          firstRun,
         ),
       ).resolves.toBe(4100);
       await expect(
         waitForPid(
           resolveAgenCDaemonPidPath(secondHost.env, secondHost.userHome),
           CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+          secondRun,
         ),
       ).resolves.toBe(4100);
       const firstUrl = await waitForDaemonWebSocketUrl(
         firstIo,
         CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+        firstRun,
       );
       const secondUrl = await waitForDaemonWebSocketUrl(
         secondIo,
         CONCURRENT_DAEMON_MILESTONE_BUDGET_MS,
+        secondRun,
       );
       expect(firstUrl).not.toBe(secondUrl);
     } finally {
@@ -1083,7 +1211,10 @@ describe("AgenC daemon CLI", () => {
     }
     // Two foreground daemons start concurrently here, so the budgets above
     // clear DEFAULT_DAEMON_READY_TIMEOUT_MS instead of racing it, and this
-    // case needs its own bound to hold them.
+    // case needs its own bound to hold them. Those budgets only ever run out
+    // on daemons that are still alive: each poll is handed the run it waits
+    // on, so an environment the daemon refuses to start in (a long TMPDIR,
+    // say) fails in milliseconds with that daemon's exit code and stderr.
   }, 120_000);
 
   it("creates a private daemon cookie and reuses it", async () => {
@@ -4942,12 +5073,10 @@ snapshot_max_bytes = 64
     );
     const pidPath = resolveAgenCDaemonPidPath(host.env, host.userHome);
     await expect(
-      Promise.race([
-        waitForPid(pidPath),
-        running.then((code) => {
-          throw new Error(`daemon exited ${code}: ${io.stderrText()}`);
-        }),
-      ]),
+      waitForPid(pidPath, DAEMON_MILESTONE_BUDGET_MS, {
+        running,
+        stderrText: io.stderrText,
+      }),
     ).resolves.toBe(4100);
     expect(restoreAgent).not.toHaveBeenCalled();
 
