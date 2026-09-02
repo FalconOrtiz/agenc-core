@@ -234,7 +234,13 @@ export function commandsForPlan(plan, {
 } = {}) {
   if (!plan.typecheck) return [];
 
-  const commands = [{ executable: npmExecutable, args: ["run", "typecheck"] }];
+  const commands = [
+    {
+      executable: process.execPath,
+      args: ["runtime/scripts/check-ripgrep-available.mjs"],
+    },
+    { executable: npmExecutable, args: ["run", "typecheck"] },
+  ];
   const existingRuntimeNodeTests = plan.runtimeNodeTests.filter(fileExists);
   if (existingRuntimeNodeTests.length > 0) {
     commands.push({ executable: process.execPath, args: ["--test", ...existingRuntimeNodeTests] });
