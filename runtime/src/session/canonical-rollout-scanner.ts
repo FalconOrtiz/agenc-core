@@ -669,37 +669,10 @@ function scanCanonicalRolloutUntimed(
     ) {
       latestCommittedAttempt.laterWork = true;
     }
-    for (const attempt of attempts.values()) {
-      if (attempt.intent === undefined) {
-        throw new Error(
-          "canonical compaction intent did not reconstruct its source manifests",
-        );
-      }
-      if (
-        attempt.persistedIntent !== undefined &&
-        attempt.sourceHistoryValidated !== true &&
-        !attempt.records.some(
-          (record) => record.item.type === "compaction_source_release",
-        )
-      ) {
-        throw new Error(
-          "canonical compaction source history is missing without a durable release",
-        );
-      }
-    }
+    assertAttemptsReconstructed(attempts);
 
     checkOperationalBudget();
-    const sourceLines = new Set(options.additionalSourceLines ?? []);
-    for (const attempt of attempts.values()) {
-      for (const ref of attempt.intent!.source.active_history_refs) {
-        sourceLines.add(ref.first_sequence);
-      }
-    }
-    if (options.captureActiveHistory === true) {
-      for (const position of activePositions) {
-        sourceLines.add(position.lineNumber);
-      }
-    }
+    const sourceLines = collectSourceLines(options, attempts, activePositions);
     const sourceRecords = new Map<number, CanonicalRolloutSourceRecord>();
     const payloadRecordsAtAttempts = new Map<
       string,
@@ -1011,6 +984,57 @@ function persistedRollbackPayload(
   )
     return undefined;
   return readCompactionPersistedRollbackCommittedV1(payload);
+}
+
+/**
+ * Every retained attempt must have rebuilt its intent from the payload
+ * bundle and either validated its source history or released it durably.
+ */
+function assertAttemptsReconstructed(
+  attempts: ReadonlyMap<string, MutableAttemptScan>,
+): void {
+  for (const attempt of attempts.values()) {
+    if (attempt.intent === undefined) {
+      throw new Error(
+        "canonical compaction intent did not reconstruct its source manifests",
+      );
+    }
+    if (
+      attempt.persistedIntent !== undefined &&
+      attempt.sourceHistoryValidated !== true &&
+      !attempt.records.some(
+        (record) => record.item.type === "compaction_source_release",
+      )
+    ) {
+      throw new Error(
+        "canonical compaction source history is missing without a durable release",
+      );
+    }
+  }
+}
+
+/**
+ * Line numbers the digest-anchored second pass must re-read: the caller's
+ * additional lines, every attempt's active-history refs, and the live active
+ * history positions when the caller captures it.
+ */
+function collectSourceLines(
+  options: CanonicalRolloutScanOptions,
+  attempts: ReadonlyMap<string, MutableAttemptScan>,
+  activePositions: readonly CanonicalActiveHistoryPosition[],
+): Set<number> {
+  const sourceLines = new Set(options.additionalSourceLines ?? []);
+  for (const attempt of attempts.values()) {
+    for (const ref of attempt.intent!.source.active_history_refs) {
+      sourceLines.add(ref.first_sequence);
+    }
+  }
+  if (options.captureActiveHistory === true) {
+    for (const position of activePositions) {
+      sourceLines.add(position.lineNumber);
+    }
+  }
+  return sourceLines;
 }
 
 type PostCommitBookkeeping =
