@@ -1993,152 +1993,148 @@ export class SessionStore {
     }
     this.flushDepth += 1;
     try {
-      return this.flushBatchUnlocked(durable);
+      // I-83 suspend detection: if the batch was open for > 10s (e.g.
+      // system suspend/resume gap), emit TWO marker events (warning +
+      // sentinel system_resumed_from) AHEAD of the pending batch.
+      // The markers are informational warnings (non-state-mutating in the
+      // reducer); the queued durable response_item / session_state lines
+      // that straddle the suspend window MUST be preserved and flushed,
+      // not discarded — dropping them permanently loses in-flight history.
+      if (
+        this.batchOpenedAtMs !== null &&
+        monotonicMs() - this.batchOpenedAtMs > I83_SUSPEND_DETECTION_MS
+      ) {
+        const durationMs = Math.round(monotonicMs() - this.batchOpenedAtMs);
+        this.batchOpenedAtMs = null;
+        // Prepend the two I-83 marker events so the log shows (a) the
+        // operator-visible warning and (b) a structural sentinel the
+        // reducer can reason about, while the original pending items
+        // remain queued behind them.
+        const warning: RolloutItem = {
+          type: "event_msg",
+          payload: {
+            id: "system",
+            msg: {
+              type: "warning",
+              payload: {
+                cause: "event_log_batch_delayed",
+                message: `event-log batch delayed ${durationMs}ms (I-83)`,
+              },
+            },
+          },
+        };
+        // Sentinel encoded as a warning with cause=system_resumed_from
+        // so it round-trips through the 24-variant EventMsg union
+        // without adding a new variant.
+        const sentinel: RolloutItem = {
+          type: "event_msg",
+          payload: {
+            id: "system",
+            msg: {
+              type: "warning",
+              payload: {
+                cause: "system_resumed_from",
+                message: `${durationMs}`,
+              },
+            },
+          },
+        };
+        this.pending = [warning, sentinel, ...this.pending];
+        this.emitDiagnostic({
+          at: Date.now(),
+          level: "warning",
+          cause: "event_log_batch_delayed",
+          message: `system_resumed_from(${durationMs}ms)`,
+        });
+      }
+
+      // Record byte offsets for each event row before write so the
+      // index.json snapshot + fast-seek readers can jump to a specific
+      // seq without parsing the whole file.
+      let offsetAccumulator = this.fileSize;
+      for (const item of this.pending) {
+        if (item.type === "event_msg" && item.payload.seq !== undefined) {
+          this.offsetsBySeq.set(item.payload.seq, offsetAccumulator);
+        }
+        offsetAccumulator += Buffer.byteLength(
+          serializeRolloutItem(item),
+          "utf8",
+        );
+      }
+      this.boundIndexMap(this.offsetsBySeq);
+
+      const lines = this.pending.map(serializeRolloutItem).join("");
+      const toWrite = this.pending;
+      this.pending = [];
+      this.batchOpenedAtMs = null;
+
+      // `requeue` distinguishes the failure shapes (#11):
+      //   - writeSync failed before writing, or a partial append was rolled back
+      //     and fsync'd: the items can be re-queued into the degraded ring buffer
+      //     for a later complete re-append (requeue=true).
+      //   - a partial append could not be durably rolled back: the on-disk tail
+      //     is uncertain and re-append could duplicate it (requeue=false).
+      //   - writeSync succeeded but fsync (+ its I-38 retry) failed: the
+      //     bytes are ALREADY appended to the rollout on disk. Re-queueing
+      //     them would re-serialize + re-append the same rows on degraded
+      //     flush, bypassing the append()-level seq/UUID dedup and landing
+      //     duplicates in the JSONL (double on resume). So we enter
+      //     degraded mode WITHOUT re-queueing (requeue=false).
+      const routeToDegraded = (err: unknown, requeue: boolean) => {
+        if (isDegradedErrno(err)) {
+          // I-12 / I-38 path: enter degraded so subsequent appends buffer
+          // instead of touching the sick disk. Emit once on the transition
+          // so a live-sequenced diagnostic listener cannot re-enter flush
+          // and recurse on the still-failing write (#2032).
+          const entered = !this.degraded.isDegraded;
+          this.degraded.enterDegraded(
+            `${(err as { code?: string }).code} during append`,
+          );
+          if (requeue) {
+            for (const item of toWrite) this.degraded.append(item);
+          }
+          if (entered) {
+            this.emitDiagnostic({
+              at: Date.now(),
+              level: "error",
+              cause: "rollout_degraded",
+              message: requeue
+                ? `${(err as { code?: string }).code ?? "unknown"} during append — ${toWrite.length} events queued in degraded ring buffer`
+                : `${(err as { code?: string }).code ?? "unknown"} during fsync — ${toWrite.length} events already on disk, entering degraded mode without re-queue`,
+            });
+          }
+          return true;
+        }
+        return false;
+      };
+
+      let committed = true;
+      try {
+        if (durable) {
+          // I-38: async retry on fsync failure routes to degraded via
+          // the callback. The bytes were already writeSync'd by this
+          // point, so we MUST NOT re-queue them (#11) — only enter
+          // degraded mode.
+          committed = this.writeBytesWithFsync(lines, (err) => {
+            routeToDegraded(err, /*requeue*/ false);
+          });
+        } else {
+          this.writeBytesAppendOnly(lines);
+        }
+        this.fileSize += Buffer.byteLength(lines, "utf8");
+        this.trajectoryExport.writeItems(toWrite);
+      } catch (err) {
+        const safeToRequeue = !(err instanceof AppendRollbackError);
+        if (!routeToDegraded(err, safeToRequeue)) {
+          throw err;
+        }
+        committed = false;
+      }
+      return committed;
     } finally {
       this.flushDepth -= 1;
       this.releaseDeferredFlushDiagnostics();
     }
-  }
-
-  private flushBatchUnlocked(durable: boolean): boolean {
-    // I-83 suspend detection: if the batch was open for > 10s (e.g.
-    // system suspend/resume gap), emit TWO marker events (warning +
-    // sentinel system_resumed_from) AHEAD of the pending batch.
-    // The markers are informational warnings (non-state-mutating in the
-    // reducer); the queued durable response_item / session_state lines
-    // that straddle the suspend window MUST be preserved and flushed,
-    // not discarded — dropping them permanently loses in-flight history.
-    if (
-      this.batchOpenedAtMs !== null &&
-      monotonicMs() - this.batchOpenedAtMs > I83_SUSPEND_DETECTION_MS
-    ) {
-      const durationMs = Math.round(monotonicMs() - this.batchOpenedAtMs);
-      this.batchOpenedAtMs = null;
-      // Prepend the two I-83 marker events so the log shows (a) the
-      // operator-visible warning and (b) a structural sentinel the
-      // reducer can reason about, while the original pending items
-      // remain queued behind them.
-      const warning: RolloutItem = {
-        type: "event_msg",
-        payload: {
-          id: "system",
-          msg: {
-            type: "warning",
-            payload: {
-              cause: "event_log_batch_delayed",
-              message: `event-log batch delayed ${durationMs}ms (I-83)`,
-            },
-          },
-        },
-      };
-      // Sentinel encoded as a warning with cause=system_resumed_from
-      // so it round-trips through the 24-variant EventMsg union
-      // without adding a new variant.
-      const sentinel: RolloutItem = {
-        type: "event_msg",
-        payload: {
-          id: "system",
-          msg: {
-            type: "warning",
-            payload: {
-              cause: "system_resumed_from",
-              message: `${durationMs}`,
-            },
-          },
-        },
-      };
-      this.pending = [warning, sentinel, ...this.pending];
-      this.emitDiagnostic({
-        at: Date.now(),
-        level: "warning",
-        cause: "event_log_batch_delayed",
-        message: `system_resumed_from(${durationMs}ms)`,
-      });
-    }
-
-    // Record byte offsets for each event row before write so the
-    // index.json snapshot + fast-seek readers can jump to a specific
-    // seq without parsing the whole file.
-    let offsetAccumulator = this.fileSize;
-    for (const item of this.pending) {
-      if (item.type === "event_msg" && item.payload.seq !== undefined) {
-        this.offsetsBySeq.set(item.payload.seq, offsetAccumulator);
-      }
-      offsetAccumulator += Buffer.byteLength(
-        serializeRolloutItem(item),
-        "utf8",
-      );
-    }
-    this.boundIndexMap(this.offsetsBySeq);
-
-    const lines = this.pending.map(serializeRolloutItem).join("");
-    const toWrite = this.pending;
-    this.pending = [];
-    this.batchOpenedAtMs = null;
-
-    // `requeue` distinguishes the failure shapes (#11):
-    //   - writeSync failed before writing, or a partial append was rolled back
-    //     and fsync'd: the items can be re-queued into the degraded ring buffer
-    //     for a later complete re-append (requeue=true).
-    //   - a partial append could not be durably rolled back: the on-disk tail
-    //     is uncertain and re-append could duplicate it (requeue=false).
-    //   - writeSync succeeded but fsync (+ its I-38 retry) failed: the
-    //     bytes are ALREADY appended to the rollout on disk. Re-queueing
-    //     them would re-serialize + re-append the same rows on degraded
-    //     flush, bypassing the append()-level seq/UUID dedup and landing
-    //     duplicates in the JSONL (double on resume). So we enter
-    //     degraded mode WITHOUT re-queueing (requeue=false).
-    const routeToDegraded = (err: unknown, requeue: boolean) => {
-      if (isDegradedErrno(err)) {
-        // I-12 / I-38 path: enter degraded so subsequent appends buffer
-        // instead of touching the sick disk. Emit once on the transition
-        // so a live-sequenced diagnostic listener cannot re-enter flush
-        // and recurse on the still-failing write (#2032).
-        const entered = !this.degraded.isDegraded;
-        this.degraded.enterDegraded(
-          `${(err as { code?: string }).code} during append`,
-        );
-        if (requeue) {
-          for (const item of toWrite) this.degraded.append(item);
-        }
-        if (entered) {
-          this.emitDiagnostic({
-            at: Date.now(),
-            level: "error",
-            cause: "rollout_degraded",
-            message: requeue
-              ? `${(err as { code?: string }).code ?? "unknown"} during append — ${toWrite.length} events queued in degraded ring buffer`
-              : `${(err as { code?: string }).code ?? "unknown"} during fsync — ${toWrite.length} events already on disk, entering degraded mode without re-queue`,
-          });
-        }
-        return true;
-      }
-      return false;
-    };
-
-    let committed = true;
-    try {
-      if (durable) {
-        // I-38: async retry on fsync failure routes to degraded via
-        // the callback. The bytes were already writeSync'd by this
-        // point, so we MUST NOT re-queue them (#11) — only enter
-        // degraded mode.
-        committed = this.writeBytesWithFsync(lines, (err) => {
-          routeToDegraded(err, /*requeue*/ false);
-        });
-      } else {
-        this.writeBytesAppendOnly(lines);
-      }
-      this.fileSize += Buffer.byteLength(lines, "utf8");
-      this.trajectoryExport.writeItems(toWrite);
-    } catch (err) {
-      const safeToRequeue = !(err instanceof AppendRollbackError);
-      if (!routeToDegraded(err, safeToRequeue)) {
-        throw err;
-      }
-      committed = false;
-    }
-    return committed;
   }
 
   /**
