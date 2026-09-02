@@ -385,24 +385,44 @@ function chooseKeepCount(messages: readonly RuntimeMessage[]): number {
 
 /** How far back the kept suffix may stretch to include the last human message. */
 const KEEP_RECENT_HUMAN_MESSAGE_WITHIN = 12;
+/** The kept tail may hold at most this share of the history's bytes, or 16 KB. */
+const KEEP_RECENT_HUMAN_MESSAGE_BYTE_SHARE = 0.15;
+const KEEP_RECENT_HUMAN_MESSAGE_MIN_BYTES = 16_384;
 
 /**
  * Index of the most recent message the human typed, when it lies within the
- * last few messages; otherwise the list length, which leaves the positional
- * split alone. Runtime-authored user-role messages (boundary markers, prior
- * summaries, agent invocations) do not count.
+ * last few messages and the tail from it onwards is small; otherwise the list
+ * length, which leaves the positional split alone. Runtime-authored user-role
+ * messages (boundary markers, prior summaries, agent invocations) do not
+ * count. The byte bound keeps a context-window collapse able to shrink: a
+ * tail full of large tool results is summarized, not kept.
  */
 export function nearestRecentHumanMessageIndex(
   messages: readonly RuntimeMessage[],
   keepCount: number,
 ): number {
   const reach = Math.max(keepCount, KEEP_RECENT_HUMAN_MESSAGE_WITHIN);
+  const bytesOf = (message: RuntimeMessage): number =>
+    Buffer.byteLength(
+      typeof message.content === "string"
+        ? message.content
+        : JSON.stringify(message.content ?? message.message?.content ?? ""),
+      "utf8",
+    );
+  const totalBytes = messages.reduce((sum, message) => sum + bytesOf(message), 0);
+  const tailBudget = Math.max(
+    KEEP_RECENT_HUMAN_MESSAGE_MIN_BYTES,
+    Math.floor(totalBytes * KEEP_RECENT_HUMAN_MESSAGE_BYTE_SHARE),
+  );
+  let tailBytes = 0;
   for (
     let index = messages.length - 1;
     index >= Math.max(0, messages.length - reach);
     index -= 1
   ) {
     const message = messages[index]!;
+    tailBytes += bytesOf(message);
+    if (tailBytes > tailBudget) return messages.length;
     if (message.role !== "user") continue;
     if (message.originalRole !== undefined && message.originalRole !== "user") {
       continue;
