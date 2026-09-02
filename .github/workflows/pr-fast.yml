@@ -23,7 +23,14 @@ jobs:
   affected-tests:
     name: affected-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # `vitest related` walks the import graph, so a change to a widely imported
+    # module (a util, a config loader) selects most of the suite, not a handful
+    # of files. At the runner's two workers that is ~20 minutes of tests, and
+    # the old 15-minute cap cancelled the job mid-run: the gate reported
+    # `cancelled` with zero failures, so a correct change could never go green
+    # and the module was effectively unmergeable. Other jobs in this repo
+    # already allow 30-60 minutes.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
