@@ -140,6 +140,12 @@ dirs; extract/background helpers may run on interactive sessions (also gated by
 build features such as `EXTRACT_MEMORIES`). Session memory lives in conversation
 state, not a separate durable path contract.
 
+The session-notes subagent (`memory/session`, writes `summary.md`) is **off by
+default**: nothing reads the notes yet and compaction already summarizes the
+same material, so it only runs when `AGENC_SESSION_MEMORY_ENABLED=1` is set
+(`AGENC_DISABLE_SESSION_MEMORY=1` still wins). Failures surface as the
+`session_memory_update_failed` warning.
+
 The extraction child (`services/extractMemories`) forks the full history on
 every third eligible terminating turn by default (`DEFAULT_MIN_ELIGIBLE_TURNS`),
 sees only the file read/write tools (`MEMORY_EXTRACTION_TOOL_ALLOWLIST`) inside
