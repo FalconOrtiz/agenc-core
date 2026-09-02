@@ -158,13 +158,35 @@ function blockedCallMessage(
 }
 
 /**
+ * The transcript explanation for a turn the refusal ends. Worded like the
+ * behavioral backstop's own stop message because it is the same stop,
+ * detected early: the model kept issuing one call that kept failing the
+ * same way.
+ */
+export function repeatedFailingCallStopExplanation(
+  call: LLMToolCall,
+  blocked: ToolDispatchResult,
+): string {
+  const recorded = blocked.metadata?.repeatedFailures;
+  const count =
+    typeof recorded === "number" ? recorded : REPEATED_FAILURE_BLOCK_THRESHOLD;
+  return (
+    `Turn stopped by the no-progress backstop: the exact ${call.name} call ` +
+    `failed ${count} times with the same error and was refused (count=${count}). ` +
+    "No further progress was being made. No task was completed."
+  );
+}
+
+/**
  * Refuse a call that has already failed identically
  * `REPEATED_FAILURE_BLOCK_THRESHOLD` times in this turn. Returns the
  * synthetic error result to record in place of a dispatch, or null when the
  * call may run. The result carries `preventContinuation` so the turn ends
- * after the batch, the same guard a resolver denial uses. Successful
- * repeats (re-reading a file, polling) are never affected: only an
- * unbroken run of identical error results counts.
+ * after the batch; the caller records a `noProgressStop` so that end is
+ * reported as the bounded `no_progress` terminal the behavioral backstop
+ * uses, not as a completed turn. Successful repeats (re-reading a file,
+ * polling) are never affected: only an unbroken run of identical error
+ * results counts.
  */
 export function blockRepeatedFailingCall(
   state: TurnState,

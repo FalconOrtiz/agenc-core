@@ -60,6 +60,7 @@ import { emitWarning as emitWarningEvent } from "../session/event-log.js";
 import {
   appendRepeatToolAdvisory,
   blockRepeatedFailingCall,
+  repeatedFailingCallStopExplanation,
 } from "./repeat-tool-advisory.js";
 import type { Session } from "../session/session.js";
 import type { GuardianApprovalReviewer } from "../permissions/guardian/reviewer.js";
@@ -972,7 +973,14 @@ export async function executeTools(
       });
       const completed = recordCompletedToolCall(state, ctx, session, call, blocked);
       completedThisPass.set(completed.callId, completed);
-      if (blocked.preventContinuation === true) preventContinuation = true;
+      if (blocked.preventContinuation === true) {
+        preventContinuation = true;
+        // The refusal is a no-progress stop, not a completed turn: report
+        // it the way the behavioral backstop reports its own.
+        state.noProgressStop ??= {
+          explanation: repeatedFailingCallStopExplanation(call, blocked),
+        };
+      }
       continue;
     }
 

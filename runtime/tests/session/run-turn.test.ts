@@ -1809,6 +1809,81 @@ describe("runTurn — T6 gap #119 lifecycle emits", () => {
     expect(yielded.at(-1)?.type).toBe("turn_complete");
   });
 
+  test("a call that keeps failing the same way ends the turn as a no-progress stop", async () => {
+    // The model re-issues one failing call every turn. The identical-failing
+    // call guard refuses the fourth attempt and the turn must end with the
+    // bounded `no_progress` terminal (what hooks and subagents key on), with
+    // the backstop's explanation as the last assistant message, not as a
+    // quietly completed turn.
+    let calls = 0;
+    const provider: LLMProvider = {
+      ...mkProvider({}),
+      chatStream: async () => {
+        calls += 1;
+        return {
+          content: "retrying now that writes are allowed",
+          toolCalls: [
+            {
+              id: `flaky-${calls}`,
+              name: "flaky_tool",
+              arguments: JSON.stringify({ file_path: "/root/memory/style.md" }),
+            },
+          ],
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+          model: "test-model",
+          finishReason: "tool_calls",
+        };
+      },
+    };
+    const failure = {
+      content: '{"error":"file_path is outside allowed directories"}',
+      isError: true,
+    };
+    let executed = 0;
+    // Idempotent so the bare error settles as a plain failed result; a
+    // side-effecting tool's undecorated error would trip the
+    // effect-settlement gate, whose own identical messages the guard would
+    // then be counting instead of the tool's.
+    const tool: Tool = {
+      name: "flaky_tool",
+      description: "always fails the same way",
+      inputSchema: { type: "object" },
+      recoveryCategory: "idempotent",
+      requiresApproval: false,
+      execute: async () => {
+        executed += 1;
+        return failure;
+      },
+    };
+    const registry = {
+      tools: [tool],
+      toLLMTools: () => [],
+      dispatch: async () => {
+        executed += 1;
+        return failure;
+      },
+    } as unknown as ToolRegistry;
+    const { session } = mkSession({ provider, registry });
+
+    const yielded: PhaseEvent[] = [];
+    for await (const event of session.runTurn("start", { ctx: mkCtx() })) {
+      yielded.push(event);
+    }
+
+    // Three failures ran; the fourth identical call was refused instead.
+    expect(executed).toBe(3);
+    expect(calls).toBe(4);
+    const last = yielded.at(-1);
+    expect(last?.type).toBe("turn_complete");
+    if (last?.type !== "turn_complete") throw new Error("unreachable");
+    expect(last.stopReason).toBe("no_progress");
+    expect(last.content).toBe(
+      "Turn stopped by the no-progress backstop: the exact flaky_tool call failed 3 " +
+        "times with the same error and was refused (count=3). No further progress " +
+        "was being made. No task was completed.",
+    );
+  });
+
   test("session abort during tool execution stops before follow-up sampling", async () => {
     const seenMessages: LLMMessage[][] = [];
     const { provider, calls } = mkSingleToolFollowUpProvider({

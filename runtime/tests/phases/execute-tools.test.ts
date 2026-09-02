@@ -1211,9 +1211,16 @@ describe("executeTools — T7 gap #109 pipeline", () => {
           event.msg.payload?.callId === "write-4",
       ),
     ).toHaveLength(2);
-    // The refusal ends the turn after the batch.
+    // The refusal ends the turn after the batch, as a no-progress stop with
+    // the backstop's wording rather than as a completed turn.
     expect(state.preventContinuation).toBe(true);
     expect(state.needsFollowUp).toBe(false);
+    expect(state.noProgressStop).toEqual({
+      explanation:
+        "Turn stopped by the no-progress backstop: the exact Write call failed 3 " +
+        "times with the same error and was refused (count=3). No further progress " +
+        "was being made. No task was completed.",
+    });
   });
 
   test("identical calls that keep succeeding are never refused", async () => {

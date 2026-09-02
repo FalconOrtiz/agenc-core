@@ -5207,6 +5207,30 @@ async function* runTurnKernelInner(
       await commit(state, ctx, session, signal, {
         querySource: turnQuerySource,
       });
+      // A tool-phase guard that found the turn going nowhere (one call
+      // failing the same way over and over) ends it as the behavioral
+      // backstop would: the explanation goes into the transcript and the
+      // terminal is the bounded `no_progress`, so hooks and subagents do
+      // not mistake the halt for a completed turn.
+      const noProgressStop =
+        state.transition === undefined ? state.noProgressStop : undefined;
+      if (noProgressStop !== undefined) {
+        state.messages.push({
+          role: "assistant",
+          content: noProgressStop.explanation,
+        });
+        lastContent = noProgressStop.explanation;
+        session.emit({
+          id: session.nextInternalSubId(),
+          msg: {
+            type: "warning",
+            payload: {
+              cause: "no_progress_detected",
+              message: noProgressStop.explanation,
+            },
+          },
+        });
+      }
       await syncSessionState();
       if (state.transition !== undefined) {
         state.transition = undefined;
@@ -5214,12 +5238,13 @@ async function* runTurnKernelInner(
       }
       launchTerminalPostSampling(state, session, ctx, turnQuerySource, signal);
       emitTurnComplete(lastContent);
-      const terminal: Terminal = { reason: "completed" };
+      const stopReason = noProgressStop !== undefined ? "no_progress" : "completed";
+      const terminal: Terminal = { reason: stopReason };
       yield {
         type: "turn_complete",
         content: lastContent,
         usage,
-        stopReason: "completed",
+        stopReason,
       };
       await drainPendingExtraction();
       return terminal;

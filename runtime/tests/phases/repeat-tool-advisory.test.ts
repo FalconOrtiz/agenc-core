@@ -12,6 +12,7 @@ import {
   REPEAT_TOOL_THRESHOLDS,
   REPEATED_FAILURE_BLOCK_THRESHOLD,
   REPEATED_FAILURE_BLOCKED_METADATA_KEY,
+  repeatedFailingCallStopExplanation,
 } from "../../src/phases/repeat-tool-advisory.js";
 
 function call(name: string, args: unknown, id = "c"): LLMToolCall {
@@ -281,6 +282,23 @@ describe("blockRepeatedFailingCall", () => {
           "Write refused: identical call failed 3 times with the same error in this turn",
       },
     ]);
+  });
+
+  test("the refusal's turn stop is worded like the behavioral backstop", () => {
+    const { session } = mkSessionStub();
+    const failures = Array.from({ length: 5 }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    const blocked = blockRepeatedFailingCall(mkState(failures), session, write);
+    expect(repeatedFailingCallStopExplanation(write, blocked!)).toBe(
+      "Turn stopped by the no-progress backstop: the exact Write call failed 5 " +
+        "times with the same error and was refused (count=5). No further progress " +
+        "was being made. No task was completed.",
+    );
+    // Without the recorded count the threshold is the honest lower bound.
+    expect(
+      repeatedFailingCallStopExplanation(write, { content: "", isError: true }),
+    ).toContain(`failed ${REPEATED_FAILURE_BLOCK_THRESHOLD} times`);
   });
 
   test("identical successes are never blocked", () => {
