@@ -47,6 +47,6 @@ if (system === undefined && packaged === undefined) {
   );
   process.exit(1);
 }
-process.stdout.write(
-  `ripgrep ok (${runtimeRoot}): ${system !== undefined ? `system=${system}` : `packaged=${packaged}`}\n`,
-);
+const rgDetail =
+  system !== undefined ? `system=${system}` : `packaged=${packaged}`;
+process.stdout.write(`ripgrep ok (${runtimeRoot}): ${rgDetail}\n`);

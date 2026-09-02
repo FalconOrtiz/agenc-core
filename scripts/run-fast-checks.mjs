@@ -23,9 +23,9 @@ function fixedPathEnv() {
     ? [
       process.env.SystemRoot
         ? path.join(process.env.SystemRoot, "System32")
-        : "C:\\Windows\\System32",
-      "C:\\Program Files\\Git\\cmd",
-      "C:\\Program Files\\Git\\bin",
+        : String.raw`C:\Windows\System32`,
+      String.raw`C:\Program Files\Git\cmd`,
+      String.raw`C:\Program Files\Git\bin`,
     ]
     : ["/usr/bin", "/bin", "/usr/local/bin"];
   return {
