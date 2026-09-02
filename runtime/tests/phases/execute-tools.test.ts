@@ -3252,7 +3252,13 @@ describe("executeTools — T7 gap #109 pipeline", () => {
 
     expect(executed).toBe(0);
     expect(state.messages).toHaveLength(1);
-    expect(state.messages[0]!.content).toContain("rejected by user");
+    expect(state.messages[0]!.content).toContain(
+      "Permission denied: ExitPlanMode was denied by this session's approval resolver. Do not retry the same call",
+    );
+    // The denial ends the turn after this batch so the model cannot loop
+    // on the same call.
+    expect(state.preventContinuation).toBe(true);
+    expect(state.needsFollowUp).toBe(false);
   });
 
   test("requiresApproval tools do not dispatch when guardian review denies", async () => {

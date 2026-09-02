@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   ApprovalRejectedError,
+  isNonRetryableApprovalDenial,
   SandboxDeniedError,
   attemptWithRetry,
   classifyToolApproval,
@@ -1216,6 +1217,56 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     });
     expect(dispatched).not.toHaveBeenCalled();
     expect(guardian.reviewApprovalRequest).toHaveBeenCalledOnce();
+  });
+
+  test("resolver denial names the tool, forbids a retry, and records its source", async () => {
+    const resolver: ApprovalResolver = {
+      request: async () => ({ kind: "denied" }),
+    };
+    const dispatched = vi.fn(async () => "ok");
+    const rejection = await orchestrateToolCall<string>({
+      tool: mkTool({ requiresApproval: true }),
+      approvalCtx: mkCtx(),
+      approvalPolicy: "on_request",
+      sandboxMode: "workspace_write",
+      dispatch: dispatched,
+      approvalResolver: resolver,
+    }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+
+    expect(rejection).toBeInstanceOf(ApprovalRejectedError);
+    const error = rejection as ApprovalRejectedError;
+    expect(error.decision).toEqual({ kind: "denied" });
+    expect(error.source).toBe("resolver");
+    expect(error.message).toBe(
+      "Permission denied: test.cmd was denied by this session's approval resolver. Do not retry the same call; choose a different approach or ask the user how to proceed.",
+    );
+    expect(isNonRetryableApprovalDenial(error)).toBe(true);
+    expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  test("default denial says the tool is not permitted in this session", async () => {
+    const rejection = await orchestrateToolCall<string>({
+      tool: mkTool(),
+      approvalCtx: mkCtx(),
+      approvalPolicy: "untrusted",
+      sandboxMode: "workspace_write",
+      dispatch: async () => "ok",
+    }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+
+    expect(rejection).toBeInstanceOf(ApprovalRejectedError);
+    const error = rejection as ApprovalRejectedError;
+    expect(error.decision).toEqual({ kind: "denied" });
+    expect(error.source).toBe("default_deny");
+    expect(error.message).toBe(
+      "Not permitted: test.cmd cannot run in this session because no approval resolver is available to allow it. Do not retry this call; use a different tool or ask the user.",
+    );
+    expect(isNonRetryableApprovalDenial(error)).toBe(true);
   });
 
   test("needs_approval path: no resolver + no hook → default-deny (ApprovalRejectedError)", async () => {

@@ -470,11 +470,32 @@ function effectiveApprovalPolicyForTool(
 export class ApprovalRejectedError extends Error {
   readonly kind = "approval_rejected" as const;
   readonly decision: ReviewDecision;
-  constructor(message: string, decision: ReviewDecision) {
+  /** Where the decision came from; absent for callers that predate it. */
+  readonly source?: RequestApprovalResult["source"];
+  constructor(
+    message: string,
+    decision: ReviewDecision,
+    source?: RequestApprovalResult["source"],
+  ) {
     super(message);
     this.name = "ApprovalRejectedError";
     this.decision = decision;
+    if (source !== undefined) this.source = source;
   }
+}
+
+/**
+ * True for a denial that no reviewer explained and that the model must not
+ * retry: the approval resolver said no, or no resolver exists at all. Such
+ * results also stop the turn so the model cannot loop on the same call.
+ */
+export function isNonRetryableApprovalDenial(
+  err: ApprovalRejectedError,
+): boolean {
+  return (
+    err.decision.kind === "denied" &&
+    (err.source === "resolver" || err.source === "default_deny")
+  );
 }
 
 function resolveApprovalSignal(
@@ -490,18 +511,33 @@ function resolveApprovalSignal(
 
 function approvalRejectionMessage(
   result: RequestApprovalResult,
+  toolName: string,
 ): string {
   if (result.reason !== undefined && result.reason.trim().length > 0) {
     return result.reason;
   }
   if (result.source === "default_deny") {
-    return "no_approval_resolver";
+    return (
+      `Not permitted: ${toolName} cannot run in this session because no ` +
+      "approval resolver is available to allow it. Do not retry this call; " +
+      "use a different tool or ask the user."
+    );
   }
   if (result.decision.kind === "timed_out") {
     return "approval timed out";
   }
   if (result.decision.kind === "abort") {
     return "approval aborted";
+  }
+  if (result.source === "resolver") {
+    // The resolver may be a live prompt or an automated policy; the text
+    // stays true for both. "Permission denied:" is the prefix the TUI
+    // denial renderer recognizes.
+    return (
+      `Permission denied: ${toolName} was denied by this session's approval ` +
+      "resolver. Do not retry the same call; choose a different approach or " +
+      "ask the user how to proceed."
+    );
   }
   return "rejected by user";
 }
@@ -784,8 +820,9 @@ export async function orchestrateToolCall<T>(
     });
     if (!isApprovalAccepted(approval.decision)) {
       throw new ApprovalRejectedError(
-        approvalRejectionMessage(approval),
+        approvalRejectionMessage(approval, approvalCtx.toolName),
         approval.decision,
+        approval.source,
       );
     }
     alreadyApproved = true;
@@ -872,8 +909,9 @@ export async function orchestrateToolCall<T>(
       });
       if (!isApprovalAccepted(approval.decision)) {
         throw new ApprovalRejectedError(
-          approvalRejectionMessage(approval),
+          approvalRejectionMessage(approval, escalationCtx.toolName),
           approval.decision,
+          approval.source,
         );
       }
     }
