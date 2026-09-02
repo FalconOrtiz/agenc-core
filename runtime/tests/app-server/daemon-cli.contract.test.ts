@@ -605,7 +605,7 @@ async function stopDaemon(
   signalProcess: ReturnType<typeof createSignalProcess>,
   running: Promise<number>,
 ): Promise<void> {
-  await stopDaemon(signalProcess, running);
+  await stopRunningDaemons([{ signalProcess, running }]);
 }
 
 async function stopDaemonQuiet(
@@ -613,6 +613,24 @@ async function stopDaemonQuiet(
   running: Promise<number>,
 ): Promise<void> {
   await stopDaemon(signalProcess, running).catch(() => {});
+}
+
+async function stopDaemonExpectZero(
+  signalProcess: ReturnType<typeof createSignalProcess>,
+  running: Promise<number>,
+): Promise<void> {
+  await stopDaemon(signalProcess, running);
+  await expect(running).resolves.toBe(0);
+}
+
+async function cleanupDaemonTest(
+  signalProcess: ReturnType<typeof createSignalProcess>,
+  running: Promise<number>,
+  stopped: boolean,
+  agencHome: string,
+): Promise<void> {
+  if (!stopped) await stopDaemonQuiet(signalProcess, running);
+  await rm(agencHome, { recursive: true, force: true });
 }
 
 async function availableLoopbackPort(): Promise<number> {
@@ -1421,14 +1439,10 @@ describe("AgenC daemon CLI", () => {
       expect(out).toMatch(/memory: rss=[\d.]+ MiB/);
       expect(out).toMatch(/sessions: active=\d+, closed=\d+, total=\d+/);
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
     }
   });
 
@@ -2714,9 +2728,8 @@ describe("AgenC daemon CLI", () => {
       });
       expect(spawnCount).toBe(0);
 
-      await stopDaemon(signalProcess, foreground);
+      await stopDaemonExpectZero(signalProcess, foreground);
       stopped = true;
-      await expect(foreground).resolves.toBe(0);
     } finally {
       publishForeground();
       if (!stopped) {
@@ -3093,14 +3106,10 @@ token_cap = 123
       );
       expect(io.stderrText()).toContain("AgenC daemon config reloaded");
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
       updateRuntimeConfig.mockRestore();
     }
     // Starts a real daemon and reloads its config; on a loaded runner that
@@ -3197,9 +3206,8 @@ workspace = ${JSON.stringify(workspaceB)}
       );
       expect(workspaceARead.body).toContain("ADMISSION_IDENTITY_REQUIRED");
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
       if (!stopped) {
         await stopDaemonQuiet(signalProcess, running);
@@ -3308,14 +3316,10 @@ workspace = ${JSON.stringify(process.cwd())}
       expect(host.terminatedPids).toEqual([]);
       await expect(readAgenCDaemonPid(pidPath)).resolves.toBe(4100);
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
     }
   });
 
@@ -4289,14 +4293,10 @@ backend = "local"
         initialSnapshots,
       );
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
     }
   });
 
@@ -4387,14 +4387,10 @@ backend = "local"
       });
       expect(permissionAgentIds).toEqual([created.agentId]);
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
     }
   });
 
@@ -4612,14 +4608,10 @@ snapshot_max_bytes = 64
         readSnapshotTimes(agencHome, process.cwd(), "session-retention-bytes"),
       ).toEqual(["2026-05-06T00:00:01.000Z"]);
 
-      await stopDaemon(signalProcess, running);
+      await stopDaemonExpectZero(signalProcess, running);
       stopped = true;
-      await expect(running).resolves.toBe(0);
     } finally {
-      if (!stopped) {
-        await stopDaemonQuiet(signalProcess, running);
-      }
-      await rm(agencHome, { recursive: true, force: true });
+      await cleanupDaemonTest(signalProcess, running, stopped, agencHome);
     }
   });
 
