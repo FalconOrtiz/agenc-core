@@ -342,8 +342,7 @@ function scanCanonicalRolloutUntimed(
     let retainedLifecycleRecords = 0;
     let activeAdmissionAttempt: MutableAttemptScan | undefined;
     let latestCommittedAttempt: MutableAttemptScan | undefined;
-    let postCommitBookkeeping:
-      "await_context" | "await_meta" | "complete" | undefined;
+    let postCommitBookkeeping: PostCommitBookkeeping;
     checkOperationalBudget();
     let identityRegistry: DiskCanonicalIdentityRegistry | undefined;
     let payloadRegistry: DiskCompactionPayloadRegistry | undefined;
@@ -371,29 +370,18 @@ function scanCanonicalRolloutUntimed(
               : undefined;
 
           if (latestCommittedAttempt !== undefined) {
-            const committedAttemptId =
-              latestCommittedAttempt.intent?.attempt_id;
-            if (
-              item.type === "compaction_cleanup_pending" &&
-              item.payload.attempt_id === committedAttemptId
-            ) {
-              // Cleanup evidence is part of the commit transaction itself.
-            } else if (
-              postCommitBookkeeping === "await_context" &&
-              latestCommittedAttempt.intent?.automatic === true &&
-              isCausalAutoCompactionBoundary(item)
-            ) {
-              postCommitBookkeeping = "await_meta";
-            } else if (
-              postCommitBookkeeping === "await_meta" &&
-              item.type === "session_meta" &&
-              item.payload.sessionId === options.expectedRunId
-            ) {
-              postCommitBookkeeping = "complete";
-            } else {
+            const next = nextPostCommitBookkeeping(
+              item,
+              latestCommittedAttempt,
+              postCommitBookkeeping,
+              options.expectedRunId,
+            );
+            if (next === "later_work") {
               latestCommittedAttempt.laterWork = true;
               latestCommittedAttempt = undefined;
               postCommitBookkeeping = undefined;
+            } else {
+              postCommitBookkeeping = next;
             }
           }
           if (
@@ -1023,6 +1011,47 @@ function persistedRollbackPayload(
   )
     return undefined;
   return readCompactionPersistedRollbackCommittedV1(payload);
+}
+
+type PostCommitBookkeeping =
+  | "await_context"
+  | "await_meta"
+  | "complete"
+  | undefined;
+
+/**
+ * Advance the bookkeeping that follows a committed compaction: its own
+ * cleanup evidence is part of the commit transaction, an automatic attempt
+ * then expects the causal context boundary and the session_meta rewrite, and
+ * anything else is later work that ends the post-commit window.
+ */
+function nextPostCommitBookkeeping(
+  item: RolloutItem,
+  committed: MutableAttemptScan,
+  current: PostCommitBookkeeping,
+  expectedRunId: string | undefined,
+): PostCommitBookkeeping | "later_work" {
+  if (
+    item.type === "compaction_cleanup_pending" &&
+    item.payload.attempt_id === committed.intent?.attempt_id
+  ) {
+    return current;
+  }
+  if (
+    current === "await_context" &&
+    committed.intent?.automatic === true &&
+    isCausalAutoCompactionBoundary(item)
+  ) {
+    return "await_meta";
+  }
+  if (
+    current === "await_meta" &&
+    item.type === "session_meta" &&
+    item.payload.sessionId === expectedRunId
+  ) {
+    return "complete";
+  }
+  return "later_work";
 }
 
 function isCausalAutoCompactionBoundary(item: RolloutItem): boolean {

@@ -404,7 +404,7 @@ export class AgenCSessionSnapshotPolicy {
    */
   flushSession(sessionId: string): SnapshotPolicySnapshotRecord | undefined {
     const state = this.#sessions.get(sessionId);
-    if (state === undefined || !state.dirty) return undefined;
+    if (!state?.dirty) return undefined;
     return this.#writeSnapshot(state, state.pendingTrigger ?? "periodic");
   }
 
@@ -414,7 +414,8 @@ export class AgenCSessionSnapshotPolicy {
    */
   close(): void {
     this.stopPeriodic();
-    for (const state of [...this.#sessions.values()]) {
+    // Dropping the current entry while iterating a Map is well defined.
+    for (const state of this.#sessions.values()) {
       try {
         if (state.dirty) {
           this.#writeSnapshot(state, state.pendingTrigger ?? "periodic");
@@ -1067,7 +1068,9 @@ export class AgenCSessionSnapshotPolicy {
     if (this.#prunedSinceReport === 0) return;
     const report: AgentSnapshotPruningReport = {
       prunedSnapshots: this.#prunedSinceReport,
-      prunedSessionIds: [...this.#prunedSessionsSinceReport].sort(),
+      prunedSessionIds: [...this.#prunedSessionsSinceReport].sort(
+        (left, right) => left.localeCompare(right),
+      ),
     };
     this.#prunedSinceReport = 0;
     this.#prunedSessionsSinceReport.clear();

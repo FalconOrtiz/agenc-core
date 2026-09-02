@@ -4135,8 +4135,9 @@ function recoverAgenCDaemonStartupState(
     for (const pathSet of paths) {
       const driver = openStateDatabasePaths(pathSet);
       try {
+        const walPath = `${pathSet.stateDbPath}-wal`;
         log(
-          `daemon opened state DB ${pathSet.stateDbPath} (${describeFileSizeMb(pathSet.stateDbPath)}, wal ${describeFileSizeMb(`${pathSet.stateDbPath}-wal`)})`,
+          `daemon opened state DB ${pathSet.stateDbPath} (${describeFileSizeMb(pathSet.stateDbPath)}, wal ${describeFileSizeMb(walPath)})`,
         );
         const prunedRuns = pruneTerminalAgentRuns(
           driver,

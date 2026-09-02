@@ -461,7 +461,7 @@ describe("AgenCSessionSnapshotPolicy", () => {
       completed: Record<string, { input?: unknown }>;
     };
     const keys = Object.keys(toolState.completed);
-    expect(keys.length).toBe(20);
+    expect(keys).toHaveLength(20);
     expect(toolState.completed["tool-9"]).toBeUndefined();
     expect(toolState.completed["tool-29"]).toBeDefined();
     for (const key of keys) {
