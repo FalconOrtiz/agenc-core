@@ -57,7 +57,10 @@ import type { ToolDispatchResult } from "../tool-registry.js";
 import type { Tool } from "../tools/types.js";
 import { emitError as emitErrorEvent } from "../session/event-log.js";
 import { emitWarning as emitWarningEvent } from "../session/event-log.js";
-import { appendRepeatToolAdvisory } from "./repeat-tool-advisory.js";
+import {
+  appendRepeatToolAdvisory,
+  blockRepeatedFailingCall,
+} from "./repeat-tool-advisory.js";
 import type { Session } from "../session/session.js";
 import type { GuardianApprovalReviewer } from "../permissions/guardian/reviewer.js";
 import type { PermissionAuditEventInput } from "../permissions/permission-audit-log.js";
@@ -957,6 +960,20 @@ export async function executeTools(
         completedThisPass.set(completed.callId, completed);
         continue;
       }
+    }
+
+    // Hard stop for a byte-identical call that already failed the same way
+    // three times this turn: refuse it instead of burning another round trip.
+    const blocked = blockRepeatedFailingCall(state, session, call);
+    if (blocked !== null) {
+      session.emit({
+        id: session.nextInternalSubId(),
+        msg: toolCallStartedEvent(call),
+      });
+      const completed = recordCompletedToolCall(state, ctx, session, call, blocked);
+      completedThisPass.set(completed.callId, completed);
+      if (blocked.preventContinuation === true) preventContinuation = true;
+      continue;
     }
 
     const queued = queueStreamingToolCall(

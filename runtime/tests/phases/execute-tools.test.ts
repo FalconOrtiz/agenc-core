@@ -1138,6 +1138,111 @@ describe("executeTools — T7 gap #109 pipeline", () => {
     expect(state.completedToolResults[0]?.content).toBe(successText);
   });
 
+  test("a byte-identical call that failed the same way three times is refused, not run", async () => {
+    const denial =
+      '{"error":"file_path is outside allowed directories: /root/memory/style.md"}';
+    let executed = 0;
+    const writeTool: Tool = {
+      name: "Write",
+      description: "writes a file",
+      inputSchema: { type: "object" },
+      metadata: { family: "filesystem", source: "builtin", mutating: true },
+      execute: async () => {
+        executed += 1;
+        return { content: denial, isError: true };
+      },
+    };
+    const registry = mkRegistry([writeTool]);
+    const log = new EventLog();
+    const warnings: string[] = [];
+    log.subscribe((event) => {
+      if (event.msg.type === "warning") warnings.push(event.msg.payload.cause);
+    });
+    const session = mkSession({ log, registry });
+    const args = JSON.stringify({ file_path: "/root/memory/style.md", content: "x" });
+    const state = mkState({
+      toolCalls: [{ id: "write-4", name: "Write", arguments: args }],
+    });
+    // Three earlier rounds of this turn already failed identically.
+    state.completedToolResults = [1, 2, 3].map((n) => ({
+      callId: `write-${n}`,
+      toolName: "Write",
+      arguments: args,
+      content: denial,
+      isError: true,
+    }));
+
+    await executeTools(
+      state,
+      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
+      session,
+    );
+
+    expect(executed).toBe(0);
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.content).toContain(
+      "This exact Write call already failed 3 times with the same error in this turn and will not run again.",
+    );
+    expect(state.messages[0]?.content).toContain("stop retrying");
+    expect(warnings).toContain("repeated_failing_call_blocked");
+    const emitted = (
+      session as unknown as {
+        _emitted: Array<{
+          msg: { type: string; payload?: { callId?: string } };
+        }>;
+      }
+    )._emitted;
+    // Started/completed events still pair up for the refused call.
+    expect(
+      emitted.filter(
+        (event) =>
+          (event.msg.type === "tool_call_started" ||
+            event.msg.type === "tool_call_completed") &&
+          event.msg.payload?.callId === "write-4",
+      ),
+    ).toHaveLength(2);
+    // The refusal ends the turn after the batch.
+    expect(state.preventContinuation).toBe(true);
+    expect(state.needsFollowUp).toBe(false);
+  });
+
+  test("identical calls that keep succeeding are never refused", async () => {
+    let executed = 0;
+    const readTool: Tool = {
+      name: "FileRead",
+      description: "reads a file",
+      inputSchema: { type: "object" },
+      metadata: { family: "filesystem", source: "builtin" },
+      isReadOnly: true,
+      execute: async () => {
+        executed += 1;
+        return { content: "1\tconst a = 1;" };
+      },
+    };
+    const registry = mkRegistry([readTool]);
+    const session = mkSession({ log: new EventLog(), registry });
+    const args = JSON.stringify({ file_path: "src/app.ts" });
+    const state = mkState({
+      toolCalls: [{ id: "read-4", name: "FileRead", arguments: args }],
+    });
+    state.completedToolResults = [1, 2, 3].map((n) => ({
+      callId: `read-${n}`,
+      toolName: "FileRead",
+      arguments: args,
+      content: "1\tconst a = 1;",
+      isError: false,
+    }));
+
+    await executeTools(
+      state,
+      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
+      session,
+    );
+
+    expect(executed).toBe(1);
+    expect(state.preventContinuation).toBe(false);
+  });
+
   test("tool_call_completed carries the measured execution duration", async () => {
     const tool: Tool = {
       name: "FileRead",

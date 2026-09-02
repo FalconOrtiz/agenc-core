@@ -1,5 +1,5 @@
 /**
- * Repeat-tool advisory — an advisory loop-breaker, not a gate.
+ * Repeat-tool advisory — an advisory loop-breaker, plus one hard gate.
  *
  * Watches each session's stream of dispatched tool calls, counts runs of
  * consecutive calls to the same tool with identical canonicalized arguments,
@@ -17,12 +17,23 @@
  * excluded from durable history, so a false positive never pollutes the
  * rollout that `--resume` replays.
  *
+ * The one exception is `blockRepeatedFailingCall`: a byte-identical call
+ * that has already failed with the same error result three times in this
+ * turn is not executed again. Nothing about the call or the runtime has
+ * changed, so the result cannot change either; re-running it only burns a
+ * model round trip. That case is refused before dispatch with a plain
+ * explanation and ends the turn after the batch.
+ *
  * @module
  */
 
 import type { LLMToolCall } from "../llm/types.js";
 import type { Session } from "../session/session.js";
-import type { TurnState } from "../session/turn-state.js";
+import type {
+  CompletedToolResultRecord,
+  TurnState,
+} from "../session/turn-state.js";
+import type { ToolDispatchResult } from "../tool-registry.js";
 import { emitWarning } from "../session/event-log.js";
 import { stableStringify } from "../utils/stableStringify.js";
 
@@ -42,6 +53,20 @@ const TRANSPARENT_TOOLS: ReadonlySet<string> = new Set(["TaskList"]);
 
 /** Cap on the argument preview quoted inside the detailed reminder. */
 const ARGUMENTS_PREVIEW_CHARS = 500;
+
+/**
+ * Identical failures of one exact call, within one turn, after which the
+ * call is refused instead of executed. Observed motivation: a model that
+ * repeated the same two failing Write calls 12 times across 14 model calls
+ * (about 2.5 minutes), narrating each time that the denial would clear.
+ */
+export const REPEATED_FAILURE_BLOCK_THRESHOLD = 3;
+
+/** Metadata marker on the synthetic refusal so it never counts as a failure. */
+export const REPEATED_FAILURE_BLOCKED_METADATA_KEY = "repeatedFailingCallBlocked";
+
+/** Cap on the last error quoted inside the refusal. */
+const LAST_ERROR_PREVIEW_CHARS = 300;
 
 interface RepeatRun {
   key: string;
@@ -71,6 +96,99 @@ function canonicalCallKey(call: LLMToolCall): string {
     // Verbatim fallback keeps unparseable-argument repeats detectable.
   }
   return `${call.name}\n${canonicalArguments}`;
+}
+
+function completedRecordKey(record: CompletedToolResultRecord): string {
+  return canonicalCallKey({
+    id: record.callId,
+    name: record.toolName,
+    arguments: record.arguments,
+  });
+}
+
+/**
+ * How many times this exact call (same tool, same canonical arguments) has
+ * failed in a row with the same error result earlier in this turn, read
+ * from the turn's completed results. A success or a different error for the
+ * same call resets the run; the synthetic refusal records this module
+ * writes are skipped so they never stand in for the original error.
+ */
+export function identicalFailureRun(
+  state: TurnState,
+  call: LLMToolCall,
+): { readonly count: number; readonly lastError: string } {
+  const key = canonicalCallKey(call);
+  let count = 0;
+  let lastError = "";
+  for (const record of state.completedToolResults) {
+    if (record.metadata?.[REPEATED_FAILURE_BLOCKED_METADATA_KEY] === true) {
+      continue;
+    }
+    if (completedRecordKey(record) !== key) continue;
+    if (!record.isError) {
+      count = 0;
+      lastError = "";
+      continue;
+    }
+    if (count > 0 && record.content === lastError) {
+      count += 1;
+    } else {
+      count = 1;
+      lastError = record.content;
+    }
+  }
+  return { count, lastError };
+}
+
+function blockedCallMessage(
+  call: LLMToolCall,
+  count: number,
+  lastError: string,
+): string {
+  const preview =
+    lastError.length > LAST_ERROR_PREVIEW_CHARS
+      ? `${lastError.slice(0, LAST_ERROR_PREVIEW_CHARS)}…`
+      : lastError;
+  return (
+    `This exact ${call.name} call already failed ${count} times with the ` +
+    "same error in this turn and will not run again. The error is not going " +
+    "to change; stop retrying, and if you cannot proceed without it, tell " +
+    `the user. Last error: ${preview}`
+  );
+}
+
+/**
+ * Refuse a call that has already failed identically
+ * `REPEATED_FAILURE_BLOCK_THRESHOLD` times in this turn. Returns the
+ * synthetic error result to record in place of a dispatch, or null when the
+ * call may run. The result carries `preventContinuation` so the turn ends
+ * after the batch, the same guard a resolver denial uses. Successful
+ * repeats (re-reading a file, polling) are never affected: only an
+ * unbroken run of identical error results counts.
+ */
+export function blockRepeatedFailingCall(
+  state: TurnState,
+  session: Session,
+  call: LLMToolCall,
+): ToolDispatchResult | null {
+  const { count, lastError } = identicalFailureRun(state, call);
+  if (count < REPEATED_FAILURE_BLOCK_THRESHOLD) return null;
+  const message = blockedCallMessage(call, count, lastError);
+  emitWarning(
+    session.eventLog,
+    session.nextInternalSubId(),
+    "repeated_failing_call_blocked",
+    `${call.name} refused: identical call failed ${count} times with the same error in this turn`,
+  );
+  return {
+    content: JSON.stringify({ error: message }),
+    isError: true,
+    metadata: {
+      [REPEATED_FAILURE_BLOCKED_METADATA_KEY]: true,
+      repeatedFailures: count,
+    },
+    preventContinuation: true,
+  };
 }
 
 function advisoryText(run: RepeatRun): string {
