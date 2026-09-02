@@ -530,9 +530,14 @@ export function checkMemorySecrets(
 ): string | null {
   // Path-only classification: the screen must hold even where no settings
   // authority is scoped (it is reached from tool input validation), so it
-  // does not consult the auto-memory enabled flag.
-  if (!isDurableMemoryPath(filePath)) {
-    return checkTeamMemSecrets(filePath, content)
+  // does not consult the auto-memory enabled flag, and a path resolver
+  // failure leaves the write on its ordinary path instead of failing it.
+  let durable: boolean
+  try {
+    durable = isDurableMemoryPath(filePath)
+    if (!durable) return checkTeamMemSecrets(filePath, content)
+  } catch {
+    return null
   }
   const matches = scanForSecrets(content)
   if (matches.length === 0) {

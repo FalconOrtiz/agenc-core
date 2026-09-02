@@ -353,3 +353,18 @@ export function isProjectMemoryPath(absolutePath: string): boolean {
 export function isDurableMemoryPath(absolutePath: string): boolean {
   return isGlobalMemoryPath(absolutePath) || isProjectMemoryPath(absolutePath)
 }
+
+/**
+ * The durable memory directories the file tools admit regardless of the
+ * workspace boundary: exactly the global and project roots the memory prompt
+ * advertises, so a Write to the path the prompt names is never refused as
+ * "outside allowed directories". Returns [] when the roots cannot be
+ * resolved so the workspace boundary stays as it was.
+ */
+export function getDurableMemoryRoots(): readonly string[] {
+  try {
+    return Array.from(new Set([getGlobalMemoryPath(), getProjectMemoryPath()]))
+  } catch {
+    return []
+  }
+}

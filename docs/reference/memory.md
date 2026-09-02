@@ -104,6 +104,14 @@ the instruction envelope (`prompts/live-instructions.ts`), truncated by
 `<persistent_memory_context type="AutoMem">` blocks ahead of the trusted
 base prompt.
 
+The file tools (`FileRead`, `Glob`, `Grep`, `Write`, `Edit`, `MultiEdit`)
+admit both memory roots regardless of the workspace boundary
+(`resolveToolAllowedPaths` folds in `getDurableMemoryRoots()`), so the model
+can read and write where the prompt points. Only those two directories are
+admitted: sibling state under `$AGENC_HOME` such as
+`projects/<slug>/sessions/`, `config.toml` or `auth.json` stays denied, and
+memory writes through these tools are screened by `checkMemorySecrets`.
+
 ---
 
 ## Persona files (workspace root)

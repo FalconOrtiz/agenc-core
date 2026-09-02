@@ -84,6 +84,7 @@ export {
   getAutoMemEntrypoint,
   getAutoMemDailyLogPath,
   getAutoMemPath,
+  getDurableMemoryRoots,
   getGlobalMemoryEntrypoint,
   getGlobalMemoryPath,
   getMemoryBaseDir,
