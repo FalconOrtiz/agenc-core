@@ -95,7 +95,22 @@ function toolNames(tools: unknown): string[] {
   });
 }
 
-/** Request params with message bodies replaced by sizes. */
+/** Items at the head of the request whose digests the trace records. */
+export const TRACE_PREFIX_ITEM_COUNT = 4;
+
+function shortDigest(value: unknown): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+/**
+ * Request params with message bodies replaced by sizes and digests. The
+ * digests of the leading items (instructions, system messages, the first
+ * user message) and of the tool list let two consecutive requests be
+ * compared for cache-prefix stability without persisting any body: a
+ * prompt-cache miss between calls whose prefix digests are identical is the
+ * provider's, one whose digests differ is ours.
+ */
 export function summarizeProviderRequestParams(
   payload: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -110,14 +125,21 @@ export function summarizeProviderRequestParams(
   for (const [key, value] of Object.entries(payload)) {
     if (key in out) continue;
     if (MESSAGE_BODY_KEYS.has(key)) {
-      if (Array.isArray(value)) out[`${key}_items`] = value.length;
+      if (Array.isArray(value)) {
+        out[`${key}_items`] = value.length;
+        out[`${key}_prefix_sha256`] = value
+          .slice(0, TRACE_PREFIX_ITEM_COUNT)
+          .map((item) => shortDigest(item));
+      }
       out[`${key}_chars`] = jsonChars(value);
+      out[`${key}_sha256`] = shortDigest(value);
       continue;
     }
     if (key === "tools") {
       const names = toolNames(value);
       out.tool_count = names.length;
       out.tool_names = names;
+      out.tools_sha256 = shortDigest(value);
       continue;
     }
     out[key] = value;

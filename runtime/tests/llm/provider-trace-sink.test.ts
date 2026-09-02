@@ -193,6 +193,44 @@ describe("provider trace sink", () => {
     });
   });
 
+  test("summarizeProviderRequestParams records prefix and tool digests without bodies", () => {
+    const payload = {
+      model: "grok-4.6",
+      input: [
+        { role: "system", content: "You are the AgenC runtime. SECRET-A" },
+        { role: "developer", content: "memory: SECRET-B" },
+        { role: "user", content: "Add levels" },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "and a banner" },
+      ],
+      tools: [{ type: "function", name: "FileRead" }, { type: "function", name: "Edit" }],
+    };
+    const summary = summarizeProviderRequestParams(payload);
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain("SECRET-A");
+    expect(serialized).not.toContain("SECRET-B");
+    expect(summary.input_items).toBe(5);
+    expect(summary.input_prefix_sha256).toHaveLength(4);
+    expect(typeof summary.input_sha256).toBe("string");
+    expect(typeof summary.tools_sha256).toBe("string");
+
+    // A change in the second item moves only its digest (and the whole-body digest).
+    const changed = summarizeProviderRequestParams({
+      ...payload,
+      input: payload.input.map((item, index) =>
+        index === 1 ? { ...item, content: "memory: recalled today" } : item,
+      ),
+    });
+    const before = summary.input_prefix_sha256 as string[];
+    const after = changed.input_prefix_sha256 as string[];
+    expect(after[0]).toBe(before[0]);
+    expect(after[1]).not.toBe(before[1]);
+    expect(after[2]).toBe(before[2]);
+    expect(after[3]).toBe(before[3]);
+    expect(changed.input_sha256).not.toBe(summary.input_sha256);
+    expect(changed.tools_sha256).toBe(summary.tools_sha256);
+  });
+
   test("summarizeProviderRequestParams reports absent routing fields as null", () => {
     expect(summarizeProviderRequestParams({ model: "grok-4.6", input: [] })).toEqual({
       model: "grok-4.6",
