@@ -312,9 +312,11 @@ otherwise.
 synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
 minutes of provider silence): the runtime warns at half that time and aborts
 the stream with a retryable `stream_idle` error at the deadline. Set it to
-`0` to permit provider silence indefinitely. `[budget]`, `[heartbeat]`,
-`[browser]`, and `[transaction_guard]` apply their documented subsystem
-defaults when absent.
+`0` to permit provider silence indefinitely. It applies to session turns only:
+a one-shot review delegate (`/review`, guardian approval review) carries its
+own deadline, unbounded unless the caller sets one, and is not subject to this
+default. `[budget]`, `[heartbeat]`, `[browser]`, and `[transaction_guard]`
+apply their documented subsystem defaults when absent.
 
 On a keep-alive (interactive) session, hitting `max_turns`,
 `max_budget_usd`, the no-progress backstop, or `compact_failed` ends

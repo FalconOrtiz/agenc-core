@@ -985,7 +985,12 @@ export async function streamModel(
   const configuredWatchdogMs = (() => {
     const services = session.services as {
       configStore?: { current?: () => { stream_watchdog_timeout_ms?: number } };
+      streamIdleWatchdogDisabled?: boolean;
     };
+    // One-shot review delegates carry their own deadline and their own
+    // classification of it; the ambient default must not add a second,
+    // worse-typed one on top. See SessionServices.streamIdleWatchdogDisabled.
+    if (services.streamIdleWatchdogDisabled === true) return undefined;
     try {
       const value =
         services.configStore?.current?.()?.stream_watchdog_timeout_ms;

@@ -643,6 +643,14 @@ function buildChildServices(
     // service would make the child ignore `provider` above and route review
     // traffic through the parent's active model instead.
     providerService: undefined,
+    // A delegate also owns its deadline: `req.timeoutMs` (unbounded when the
+    // caller omits it) aborts with reason `"timeout"` and is classified as the
+    // `timeout` verdict. The ambient stream-idle watchdog would abort the same
+    // turn first with reason `stream_idle`, which reaches the caller as a
+    // generic review failure — the guardian reviewer turns that into a
+    // high-risk denial of the user's tool call. Opt out so a stalled socket
+    // cannot masquerade as a safety verdict.
+    streamIdleWatchdogDisabled: true,
     admissionRequired: parent.services.admissionRequired !== false,
     ...(parent.services.executionAdmission !== undefined
       ? {

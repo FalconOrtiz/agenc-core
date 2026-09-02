@@ -1454,6 +1454,16 @@ export interface SessionServices {
   readonly executionAdmission?: ExecutionAdmissionClient;
   /** Production sessions set this so a missing kernel is a typed hard stop. */
   readonly admissionRequired?: boolean;
+  /**
+   * Set by the one-shot review delegate on its child session. That delegate
+   * owns the review deadline (`AgenCReviewOneShotRequest.timeoutMs`, unbounded
+   * when the caller omits it) and classifies its own expiry as a `timeout`
+   * verdict. The ambient `stream_watchdog_timeout_ms` deadline would pre-empt
+   * that with an untyped `stream_idle` abort, which the guardian reviewer can
+   * only report as a review failure, so the child opts out and the delegate's
+   * deadline stays the single authority over how long a review may run.
+   */
+  readonly streamIdleWatchdogDisabled?: boolean;
   readonly querySource?: QuerySource;
   readonly permissionRequestHooks?: ReadonlyArray<PermissionRequestHook>;
   readonly approvalResolver?: ApprovalResolver;

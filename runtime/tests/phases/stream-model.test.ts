@@ -569,6 +569,77 @@ describe("streamModel — live assistant text sanitization", () => {
     }
   });
 
+  test("a session that owns its own deadline opts out of the ambient watchdog", async () => {
+    // The one-shot review delegate sets `streamIdleWatchdogDisabled` on its
+    // child services because it owns the review deadline
+    // (`AgenCReviewOneShotRequest.timeoutMs`, unbounded when the caller omits
+    // it) and classifies its expiry as a `timeout` verdict. A `stream_idle`
+    // abort on the same turn reaches the caller as an untyped review failure,
+    // which the guardian reviewer can only report as a high-risk denial of the
+    // user's tool call, so the ambient default must not apply there.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const sixHoursMs = 6 * 60 * 60 * 1_000;
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+            setTimeout(
+              () =>
+                resolve({
+                  content: "ok",
+                  toolCalls: [],
+                  usage: {
+                    promptTokens: 1,
+                    completionTokens: 1,
+                    totalTokens: 2,
+                  },
+                  model: "test-model",
+                  finishReason: "stop",
+                }),
+              sixHoursMs,
+            );
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: defaultConfig().stream_watchdog_timeout_ms,
+        }),
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const outcome = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      );
+
+      await vi.advanceTimersByTimeAsync(sixHoursMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+      expect(events.some((event) => event.msg.type === "stream_error")).toBe(
+        false,
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(outcome).resolves.toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("closes thinking blocks left open by a failed attempt before the error propagates", async () => {
     // A retried attempt (reconnect ladder) re-streams reasoning from scratch;
     // without the synthetic block_stop the UI keeps the first attempt's block
