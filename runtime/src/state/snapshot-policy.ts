@@ -19,6 +19,7 @@ import {
   type ToolOutputRotationPolicy,
 } from "./tool-output-rotation.js";
 import { asRecord } from "../utils/record.js";
+import { timed } from "../utils/slow-store-op.js";
 
 export type SnapshotPolicyTrigger =
   | "agent_status"
@@ -1020,16 +1021,18 @@ export class AgenCSessionSnapshotPolicy {
       extras: undefined,
       events: [...state.mcpConnectionState.events],
     });
-    writeSessionSnapshotAtomically(
-      this.#driver,
-      {
-        sessionId: state.sessionId,
-        snapshotAt,
-        conversationJson: JSON.stringify(conversation),
-        toolStateJson: JSON.stringify(toolState),
-        mcpConnectionStateJson: JSON.stringify(mcpConnectionState),
-      },
-      { updateRunLastSnapshotAt: true, replayOnStartup: true },
+    timed("session_snapshot_write", () =>
+      writeSessionSnapshotAtomically(
+        this.#driver,
+        {
+          sessionId: state.sessionId,
+          snapshotAt,
+          conversationJson: JSON.stringify(conversation),
+          toolStateJson: JSON.stringify(toolState),
+          mcpConnectionStateJson: JSON.stringify(mcpConnectionState),
+        },
+        { updateRunLastSnapshotAt: true, replayOnStartup: true },
+      ),
     );
     // Retention runs on every write. The per-session prune is a few indexed
     // statements over at most SESSION_SNAPSHOT_HARD_CAP rows, unlike the

@@ -11,6 +11,7 @@ import {
 import type { BigIntStats } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { timed } from "../utils/slow-store-op.js";
 import type BetterSqlite3 from "better-sqlite3";
 
 import type { AdmissionJournalEvent } from "../budget/admission-types.js";
@@ -291,6 +292,17 @@ export interface CanonicalRolloutScanOptions extends Pick<
  * exact source rows named by those lifecycles and existing retention pins.
  */
 export function scanCanonicalRollout(
+  rolloutPath: string,
+  options: CanonicalRolloutScanOptions,
+): CanonicalRolloutScan {
+  // Every open, compaction attempt and resume re-parses the whole file here
+  // (17,610 lines / 8.6 MB for the measured session), synchronously.
+  return timed("canonical_rollout_scan", () =>
+    scanCanonicalRolloutUntimed(rolloutPath, options),
+  );
+}
+
+function scanCanonicalRolloutUntimed(
   rolloutPath: string,
   options: CanonicalRolloutScanOptions,
 ): CanonicalRolloutScan {

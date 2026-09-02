@@ -16,6 +16,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  statSync,
 } from "node:fs";
 import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, isIP } from "node:net";
@@ -4092,6 +4093,14 @@ async function closeDaemonMcpServerAfterReloadFailure(
   }
 }
 
+function describeFileSizeMb(path: string): string {
+  try {
+    return `${(statSync(path).size / 1_048_576).toFixed(1)} MB`;
+  } catch {
+    return "absent";
+  }
+}
+
 function describeSnapshotRetention(
   retention: AgentRunRetentionConfig | undefined,
 ): string {
@@ -4126,6 +4135,9 @@ function recoverAgenCDaemonStartupState(
     for (const pathSet of paths) {
       const driver = openStateDatabasePaths(pathSet);
       try {
+        log(
+          `daemon opened state DB ${pathSet.stateDbPath} (${describeFileSizeMb(pathSet.stateDbPath)}, wal ${describeFileSizeMb(`${pathSet.stateDbPath}-wal`)})`,
+        );
         const prunedRuns = pruneTerminalAgentRuns(
           driver,
           config.agent?.retention,

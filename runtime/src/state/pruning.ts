@@ -16,6 +16,7 @@ import { agentIdFromThreadSourceJson } from "../thread-store/thread-source.js";
 import { StateRunDurabilityRepository } from "./run-durability.js";
 import { parseRolloutLine } from "../session/rollout-item.js";
 import { SessionLock, SessionLockedError } from "../session/session-store.js";
+import { timed } from "../utils/slow-store-op.js";
 
 const COMPLETED_AGENT_RUN_STATUSES = ["completed", "stopped"] as const;
 const FAILED_AGENT_RUN_STATUSES = ["failed", "error", "errored"] as const;
@@ -171,7 +172,7 @@ export function pruneSessionStateSnapshots(
     return emptySnapshotReport();
   }
 
-  return driver.transaction(() => {
+  return timed("session_snapshot_prune_table", () => driver.transaction(() => {
     const rows = loadSnapshotPruneCandidates(driver, sessionId);
     if (rows.length === 0) return emptySnapshotReport();
 
@@ -209,7 +210,7 @@ export function pruneSessionStateSnapshots(
       prunedSnapshots,
       prunedSessionIds: [...prunedSessionIds].sort(),
     };
-  });
+  }));
 }
 
 /**
@@ -240,7 +241,7 @@ export function pruneSessionSnapshotsForSession(
     retention.maxCount ?? SESSION_SNAPSHOT_HARD_CAP,
   );
   const maxBytes = retention.maxBytes;
-  return driver.transaction(() => {
+  return timed("session_snapshot_prune", () => driver.transaction(() => {
     let prunedSnapshots = driver
       .prepareState<[string, string, number]>(
         `DELETE FROM session_state_snapshots
@@ -299,7 +300,7 @@ export function pruneSessionSnapshotsForSession(
       prunedSnapshots,
       prunedSessionIds: prunedSnapshots > 0 ? [sessionId] : [],
     };
-  });
+  }));
 }
 
 /** Apply {@link pruneSessionSnapshotsForSession} to every session in the table. */

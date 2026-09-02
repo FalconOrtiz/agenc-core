@@ -67,6 +67,7 @@ import {
   writeSync,
   unlinkSync,
 } from "node:fs";
+import { timed } from "../utils/slow-store-op.js";
 import {
   basename,
   dirname,
@@ -1965,6 +1966,24 @@ export class SessionStore {
    * for tests.
    */
   flushBatch(durable: boolean): boolean {
+    // A slow flush (a large batch, or a durable fsync on a busy disk) stalls
+    // the event loop that streams to every client; report it through the
+    // store's diagnostic channel so it lands in the rollout like the I-83
+    // batch-delay warning does.
+    return timed(
+      durable ? "rollout_flush_durable" : "rollout_flush_batch",
+      () => this.flushBatchUntimed(durable),
+      (warning) =>
+        this.emitDiagnostic({
+          at: Date.now(),
+          level: "warning",
+          cause: warning.cause,
+          message: `${warning.label} took ${warning.ms}ms`,
+        }),
+    );
+  }
+
+  private flushBatchUntimed(durable: boolean): boolean {
     if (this.pending.length === 0) {
       this.batchOpenedAtMs = null;
       return true;

@@ -56,6 +56,7 @@ import {
 import { StateThreadRepository } from "../state/threads.js";
 import { backfillRolloutFile } from "../state/backfill.js";
 import { isRecord } from "../utils/record.js";
+import { timed } from "../utils/slow-store-op.js";
 
 // ─────────────────────────────────────────────────────────────────────
 // Params + types — mirrored from agenc runtime `thread-store/src/types.rs`.
@@ -848,28 +849,30 @@ export class FileThreadStore implements ThreadStore {
 
   archiveThread(params: ArchiveThreadParams): void {
     this.assertOpen();
-    this.updateRegistry((registry) => {
-      const existing = registry.get(params.threadId);
-      if (existing === undefined) {
-        throw new ThreadNotFoundError(params.threadId);
-      }
-      if (existing.archivedAt !== undefined) {
-        return; // already archived
-      }
-      const now = new Date().toISOString();
-      this.appendThreadMetadataRollout(existing, {
-        archivedAt: now,
-      });
-      const archivedRolloutPath = this.liveRecorders.has(params.threadId)
-        ? existing.archivedRolloutPath
-        : this.archiveRolloutFile(existing);
-      registry.set(params.threadId, {
-        ...existing,
-        updatedAt: now,
-        archivedAt: now,
-        ...(archivedRolloutPath !== undefined ? { archivedRolloutPath } : {}),
-      });
-    });
+    timed("thread_archive", () =>
+      this.updateRegistry((registry) => {
+        const existing = registry.get(params.threadId);
+        if (existing === undefined) {
+          throw new ThreadNotFoundError(params.threadId);
+        }
+        if (existing.archivedAt !== undefined) {
+          return; // already archived
+        }
+        const now = new Date().toISOString();
+        this.appendThreadMetadataRollout(existing, {
+          archivedAt: now,
+        });
+        const archivedRolloutPath = this.liveRecorders.has(params.threadId)
+          ? existing.archivedRolloutPath
+          : this.archiveRolloutFile(existing);
+        registry.set(params.threadId, {
+          ...existing,
+          updatedAt: now,
+          archivedAt: now,
+          ...(archivedRolloutPath !== undefined ? { archivedRolloutPath } : {}),
+        });
+      }),
+    );
   }
 
   unarchiveThread(params: ArchiveThreadParams): StoredThread {
