@@ -22,7 +22,10 @@ vi.mock("../../utils/settings/settings.js", async (importOriginal) => {
 
 import { getProjectRoot, setProjectRoot } from "../../bootstrap/state.js";
 import { ConfigStore } from "../../config/store.js";
-import { getAttachmentTrackingState } from "../../session/attachment-state.js";
+import {
+  getAttachmentTrackingState,
+  resetRelevantMemoryBudget,
+} from "../../session/attachment-state.js";
 import type {
   AdmittedMemorySelector,
   MemorySelectorRequest,
@@ -235,7 +238,7 @@ describe("relevantMemoriesProducer", () => {
     expect(selectorCall.mock.calls[0]?.[0].recentTools).toEqual(["browser"]);
   });
 
-  test("dedupes memories already surfaced in the session", async () => {
+  test("surfaces a matching memory again on the next request", async () => {
     installMemoryAuthority();
     const memoryDir = join(agencHome, "memory");
     const memoryPath = writeMemory(
@@ -246,12 +249,42 @@ describe("relevantMemoriesProducer", () => {
     );
     selectMemory("browser.md");
     const trackingState = getAttachmentTrackingState({});
-    trackingState.surfacedRelevantMemoryPaths.add(memoryPath);
 
+    // Attachments live only in the request projection, so a memory that
+    // matched the previous request must be shown again, not blocked for the
+    // rest of the session.
+    const first = await relevantMemoriesProducer(makeOpts(), trackingState);
+    const second = await relevantMemoriesProducer(makeOpts(), trackingState);
+
+    for (const out of [first, second]) {
+      expect(out).toMatchObject([
+        { kind: "relevant_memories", memories: [{ path: memoryPath }] },
+      ]);
+    }
+    expect(trackingState.surfacedRelevantMemoryPaths).toEqual(new Set([memoryPath]));
+    expect(trackingState.surfacedRelevantMemoryBytes).toBeGreaterThan(0);
+  });
+
+  test("compaction resets the cumulative recall budget", async () => {
+    installMemoryAuthority();
+    const memoryDir = join(agencHome, "memory");
+    writeMemory(
+      memoryDir,
+      "browser.md",
+      "Browser automation guidance",
+      "Use the browser automation workflow.",
+    );
+    selectMemory("browser.md");
+    const sessionKey = {};
+    const trackingState = getAttachmentTrackingState(sessionKey);
+    trackingState.surfacedRelevantMemoryBytes = 60 * 1_024;
+
+    expect(await relevantMemoriesProducer(makeOpts(), trackingState)).toEqual([]);
+
+    resetRelevantMemoryBudget(sessionKey);
+    expect(trackingState.surfacedRelevantMemoryBytes).toBe(0);
     const out = await relevantMemoriesProducer(makeOpts(), trackingState);
-
-    expect(out).toEqual([]);
-    expect(selectorCall).not.toHaveBeenCalled();
+    expect(out).toHaveLength(1);
   });
 
   test("injects project/CWD-keyed memories on the first turn without a user query", async () => {

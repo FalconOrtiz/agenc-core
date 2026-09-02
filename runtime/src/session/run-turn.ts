@@ -112,7 +112,10 @@ import {
   postSampleRecovery,
 } from "../phases/post-sample-recovery.js";
 import { getAttachments } from "../prompts/attachments/orchestrator.js";
-import { getAttachmentTrackingState } from "./attachment-state.js";
+import {
+  getAttachmentTrackingState,
+  resetRelevantMemoryBudget,
+} from "./attachment-state.js";
 import { claimRequiredSwarmToolChoice } from "../prompts/attachments/swarm-mode.js";
 import {
   frameWorkspaceAgentRoleGuidance,
@@ -2463,6 +2466,9 @@ async function runAutoCompact(
 }
 
 function cleanupSessionAfterCompaction(session: Session): void {
+  // Compaction dropped every recalled memory along with the history it was
+  // attached to, so the cumulative recall budget starts over.
+  resetRelevantMemoryBudget(session);
   const direct = session as unknown as {
     readonly readFileState?: { clear(): void };
     readonly clearSearchIndexes?: () => void;

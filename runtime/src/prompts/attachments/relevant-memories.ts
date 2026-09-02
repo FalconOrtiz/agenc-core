@@ -42,6 +42,11 @@ export const relevantMemoriesProducer: AttachmentProducer = async (
   const query = opts.userInput?.trim() ?? "";
   const mode = selectRecallMode(query, opts.subagentDepth, trackingState);
   if (mode === null) return [];
+  // The attachment lives only in the current request's projection
+  // (`messagesForQuery`), never in durable history, so a memory surfaced on
+  // one turn is gone from the model's context on the next. Dedup therefore
+  // scopes to one request: a memory that matches again is shown again.
+  trackingState.surfacedRelevantMemoryPaths.clear();
   const memoryDirs = durableMemorySearchDirs(opts.agencHome);
   if (memoryDirs.length === 0) return [];
 
