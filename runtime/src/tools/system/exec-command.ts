@@ -34,6 +34,11 @@ import { nonEmptyString as asString } from "../../utils/stringUtils.js";
 import { createToolEffectDispositionEvidence } from "../effect-boundary.js";
 import { readToolRuntimeContext } from "../runtimes/context.js";
 import {
+  execSandboxDenialNotice,
+  sandboxEscalationAvailable,
+} from "./exec-sandbox-denial.js";
+import { parseSandboxPermissionsArgs } from "../../sandbox/escalation/sandboxing.js";
+import {
   permissionProfileForRuntimeContext,
   runtimePlatformSandboxStatus,
   sandboxModeRequiresPlatformIsolation,
@@ -399,24 +404,38 @@ export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
             "Shell executable to run the command through. Defaults to the user's shell.",
         },
         sandbox_permissions: {
-          anyOf: [
-            {
-              type: "string",
-              enum: [
-                "default",
-                "require_escalated",
-                "with_additional_permissions",
-              ],
-            },
-            { type: "object" },
+          // Only the three documented modes. The former `{type:"object"}`
+          // alternative invited a shape no parser accepted, so a model could
+          // send an escalation request that was discarded without a word.
+          type: "string",
+          enum: [
+            "default",
+            "require_escalated",
+            "with_additional_permissions",
           ],
           description:
-            "Sandbox escalation mode or scoped permission request.",
+            "Sandbox escalation mode. Scoped permissions go in additional_permissions.",
         },
         additional_permissions: {
           type: "object",
+          properties: {
+            network: {
+              type: "object",
+              properties: { enabled: { type: "boolean" } },
+              additionalProperties: false,
+            },
+            file_system: {
+              type: "object",
+              properties: {
+                read: { type: "array", items: { type: "string" } },
+                write: { type: "array", items: { type: "string" } },
+              },
+              additionalProperties: false,
+            },
+          },
+          additionalProperties: false,
           description:
-            "Additional permissions field accepted for request shape parity.",
+            "Scoped permissions to request alongside sandbox_permissions \"with_additional_permissions\".",
         },
         justification: {
           type: "string",
@@ -445,6 +464,22 @@ export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
             ),
           };
         }
+      }
+      // An escalation request the runtime cannot parse must be refused, not
+      // dropped: the schema invites an object here, and silently treating an
+      // unknown one as "no escalation requested" left the live incident's
+      // model re-sending the same request twelve times with no sign it had
+      // never been read.
+      const permissionsParse = parseSandboxPermissionsArgs(args);
+      if (permissionsParse.kind === "invalid") {
+        return {
+          content: safeStringify({ error: permissionsParse.reason }),
+          isError: true,
+          effectDisposition: confirmedNoEffectDisposition(
+            "tool:system.exec-command:invalid-input",
+            permissionsParse.reason,
+          ),
+        };
       }
       const cmd = asString(args.cmd);
       if (!cmd) {
@@ -610,8 +645,23 @@ export function createExecCommandTool(config?: ExecCommandToolConfig): Tool {
         const isError =
           (output.exitCode !== null && output.exitCode !== 0) ||
           (output.exitCode === null && !stillAlive);
+        // An OS-level sandbox refusal reaches us only as the child's own
+        // errno text. Say plainly that the sandbox did it and whether
+        // escalation can change the answer, so a denial reads as a verdict
+        // instead of an invitation to retry with a longer timeout.
+        const execContent = formatUnifiedExecToolContent(output);
+        const runtimeContext = readToolRuntimeContext(args);
+        const denial = execSandboxDenialNotice({
+          output: execContent,
+          exitCode: output.exitCode,
+          sandboxApplied: runtimeSandbox !== undefined,
+          escalationAvailable:
+            runtimeContext === undefined ||
+            sandboxEscalationAvailable(runtimeContext.approvalPolicy),
+        });
         return {
-          content: formatUnifiedExecToolContent(output),
+          content:
+            denial === null ? execContent : `${execContent}\n\n${denial.notice}`,
           isError: isError || undefined,
           codeModeResult: unifiedExecCodeModeResult(output),
           effectDisposition: processObservationDisposition(
