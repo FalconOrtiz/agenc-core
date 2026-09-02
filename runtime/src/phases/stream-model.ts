@@ -96,12 +96,12 @@ function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
   supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
 ): WireReasoningEffort | undefined {
-  const requested =
-    turnEffort !== undefined
-      ? turnEffort === "none"
-        ? undefined
-        : turnEffort
-      : effortValueToReasoningEffort(getInitialEffortSetting());
+  let requested: ReasoningEffort | undefined;
+  if (turnEffort === undefined) {
+    requested = effortValueToReasoningEffort(getInitialEffortSetting());
+  } else if (turnEffort !== "none") {
+    requested = turnEffort;
+  }
   if (requested === undefined) return undefined;
   const wire: WireReasoningEffort = requested === "max" ? "xhigh" : requested;
   if (

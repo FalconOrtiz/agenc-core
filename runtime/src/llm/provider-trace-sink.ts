@@ -56,11 +56,19 @@ const MESSAGE_BODY_KEYS: ReadonlySet<string> = new Set([
   "system",
 ]);
 
+function trimUnderscores(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && value[start] === "_") start += 1;
+  while (end > start && value[end - 1] === "_") end -= 1;
+  return value.slice(start, end);
+}
+
 function safeSegment(value: string): string {
   if (value !== "." && value !== ".." && /^[a-zA-Z0-9._-]{1,128}$/.test(value)) {
     return value;
   }
-  const safe = value.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 80);
+  const safe = trimUnderscores(value.replace(/[^a-zA-Z0-9._-]+/g, "_")).slice(0, 80);
   const hash = createHash("sha256").update(value).digest("hex").slice(0, 10);
   return `${safe.length > 0 ? safe : "unknown"}-${hash}`;
 }
@@ -117,23 +125,38 @@ export function summarizeProviderRequestParams(
   return out;
 }
 
-function summarizeProviderResponse(
-  payload: Record<string, unknown>,
-): Record<string, unknown> {
-  const output = Array.isArray(payload.output) ? payload.output : [];
+function messageTextChars(content: unknown): number {
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const part of content) {
+    const text = (part as Record<string, unknown> | null)?.text;
+    if (typeof text === "string") chars += text.length;
+  }
+  return chars;
+}
+
+function summarizeOutputItems(output: readonly unknown[]): {
+  readonly outputTextChars: number;
+  readonly toolCalls: number;
+} {
   let outputTextChars = 0;
   let toolCalls = 0;
   for (const item of output) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
     if (record.type === "function_call") toolCalls += 1;
-    if (record.type === "message" && Array.isArray(record.content)) {
-      for (const part of record.content) {
-        const text = (part as Record<string, unknown> | null)?.text;
-        if (typeof text === "string") outputTextChars += text.length;
-      }
+    if (record.type === "message") {
+      outputTextChars += messageTextChars(record.content);
     }
   }
+  return { outputTextChars, toolCalls };
+}
+
+function summarizeProviderResponse(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  const { outputTextChars, toolCalls } = summarizeOutputItems(output);
   return {
     id: payload.id ?? null,
     status: payload.status ?? null,
@@ -215,9 +238,7 @@ export function createProviderTraceSink(params: {
     if (inFlight === undefined) return;
     if (event.kind === "stream_event") {
       inFlight.streamEvents += 1;
-      if (inFlight.firstStreamEventMs === undefined) {
-        inFlight.firstStreamEventMs = now() - inFlight.startedAtMs;
-      }
+      inFlight.firstStreamEventMs ??= now() - inFlight.startedAtMs;
       return;
     }
     const request = inFlight;

@@ -438,9 +438,9 @@ export function applyEnvOverrides(
     const incremental = readBoolean(e.AGENC_XAI_INCREMENTAL);
     if (incremental !== undefined) {
       override.providers = {
-        ...(override.providers ?? {}),
+        ...override.providers,
         grok: {
-          ...(override.providers?.grok ?? {}),
+          ...override.providers?.grok,
           incremental_continuation: incremental,
         },
       };

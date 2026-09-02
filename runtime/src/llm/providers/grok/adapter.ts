@@ -2301,7 +2301,7 @@ export class GrokProvider implements LLMProvider {
     // message (timestamp, git state) changes every call, so recording it
     // would fail the next request's prefix check at that position and force
     // a full resend; the fresh dynamic tail travels in the delta instead.
-    const trailing = repairedMessages[repairedMessages.length - 1];
+    const trailing = repairedMessages.at(-1);
     const incrementalBaseline =
       this.config.incrementalContinuation === true &&
       dynamicSystemPrompt !== undefined &&
