@@ -122,17 +122,44 @@ function resolveMinEligibleTurns(value: number | undefined): number {
   return Math.max(1, Math.trunc(value ?? DEFAULT_MIN_ELIGIBLE_TURNS));
 }
 
+/**
+ * Eligible turns waiting in a range, counted as the human messages in it.
+ * This is the history-derived twin of `turnsSinceLastExtraction`: the counter
+ * lives in process memory and a daemon restart sets it back to zero, while
+ * the range is recomputed from the conversation and survives.
+ */
+export function eligibleTurnsInRange(
+  unprocessedMessages: readonly LLMMessage[],
+): number {
+  return unprocessedMessages.filter((message) => message.role === "user").length;
+}
+
+/**
+ * Whether to hold this extraction back for the cadence.
+ *
+ * The counter alone was not restart-safe: it lives in the in-process lane
+ * map, so every daemon restart began the wait again. In the live 15-prompt
+ * run three restarts meant the extraction ran once in thirteen turns, each
+ * restart logging "deferred by eligible-turn cadence (1/3 eligible turns)".
+ * The waiting turns are recoverable from the conversation itself, so the
+ * decision now takes whichever is larger: what this process has counted, or
+ * what the unprocessed range shows is already waiting. A fresh session is
+ * unaffected — on its first turn both are 1 — and a resumed session no
+ * longer pays another full cadence before its memory is written.
+ */
 export function shouldDeferForEligibleTurnCadence(params: {
   readonly state: MemoryExtractionTriggerState;
   readonly minEligibleTurns: number | undefined;
   readonly isTrailingRun: boolean;
+  readonly unprocessedEligibleTurns?: number;
 }): boolean {
   if (params.isTrailingRun) return false;
   params.state.turnsSinceLastExtraction += 1;
-  if (
-    params.state.turnsSinceLastExtraction <
-    resolveMinEligibleTurns(params.minEligibleTurns)
-  ) {
+  const waiting = Math.max(
+    params.state.turnsSinceLastExtraction,
+    params.unprocessedEligibleTurns ?? 0,
+  );
+  if (waiting < resolveMinEligibleTurns(params.minEligibleTurns)) {
     return true;
   }
   params.state.turnsSinceLastExtraction = 0;

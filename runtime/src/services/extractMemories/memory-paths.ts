@@ -302,6 +302,31 @@ export async function resolveAutoMemoryDirectory(
   };
 }
 
+/**
+ * The global memory root for these options, or undefined when it cannot be
+ * resolved. Same formula as `src/memory/paths.ts` (`<base>/memory`), computed
+ * here from explicit options rather than ambient session state, which is why
+ * this module keeps its own copy. Deliberately NOT moved by the
+ * project-directory overrides above: a project override redirects that
+ * project's memory, not the machine-wide root the main agent uses.
+ */
+export async function resolveGlobalMemoryDirectory(
+  opts: ResolveAutoMemoryDirectoryOptions = {},
+): Promise<string | undefined> {
+  const runtimeOptions = opts.runtimeOptions ?? getActiveAgentRuntimeOptions();
+  const homeDir = effectiveHome(opts);
+  const remoteMemoryDir = runtimeOptions?.remoteMemoryRoot;
+  const baseRoot =
+    remoteMemoryDir !== undefined && remoteMemoryDir.trim().length > 0
+      ? validateAutoMemoryDirectoryPath(remoteMemoryDir, {
+          expandTilde: false,
+          homeDir,
+        })
+      : normalizeWithTrailingSep(resolveConfigHome(opts));
+  if (!baseRoot) return undefined;
+  return normalizeWithTrailingSep(join(baseRoot, "memory"));
+}
+
 export function isPathInsideMemoryDir(candidate: string, memoryDir: string): boolean {
   const root = normalize(memoryDir);
   const normalizedRoot = root.endsWith(sep) ? root.slice(0, -1) : root;

@@ -24,6 +24,7 @@ function opener(
   newMessageCount: number,
   existingMemories: string,
   memoryDir?: string,
+  globalMemoryDir?: string,
 ): string {
   const manifest =
     existingMemories.trim().length > 0
@@ -34,7 +35,16 @@ function opener(
     "",
     memoryDir === undefined
       ? "Available tools: FileRead, Grep, Glob, and Edit/MultiEdit/Write for paths inside the memory directory only. All other tools will be denied."
-      : `Available tools: FileRead, Grep, Glob, and Edit/MultiEdit/Write for paths inside the memory directory only. The memory directory is ${memoryDir} — read and write only there; any other path and every other tool will be denied.`,
+      : [
+          "Available tools: FileRead, Grep, Glob, and Edit/MultiEdit/Write.",
+          `Write to this project's memory directory only: ${memoryDir}`,
+          ...(globalMemoryDir === undefined
+            ? []
+            : [
+                `You may also READ the shared memory directory ${globalMemoryDir} — check it so you do not duplicate something already recorded there — but you cannot write to it.`,
+              ]),
+          "Any other path and every other tool will be denied.",
+        ].join(" "),
     "",
     "You have a limited turn budget. Edit requires a prior FileRead of the same file, so the efficient strategy is: turn 1 — issue all FileRead calls in parallel for every file you might update; turn 2 — issue all Write/Edit/MultiEdit calls in parallel. Do not interleave reads and writes across multiple turns.",
     "",
@@ -53,6 +63,7 @@ export function buildExtractAutoOnlyPrompt(
   existingMemories: string,
   omitIndexFile = false,
   memoryDir?: string,
+  globalMemoryDir?: string,
 ): string {
   const howToSave = omitIndexFile
     ? [
@@ -84,7 +95,7 @@ export function buildExtractAutoOnlyPrompt(
       ];
 
   return [
-    opener(newMessageCount, existingMemories, memoryDir),
+    opener(newMessageCount, existingMemories, memoryDir, globalMemoryDir),
     "",
     "If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.",
     "",

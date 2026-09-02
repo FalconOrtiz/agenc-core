@@ -43,6 +43,7 @@ import {
   isMemoryExtractionDisabledByEnv,
   memoryExtractionVisibleRange,
   parseMemoryToolArguments,
+  eligibleTurnsInRange,
   shouldDeferForEligibleTurnCadence,
   type MemoryExtractionTriggerState,
 } from "../../memory/extraction-triggers.js";
@@ -55,6 +56,7 @@ import {
   AUTO_MEMORY_INDEX_FILE,
   isPathInsideMemoryDir,
   resolveAutoMemoryDirectory,
+  resolveGlobalMemoryDirectory,
   type AutoMemoryPathResult,
   type MemoryPathEnv,
   type ResolveAutoMemoryDirectoryOptions,
@@ -217,6 +219,37 @@ function memoryRoot(memoryDir: string): string {
   return normalize(memoryDir);
 }
 
+/**
+ * First root that contains `value`, or undefined. Read tools may look in any
+ * memory root the session owns; writes stay in one.
+ */
+function resolveMemoryPathInRoots(
+  value: unknown,
+  roots: readonly string[],
+): string | undefined {
+  for (const root of roots) {
+    const resolved = resolveMemoryPath(value, root);
+    if (resolved) return resolved;
+  }
+  return undefined;
+}
+
+function allowWithMemoryRoots(
+  input: Record<string, unknown>,
+  roots: readonly string[],
+): ReturnType<ChildToolPolicy> {
+  return {
+    behavior: "allow",
+    updatedInput: withSignedAllowedRoots(input, [...roots]),
+  };
+}
+
+function describeRoots(roots: readonly string[]): string {
+  return roots.length === 1
+    ? (roots[0] as string)
+    : `${roots.join(" or ")}`;
+}
+
 function resolveMemoryPath(
   value: unknown,
   memoryDir: string,
@@ -240,28 +273,11 @@ function resolveDirectMemoryWritePath(
   return isPathInsideMemoryDir(candidate, root) ? candidate : null;
 }
 
-function withMemoryAllowedRoot(
-  input: Record<string, unknown>,
-  memoryDir: string,
-): Record<string, unknown> {
-  return withSignedAllowedRoots(input, [memoryDir]);
-}
-
 function deny(message: string, reason: string): ReturnType<ChildToolPolicy> {
   return {
     behavior: "deny",
     message,
     metadata: { reason },
-  };
-}
-
-function allowWithMemoryRoot(
-  input: Record<string, unknown>,
-  memoryDir: string,
-): ReturnType<ChildToolPolicy> {
-  return {
-    behavior: "allow",
-    updatedInput: withMemoryAllowedRoot(input, memoryDir),
   };
 }
 
@@ -282,32 +298,57 @@ function globPatternStaysInsideMemory(
   return isPathInsideMemoryDir(candidate, memoryRoot(memoryDir));
 }
 
-export function createAutoMemoryToolPolicy(memoryDir: string): ChildToolPolicy {
+/**
+ * The child may READ every memory root the session owns and WRITE only to the
+ * project root.
+ *
+ * Reads were single-root, so the child could not open the global
+ * `$AGENC_HOME/memory` index that the main agent reads and writes. Live, it
+ * probed that root, was denied, and the run was recorded as a failed
+ * extraction. The platform already unions both roots for file tools
+ * (`resolveToolAllowedPaths`); only this policy was stricter.
+ *
+ * Writes stay project-scoped on purpose. The child summarizes untrusted
+ * conversation content, and the global root is shared by every project on the
+ * machine: a memory planted there from one conversation would reach every
+ * later session everywhere. Reading it is enough to stop the duplicate writes
+ * that motivated this; extracting `user`-type memories into the global root
+ * needs a routing rule and a narrower writer, which is its own change.
+ */
+export function createAutoMemoryToolPolicy(
+  memoryDir: string,
+  readOnlyRoots: readonly string[] = [],
+): ChildToolPolicy {
+  const writeRoot = memoryDir;
+  const readRoots = [
+    memoryDir,
+    ...readOnlyRoots.filter((root) => memoryRoot(root) !== memoryRoot(memoryDir)),
+  ];
   return (tool, input) => {
     if (tool.name === "FileRead") {
-      const filePath = resolveMemoryPath(input.file_path, memoryDir);
+      const filePath = resolveMemoryPathInRoots(input.file_path, readRoots);
       if (!filePath) {
         return deny(
-          `FileRead is restricted to the memory directory: ${memoryDir}`,
+          `FileRead is restricted to the memory directory: ${describeRoots(readRoots)}`,
           "file_read_outside_memory",
         );
       }
-      return allowWithMemoryRoot({ ...input, file_path: filePath }, memoryDir);
+      return allowWithMemoryRoots({ ...input, file_path: filePath }, readRoots);
     }
 
     if (tool.name === "Grep") {
       const rawPath = input.path ?? input.cwd;
       const path =
         rawPath === undefined
-          ? memoryRoot(memoryDir)
-          : resolveMemoryPath(rawPath, memoryDir);
+          ? memoryRoot(writeRoot)
+          : resolveMemoryPathInRoots(rawPath, readRoots);
       if (!path) {
         return deny(
-          `Grep is restricted to the memory directory: ${memoryDir}`,
+          `Grep is restricted to the memory directory: ${describeRoots(readRoots)}`,
           "grep_outside_memory",
         );
       }
-      return allowWithMemoryRoot({ ...input, path }, memoryDir);
+      return allowWithMemoryRoots({ ...input, path }, readRoots);
     }
 
     if (tool.name === "Glob") {
@@ -315,31 +356,34 @@ export function createAutoMemoryToolPolicy(memoryDir: string): ChildToolPolicy {
       const rawPath = input.path ?? input.cwd;
       const path =
         rawPath === undefined
-          ? memoryRoot(memoryDir)
-          : resolveMemoryPath(rawPath, memoryDir);
+          ? memoryRoot(writeRoot)
+          : resolveMemoryPathInRoots(rawPath, readRoots);
       if (!path) {
         return deny(
-          `Glob is restricted to the memory directory: ${memoryDir}`,
+          `Glob is restricted to the memory directory: ${describeRoots(readRoots)}`,
           "glob_outside_memory",
         );
       }
       if (
         pattern.length > 0 &&
-        !globPatternStaysInsideMemory(pattern, path, memoryDir)
+        !readRoots.some((root) => globPatternStaysInsideMemory(pattern, path, root))
       ) {
         return deny(
-          `Glob is restricted to the memory directory: ${memoryDir}`,
+          `Glob is restricted to the memory directory: ${describeRoots(readRoots)}`,
           "glob_outside_memory",
         );
       }
-      return allowWithMemoryRoot({ ...input, path }, memoryDir);
+      return allowWithMemoryRoots({ ...input, path }, readRoots);
     }
 
     if (WRITE_TOOL_NAMES.has(tool.name)) {
-      const filePath = resolveMemoryPath(input.file_path, memoryDir);
+      const filePath = resolveMemoryPath(input.file_path, writeRoot);
       if (!filePath) {
+        const readable = resolveMemoryPathInRoots(input.file_path, readRoots);
         return deny(
-          `${tool.name} is restricted to the memory directory: ${memoryDir}`,
+          readable
+            ? `${tool.name} may only write to this session's project memory directory: ${writeRoot}. The other memory roots are readable but not writable from memory extraction.`
+            : `${tool.name} is restricted to the memory directory: ${writeRoot}`,
           "write_outside_memory",
         );
       }
@@ -352,7 +396,7 @@ export function createAutoMemoryToolPolicy(memoryDir: string): ChildToolPolicy {
           "secret_in_memory_write",
         );
       }
-      return allowWithMemoryRoot({ ...input, file_path: filePath }, memoryDir);
+      return allowWithMemoryRoots({ ...input, file_path: filePath }, [writeRoot]);
     }
 
     return deny(
@@ -519,6 +563,7 @@ export function initExtractMemories(
     memoryDir: string,
     lane: ExtractionLane,
     isTrailingRun = false,
+    readOnlyMemoryRoots: readonly string[] = [],
   ): Promise<void> {
     const session = queued.context.session;
     const range: VisibleRange = memoryExtractionVisibleRange(
@@ -558,6 +603,8 @@ export function initExtractMemories(
         state: lane.trigger,
         minEligibleTurns: deps.minEligibleTurns,
         isTrailingRun,
+        // Survives a daemon restart, which the in-process counter does not.
+        unprocessedEligibleTurns: eligibleTurnsInRange(range.unprocessedMessages),
       })
     ) {
       emitExtractionWarning(
@@ -580,6 +627,7 @@ export function initExtractMemories(
       existingMemories,
       deps.omitIndexFile ?? false,
       memoryDir,
+      readOnlyMemoryRoots[0],
     );
     const maxTurns = deps.maxTurns ?? DEFAULT_MAX_TURNS;
     const childResult = await (deps.runChild ??
@@ -588,7 +636,7 @@ export function initExtractMemories(
       messages: queued.context.messages,
       prompt,
       memoryDir,
-      toolPolicy: createAutoMemoryToolPolicy(memoryDir),
+      toolPolicy: createAutoMemoryToolPolicy(memoryDir, readOnlyMemoryRoots),
       signal: queued.context.signal,
       onProgress: (event) => tracker.onProgress(event),
     });
@@ -659,6 +707,17 @@ export function initExtractMemories(
       configStore: queued.context.session.services?.configStore,
       runtimeOptions: queued.context.session.services.runtimeOptions,
     });
+    // The main agent reads and writes a machine-wide memory root too. The
+    // child could not open it, so it probed, was denied, and the run was
+    // recorded as a failed extraction. It may read that root to avoid
+    // duplicating what is already there; it still writes only to this
+    // session's project root.
+    const globalMemoryRoot = await resolveGlobalMemoryDirectory({
+      env: deps.env,
+      cwd: queued.context.ctx.cwd,
+      configStore: queued.context.session.services?.configStore,
+      runtimeOptions: queued.context.session.services.runtimeOptions,
+    }).catch(() => undefined);
     if (!pathResult.enabled || !pathResult.path) {
       emitExtractionWarning(
         queued.context.session,
@@ -669,6 +728,8 @@ export function initExtractMemories(
     }
 
     const memoryDir = pathResult.path;
+    const readOnlyMemoryRoots =
+      globalMemoryRoot === undefined ? [] : [globalMemoryRoot];
     const lane = extractionLane(queued.context.session, memoryDir);
 
     if (lane.inProgress) {
@@ -679,7 +740,7 @@ export function initExtractMemories(
     lane.inProgress = true;
     try {
       try {
-        await runExtraction(queued, memoryDir, lane);
+        await runExtraction(queued, memoryDir, lane, false, readOnlyMemoryRoots);
       } catch (error) {
         // Best effort: extraction failures must never break the user turn,
         // but they must not vanish either.
@@ -693,7 +754,7 @@ export function initExtractMemories(
         const trailing = lane.pendingContext;
         lane.pendingContext = undefined;
         try {
-          await runExtraction(trailing, memoryDir, lane, true);
+          await runExtraction(trailing, memoryDir, lane, true, readOnlyMemoryRoots);
         } catch (error) {
           emitExtractionWarning(
             trailing.context.session,
