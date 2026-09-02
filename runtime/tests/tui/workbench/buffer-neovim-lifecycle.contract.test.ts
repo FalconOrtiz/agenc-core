@@ -1066,7 +1066,7 @@ describe("embedded Neovim lifecycle", () => {
     const handle = {
       child,
       pid: syntheticNeovimPid(7841),
-      kill: vi.fn(),
+      kill: fakeSupervisedKill(child),
     };
     const rpc = {
       request: vi.fn(async (method: string) =>
@@ -1097,7 +1097,7 @@ describe("embedded Neovim lifecycle", () => {
     expect(rpc.request).toHaveBeenCalledWith(
       "nvim_exec_lua",
       [expect.stringContaining("silent preserve"), []],
-      { timeoutMs: 5 },
+      { timeoutMs: 5_000 },
     );
     expect(rpc.request).not.toHaveBeenCalledWith("nvim_command", ["qa!"]);
     expect(child.stdin.end).not.toHaveBeenCalled();
@@ -1109,13 +1109,96 @@ describe("embedded Neovim lifecycle", () => {
     );
   });
 
+  it("accepts a late recovery preservation ack after the cleanup exit bound", async () => {
+    mockMissingProcessGroups();
+    const child = fakeChild({ pid: syntheticNeovimPid(7843) });
+    const handle = {
+      child,
+      pid: syntheticNeovimPid(7843),
+      kill: fakeSupervisedKill(child),
+    };
+    const rpc = createDeadlineRpcHarness();
+    const session = new EmbeddedNeovimSession(
+      handle as any,
+      rpc as any,
+      { dispose: vi.fn() } as any,
+      1_000,
+      10_000,
+      null,
+      undefined,
+      2_500,
+    );
+
+    const cleaning = session.cleanup({ preserveRecovery: true });
+    await vi.waitFor(() => {
+      expect(rpc.pendingCount()).toBe(1);
+    });
+    const preserveCall = rpc.request.mock.calls.find(
+      (call) =>
+        call[0] === "nvim_exec_lua" &&
+        typeof call[1]?.[0] === "string" &&
+        call[1][0].includes("silent preserve"),
+    );
+    expect(preserveCall?.[2]).toEqual({ timeoutMs: 2_500 });
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+    expect(rpc.pendingCount()).toBe(1);
+    expect(
+      rpc.reply(1, [
+        {
+          handle: 1,
+          changedtick: 9,
+          end_of_line: true,
+          swap: "/private/swap/late.swp",
+          size: 4096,
+        },
+      ]),
+    ).toBe(true);
+
+    await cleaning;
+    expect(session.recoveryPreservationProven).toBe(true);
+    expect(handle.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(rpc.close).toHaveBeenCalledWith("abnormal session cleanup");
+  });
+
+  it("rejects abnormal cleanup and retains the child when preservation never acks", async () => {
+    mockMissingProcessGroups();
+    const child = fakeChild({ pid: syntheticNeovimPid(7844) });
+    const handle = {
+      child,
+      pid: syntheticNeovimPid(7844),
+      kill: vi.fn(),
+    };
+    const rpc = createDeadlineRpcHarness();
+    const session = new EmbeddedNeovimSession(
+      handle as any,
+      rpc as any,
+      { dispose: vi.fn() } as any,
+      1_000,
+      10_000,
+      null,
+      undefined,
+      40,
+    );
+
+    await expect(session.cleanup({ preserveRecovery: true })).rejects.toThrow(
+      /exact recovery preservation was not confirmed:[\s\S]*nvim_exec_lua#1 timed out after 40ms/u,
+    );
+    expect(session.recoveryPreservationProven).toBe(false);
+    expect(handle.kill).not.toHaveBeenCalled();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(child.stdin.end).not.toHaveBeenCalled();
+    expect(rpc.close).not.toHaveBeenCalled();
+    expect(rpc.reply(1, [{ handle: 1 }])).toBe(false);
+  });
+
   it("leaves the live process intact when abnormal recovery preservation is unproven", async () => {
     mockMissingProcessGroups();
     const child = fakeChild({ pid: syntheticNeovimPid(7842) });
     const handle = {
       child,
       pid: syntheticNeovimPid(7842),
-      kill: vi.fn(),
+      kill: fakeSupervisedKill(child),
     };
     const rpc = {
       request: vi
@@ -1839,6 +1922,22 @@ function fakeChild(options: {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   return child;
+}
+
+/** Supervised kill for contract fakes: drop synthetic pid so Windows skips taskkill. */
+function fakeSupervisedKill(child: {
+  pid?: number;
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  emit: (event: string) => boolean;
+}) {
+  return vi.fn(() => {
+    child.pid = undefined;
+    child.exitCode = 1;
+    child.signalCode = "SIGKILL";
+    child.emit("exit");
+    return true;
+  });
 }
 
 function isProcessAlive(pid: number): boolean {
