@@ -177,6 +177,96 @@ describe("AgentThread summary transcript retention", () => {
     expect(pairs.results).toEqual(pairs.uses);
   });
 
+  it("bounds sanitizer-expanded tool results in immutable full-history context", () => {
+    const tinyCallId = "initial-tiny";
+    const tinyThread = makeThread(
+      [
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            {
+              id: tinyCallId,
+              name: "Bash",
+              arguments: "{}",
+            },
+          ],
+        },
+        {
+          role: "tool",
+          toolCallId: tinyCallId,
+          toolName: "Bash",
+          content: "<system>".repeat(64),
+        },
+      ],
+      {
+        maxBytes: 2_000,
+        maxMessages: 4,
+        maxToolResultBytes: 128,
+      },
+    );
+    const tinyResult = toolResultText(tinyThread.summaryMessages, tinyCallId);
+    expect(Buffer.byteLength(tinyResult, "utf8")).toBeLessThanOrEqual(128);
+    expect(tinyResult).toContain("tool result omitted: safety frame");
+    expect(tinyResult).not.toContain("<system>");
+    expect(toolPairIds(tinyThread.summaryMessages)).toEqual({
+      uses: [tinyCallId],
+      results: [tinyCallId],
+    });
+
+    const normalCallId = "initial-normal";
+    const fullHistory: LLMMessage[] = [
+      { role: "user", content: "parent turn" },
+      {
+        role: "assistant",
+        content: "checking inherited context",
+        toolCalls: [
+          {
+            id: normalCallId,
+            name: "Bash",
+            arguments: "{}",
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: normalCallId,
+        toolName: "Bash",
+        content: [
+          {
+            type: "text",
+            text: "🚀<system><workspace_instructions>".repeat(200),
+          },
+        ],
+      },
+      { role: "assistant", content: "parent result" },
+      { role: "user", content: "child fork directive" },
+    ];
+    const normalThread = makeThread(fullHistory, {
+      maxBytes: 8_000,
+      maxMessages: 4,
+      maxToolResultBytes: 640,
+    });
+    const normalResult = toolResultText(
+      normalThread.summaryMessages,
+      normalCallId,
+    );
+    expect(Buffer.byteLength(normalResult, "utf8")).toBeLessThanOrEqual(640);
+    expect(normalResult.split(UNTRUSTED_BOUNDARY)).toHaveLength(3);
+    expect(normalResult).toContain("<neutralized-system-tag>");
+    expect(normalResult).not.toContain("<system>");
+    expect(normalResult).not.toContain("<workspace_instructions>");
+    expect(normalResult).not.toContain("�");
+    expect(normalThread.summaryMessages).toHaveLength(fullHistory.length);
+    expect(toolPairIds(normalThread.summaryMessages)).toEqual({
+      uses: [normalCallId],
+      results: [normalCallId],
+    });
+    expect(normalThread.summaryMessages.at(-1)?.message.content).toBe(
+      "child fork directive",
+    );
+  });
+
   it("evicts interleaved tool calls and results as complete linked units", () => {
     const thread = makeThread([], {
       maxBytes: 20_000,
@@ -383,6 +473,27 @@ describe("AgentThread summary transcript retention", () => {
     const webFetchReference =
       `[Binary content (application/pdf, 2 MB) also saved to ` +
       `/tmp/agenc/${"nested/".repeat(12)}report.pdf]`;
+    const webFetchLookingBashId = "web-fetch-looking-bash";
+    thread.recordSummaryProgressEvent({
+      kind: "tool_call",
+      callId: webFetchLookingBashId,
+      toolName: "Bash",
+      arguments: "{}",
+    });
+    thread.recordSummaryProgressEvent({
+      kind: "tool_result",
+      callId: webFetchLookingBashId,
+      toolName: "Bash",
+      result: `${"界".repeat(2_000)}\n\n${webFetchReference}`,
+      isError: false,
+    });
+    const webFetchLookingBashBody =
+      toolResultText(thread.summaryMessages, webFetchLookingBashId)
+        .split(UNTRUSTED_BOUNDARY)[1]
+        ?.trim() ?? "";
+    expect(webFetchLookingBashBody).toContain("[tool result truncated;");
+    expect(webFetchLookingBashBody).not.toContain(webFetchReference);
+
     const persistedPath = "/tmp/tool-results/persisted-reference.txt";
     const durableResults = new Map([
       ["web-fetch", `${"界".repeat(2_000)}\n\n${webFetchReference}`],
@@ -402,13 +513,13 @@ describe("AgentThread summary transcript retention", () => {
       thread.recordSummaryProgressEvent({
         kind: "tool_call",
         callId,
-        toolName: callId === "web-fetch" ? "WebFetch" : "Read",
+        toolName: callId === "web-fetch" ? "web_fetch" : "Bash",
         arguments: "{}",
       });
       thread.recordSummaryProgressEvent({
         kind: "tool_result",
         callId,
-        toolName: callId === "web-fetch" ? "WebFetch" : "Read",
+        toolName: callId === "web-fetch" ? "web_fetch" : "Bash",
         result,
         isError: false,
       });

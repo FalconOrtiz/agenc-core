@@ -5,6 +5,7 @@ import {
   llmMessageToAgentSummaryMessage,
   runAgentProgressEventToAgentSummaryMessage,
 } from "./transcript.js";
+import { WEB_FETCH_TOOL_NAME } from "../../tools/WebFetchTool/prompt.js";
 
 export interface AgentSummaryTranscriptLimits {
   /** Maximum JSON-serialized UTF-8 bytes retained for rolling activity. */
@@ -41,6 +42,8 @@ type BoundedRawToolResult = {
   readonly prefix: string;
   readonly reference: string | null;
 };
+
+type ToolResultMessageFactory = (result: string) => Message;
 
 type ToolMessageIds = {
   readonly uses: ReadonlySet<string>;
@@ -178,11 +181,16 @@ function webFetchOutputReference(text: string): string | null {
   );
 }
 
-function durableToolResultReference(text: string): string | null {
+function durableToolResultReference(
+  text: string,
+  producingToolName: string,
+): string | null {
   return (
     persistedOutputReference(text) ??
     offloadedOutputReference(text) ??
-    webFetchOutputReference(text)
+    (producingToolName === WEB_FETCH_TOOL_NAME
+      ? webFetchOutputReference(text)
+      : null)
   );
 }
 
@@ -213,13 +221,14 @@ function composeRawToolResult(
 
 function boundRawToolResult(
   text: string,
+  producingToolName: string,
   maxBytes: number,
 ): BoundedRawToolResult {
   const originalBytes = Buffer.byteLength(text, "utf8");
   return {
     originalBytes,
     prefix: utf8Prefix(text, maxBytes),
-    reference: durableToolResultReference(text),
+    reference: durableToolResultReference(text, producingToolName),
   };
 }
 
@@ -305,16 +314,21 @@ function replaceToolResultText(message: Message, text: string): Message {
 }
 
 function boundedToolResultMessage(
-  event: ToolResultProgressEvent,
-  index: number,
+  sourceResult: string,
+  producingToolName: string,
   maxBytes: number,
+  createMessage: ToolResultMessageFactory,
 ): Message {
-  const bounded = boundRawToolResult(event.result, maxBytes);
-  const rawResult = composeRawToolResult(bounded, maxBytes);
-  const initial = convertedToolResultMessage(event, rawResult, index);
+  const bounded = boundRawToolResult(
+    sourceResult,
+    producingToolName,
+    maxBytes,
+  );
+  const boundedResult = composeRawToolResult(bounded, maxBytes);
+  const initial = createMessage(boundedResult);
   if (toolResultTextBytes(initial) <= maxBytes) return initial;
 
-  const empty = convertedToolResultMessage(event, "", index);
+  const empty = createMessage("");
   if (toolResultTextBytes(empty) > maxBytes) {
     return replaceToolResultText(
       initial,
@@ -328,11 +342,7 @@ function boundedToolResultMessage(
   while (low <= high) {
     const candidateBudget = low + Math.floor((high - low) / 2);
     const candidateResult = composeRawToolResult(bounded, candidateBudget);
-    const candidate = convertedToolResultMessage(
-      event,
-      candidateResult,
-      index,
-    );
+    const candidate = createMessage(candidateResult);
     if (toolResultTextBytes(candidate) <= maxBytes) {
       best = candidate;
       low = candidateBudget + 1;
@@ -343,13 +353,61 @@ function boundedToolResultMessage(
   return best;
 }
 
+function initialToolResultText(message: LLMMessage): string {
+  return typeof message.content === "string"
+    ? message.content
+    : message.content
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n");
+}
+
+function boundedInitialMessage(
+  message: LLMMessage,
+  index: number,
+  maxToolResultBytes: number,
+  toolNamesByCallId: ReadonlyMap<string, string>,
+): Message {
+  if (message.role !== "tool" || !message.toolCallId) {
+    return llmMessageToAgentSummaryMessage(message, index);
+  }
+  const recordedToolName = message.toolName?.trim();
+  const producingToolName =
+    toolNamesByCallId.get(message.toolCallId) ??
+    (recordedToolName && recordedToolName.length > 0
+      ? recordedToolName
+      : "unknown_tool");
+  const normalizedMessage =
+    message.toolName === producingToolName
+      ? message
+      : { ...message, toolName: producingToolName };
+  const rawResult = initialToolResultText(normalizedMessage);
+  return boundedToolResultMessage(
+    rawResult,
+    producingToolName,
+    maxToolResultBytes,
+    (result) =>
+      llmMessageToAgentSummaryMessage(
+        result === rawResult
+          ? normalizedMessage
+          : { ...normalizedMessage, content: result },
+        index,
+      ),
+  );
+}
+
 function boundedProgressMessage(
   event: RunAgentProgressEvent,
   index: number,
   maxToolResultBytes: number,
 ): Message | null {
   return event.kind === "tool_result"
-    ? boundedToolResultMessage(event, index, maxToolResultBytes)
+    ? boundedToolResultMessage(
+        event.result,
+        event.toolName,
+        maxToolResultBytes,
+        (result) => convertedToolResultMessage(event, result, index),
+      )
     : runAgentProgressEventToAgentSummaryMessage(event, index);
 }
 
@@ -397,10 +455,19 @@ export class AgentSummaryTranscript {
     limitOverrides: AgentSummaryTranscriptLimitOverrides = {},
   ) {
     this.limits = resolveLimits(limitOverrides);
+    const toolNamesByCallId = new Map<string, string>();
     this.forkContextMessages = Object.freeze(
-      initialMessages.map((message, index) =>
-        llmMessageToAgentSummaryMessage(message, index),
-      ),
+      initialMessages.map((message, index) => {
+        for (const toolCall of message.toolCalls ?? []) {
+          toolNamesByCallId.set(toolCall.id, toolCall.name);
+        }
+        return boundedInitialMessage(
+          message,
+          index,
+          this.limits.maxToolResultBytes,
+          toolNamesByCallId,
+        );
+      }),
     );
     this.nextMessageIndex = this.forkContextMessages.length;
   }
