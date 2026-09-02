@@ -197,6 +197,22 @@ describe("providers/grok entrypoint", () => {
     );
   });
 
+  test("projects the incrementalContinuation extra onto the adapter config", () => {
+    const provider = createProvider("grok", {
+      apiKey: "test-key",
+      model: "grok-4-fast",
+      extra: { incrementalContinuation: true },
+    });
+    expect(provider).toBeInstanceOf(GrokProvider);
+    expect((provider as any).config.incrementalContinuation).toBe(true);
+
+    const plain = createProvider("grok", {
+      apiKey: "test-key",
+      model: "grok-4-fast",
+    });
+    expect((plain as any).config.incrementalContinuation).toBeUndefined();
+  });
+
   test("prewarms the production Grok client and returns a reusable stream handle", async () => {
     const provider = new GrokProvider({
       apiKey: "test-key",

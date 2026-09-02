@@ -625,6 +625,13 @@ export interface ProviderConfig {
   readonly enable_video_understanding?: boolean;
   readonly collections?: GrokCollectionsConfig;
   readonly remote_mcp?: GrokRemoteMcpConfig;
+  /**
+   * Grok-only opt-in for Responses `previous_response_id` continuation on
+   * streaming turns (`AGENC_XAI_INCREMENTAL=1`). Off by default: with it on,
+   * follow-up requests carry only the items added since the last completed
+   * response instead of re-uploading the full history.
+   */
+  readonly incremental_continuation?: boolean;
 }
 
 /**
@@ -1040,6 +1047,16 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
   "_unknown",
 ]);
 
+/**
+ * Default session stream-idle deadline. xAI streams reasoning deltas
+ * continuously (11,478 thinking deltas in one reviewed session), so ten
+ * minutes of complete provider silence is a dead socket or a stalled stream,
+ * not thinking. The watchdog warns at half this value and the resulting
+ * `stream_idle` abort is retryable through the reconnect ladder. Operators
+ * set `stream_watchdog_timeout_ms = 0` to disable it.
+ */
+export const DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS = 600_000;
+
 export function defaultConfig(): AgenCConfig {
   return Object.freeze({
     configVersion: 2,
@@ -1088,10 +1105,11 @@ export function defaultConfig(): AgenCConfig {
       "pyproject.toml",
     ]) as readonly string[],
     project_doc_max_bytes: 32_768,
-    // No default stream-idle deadline. Providers can remain silent for hours
-    // while reasoning or generating large tool payloads; transport failures
-    // still surface as socket errors. Operators may opt in by setting
-    // stream_watchdog_timeout_ms explicitly.
+    // Ten-minute stream-idle deadline by default (see
+    // DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS). A half-open socket or a stalled
+    // provider stream otherwise hangs the turn until the user cancels;
+    // `0` disables the deadline for operators who need unbounded silence.
+    stream_watchdog_timeout_ms: DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS,
     // No default turn cap. Interactive / long-running agents stop on the
     // model’s own stop signal (or explicit cancel / budget). Operators who
     // want a runaway-loop backstop can set `max_turns` (or its documented env
@@ -1530,6 +1548,7 @@ const PROVIDER_KEYS: ReadonlySet<string> = new Set([
   "enable_video_understanding",
   "collections",
   "remote_mcp",
+  "incremental_continuation",
 ]);
 
 const GROK_CAPABILITY_BOOLEAN_KEYS = Object.freeze([
@@ -1549,6 +1568,7 @@ function validateGrokCapabilities(
     ...GROK_CAPABILITY_BOOLEAN_KEYS,
     "collections",
     "remote_mcp",
+    "incremental_continuation",
   ] as const;
   if (
     providerId !== "grok" &&
@@ -1571,6 +1591,14 @@ function validateGrokCapabilities(
       makeError,
     );
     if (value !== undefined) out[key] = value;
+  }
+  const incrementalContinuation = optionalBoolean(
+    record.incremental_continuation,
+    fieldPath(providerId, "incremental_continuation"),
+    makeError,
+  );
+  if (incrementalContinuation !== undefined) {
+    out.incremental_continuation = incrementalContinuation;
   }
   if (record.collections !== undefined) {
     const field = fieldPath(providerId, "collections");

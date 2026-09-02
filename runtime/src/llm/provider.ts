@@ -131,6 +131,8 @@ export type ProviderRuntimeExtra = Partial<
     readonly azureApiVersion?: string;
   };
   readonly gemini?: GeminiRuntimeOptions;
+  /** Grok-only opt-in for streaming previous_response_id continuation. */
+  readonly incrementalContinuation?: boolean;
   readonly grokAcp?: {
     readonly binaryPath?: string;
     readonly allowPermissions?: boolean;
@@ -1149,6 +1151,9 @@ function readRuntimeExtra(
     ...(readBoolean(extra, "parallelToolCalls") !== undefined
       ? { parallelToolCalls: readBoolean(extra, "parallelToolCalls") }
       : {}),
+    ...(readBoolean(extra, "incrementalContinuation") !== undefined
+      ? { incrementalContinuation: readBoolean(extra, "incrementalContinuation") }
+      : {}),
     ...(readString(extra, "visionModel") !== undefined
       ? { visionModel: readString(extra, "visionModel") }
       : {}),
@@ -1613,6 +1618,9 @@ export function createProvider(
           : {}),
         ...(extra.parallelToolCalls !== undefined
           ? { parallelToolCalls: extra.parallelToolCalls }
+          : {}),
+        ...(extra.incrementalContinuation !== undefined
+          ? { incrementalContinuation: extra.incrementalContinuation }
           : {}),
         ...(extra.visionModel ? { visionModel: extra.visionModel } : {}),
         ...(extra.webSearch !== undefined

@@ -245,7 +245,21 @@ export function sessionConfigurationFromAgenCConfig(params: {
           } as unknown as SessionConfiguration["provider"],
         }
       : {}),
-    collaborationMode: { model: params.model },
+    collaborationMode: {
+      model: params.model,
+      // Seed the session's effort from canonical config so the turn context,
+      // the provider request, and `run_runtime_settings_changed` all report
+      // the configured tier instead of `null` while the wire silently falls
+      // back to a settings read. `max` is the persisted alias of `xhigh`.
+      ...(params.config.reasoning_effort !== undefined
+        ? {
+            reasoningEffort:
+              params.config.reasoning_effort === "max"
+                ? "xhigh"
+                : params.config.reasoning_effort,
+          }
+        : {}),
+    },
     dynamicTools: [],
     sessionSource: "cli_main",
     ...(params.config.approvals_reviewer !== undefined

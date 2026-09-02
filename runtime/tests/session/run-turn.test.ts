@@ -72,6 +72,7 @@ import {
   EDITOR_INTERACTION_MAX_QUERY_TOKENS,
   EDITOR_INTERACTION_MAX_TOOL_CALLS,
   insertContextMessagesAfterLeadingSystem,
+  insertContextMessagesBeforeCurrentUser,
   isRetryableStreamError,
   maybeRunPreviousModelInlineCompact,
   runTurn,
@@ -4736,6 +4737,42 @@ describe("runTurn — model request context ordering", () => {
       { role: "system", content: "base prompt" },
       attachments[0],
       { role: "user", content: "hello" },
+    ]);
+  });
+
+  test("per-turn attachments sit right before the current human message, keeping the history prefix stable", () => {
+    const history: LLMMessage[] = [
+      { role: "system", content: "base prompt" },
+      { role: "user", content: "first request" },
+      { role: "assistant", content: "done", toolCalls: [{ id: "c1", name: "Edit", arguments: "{}" }] },
+      { role: "tool", content: "ok", toolCallId: "c1", toolName: "Edit" },
+      { role: "user", content: "second request" },
+    ];
+    const attachments: LLMMessage[] = [
+      {
+        role: "user",
+        content: "<system-reminder>skills listing</system-reminder>",
+        runtimeOnly: { mergeBoundary: "user_context" },
+      },
+    ];
+    const withAttachments = insertContextMessagesBeforeCurrentUser(history, attachments);
+    expect(withAttachments.slice(0, 4)).toEqual(history.slice(0, 4));
+    expect(withAttachments.slice(4)).toEqual([attachments[0], history[4]]);
+    // A later call of the same turn without the one-shot attachment shares the
+    // first four items with the call that had it.
+    expect(insertContextMessagesBeforeCurrentUser(history, []).slice(0, 4)).toEqual(
+      withAttachments.slice(0, 4),
+    );
+    // No human message: the leading-system placement is kept.
+    expect(
+      insertContextMessagesBeforeCurrentUser(
+        [{ role: "system", content: "base prompt" }, { role: "assistant", content: "hi" }],
+        attachments,
+      ),
+    ).toEqual([
+      { role: "system", content: "base prompt" },
+      attachments[0],
+      { role: "assistant", content: "hi" },
     ]);
   });
 

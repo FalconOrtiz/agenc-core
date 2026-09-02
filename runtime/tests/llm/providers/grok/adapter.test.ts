@@ -1,7 +1,9 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { LLMMessage, LLMTool } from "../../types.js";
-import { GrokProvider } from "./adapter.js";
+import { LLMTimeoutError } from "../../errors.js";
+import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER } from "../../wire/shared.js";
+import { DEFAULT_REQUEST_OPEN_TIMEOUT_MS, GrokProvider } from "./adapter.js";
 
 function buildXaiResponse(id: string, text: string): Record<string, unknown> {
   return {
@@ -863,6 +865,120 @@ describe("GrokProvider incremental continuation", () => {
   });
 });
 
+describe("GrokProvider streaming incremental continuation (AGENC_XAI_INCREMENTAL)", () => {
+  const firstTurn: LLMMessage[] = [{ role: "user", content: "hello" }];
+  const secondTurn: LLMMessage[] = [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi" },
+    { role: "user", content: "follow up" },
+  ];
+  const systemPromptAt = (clock: string): string =>
+    `Static instructions.${SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER}Current time: ${clock}`;
+
+  function streamingProvider(incrementalContinuation: boolean | undefined) {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      emitWarning: (warning) => warnings.push(warning),
+      ...(incrementalContinuation !== undefined
+        ? { incrementalContinuation }
+        : {}),
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    const create = vi.fn((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      const ordinal = requestBodies.length;
+      return withResponse(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse(
+              `resp_${ordinal}`,
+              ordinal === 1 ? "hi" : "done",
+            ),
+          },
+        ]),
+      );
+    });
+    (provider as any).client = { responses: { create } };
+    return { provider, requestBodies, create, warnings };
+  }
+
+  test("the second streaming request carries previous_response_id and only the delta", async () => {
+    const { provider, requestBodies } = streamingProvider(true);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.previous_response_id).toBeUndefined();
+    expect(JSON.stringify(requestBodies[0]?.input)).toContain("Static instructions");
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    const delta = JSON.stringify(requestBodies[1]?.input);
+    // Only the items added since the stored response, plus the fresh dynamic
+    // tail; the static system prompt and the earlier turns live server-side.
+    expect(delta).toContain("follow up");
+    expect(delta).toContain("Current time: one");
+    expect(delta).not.toContain("hello");
+    expect(delta).not.toContain("Static instructions");
+    expect(delta).not.toContain("Current time: noon");
+  });
+
+  test("stays off by default: every streaming request re-sends the full history", async () => {
+    const { provider, requestBodies } = streamingProvider(undefined);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBeUndefined();
+    const full = JSON.stringify(requestBodies[1]?.input);
+    expect(full).toContain("hello");
+    expect(full).toContain("follow up");
+    expect(full).toContain("Static instructions");
+  });
+
+  test("a single-wire attempt that loses its continuation clears the tracker for the next attempt", async () => {
+    const { provider, requestBodies, create, warnings } = streamingProvider(true);
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    expect((provider as any).incrementalTracker.previousResponseId()).toBe("resp_1");
+
+    create.mockImplementationOnce((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      throw Object.assign(new Error("previous response not found"), {
+        status: 404,
+      });
+    });
+
+    await expect(
+      provider.chatStream(secondTurn, () => {}, {
+        systemPrompt: systemPromptAt("one"),
+        singleWireAttempt: true,
+      }),
+    ).rejects.toBeDefined();
+
+    // One rejected wire attempt, no in-band retry, continuation cleared so
+    // the reconnect ladder's next admitted attempt sends full history.
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    expect((provider as any).incrementalTracker.previousResponseId()).toBeUndefined();
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ cause: "previous_response_id_expired" }),
+    );
+  });
+});
+
 describe("GrokProvider stream timeout semantics", () => {
   // Chunks arrive `gapMs` after the previous chunk is consumed, so the
   // stream is never idle for longer than `gapMs` even though its total
@@ -919,6 +1035,91 @@ describe("GrokProvider stream timeout semantics", () => {
         finishReason: "stop",
       });
       expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an unconfigured request whose headers never arrive aborts at the request-open default", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+      });
+      // The SDK request honours the abort signal but never produces headers:
+      // the shape of a half-open TCP connection.
+      const create = vi.fn(
+        (_params: Record<string, unknown>, requestOptions: { signal?: AbortSignal }) =>
+          new Promise<never>((_resolve, reject) => {
+            requestOptions.signal?.addEventListener(
+              "abort",
+              () => reject(requestOptions.signal?.reason ?? new Error("aborted")),
+              { once: true },
+            );
+          }),
+      );
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      let settled = false;
+      const outcome = resultPromise.then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+      void outcome.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_OPEN_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(LLMTimeoutError);
+      expect(error).toMatchObject({ timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS });
+      expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an explicit timeout_ms of 0 keeps the request-open phase unbounded", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+        timeoutMs: 0,
+      });
+      const headersGate = Promise.withResolvers<unknown>();
+      const create = vi.fn(() => headersGate.promise);
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      resultPromise.catch(() => {});
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60_000);
+
+      // A bare promise has no withResponse(); the adapter awaits it and uses
+      // the settled value as the stream itself.
+      headersGate.resolve(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse("resp_unbounded_open", "late but fine"),
+          },
+        ]),
+      );
+      await expect(resultPromise).resolves.toMatchObject({
+        content: "late but fine",
+        finishReason: "stop",
+      });
     } finally {
       vi.useRealTimers();
     }
