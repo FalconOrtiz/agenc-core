@@ -76,6 +76,40 @@ function expectUnframedRuntimeResult(content: unknown, raw: string): void {
   expect(content).toBe(raw);
 }
 
+/**
+ * One registered tool, one call to it, a session over a fresh EventLog whose
+ * warning causes are collected. `run()` executes the batch under
+ * danger_full_access so the tool itself is what the test observes.
+ */
+function singleToolRun(tool: Tool, call: LLMToolCall) {
+  const log = new EventLog();
+  const warnings: string[] = [];
+  log.subscribe((event) => {
+    if (event.msg.type === "warning") warnings.push(event.msg.payload.cause);
+  });
+  const session = mkSession({ log, registry: mkRegistry([tool]) });
+  const state = mkState({ toolCalls: [call] });
+  const emitted = (
+    session as unknown as {
+      _emitted: Array<{
+        msg: { type: string; payload?: Record<string, unknown> };
+      }>;
+    }
+  )._emitted;
+  return {
+    state,
+    session,
+    warnings,
+    emitted,
+    run: () =>
+      executeTools(
+        state,
+        mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
+        session,
+      ),
+  };
+}
+
 function mkCtx(overrides: Record<string, unknown> = {}): TurnContext {
   return {
     subId: "turn-1",
@@ -1112,24 +1146,18 @@ describe("executeTools — T7 gap #109 pipeline", () => {
 
   test("runtime-authored Edit results reach the model unframed", async () => {
     const successText = "The file src/app.ts has been updated successfully.";
-    const editTool: Tool = {
-      name: "Edit",
-      description: "edits a file",
-      inputSchema: { type: "object" },
-      metadata: { family: "filesystem", source: "builtin", mutating: true },
-      execute: async () => ({ content: successText }),
-    };
-    const registry = mkRegistry([editTool]);
-    const session = mkSession({ log: new EventLog(), registry });
-    const state = mkState({
-      toolCalls: [{ id: "edit-1", name: "Edit", arguments: "{}" }],
-    });
-
-    await executeTools(
-      state,
-      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
-      session,
+    const { state, run } = singleToolRun(
+      {
+        name: "Edit",
+        description: "edits a file",
+        inputSchema: { type: "object" },
+        metadata: { family: "filesystem", source: "builtin", mutating: true },
+        execute: async () => ({ content: successText }),
+      },
+      { id: "edit-1", name: "Edit", arguments: "{}" },
     );
+
+    await run();
 
     expect(state.messages).toHaveLength(1);
     // Exact model-facing content: no provenance line, no boundary marker.
@@ -1142,27 +1170,20 @@ describe("executeTools — T7 gap #109 pipeline", () => {
     const denial =
       '{"error":"file_path is outside allowed directories: /root/memory/style.md"}';
     let executed = 0;
-    const writeTool: Tool = {
-      name: "Write",
-      description: "writes a file",
-      inputSchema: { type: "object" },
-      metadata: { family: "filesystem", source: "builtin", mutating: true },
-      execute: async () => {
-        executed += 1;
-        return { content: denial, isError: true };
-      },
-    };
-    const registry = mkRegistry([writeTool]);
-    const log = new EventLog();
-    const warnings: string[] = [];
-    log.subscribe((event) => {
-      if (event.msg.type === "warning") warnings.push(event.msg.payload.cause);
-    });
-    const session = mkSession({ log, registry });
     const args = JSON.stringify({ file_path: "/root/memory/style.md", content: "x" });
-    const state = mkState({
-      toolCalls: [{ id: "write-4", name: "Write", arguments: args }],
-    });
+    const { state, warnings, emitted, run } = singleToolRun(
+      {
+        name: "Write",
+        description: "writes a file",
+        inputSchema: { type: "object" },
+        metadata: { family: "filesystem", source: "builtin", mutating: true },
+        execute: async () => {
+          executed += 1;
+          return { content: denial, isError: true };
+        },
+      },
+      { id: "write-4", name: "Write", arguments: args },
+    );
     // Three earlier rounds of this turn already failed identically.
     state.completedToolResults = [1, 2, 3].map((n) => ({
       callId: `write-${n}`,
@@ -1172,11 +1193,7 @@ describe("executeTools — T7 gap #109 pipeline", () => {
       isError: true,
     }));
 
-    await executeTools(
-      state,
-      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
-      session,
-    );
+    await run();
 
     expect(executed).toBe(0);
     expect(state.messages).toHaveLength(1);
@@ -1185,13 +1202,6 @@ describe("executeTools — T7 gap #109 pipeline", () => {
     );
     expect(state.messages[0]?.content).toContain("stop retrying");
     expect(warnings).toContain("repeated_failing_call_blocked");
-    const emitted = (
-      session as unknown as {
-        _emitted: Array<{
-          msg: { type: string; payload?: { callId?: string } };
-        }>;
-      }
-    )._emitted;
     // Started/completed events still pair up for the refused call.
     expect(
       emitted.filter(
@@ -1208,23 +1218,21 @@ describe("executeTools — T7 gap #109 pipeline", () => {
 
   test("identical calls that keep succeeding are never refused", async () => {
     let executed = 0;
-    const readTool: Tool = {
-      name: "FileRead",
-      description: "reads a file",
-      inputSchema: { type: "object" },
-      metadata: { family: "filesystem", source: "builtin" },
-      isReadOnly: true,
-      execute: async () => {
-        executed += 1;
-        return { content: "1\tconst a = 1;" };
-      },
-    };
-    const registry = mkRegistry([readTool]);
-    const session = mkSession({ log: new EventLog(), registry });
     const args = JSON.stringify({ file_path: "src/app.ts" });
-    const state = mkState({
-      toolCalls: [{ id: "read-4", name: "FileRead", arguments: args }],
-    });
+    const { state, run } = singleToolRun(
+      {
+        name: "FileRead",
+        description: "reads a file",
+        inputSchema: { type: "object" },
+        metadata: { family: "filesystem", source: "builtin" },
+        isReadOnly: true,
+        execute: async () => {
+          executed += 1;
+          return { content: "1\tconst a = 1;" };
+        },
+      },
+      { id: "read-4", name: "FileRead", arguments: args },
+    );
     state.completedToolResults = [1, 2, 3].map((n) => ({
       callId: `read-${n}`,
       toolName: "FileRead",
@@ -1233,47 +1241,30 @@ describe("executeTools — T7 gap #109 pipeline", () => {
       isError: false,
     }));
 
-    await executeTools(
-      state,
-      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
-      session,
-    );
+    await run();
 
     expect(executed).toBe(1);
     expect(state.preventContinuation).toBe(false);
   });
 
   test("tool_call_completed carries the measured execution duration", async () => {
-    const tool: Tool = {
-      name: "FileRead",
-      description: "reads a file slowly",
-      inputSchema: { type: "object" },
-      metadata: { family: "filesystem", source: "builtin" },
-      isReadOnly: true,
-      execute: async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 12));
-        return { content: "body" };
+    const { emitted, run } = singleToolRun(
+      {
+        name: "FileRead",
+        description: "reads a file slowly",
+        inputSchema: { type: "object" },
+        metadata: { family: "filesystem", source: "builtin" },
+        isReadOnly: true,
+        execute: async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 12));
+          return { content: "body" };
+        },
       },
-    };
-    const registry = mkRegistry([tool]);
-    const session = mkSession({ log: new EventLog(), registry });
-    const state = mkState({
-      toolCalls: [{ id: "timed-1", name: "FileRead", arguments: "{}" }],
-    });
-
-    await executeTools(
-      state,
-      mkCtx({ sandboxPolicy: { value: "danger_full_access" } }),
-      session,
+      { id: "timed-1", name: "FileRead", arguments: "{}" },
     );
 
-    const emitted = (
-      session as unknown as {
-        _emitted: Array<{
-          msg: { type: string; payload?: { durationMs?: unknown } };
-        }>;
-      }
-    )._emitted;
+    await run();
+
     const completed = emitted.find(
       (event) => event.msg.type === "tool_call_completed",
     );

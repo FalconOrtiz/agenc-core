@@ -22,6 +22,12 @@ import type { Tool } from "../../src/tools/types.js";
 import { attachPendingPhysicalSettlement } from "../../src/tools/physical-settlement.js";
 import { createFileEditTool } from "../../src/tools/system/file-edit.js";
 
+const zeroAdmissionEstimate = () => ({
+  maxInputTokens: 0,
+  maxOutputTokens: 0,
+  maxCostUsd: 0,
+});
+
 function toolHarness() {
   const leaseController = new AbortController();
   const acquire = vi.fn(
@@ -697,11 +703,7 @@ describe("runAdmittedToolCall", () => {
         callId: "call-edit-miss",
         tool: {
           ...editTool,
-          admissionEstimate: () => ({
-            maxInputTokens: 0,
-            maxOutputTokens: 0,
-            maxCostUsd: 0,
-          }),
+          admissionEstimate: zeroAdmissionEstimate,
         } as unknown as Tool,
         args: {},
         invoke: async ({ crossEffectBoundary }) => {
@@ -736,11 +738,7 @@ describe("runAdmittedToolCall", () => {
           tool: {
             name: "write.follow-up",
             recoveryCategory: "side-effecting",
-            admissionEstimate: () => ({
-              maxInputTokens: 0,
-              maxOutputTokens: 0,
-              maxCostUsd: 0,
-            }),
+            admissionEstimate: zeroAdmissionEstimate,
           } as unknown as Tool,
           args: {},
           invoke: async ({ crossEffectBoundary }) => {

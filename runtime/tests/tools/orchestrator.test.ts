@@ -1219,26 +1219,35 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     expect(guardian.reviewApprovalRequest).toHaveBeenCalledOnce();
   });
 
-  test("resolver denial names the tool, forbids a retry, and records its source", async () => {
-    const resolver: ApprovalResolver = {
-      request: async () => ({ kind: "denied" }),
-    };
-    const dispatched = vi.fn(async () => "ok");
+  /** Run the call, expect an ApprovalRejectedError with a denied decision. */
+  async function deniedCall(
+    opts: Partial<Parameters<typeof orchestrateToolCall<string>>[0]>,
+  ): Promise<ApprovalRejectedError> {
     const rejection = await orchestrateToolCall<string>({
-      tool: mkTool({ requiresApproval: true }),
+      tool: mkTool(),
       approvalCtx: mkCtx(),
       approvalPolicy: "on_request",
       sandboxMode: "workspace_write",
-      dispatch: dispatched,
-      approvalResolver: resolver,
+      dispatch: async () => "ok",
+      ...opts,
     }).then(
       () => undefined,
       (err: unknown) => err,
     );
-
     expect(rejection).toBeInstanceOf(ApprovalRejectedError);
     const error = rejection as ApprovalRejectedError;
     expect(error.decision).toEqual({ kind: "denied" });
+    return error;
+  }
+
+  test("resolver denial names the tool, forbids a retry, and records its source", async () => {
+    const dispatched = vi.fn(async () => "ok");
+    const error = await deniedCall({
+      tool: mkTool({ requiresApproval: true }),
+      dispatch: dispatched,
+      approvalResolver: { request: async () => ({ kind: "denied" }) },
+    });
+
     expect(error.source).toBe("resolver");
     expect(error.message).toBe(
       "Permission denied: test.cmd was denied by this session's approval resolver. Do not retry the same call; choose a different approach or ask the user how to proceed.",
@@ -1248,20 +1257,8 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
   });
 
   test("default denial says the tool is not permitted in this session", async () => {
-    const rejection = await orchestrateToolCall<string>({
-      tool: mkTool(),
-      approvalCtx: mkCtx(),
-      approvalPolicy: "untrusted",
-      sandboxMode: "workspace_write",
-      dispatch: async () => "ok",
-    }).then(
-      () => undefined,
-      (err: unknown) => err,
-    );
+    const error = await deniedCall({ approvalPolicy: "untrusted" });
 
-    expect(rejection).toBeInstanceOf(ApprovalRejectedError);
-    const error = rejection as ApprovalRejectedError;
-    expect(error.decision).toEqual({ kind: "denied" });
     expect(error.source).toBe("default_deny");
     expect(error.message).toBe(
       "Not permitted: test.cmd cannot run in this session because no approval resolver is available to allow it. Do not retry this call; use a different tool or ask the user.",

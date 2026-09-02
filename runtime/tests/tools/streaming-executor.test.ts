@@ -119,6 +119,58 @@ function testTool(overrides: Partial<Tool> & { name: string }): Tool {
   };
 }
 
+interface DrainedResult {
+  readonly id: string;
+  readonly status: string;
+  readonly content: string;
+  readonly durationMs: number;
+}
+
+/** Drain every remaining result into a flat, easily asserted shape. */
+async function drainResults(
+  exec: StreamingToolExecutor,
+): Promise<DrainedResult[]> {
+  const results: DrainedResult[] = [];
+  for await (const r of exec.getRemainingResults()) {
+    results.push({
+      id: r.toolCall.id,
+      status: r.status,
+      content: String(r.result.content),
+      durationMs: r.durationMs,
+    });
+  }
+  return results;
+}
+
+/**
+ * Executor whose exec_command calls fail with exit 1 and whose other calls
+ * succeed with `read <id>`, recording dispatch order and sibling-abort
+ * warnings. Shared by the sibling-cascade ordering tests.
+ */
+function shellErrorExecutor(): {
+  readonly exec: StreamingToolExecutor;
+  readonly dispatched: string[];
+  readonly siblingReasons: string[];
+} {
+  const dispatched: string[] = [];
+  const siblingReasons: string[] = [];
+  const exec = new StreamingToolExecutor({
+    ...mockGuardedDispatch(async (call) => {
+      dispatched.push(call.id);
+      if (call.name === "exec_command") {
+        return { content: "exit 1", isError: true };
+      }
+      return { content: `read ${call.id}` };
+    }),
+    onSiblingAbort: (reason) => {
+      siblingReasons.push(reason);
+    },
+  });
+  exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+  exec.setConcurrencyClassFor("FileRead", SHARED_READ);
+  return { exec, dispatched, siblingReasons };
+}
+
 describe("StreamingToolExecutor (I-65 + I-41)", () => {
   test("completes in submission order (I-65)", async () => {
     const exec = new StreamingToolExecutor({
@@ -241,10 +293,9 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
     exec.addTool(makeBlock("fast", "FileRead"), makeCall("fast", "FileRead"));
     exec.close();
 
-    const durations = new Map<string, number>();
-    for await (const r of exec.getRemainingResults()) {
-      durations.set(r.toolCall.id, r.durationMs);
-    }
+    const durations = new Map(
+      (await drainResults(exec)).map((r) => [r.id, r.durationMs] as const),
+    );
 
     expect(durations.get("slow")).toBeGreaterThanOrEqual(10);
     expect(Number.isFinite(durations.get("fast"))).toBe(true);
@@ -254,47 +305,23 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
   });
 
   test("a single failing Bash call neither warns nor cascades", async () => {
-    const siblingReasons: string[] = [];
-    const exec = new StreamingToolExecutor({
-      ...mockGuardedDispatch(async () => ({
-        content: "exit 1",
-        isError: true,
-      })),
-      onSiblingAbort: (reason) => {
-        siblingReasons.push(reason);
-      },
-    });
-    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+    const { exec, siblingReasons } = shellErrorExecutor();
     exec.addTool(
       makeBlock("shell1", "exec_command"),
       makeCall("shell1", "exec_command"),
     );
     exec.close();
 
-    const results = [];
-    for await (const r of exec.getRemainingResults()) {
-      results.push({ id: r.toolCall.id, status: r.status });
-    }
+    const results = await drainResults(exec);
 
-    expect(results).toEqual([{ id: "shell1", status: "completed" }]);
+    expect(results.map((r) => [r.id, r.status])).toEqual([
+      ["shell1", "completed"],
+    ]);
     expect(siblingReasons).toEqual([]);
   });
 
   test("[FileRead, bash(error)]: a read that already finished is not cancelled", async () => {
-    const siblingReasons: string[] = [];
-    const exec = new StreamingToolExecutor({
-      ...mockGuardedDispatch(async (call) => {
-        if (call.name === "exec_command") {
-          return { content: "exit 1", isError: true };
-        }
-        return { content: `read ${call.id}` };
-      }),
-      onSiblingAbort: (reason) => {
-        siblingReasons.push(reason);
-      },
-    });
-    exec.setConcurrencyClassFor("FileRead", SHARED_READ);
-    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
+    const { exec, siblingReasons } = shellErrorExecutor();
     exec.addTool(makeBlock("read1", "FileRead"), makeCall("read1", "FileRead"));
     exec.addTool(
       makeBlock("shell1", "exec_command"),
@@ -302,43 +329,17 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
     );
     exec.close();
 
-    const results: Array<{
-      readonly id: string;
-      readonly status: string;
-      readonly content: string;
-    }> = [];
-    for await (const r of exec.getRemainingResults()) {
-      results.push({
-        id: r.toolCall.id,
-        status: r.status,
-        content: String(r.result.content),
-      });
-    }
+    const results = await drainResults(exec);
 
-    expect(results).toEqual([
-      { id: "read1", status: "completed", content: "read read1" },
-      { id: "shell1", status: "completed", content: "exit 1" },
+    expect(results.map((r) => [r.id, r.status, r.content])).toEqual([
+      ["read1", "completed", "read read1"],
+      ["shell1", "completed", "exit 1"],
     ]);
     expect(siblingReasons).toEqual([]);
   });
 
   test("[bash(error), FileRead]: a still-queued read is cancelled and warns once", async () => {
-    const dispatched: string[] = [];
-    const siblingReasons: string[] = [];
-    const exec = new StreamingToolExecutor({
-      ...mockGuardedDispatch(async (call) => {
-        dispatched.push(call.id);
-        if (call.name === "exec_command") {
-          return { content: "exit 1", isError: true };
-        }
-        return { content: `read ${call.id}` };
-      }),
-      onSiblingAbort: (reason) => {
-        siblingReasons.push(reason);
-      },
-    });
-    exec.setConcurrencyClassFor("exec_command", EXCLUSIVE);
-    exec.setConcurrencyClassFor("FileRead", SHARED_READ);
+    const { exec, dispatched, siblingReasons } = shellErrorExecutor();
     exec.addTool(
       makeBlock("shell1", "exec_command"),
       makeCall("shell1", "exec_command"),
@@ -346,18 +347,7 @@ describe("StreamingToolExecutor (I-65 + I-41)", () => {
     exec.addTool(makeBlock("read1", "FileRead"), makeCall("read1", "FileRead"));
     exec.close();
 
-    const results: Array<{
-      readonly id: string;
-      readonly status: string;
-      readonly content: string;
-    }> = [];
-    for await (const r of exec.getRemainingResults()) {
-      results.push({
-        id: r.toolCall.id,
-        status: r.status,
-        content: String(r.result.content),
-      });
-    }
+    const results = await drainResults(exec);
 
     expect(dispatched).toEqual(["shell1"]);
     expect(siblingReasons).toEqual(["bash_error:exec_command"]);
