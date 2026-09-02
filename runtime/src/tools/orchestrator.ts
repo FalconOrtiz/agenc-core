@@ -485,17 +485,19 @@ export class ApprovalRejectedError extends Error {
 }
 
 /**
- * True for a denial that no reviewer explained and that the model must not
- * retry: the approval resolver said no, or no resolver exists at all. Such
- * results also stop the turn so the model cannot loop on the same call.
+ * True for a resolver denial: the session's approval resolver (a live
+ * prompt or an automated policy) said no. Such results end the turn after
+ * the batch so the model cannot loop on the same call, the way a user
+ * rejection does in the reference harness.
+ *
+ * A default denial (no resolver exists at all) is deliberately excluded:
+ * nobody could ever approve, so ending the turn would only cut off the
+ * model's text answer. A resolver-less subagent must still be able to
+ * report that the tool is not permitted and finish; its message already
+ * says not to retry, and the identical-failing-call guard stops any loop.
  */
-export function isNonRetryableApprovalDenial(
-  err: ApprovalRejectedError,
-): boolean {
-  return (
-    err.decision.kind === "denied" &&
-    (err.source === "resolver" || err.source === "default_deny")
-  );
+export function approvalDenialEndsTurn(err: ApprovalRejectedError): boolean {
+  return err.decision.kind === "denied" && err.source === "resolver";
 }
 
 function resolveApprovalSignal(

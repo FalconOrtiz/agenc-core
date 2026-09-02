@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   ApprovalRejectedError,
-  isNonRetryableApprovalDenial,
+  approvalDenialEndsTurn,
   SandboxDeniedError,
   attemptWithRetry,
   classifyToolApproval,
@@ -1243,7 +1243,7 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     expect(error.message).toBe(
       "Permission denied: test.cmd was denied by this session's approval resolver. Do not retry the same call; choose a different approach or ask the user how to proceed.",
     );
-    expect(isNonRetryableApprovalDenial(error)).toBe(true);
+    expect(approvalDenialEndsTurn(error)).toBe(true);
     expect(dispatched).not.toHaveBeenCalled();
   });
 
@@ -1266,7 +1266,9 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     expect(error.message).toBe(
       "Not permitted: test.cmd cannot run in this session because no approval resolver is available to allow it. Do not retry this call; use a different tool or ask the user.",
     );
-    expect(isNonRetryableApprovalDenial(error)).toBe(true);
+    // No resolver means nobody could ever approve: the model keeps the turn
+    // so it can report the denial instead of being cut off.
+    expect(approvalDenialEndsTurn(error)).toBe(false);
   });
 
   test("needs_approval path: no resolver + no hook → default-deny (ApprovalRejectedError)", async () => {

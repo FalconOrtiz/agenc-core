@@ -71,7 +71,7 @@ import {
 } from "../../recovery/terminal-tool-result.js";
 import {
   ApprovalRejectedError,
-  isNonRetryableApprovalDenial,
+  approvalDenialEndsTurn,
   orchestrateToolCall,
   type ApprovalPolicy,
   type ApprovalResolver,
@@ -458,7 +458,7 @@ function approvalRejectedResult(err: ApprovalRejectedError): ToolDispatchResultL
       approvalDecision: decision,
     }),
     isError: true,
-    ...(isNonRetryableApprovalDenial(err) ? { preventContinuation: true } : {}),
+    ...(approvalDenialEndsTurn(err) ? { preventContinuation: true } : {}),
   };
 }
 
