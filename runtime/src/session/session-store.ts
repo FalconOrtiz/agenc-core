@@ -1967,19 +1967,23 @@ export class SessionStore {
    */
   flushBatch(durable: boolean): boolean {
     // A slow flush (a large batch, or a durable fsync on a busy disk) stalls
-    // the event loop that streams to every client; report it through the
-    // store's diagnostic channel so it lands in the rollout like the I-83
-    // batch-delay warning does.
+    // the event loop that streams to every client, so it is worth reporting.
+    // It must NOT go through this store's diagnostic channel:
+    // `mountRolloutStore` turns every diagnostic into `session.emit`, which
+    // allocates a live event sequence and appends a warning to the very
+    // rollout being flushed. Two
+    // consequences, both observed: the canonical journal's contents become a
+    // function of how long one fsync took, so a resumed session can fail its
+    // startup scan with "canonical journal repeats its preceding event
+    // sequence"; and the warning is itself appended and flushed, so a disk slow
+    // enough to cross the threshold keeps crossing it, writing more each time.
+    // Timing evidence belongs in the process-wide slow-op sink (the daemon's
+    // rotating daemon.log), which is where every other `timed` call site sends
+    // it. The I-83 batch-delay warning stays a journal event: it records a
+    // suspend/resume gap in the session itself, not the speed of a write.
     return timed(
       durable ? "rollout_flush_durable" : "rollout_flush_batch",
       () => this.flushBatchUntimed(durable),
-      (warning) =>
-        this.emitDiagnostic({
-          at: Date.now(),
-          level: "warning",
-          cause: warning.cause,
-          message: `${warning.label} took ${warning.ms}ms`,
-        }),
     );
   }
 
