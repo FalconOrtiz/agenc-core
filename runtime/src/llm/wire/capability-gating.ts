@@ -43,11 +43,16 @@ export interface ChatCompletionsCapabilityHints {
    */
   readonly reasoningEffortAllowedValues?: ReadonlySet<string>;
   /**
-   * Replacement for `tool_choice: "required"` when a compatible provider
-   * rejects that mode. `auto` preserves tool availability without emitting a
-   * request value the destination cannot parse.
+   * Restricts explicit tool-choice values to `auto`. Requests for `required`
+   * or a named function are downgraded to `auto`; `none` preserves its
+   * no-tools semantics by omitting both `tools` and `tool_choice`.
    */
-  readonly requiredToolChoiceFallback?: "auto";
+  readonly toolChoicePolicy?: "auto_only";
+  /**
+   * If `false`, caller-supplied stop sequences are omitted. Some compatible
+   * APIs reject the otherwise-standard `stop` request field.
+   */
+  readonly acceptsStopSequences?: boolean;
   /**
    * If `false`, `service_tier` is stripped. The field is recognized
    * only on a single upstream provider; non-matching providers
@@ -308,7 +313,8 @@ export function chatCompletionsCapabilityHintsForProvider(
     ...(reasoningEffortAllowedValues !== undefined
       ? { reasoningEffortAllowedValues }
       : {}),
-    ...(slug === "meta" ? { requiredToolChoiceFallback: "auto" as const } : {}),
+    ...(slug === "meta" ? { toolChoicePolicy: "auto_only" as const } : {}),
+    acceptsStopSequences: slug !== "meta",
     acceptsServiceTier,
     acceptsStreamUsage,
     requiresGrammarSafeToolSchemas,

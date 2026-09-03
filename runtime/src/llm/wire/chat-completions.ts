@@ -172,18 +172,22 @@ export function buildChatCompletionsRequest(
     [maxTokenField]: maxTokens,
   };
 
-  const tools = toChatCompletionsTools(input.tools, {
-    grammarSafe:
-      input.providerCapabilityHints?.requiresGrammarSafeToolSchemas === true,
-  });
+  const requestedToolChoice = input.options?.toolChoice;
+  const autoOnlyToolChoice =
+    input.providerCapabilityHints?.toolChoicePolicy === "auto_only";
+  const omitToolsForChoice =
+    autoOnlyToolChoice && requestedToolChoice === "none";
+  const tools = omitToolsForChoice
+    ? []
+    : toChatCompletionsTools(input.tools, {
+      grammarSafe:
+        input.providerCapabilityHints?.requiresGrammarSafeToolSchemas === true,
+    });
   if (tools.length > 0) body.tools = tools;
-  if (input.options?.toolChoice !== undefined) {
-    const requestedToolChoice = input.options.toolChoice;
-    body.tool_choice =
-      requestedToolChoice === "required" &&
-      input.providerCapabilityHints?.requiredToolChoiceFallback !== undefined
-        ? input.providerCapabilityHints.requiredToolChoiceFallback
-        : parseOpenAIToolChoice(requestedToolChoice);
+  if (requestedToolChoice !== undefined && !omitToolsForChoice) {
+    body.tool_choice = autoOnlyToolChoice
+      ? "auto"
+      : parseOpenAIToolChoice(requestedToolChoice);
   }
   if (input.options?.parallelToolCalls !== undefined) {
     body.parallel_tool_calls = input.options.parallelToolCalls;
@@ -193,7 +197,8 @@ export function buildChatCompletionsRequest(
   }
   if (
     input.options?.stopSequences !== undefined &&
-    input.options.stopSequences.length > 0
+    input.options.stopSequences.length > 0 &&
+    input.providerCapabilityHints?.acceptsStopSequences !== false
   ) {
     body.stop = [...input.options.stopSequences];
   }

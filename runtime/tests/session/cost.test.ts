@@ -10,7 +10,10 @@ import {
   formatDuration,
   registerCostSummaryOnExit,
 } from "./cost.js";
-import { BUILT_IN_PROVIDER_DEFAULT_MODELS } from "../config/resolve-provider.js";
+import {
+  BUILT_IN_PROVIDER_DEFAULT_MODELS,
+  BUILT_IN_PROVIDER_MODEL_CATALOG,
+} from "../config/resolve-provider.js";
 
 const ZERO_COST_DEFAULT_PROVIDERS = new Set([
   "lmstudio",
@@ -200,10 +203,14 @@ describe("cost helpers", () => {
     expect(resolution.costUsd).toBeCloseTo(0.175, 6);
   });
 
-  test("built-in provider default models resolve as known costs", () => {
+  test("built-in provider defaults with authoritative pricing resolve as known costs", () => {
     for (const [provider, model] of Object.entries(
       BUILT_IN_PROVIDER_DEFAULT_MODELS,
     )) {
+      // Meta does not publish an authoritative per-token price for Muse Spark.
+      // Its separate regression below must remain unknown rather than turning
+      // a conservative fallback estimate into a claimed provider rate.
+      if (provider === "meta") continue;
       const sidecar = new CostSidecar({
         defaultProvider: provider,
         defaultModel: model,
@@ -237,6 +244,28 @@ describe("cost helpers", () => {
       }
     }
   });
+
+  test.each(BUILT_IN_PROVIDER_MODEL_CATALOG.meta)(
+    "keeps Meta model %s pricing unknown without an authoritative rate",
+    (model) => {
+      const usage = {
+        provider: "meta",
+        model,
+        inputTokens: 1_000,
+        outputTokens: 500,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0,
+        webSearchRequests: 0,
+        totalTokens: 1_500,
+        turns: 1,
+      };
+
+      expect(resolveModelCostEntry(usage, DEFAULT_MODEL_COSTS)).toBeNull();
+      expect(computeUsdCostWithResolution(usage, DEFAULT_MODEL_COSTS))
+        .toMatchObject({ known: false });
+    },
+  );
 
   test("current DeepSeek and Mistral defaults use their official cached-token tiers", () => {
     expect(DEFAULT_MODEL_COSTS["deepseek:deepseek-v4-flash"]).toMatchObject({

@@ -64,6 +64,39 @@ describe("structured-output provider capability helpers", () => {
     ).toBe("anthropic_tool_use");
   });
 
+  test.each([
+    "muse-spark-1.3",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.1",
+  ])("uses chat response_format for Meta model %s", (model) => {
+    expect(
+      resolveProviderStructuredOutputMode({
+        provider: "meta",
+        model,
+        api: "chat_completions",
+      }),
+    ).toBe("chat_response_format");
+  });
+
+  test("keeps non-chat and unknown Meta structured output fail-closed", () => {
+    expect(
+      resolveProviderStructuredOutputMode({
+        provider: "meta",
+        model: "muse-spark-1.3",
+        api: "responses",
+      }),
+    ).toBe("unsupported");
+    expect(
+      resolveProviderStructuredOutputMode({
+        provider: "meta",
+        model: "muse-spark-future",
+        api: "chat_completions",
+      }),
+    ).toBe("unsupported");
+  });
+
   test("enforces compatible strict JSON schema constraints recursively", () => {
     expect(enforceStrictStructuredOutputSchema(SCHEMA)).toEqual({
       type: "object",

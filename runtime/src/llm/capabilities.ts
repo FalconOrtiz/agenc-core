@@ -254,7 +254,10 @@ function isGeminiThinkingModel(model: string): boolean {
 }
 
 function isMetaMuseSparkModel(model: string): boolean {
-  return matchesModelFamily(model, /(?:^|[/:])muse-spark-(?:$|[-_.:0-9])/);
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])muse-spark-(?:1\.3(?:-contributor)?|1\.2(?:-contributor)?|1\.1)$/,
+  );
 }
 
 const HOSTED_CHAT_COMPATIBLE_CAPABILITIES = {
@@ -397,6 +400,10 @@ const PROVIDER_CAPABILITIES: Readonly<Record<string, ProviderCapabilityDefinitio
   },
   meta: {
     ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isMetaMuseSparkModel,
+    supportsStructuredOutput: isMetaMuseSparkModel,
+    supportsStructuredOutputWithTools: isMetaMuseSparkModel,
+    acceptsImageHistory: isMetaMuseSparkModel,
     acceptsReasoningEffort: isMetaMuseSparkModel,
   },
   gemini: {

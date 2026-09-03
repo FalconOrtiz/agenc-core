@@ -15,15 +15,16 @@ import {
 } from "../../registry/provider-info.js";
 import { getTokenizerConfigForProvider } from "../../token-estimation.js";
 import { chatCompletionsCapabilityHintsForProvider } from "../../wire/capability-gating.js";
+import type { LLMTool, LLMToolChoice } from "../../types.js";
 
-function successfulChat(model: string): Response {
+function successfulChat(model: string, content = "ok"): Response {
   return new Response(
     JSON.stringify({
       id: "chatcmpl_meta",
       model,
       choices: [
         {
-          message: { role: "assistant", content: "ok" },
+          message: { role: "assistant", content },
           finish_reason: "stop",
         },
       ],
@@ -41,6 +42,19 @@ function successfulChat(model: string): Response {
 }
 
 describe("MetaProvider", () => {
+  const echoTool: LLMTool = {
+    type: "function",
+    function: {
+      name: "system.echo",
+      description: "Echo text.",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+      },
+    },
+  };
+
   test("factory uses Meta chat completions with bearer auth", async () => {
     const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
     const fetchImpl = vi
@@ -85,11 +99,16 @@ describe("MetaProvider", () => {
         fetchImpl,
       });
 
-      await provider.chat([{ role: "user", content: "hello" }]);
+      await provider.chat(
+        [{ role: "user", content: "hello" }],
+        { maxOutputTokens: 131_072 },
+      );
 
       const [, init] = fetchImpl.mock.calls[0] ?? [];
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       expect(body.model).toBe(model);
+      expect(body.max_completion_tokens).toBe(131_072);
+      expect(body.max_tokens).toBeUndefined();
       expect(resolveModelCatalogMetadata({ provider: "meta", model })).toEqual({
         contextWindow: 1_048_576,
         maxContextWindow: 1_048_576,
@@ -99,8 +118,11 @@ describe("MetaProvider", () => {
       expect(resolveProviderCapabilityEntry({ provider: "meta", model }))
         .toMatchObject({
           supportsToolUse: true,
-          supportsStructuredOutput: false,
-          supportsImageInput: false,
+          supportsStructuredOutput: true,
+          supportsStructuredOutputWithTools: true,
+          supportsImageInput: true,
+          supportsVisionInput: true,
+          acceptsImageHistory: true,
           supportsProviderNativeWebSearch: false,
           acceptsReasoningEffort: true,
         });
@@ -115,6 +137,9 @@ describe("MetaProvider", () => {
           "xhigh",
         ],
         defaultReasoningLevel: "medium",
+        inputModalities: ["text", "image"],
+        supportsParallelToolCalls: true,
+        supportsStructuredOutput: true,
       });
     },
   );
@@ -155,7 +180,24 @@ describe("MetaProvider", () => {
     ]);
   });
 
-  test("downgrades unsupported required tool choice to auto", async () => {
+  test.each([
+    ["auto", "auto", "auto", true],
+    ["required", "required", "auto", true],
+    [
+      "named",
+      { type: "function", name: "system.echo" },
+      "auto",
+      true,
+    ],
+    ["none", "none", undefined, false],
+  ] as const satisfies ReadonlyArray<
+    readonly [string, LLMToolChoice, "auto" | undefined, boolean]
+  >)("applies Meta's auto-only tool choice contract for %s", async (
+    _label,
+    toolChoice,
+    expectedToolChoice,
+    expectsTools,
+  ) => {
     const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       successfulChat(model),
@@ -163,33 +205,116 @@ describe("MetaProvider", () => {
     const provider = new MetaProvider({
       apiKey: "meta-test",
       model,
-      tools: [
-        {
-          type: "function",
-          function: {
-            name: "system.echo",
-            description: "Echo text.",
-            parameters: {
-              type: "object",
-              properties: { text: { type: "string" } },
-              required: ["text"],
-            },
-          },
-        },
-      ],
+      tools: [echoTool],
       fetchImpl,
     });
 
     await provider.chat(
       [{ role: "user", content: "use a tool" }],
-      { toolChoice: "required" },
+      { toolChoice },
     );
 
     const body = JSON.parse(
       String(fetchImpl.mock.calls[0]?.[1]?.body),
     ) as Record<string, unknown>;
-    expect(body.tool_choice).toBe("auto");
+    expect(body.tool_choice).toBe(expectedToolChoice);
+    if (expectsTools) {
+      expect(body.tools).toBeInstanceOf(Array);
+    } else {
+      expect(body.tools).toBeUndefined();
+    }
+  });
+
+  test("strips unsupported stop sequences while keeping parallel tool calls", async () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      successfulChat(model),
+    );
+    const provider = new MetaProvider({
+      apiKey: "meta-test",
+      model,
+      tools: [echoTool],
+      fetchImpl,
+    });
+
+    await provider.chat([{ role: "user", content: "use tools" }], {
+      parallelToolCalls: true,
+      stopSequences: ["END"],
+    });
+
+    const body = JSON.parse(
+      String(fetchImpl.mock.calls[0]?.[1]?.body),
+    ) as Record<string, unknown>;
+    expect(body.parallel_tool_calls).toBe(true);
+    expect(body.stop).toBeUndefined();
+    expect(
+      chatCompletionsCapabilityHintsForProvider("meta", model),
+    ).toMatchObject({
+      toolChoicePolicy: "auto_only",
+      acceptsStopSequences: false,
+    });
+  });
+
+  test("sends image input and JSON-schema structured output with tools", async () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      successfulChat(model, JSON.stringify({ answer: "ok" })),
+    );
+    const provider = new MetaProvider({
+      apiKey: "meta-test",
+      model,
+      tools: [echoTool],
+      fetchImpl,
+    });
+
+    await provider.chat(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image" },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,aW1hZ2U=" },
+            },
+          ],
+        },
+      ],
+      {
+        structuredOutput: {
+          schema: {
+            type: "json_schema",
+            name: "answer",
+            schema: {
+              type: "object",
+              properties: { answer: { type: "string" } },
+              required: ["answer"],
+            },
+          },
+        },
+      },
+    );
+
+    const body = JSON.parse(
+      String(fetchImpl.mock.calls[0]?.[1]?.body),
+    ) as Record<string, unknown>;
     expect(body.tools).toBeInstanceOf(Array);
+    expect(body.response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { name: "answer", strict: true },
+    });
+    expect(body.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Describe this image" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,aW1hZ2U=" },
+          },
+        ],
+      },
+    ]);
   });
 
   test("resolves the Meta credential and endpoint from canonical env", () => {

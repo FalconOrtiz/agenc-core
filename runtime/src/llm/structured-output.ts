@@ -71,6 +71,15 @@ export function supportsAnthropicStructuredOutputToolUse(
   return typeof model === "string" && model.trim().length > 0;
 }
 
+function supportsMetaStructuredOutputs(model: string | undefined): boolean {
+  if (typeof model !== "string") return false;
+  const normalized = model.trim();
+  return (
+    /(?:^|[/:])muse-spark-(?:1\.3(?:-contributor)?|1\.2(?:-contributor)?|1\.1)$/i
+      .test(normalized)
+  );
+}
+
 export function resolveProviderStructuredOutputMode(input: {
   readonly provider: string | undefined;
   readonly model: string | undefined;
@@ -90,6 +99,15 @@ export function resolveProviderStructuredOutputMode(input: {
     return input.api === "chat_completions"
       ? "chat_response_format"
       : "native_text_format";
+  }
+  if (provider === "meta") {
+    if (
+      input.api !== "chat_completions" ||
+      !supportsMetaStructuredOutputs(input.model)
+    ) {
+      return "unsupported";
+    }
+    return "chat_response_format";
   }
   if (provider === "anthropic") {
     return supportsAnthropicStructuredOutputToolUse(input.model)
