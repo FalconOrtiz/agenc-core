@@ -139,6 +139,61 @@ describe("HomeContext", () => {
 });
 
 describe("strict layered repository", () => {
+  test("does not inherit retired home config through a home-level package marker", async () => {
+    const root = realpathSync(temp("agenc-selected-workspace-boundary"));
+    const platformHome = join(root, "Users", "tester");
+    const isolatedAgencHome = join(root, "desktop-user-data", "core");
+    const workspace = join(platformHome, "Documents", "huntsman-key");
+    mkdirSync(workspace, { recursive: true });
+    write(join(platformHome, "package.json"), "{}\n");
+    write(join(platformHome, ".agenc", "settings.json"), "{}\n");
+
+    const loaded = await loadLayeredConfig({
+      env: { AGENC_HOME: isolatedAgencHome, HOME: platformHome },
+      cwd: workspace,
+      managedConfigPath: join(root, "missing-managed.toml"),
+      managedDropInDir: join(root, "missing-managed.d"),
+    });
+
+    expect(loaded.projectRoot).toBe(workspace);
+    expect(loaded.sources).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: join(platformHome, ".agenc", "settings.json"),
+      }),
+    ]));
+  });
+
+  test("still discovers a package-rooted monorepo below the home boundary", async () => {
+    const root = realpathSync(temp("agenc-selected-monorepo-boundary"));
+    const platformHome = join(root, "Users", "tester");
+    const isolatedAgencHome = join(root, "desktop-user-data", "core");
+    const projectRoot = join(platformHome, "Documents", "workspace-monorepo");
+    const workspace = join(projectRoot, "packages", "huntsman-key");
+    const projectConfig = join(projectRoot, ".agenc", "config.toml");
+    mkdirSync(workspace, { recursive: true });
+    write(join(platformHome, "package.json"), "{}\n");
+    write(join(platformHome, ".agenc", "settings.json"), "{}\n");
+    write(join(projectRoot, "package.json"), "{}\n");
+    write(projectConfig, [
+      "config_version = 2",
+      'model = "grok-4.3"',
+      "",
+    ].join("\n"));
+
+    const loaded = await loadLayeredConfig({
+      env: { AGENC_HOME: isolatedAgencHome, HOME: platformHome },
+      cwd: workspace,
+      projectTrusted: true,
+      managedConfigPath: join(root, "missing-managed.toml"),
+      managedDropInDir: join(root, "missing-managed.d"),
+    });
+
+    expect(loaded.projectRoot).toBe(projectRoot);
+    expect(loaded.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scope: "project", path: projectConfig }),
+    ]));
+  });
+
   test("keeps daemon configuration independent from the launch workspace", async () => {
     const root = temp("agenc-daemon-home-authority");
     const home = join(root, "home");

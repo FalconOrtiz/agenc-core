@@ -64,6 +64,19 @@ describe("project-instructions (T10-B)", () => {
     expect(r).toBeNull();
   });
 
+  test("findProjectRoot respects an exclusive home boundary", async () => {
+    const platformHome = join(root, "home");
+    const workspace = join(platformHome, "Documents", "huntsman-key");
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(platformHome, "package.json"), "{}\n");
+
+    await expect(findProjectRoot(
+      workspace,
+      ["package.json"],
+      { stopBefore: platformHome },
+    )).resolves.toBeNull();
+  });
+
   test("resolveInstructionFile prefers AGENC.override.md over AGENC.md", async () => {
     const dir = join(root, "d");
     mkdirSync(dir);
