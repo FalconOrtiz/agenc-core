@@ -67,6 +67,7 @@ import {
   writeSync,
   unlinkSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { timed } from "../utils/slow-store-op.js";
 import {
   basename,
@@ -75,6 +76,7 @@ import {
   join,
   relative,
   resolve,
+  sep,
 } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -267,10 +269,41 @@ export const DEFAULT_SESSION_ROOT_MARKERS: readonly string[] = [
   ".hg",
 ];
 
+export interface ProjectRootSearchOptions {
+  /**
+   * Exclusive ancestor boundary for marker discovery. When `cwd` is a strict
+   * descendant of this directory, markers in the boundary itself (and above
+   * it) are ignored. This prevents a workspace beneath the platform home from
+   * inheriting an unrelated home-level package manifest or VCS checkout.
+   */
+  readonly stopBefore?: string;
+}
+
+function projectRootStopBefore(
+  cwd: string,
+  requestedBoundary: string,
+): string | undefined {
+  const start = resolve(cwd);
+  const boundary = resolve(requestedBoundary);
+  const fromBoundary = relative(boundary, start);
+  if (
+    fromBoundary === "" ||
+    fromBoundary === ".." ||
+    fromBoundary.startsWith(`..${sep}`) ||
+    isAbsolute(fromBoundary)
+  ) {
+    return undefined;
+  }
+  return boundary;
+}
+
 /**
  * Synchronous ancestor walk to the nearest directory that contains one
  * of the configured project-root markers. Returns `null` when no marker
- * is found before reaching the filesystem root.
+ * is found before reaching the filesystem root. By default, a workspace
+ * strictly beneath the platform home does not inspect the home directory
+ * itself; callers with an injected platform home can pass the same boundary
+ * explicitly.
  *
  * Kept sync (unlike `findProjectRoot` in `prompts/project-instructions.ts`)
  * because `getProjectDir` and the SessionStore constructor are called
@@ -281,10 +314,18 @@ export const DEFAULT_SESSION_ROOT_MARKERS: readonly string[] = [
 export function findProjectRootSync(
   cwd: string,
   markers: readonly string[] = DEFAULT_SESSION_ROOT_MARKERS,
+  options: ProjectRootSearchOptions = {},
 ): { rootDir: string; marker: string } | null {
   if (markers.length === 0) return null;
+  const stopBefore = projectRootStopBefore(
+    cwd,
+    options.stopBefore ?? homedir(),
+  );
   let currentDir = cwd;
   while (true) {
+    if (stopBefore !== undefined && resolve(currentDir) === stopBefore) {
+      return null;
+    }
     for (const marker of markers) {
       if (existsSync(join(currentDir, marker))) {
         return { rootDir: currentDir, marker };

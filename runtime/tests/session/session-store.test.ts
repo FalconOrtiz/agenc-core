@@ -2472,6 +2472,38 @@ describe("session-store", () => {
     }
   });
 
+  test("findProjectRootSync excludes a home-level marker without hiding a nested monorepo", () => {
+    const platformHome = mkdtempSync(join(tmpdir(), "agenc-root-boundary-"));
+    try {
+      writeFileSync(join(platformHome, "package.json"), "{}\n");
+      const standaloneWorkspace = join(
+        platformHome,
+        "Documents",
+        "huntsman-key",
+      );
+      mkdirSync(standaloneWorkspace, { recursive: true });
+
+      expect(findProjectRootSync(
+        standaloneWorkspace,
+        ["package.json"],
+        { stopBefore: platformHome },
+      )).toBeNull();
+
+      const monorepo = join(platformHome, "Documents", "workspace-monorepo");
+      const nestedWorkspace = join(monorepo, "packages", "huntsman-key");
+      mkdirSync(nestedWorkspace, { recursive: true });
+      writeFileSync(join(monorepo, "package.json"), "{}\n");
+
+      expect(findProjectRootSync(
+        nestedWorkspace,
+        ["package.json"],
+        { stopBefore: platformHome },
+      )).toEqual({ rootDir: monorepo, marker: "package.json" });
+    } finally {
+      rmSync(platformHome, { recursive: true, force: true });
+    }
+  });
+
   test("DEFAULT_SESSION_ROOT_MARKERS covers common ecosystem roots", () => {
     // Guards against accidental drift between this list and the
     // project-instructions loader; a full equality check would couple

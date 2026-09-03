@@ -176,6 +176,18 @@ export class ConfigRepositoryError extends Error {
   }
 }
 
+function findConfigProjectRoot(
+  cwd: string,
+  markers: readonly string[] | undefined,
+  env: EnvSnapshot,
+): { rootDir: string; marker: string } | null {
+  return findProjectRootSync(
+    cwd,
+    markers,
+    env.HOME ? { stopBefore: env.HOME } : undefined,
+  );
+}
+
 const V2_TOP_LEVEL_KEYS = new Set(
   KNOWN_CONFIG_KEYS.filter(
     (key) => key !== "configVersion" && key !== "_unknown",
@@ -1216,7 +1228,8 @@ export async function assertNoRetiredConfigInputsForMutation(
   const cwd = resolve(options.cwd ?? process.cwd());
   const projectRoot = resolve(
     options.projectRoot ??
-      findProjectRootSync(cwd, defaultConfig().project_root_markers)?.rootDir ??
+      findConfigProjectRoot(cwd, defaultConfig().project_root_markers, env)
+        ?.rootDir ??
       cwd,
   );
   await assertNoRetiredConfigInputs({
@@ -1351,7 +1364,7 @@ async function loadLayeredConfigInternal(
   const projectRoot = includeWorkspaceLayers
     ? resolve(
         options.projectRoot ??
-          findProjectRootSync(cwd, rootMarkers)?.rootDir ??
+          findConfigProjectRoot(cwd, rootMarkers, env)?.rootDir ??
           cwd,
       )
     : home.path;
