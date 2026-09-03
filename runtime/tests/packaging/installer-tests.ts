@@ -3054,12 +3054,10 @@ describe.skipIf(process.platform === "win32")("install.sh", () => {
 
 test("standalone installers embed the exact same archive/install validator", () => {
   const powershellInstaller = readFileSync(INSTALL_PS1, "utf8");
-  const shell = readFileSync(INSTALL_SH, "utf8").match(
-    /<<'AGENC_RUNTIME_INSTALLER'[\s\S]*?\n(const \{ spawnSync \}[\s\S]*?)\nAGENC_RUNTIME_INSTALLER/,
-  )?.[1];
-  const powershell = powershellInstaller.match(
-    /\$RuntimeInstaller = @'\n([\s\S]*?)\n'@/,
-  )?.[1];
+  const generatedProgram =
+    /\/\/ BEGIN GENERATED AGENC RUNTIME INSTALLER PROGRAM\n([\s\S]*?)\/\/ END GENERATED AGENC RUNTIME INSTALLER PROGRAM/u;
+  const shell = readFileSync(INSTALL_SH, "utf8").match(generatedProgram)?.[1];
+  const powershell = powershellInstaller.match(generatedProgram)?.[1];
   expect(shell).toBeTruthy();
   expect(powershell).toBe(shell);
   expect(shell).toContain("loadActivationLockIdentityModule()");
