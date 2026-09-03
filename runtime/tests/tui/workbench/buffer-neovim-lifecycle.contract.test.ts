@@ -750,13 +750,13 @@ describe("embedded Neovim lifecycle", () => {
       5,
     );
 
-    await expect(session.input("Ã©K")).resolves.toBe(true);
+    await expect(session.input("\u00e9K")).resolves.toBe(true);
 
     expect(
       rpc.request.mock.calls
         .filter((call) => call[0] === "nvim_input")
         .map((call) => call[1]),
-    ).toEqual([["Ã©K"], ["Ã©K"], ["K"]]);
+    ).toEqual([["\u00e9K"], ["\u00e9K"], ["K"]]);
     expect(acceptedByteCounts).toEqual([]);
     await session.cleanup();
   });
