@@ -18,9 +18,21 @@
  *     client-supplied paths. Only the selected resource body is read,
  *     then its contents pass through the canonical egress secret sanitizer.
  *
+ * Skill and resource bodies are served by one shared descriptor-bound
+ * reader (`readScopedRegularFile`): a candidate is validated, opened once
+ * with `O_NOFOLLOW`/`O_NONBLOCK`, proven to be the same single-link
+ * regular object that validation saw, read from that handle under a byte
+ * ceiling, and re-proved after the read. A pathname is never reopened
+ * after validation, so a writable workspace cannot swap the file or an
+ * ancestor between checks and bytes. Node exposes no root-confined
+ * open (openat2/`RESOLVE_BENEATH`); as in the runtime's other verified
+ * readers, containment is enforced on the canonical resolution plus
+ * opened-handle identity proofs rather than a silent weaker path.
+ *
  * @module
  */
-import { lstat, readdir, readFile, realpath } from "node:fs/promises";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative } from "node:path";
 
 import {
@@ -41,11 +53,29 @@ import type {
   McpResourceProvider,
 } from "../../mcp-server/types.js";
 
+/** Byte ceiling for one skill / memory / instruction body served over MCP. */
+export const MAX_SCOPED_FILE_BYTES = 1_048_576;
+
+/**
+ * @internal Deterministic race seams for the shared verified reader:
+ * tests replace the candidate at each filesystem I/O boundary.
+ */
+export interface ScopedRegularFileTestHooks {
+  /** Fires after validation, before the verified open. */
+  readonly beforeOpenForTesting?: (path: string) => void | Promise<void>;
+  /** Fires after the verified open, before the bounded read. */
+  readonly beforeReadForTesting?: (path: string) => void | Promise<void>;
+}
+
 export interface SkillPromptProviderOptions {
   /** Directories whose children are skills (`<dir>/<name>/SKILL.md` or `<dir>/<name>.md`). */
   readonly skillRoots: readonly string[];
   /** Canonical containment root; candidates resolving outside it are omitted. */
   readonly scopeRoot?: string;
+  /** @internal Test seam: candidate swap point after validation. */
+  readonly beforeOpenForTesting?: (path: string) => void | Promise<void>;
+  /** @internal Test seam: candidate swap point after the verified open. */
+  readonly beforeReadForTesting?: (path: string) => void | Promise<void>;
 }
 
 interface DiscoveredSkill {
@@ -53,6 +83,26 @@ interface DiscoveredSkill {
   readonly filePath: string;
   readonly description: string;
   readonly argumentHint: string | undefined;
+  readonly rawContent: string;
+}
+
+interface ScopedFileIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly mode: bigint;
+  readonly nlink: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+}
+
+interface ScopedRegularFileResolution {
+  readonly canonicalPath: string;
+  readonly identity: ScopedFileIdentity;
+}
+
+interface ScopedRegularFileContents {
+  readonly canonicalPath: string;
   readonly rawContent: string;
 }
 
@@ -72,39 +122,138 @@ function isSameOrChildPath(scopeRoot: string, candidate: string): boolean {
   return offset === "" || (!offset.startsWith("..") && !isAbsolute(offset));
 }
 
-async function readScopedRegularFile(
-  filePath: string,
-  scopeRoot: string | null,
-  readContent: (canonicalPath: string) => Promise<string> = async (
-    canonicalPath,
-  ) => await readFile(canonicalPath, "utf8"),
-): Promise<{
-  readonly canonicalPath: string;
-  readonly rawContent: string;
-} | null> {
-  const canonicalPath = await resolveScopedRegularFile(filePath, scopeRoot);
-  if (canonicalPath === null) return null;
-  try {
-    return { canonicalPath, rawContent: await readContent(canonicalPath) };
-  } catch {
-    return null;
+function scopedIdentity(stats: BigIntStats): ScopedFileIdentity {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    mode: stats.mode,
+    nlink: stats.nlink,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+  };
+}
+
+function sameScopedIdentity(
+  left: ScopedFileIdentity,
+  right: ScopedFileIdentity,
+): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+/** One admission contract for listing and reading: regular, unlinked-again, bounded. */
+function admitsScopedSnapshot(stats: BigIntStats): boolean {
+  return (
+    stats.isFile() &&
+    !stats.isSymbolicLink() &&
+    stats.nlink === 1n &&
+    stats.size <= BigInt(MAX_SCOPED_FILE_BYTES)
+  );
+}
+
+function scopedOpenFlags(): number {
+  if (process.platform === "win32") return fsConstants.O_RDONLY;
+  // O_NOFOLLOW rejects a final component swapped to a symlink; O_NONBLOCK
+  // stops an open of a swapped-in FIFO from hanging. The opened-handle
+  // fstat below rejects every non-regular replacement; both flags are
+  // no-ops for the regular files that pass admission.
+  return (
+    fsConstants.O_RDONLY |
+    (fsConstants.O_NOFOLLOW ?? 0) |
+    (fsConstants.O_NONBLOCK ?? 0)
+  );
+}
+
+async function readScopedHandle(
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<Buffer | null> {
+  const buffer = Buffer.allocUnsafe(MAX_SCOPED_FILE_BYTES + 1);
+  let length = 0;
+  while (length < buffer.length) {
+    const { bytesRead } = await handle.read(
+      buffer,
+      length,
+      buffer.length - length,
+      null,
+    );
+    if (bytesRead === 0) break;
+    length += bytesRead;
   }
+  return length > MAX_SCOPED_FILE_BYTES ? null : buffer.subarray(0, length);
 }
 
 async function resolveScopedRegularFile(
   filePath: string,
   scopeRoot: string | null,
-): Promise<string | null> {
+): Promise<ScopedRegularFileResolution | null> {
   try {
-    const fileStat = await lstat(filePath);
-    if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+    const before = await lstat(filePath, { bigint: true });
+    if (!admitsScopedSnapshot(before)) return null;
     const canonicalPath = await realpath(filePath);
     if (scopeRoot !== null && !isSameOrChildPath(scopeRoot, canonicalPath)) {
       return null;
     }
-    return canonicalPath;
+    return { canonicalPath, identity: scopedIdentity(before) };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Shared verified reader for skill prompts and resource bodies: validate,
+ * open once, prove the opened object is the validated one, read it under
+ * the byte ceiling, and prove it never changed. Any swap, relink, growth,
+ * or escape between those boundaries yields `null`.
+ */
+async function readScopedRegularFile(
+  filePath: string,
+  scopeRoot: string | null,
+  hooks: ScopedRegularFileTestHooks = {},
+): Promise<ScopedRegularFileContents | null> {
+  const resolved = await resolveScopedRegularFile(filePath, scopeRoot);
+  if (resolved === null) return null;
+  const { canonicalPath, identity: before } = resolved;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    await hooks.beforeOpenForTesting?.(filePath);
+    handle = await open(filePath, scopedOpenFlags());
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !admitsScopedSnapshot(opened) ||
+      !sameScopedIdentity(before, scopedIdentity(opened))
+    ) {
+      return null;
+    }
+    await hooks.beforeReadForTesting?.(filePath);
+    const bytes = await readScopedHandle(handle);
+    if (bytes === null) return null;
+    const [afterRead, pathAfterRead, canonicalAfterRead] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(filePath, { bigint: true }),
+      realpath(filePath),
+    ]);
+    const openedIdentity = scopedIdentity(opened);
+    if (
+      !sameScopedIdentity(openedIdentity, scopedIdentity(afterRead)) ||
+      !sameScopedIdentity(openedIdentity, scopedIdentity(pathAfterRead)) ||
+      canonicalAfterRead !== canonicalPath ||
+      bytes.byteLength !== Number(opened.size)
+    ) {
+      return null;
+    }
+    return { canonicalPath, rawContent: bytes.toString("utf8") };
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) await handle.close().catch(() => undefined);
   }
 }
 
@@ -131,7 +280,10 @@ async function discoverSkills(
             }
           : null;
       if (candidate === null || skills.has(candidate.name)) continue;
-      const file = await readScopedRegularFile(candidate.filePath, scopeRoot);
+      const file = await readScopedRegularFile(candidate.filePath, scopeRoot, {
+        beforeOpenForTesting: options.beforeOpenForTesting,
+        beforeReadForTesting: options.beforeReadForTesting,
+      });
       if (file === null) continue;
       const { frontmatter } = parseFrontmatter(
         file.rawContent,
@@ -211,8 +363,10 @@ export interface MemoryResourceProviderOptions {
   readonly scopeRoot?: string;
   /** Captured config home used to exclude private session files. */
   readonly configHomeDir?: string;
-  /** Resource body reader. Exposed for deterministic embedding and tests. */
-  readonly readResourceContent?: (canonicalPath: string) => Promise<string>;
+  /** @internal Test seam: candidate swap point after validation. */
+  readonly beforeOpenForTesting?: (path: string) => void | Promise<void>;
+  /** @internal Test seam: candidate swap point after the verified open. */
+  readonly beforeReadForTesting?: (path: string) => void | Promise<void>;
 }
 
 const MEMORY_URI_SCHEME = "agenc-memory://";
@@ -235,11 +389,11 @@ async function listMemoryResources(
       // Session memory/transcripts are excluded outright — same boundary
       // the permission layer enforces for in-process reads.
       if (detectSessionFileType(header.filePath, options.configHomeDir) !== null) continue;
-      const canonicalPath = await resolveScopedRegularFile(
+      const resolution = await resolveScopedRegularFile(
         header.filePath,
         scopeRoot,
       );
-      if (canonicalPath === null) continue;
+      if (resolution === null) continue;
       const uri = `${MEMORY_URI_SCHEME}${dirIndex}/${header.filename}`;
       resources.set(uri, {
         definition: {
@@ -250,15 +404,15 @@ async function listMemoryResources(
             : {}),
           mimeType: "text/markdown",
         },
-        filePath: canonicalPath,
+        filePath: resolution.canonicalPath,
       });
     }
     const entrypoint = join(dir, "MEMORY.md");
-    const canonicalEntrypoint = await resolveScopedRegularFile(
+    const entrypointResolution = await resolveScopedRegularFile(
       entrypoint,
       scopeRoot,
     );
-    if (canonicalEntrypoint !== null) {
+    if (entrypointResolution !== null) {
       const uri = `${MEMORY_URI_SCHEME}${dirIndex}/MEMORY.md`;
       resources.set(uri, {
         definition: {
@@ -267,15 +421,15 @@ async function listMemoryResources(
           description: "Memory index",
           mimeType: "text/markdown",
         },
-        filePath: canonicalEntrypoint,
+        filePath: entrypointResolution.canonicalPath,
       });
     }
   }
   for (const [fileIndex, filePath] of (
     options.instructionFiles ?? []
   ).entries()) {
-    const canonicalPath = await resolveScopedRegularFile(filePath, scopeRoot);
-    if (canonicalPath === null) continue;
+    const resolution = await resolveScopedRegularFile(filePath, scopeRoot);
+    if (resolution === null) continue;
     if (detectSessionFileType(filePath, options.configHomeDir) !== null) continue;
     const uri = `${INSTRUCTIONS_URI_SCHEME}${fileIndex}/${basename(filePath)}`;
     resources.set(uri, {
@@ -285,7 +439,7 @@ async function listMemoryResources(
         description: `Project instructions (${filePath})`,
         mimeType: "text/markdown",
       },
-      filePath: canonicalPath,
+      filePath: resolution.canonicalPath,
     });
   }
   return resources;
@@ -307,11 +461,10 @@ export function createMemoryResourceProvider(
       if (resource === undefined) return null;
       const scopeRoot = await canonicalScopeRoot(options.scopeRoot);
       if (options.scopeRoot !== undefined && scopeRoot === null) return null;
-      const file = await readScopedRegularFile(
-        resource.filePath,
-        scopeRoot,
-        options.readResourceContent,
-      );
+      const file = await readScopedRegularFile(resource.filePath, scopeRoot, {
+        beforeOpenForTesting: options.beforeOpenForTesting,
+        beforeReadForTesting: options.beforeReadForTesting,
+      });
       if (file === null) return null;
       return {
         contents: [
