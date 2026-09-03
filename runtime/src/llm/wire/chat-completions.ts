@@ -189,7 +189,10 @@ export function buildChatCompletionsRequest(
       ? "auto"
       : parseOpenAIToolChoice(requestedToolChoice);
   }
-  if (input.options?.parallelToolCalls !== undefined) {
+  if (
+    input.options?.parallelToolCalls !== undefined &&
+    !(autoOnlyToolChoice && tools.length === 0)
+  ) {
     body.parallel_tool_calls = input.options.parallelToolCalls;
   }
   if (input.options?.temperature !== undefined) {

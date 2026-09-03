@@ -211,7 +211,10 @@ describe("MetaProvider", () => {
 
     await provider.chat(
       [{ role: "user", content: "use a tool" }],
-      { toolChoice },
+      {
+        toolChoice,
+        ...(toolChoice === "none" ? { parallelToolCalls: true } : {}),
+      },
     );
 
     const body = JSON.parse(
@@ -222,6 +225,7 @@ describe("MetaProvider", () => {
       expect(body.tools).toBeInstanceOf(Array);
     } else {
       expect(body.tools).toBeUndefined();
+      expect(body.parallel_tool_calls).toBeUndefined();
     }
   });
 
