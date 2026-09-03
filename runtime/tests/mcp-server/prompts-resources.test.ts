@@ -5,7 +5,7 @@
  * prompt, and reads a memory file as a resource; excluded/secret
  * content stays out.
  */
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import {
   createMemoryResourceProvider,
   createSkillPromptProvider,
 } from "../../src/mcp/server/content-providers.js";
+import { canonicalRedactionFixtures } from "../secrets/canonical-redaction-corpus.js";
 
 let root: string;
 
@@ -139,6 +140,17 @@ describe("MCP prompts backed by skills", () => {
 });
 
 describe("MCP resources backed by memory + instruction files", () => {
+  it("imports the canonical secret sanitizer for resource egress", async () => {
+    const source = await readFile(
+      new URL("../../src/mcp/server/content-providers.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(source).toContain(
+      'import { redactSecrets } from "../../secrets/sanitizer.js";',
+    );
+  });
+
   async function makeResourceServer(
     readResourceContent?: (canonicalPath: string) => Promise<string>,
   ): Promise<{
@@ -227,6 +239,33 @@ describe("MCP resources backed by memory + instruction files", () => {
     expect(text).toContain("staging pipeline");
     expect(text).not.toContain("ghp_0123456789abcdef");
   });
+
+  it.each(canonicalRedactionFixtures)(
+    "applies canonical egress redaction to memory and instructions: $name",
+    async ({ input, expected, secretFragments, preservedFragments }) => {
+      const { server } = await makeResourceServer(async () => input);
+      await initialized(server);
+      const list = await request(server, "resources/list");
+
+      for (const name of ["deploy-notes.md", "AGENC.md"]) {
+        const resource = list.result.resources.find(
+          (candidate: any) => candidate.name === name,
+        );
+        const out = await request(server, "resources/read", {
+          uri: resource.uri,
+        });
+        const text = out.result.contents[0].text;
+
+        expect(text).toBe(expected);
+        for (const secret of secretFragments) {
+          expect(text).not.toContain(secret);
+        }
+        for (const preserved of preservedFragments) {
+          expect(text).toContain(preserved);
+        }
+      }
+    },
+  );
 
   it("rejects URIs it did not mint (path bounding)", async () => {
     const { server } = await makeResourceServer();

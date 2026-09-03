@@ -16,7 +16,7 @@
  *     Canonical containment rejects symlink escapes, and `readResource`
  *     only serves URIs minted by a fresh listing — it never resolves
  *     client-supplied paths. Only the selected resource body is read,
- *     then its contents pass through the memory secret redactor.
+ *     then its contents pass through the canonical egress secret sanitizer.
  *
  * @module
  */
@@ -25,9 +25,9 @@ import { basename, isAbsolute, join, relative } from "node:path";
 
 import {
   detectSessionFileType,
-  redactSecrets,
   scanMemoryFiles,
 } from "../../memory/index.js";
+import { redactSecrets } from "../../secrets/sanitizer.js";
 import {
   parseBooleanFrontmatter,
   parseFrontmatter,
