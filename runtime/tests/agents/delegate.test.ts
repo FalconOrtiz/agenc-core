@@ -276,15 +276,18 @@ describe("delegate lifecycle recovery", () => {
     expect(outcome.thread.summaryCacheSafeParams).toBe(cacheSafeParams);
     expect(
       outcome.thread.summaryMessages.map((message) => message.type),
-    ).toEqual(["assistant", "user"]);
-    expect(outcome.thread.summaryMessages[0]?.message.content).toEqual([
+    ).toEqual(["user", "assistant", "user"]);
+    expect(outcome.thread.summaryMessages[0]?.message.content).toBe(
+      "seed prompt",
+    );
+    expect(outcome.thread.summaryMessages[1]?.message.content).toEqual([
       expect.objectContaining({
         type: "tool_use",
         id: "call-1",
         input: { file_path: "x.ts" },
       }),
     ]);
-    expect(outcome.thread.summaryMessages[1]?.message.content).toEqual([
+    expect(outcome.thread.summaryMessages[2]?.message.content).toEqual([
       expect.objectContaining({
         type: "tool_result",
         tool_use_id: "call-1",

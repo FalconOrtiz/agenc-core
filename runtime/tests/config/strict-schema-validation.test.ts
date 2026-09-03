@@ -41,7 +41,6 @@ describe("strict schema-v2 validation coverage", () => {
     ["approval policy", { approval_policy: "sometimes" }, /approval_policy/u],
     ["sandbox mode", { sandbox_mode: "container" }, /sandbox_mode/u],
     ["reasoning effort", { reasoning_effort: "max" }, /reasoning_effort/u],
-    ["retired minimal reasoning effort", { reasoning_effort: "minimal" }, /reasoning_effort/u],
     ["agent threads", { agent_max_threads: 0 }, /agent_max_threads/u],
     ["agent depth", { agent_max_depth: -1 }, /agent_max_depth/u],
     ["project markers", { project_root_markers: [".git", 4] }, /project_root_markers/u],
@@ -55,6 +54,17 @@ describe("strict schema-v2 validation coverage", () => {
     ["coordinator mode", { coordinator_mode: 1 }, /coordinator_mode/u],
   ])("rejects an invalid root %s", (_label, config, error) => {
     expect(() => validateAgenCConfigBlocks(malformed(config))).toThrow(error);
+  });
+
+  test("accepts the Meta-compatible minimal reasoning effort", () => {
+    expect(() =>
+      validateAgenCConfigBlocks(
+        malformed({
+          reasoning_effort: "minimal",
+          profiles: { meta: { reasoning_effort: "minimal" } },
+        }),
+      ),
+    ).not.toThrow();
   });
 
   test.each([
@@ -248,6 +258,31 @@ describe("strict schema-v2 validation coverage", () => {
         },
       }).mcp_servers,
     ).toHaveProperty("plugin:sample:local");
+  });
+
+  test("accepts audited virtual non-filesystem write tool names in MCP config", () => {
+    const config = validateAgenCConfigBlocks({
+      mcp_servers: {
+        desktop: {
+          command: "node",
+          virtual_no_fs_write_tools: ["browser_navigate"],
+        },
+      },
+    });
+
+    expect(config.mcp_servers?.desktop?.virtual_no_fs_write_tools).toEqual([
+      "browser_navigate",
+    ]);
+    expect(() =>
+      validateAgenCConfigBlocks(malformed({
+        mcp_servers: {
+          desktop: {
+            command: "node",
+            virtual_no_fs_write_tools: ["browser_navigate", 42],
+          },
+        },
+      })),
+    ).toThrow(/desktop\.virtual_no_fs_write_tools.*array element/u);
   });
 
   test("ordinary strict loading rejects the retired llm.xai surface", () => {

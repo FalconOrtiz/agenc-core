@@ -308,10 +308,17 @@ otherwise.
 | `agent.retention.snapshot_max_count` | `10000` |
 | `agent.retention.snapshot_max_bytes` | `67108864` |
 
-`max_turns` and `stream_watchdog_timeout_ms` are unset by default. An unset
-turn cap does not impose a synthetic stop. An unset stream watchdog permits
-provider silence indefinitely; set the timeout to `0` to explicitly disable
-it as well. `[budget]`, `[heartbeat]`, `[browser]`, and
+`max_turns` is unset by default; an unset turn cap does not impose a
+synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
+minutes of provider silence): the runtime warns at half that time and aborts
+the stream with a retryable `stream_idle` error at the deadline. Set it to
+`0` to permit provider silence indefinitely. The *default* applies to session
+turns only: a one-shot review delegate (`/review`, guardian approval review)
+carries its own deadline, so the ten-minute default is not layered on top of
+it. A value you configure yourself is still honoured inside a review delegate.
+The guardian approval review behind a permission prompt runs under a
+ten-minute deadline of its own, so a dead provider socket expires that review
+instead of parking the approval. `[budget]`, `[heartbeat]`, `[browser]`, and
 `[transaction_guard]` apply their documented subsystem defaults when absent.
 
 On a keep-alive (interactive) session, hitting `max_turns`,
@@ -349,7 +356,7 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `model_provider` | Configured startup canonical provider slug. Strict v2 rejects the retired `xai`, `custom`, and `openai_compatible` selector spellings. |
 | `approval_policy` | `untrusted`, `on-failure`, `on-request`, or `never`. |
 | `sandbox_mode` | `read-only`, `workspace-write`, or `danger-full-access`. |
-| `reasoning_effort` | `low`, `medium`, `high`, `xhigh`, or `none`. |
+| `reasoning_effort` | `minimal`, `low`, `medium`, `high`, `xhigh`, or `none`. |
 | `reasoning_summary` | `auto`, `concise`, `detailed`, or `none`. |
 | `approvals_reviewer` | `user` or `auto_review`. |
 | `model_verbosity` | `low`, `medium`, or `high`. |
@@ -367,7 +374,7 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `max_budget_usd` | Positive session cost cap. |
 | `autonomous_mode` | Boolean autonomous runtime mode. |
 | `coordinator_mode` | Boolean coordinator-only main-session behavior. |
-| `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; `0` disables. |
+| `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; default `600000`, `0` disables. |
 
 Project-root discovery happens before project and local configuration can be
 loaded. Its marker authority is therefore limited to the built-in/plugin/user
@@ -489,6 +496,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `providers.<provider>.capability_overrides.acceptsImageHistory`, `providers.<provider>.capability_overrides.acceptsAudioHistory`, `providers.<provider>.capability_overrides.acceptsThinkingHistory`, `providers.<provider>.capability_overrides.acceptsReasoningEffort` | Boolean accepted-history/effort capabilities. |
 | `providers.<provider>.web_search`, `providers.<provider>.x_search`, `providers.<provider>.code_execution` | Grok-only native web, X, and code capabilities; rejected on every other provider. |
 | `providers.<provider>.enable_image_search`, `providers.<provider>.enable_image_understanding`, `providers.<provider>.enable_video_understanding` | Grok-only native media capabilities; rejected on every other provider. |
+| `providers.<provider>.incremental_continuation` | Grok-only boolean opt-in (`AGENC_XAI_INCREMENTAL`) for Responses `previous_response_id` continuation on streaming turns; default off. |
 | `providers.<provider>.collections` | Grok-only native collection-search block. |
 | `providers.<provider>.collections.enabled`, `providers.<provider>.collections.max_num_results`, `providers.<provider>.collections.vector_store_ids` | Collection enablement, positive result cap, and vector-store ID list. |
 | `providers.<provider>.remote_mcp` | Grok-only server-side MCP block. |
@@ -542,6 +550,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `mcp_servers.<server>.enabled`, `mcp_servers.<server>.required`, `mcp_servers.<server>.timeout` | Enablement, required-startup policy, and timeout. |
 | `mcp_servers.<server>.default_tools_approval_mode` | Server-wide approval default. |
 | `mcp_servers.<server>.enabled_tools`, `mcp_servers.<server>.disabled_tools` | Tool arrays. |
+| `mcp_servers.<server>.virtual_no_fs_write_tools` | Trusted user/managed-only list of hand-audited tools that cannot perform model-directed filesystem writes. Never use it for shell/code tools or tools accepting output paths. Project, local, plugin, and session layers cannot grant this exemption. |
 | `mcp_servers.<server>.tools`, `mcp_servers.<server>.tools.<name>` | Per-tool blocks. |
 | `mcp_servers.<server>.tools.<name>.default_permission_mode` | Per-tool approval default. Enablement belongs only in the server lists. |
 | `xaa_idp` | Non-secret OIDC metadata shared by MCP Cross-App Access. IdP tokens and client secrets remain in native secure storage. |

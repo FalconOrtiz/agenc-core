@@ -861,15 +861,23 @@ export function BufferSurface({
         ) {
           return false;
         }
-        return store.handleInput(
-          input,
-          key,
-          inputContentSize.current,
-          executeVimCommand,
-          event.keypress.isPasted,
-        );
+        const ownership = store.getOrdinaryInputOwnership();
+        if (ownership === "transition") return true;
+        if (ownership === "provider") {
+          return store.handleInput(
+            input,
+            key,
+            inputContentSize.current,
+            executeVimCommand,
+            event.keypress.isPasted,
+          );
+        }
+        // Host selected a BUFFER path before the controller entered open.
+        // Fail closed so a later useInput handler cannot steal the keystroke.
+        return activePath !== null;
       },
       [
+        activePath,
         copyCrashDetails,
         crashed,
         executeVimCommand,

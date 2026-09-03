@@ -20,6 +20,7 @@ import {
 } from "./memory-paths.js";
 import { formatMemoryManifest, scanMemoryFiles } from "../../memory/index.js";
 import { resolveAgentRuntimeOptions } from "../../session/runtime-options.js";
+import { createControlledPromise } from "../../helpers/controlled-async.js";
 
 vi.mock("bun:bundle", () => ({ feature: () => false }));
 vi.mock("../../tools.js", () => ({}));
@@ -939,13 +940,17 @@ describe("extract memories service", () => {
   });
 
   it("drains active extraction work before the caller finishes shutdown", async () => {
-    let resolveChild!: () => void;
-    const runChild = vi.fn(
-      async () =>
-        new Promise<{ readonly outcome: "completed" }>((resolve) => {
-          resolveChild = () => resolve({ outcome: "completed" });
-        }),
+    const childStarted = createControlledPromise<void>(
+      "extractMemories child started",
     );
+    const releaseChild = createControlledPromise<void>(
+      "extractMemories child release",
+    );
+    const runChild = vi.fn(async () => {
+      childStarted.resolve(undefined);
+      await releaseChild.promise;
+      return { outcome: "completed" as const };
+    });
     initExtractMemories({
       env: {},
       minEligibleTurns: 1,
@@ -960,19 +965,40 @@ describe("extract memories service", () => {
     const extraction = executeExtractMemories(
       extractionContext({ cwd: root, messages }),
     );
-    await eventually(() => expect(runChild).toHaveBeenCalledOnce());
 
-    let drained = false;
-    const drain = drainPendingExtraction(1000).then(() => {
-      drained = true;
-    });
-    await Promise.resolve();
-    expect(drained).toBe(false);
+    try {
+      await Promise.race([
+        childStarted.promise,
+        new Promise<never>((_, reject) => {
+          const timer = setTimeout(() => {
+            reject(
+              new Error(
+                "timed out waiting for memory extraction child to start",
+              ),
+            );
+          }, 10_000);
+          timer.unref?.();
+        }),
+      ]);
+      expect(runChild).toHaveBeenCalledOnce();
 
-    resolveChild();
-    await extraction;
-    await drain;
-    expect(drained).toBe(true);
+      let drained = false;
+      const drain = drainPendingExtraction(1000).then(() => {
+        drained = true;
+      });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      releaseChild.assertPending();
+
+      releaseChild.resolve(undefined);
+      await extraction;
+      await drain;
+      expect(drained).toBe(true);
+    } finally {
+      if (releaseChild.state().status === "pending") {
+        releaseChild.resolve(undefined);
+      }
+    }
   });
 
   it("scopes extraction cursors by session and memory directory", async () => {

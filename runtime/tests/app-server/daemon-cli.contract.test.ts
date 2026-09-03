@@ -523,6 +523,13 @@ function createReadyPublishedDaemonOptions(
 function createSignalProcess() {
   type TestDaemonSignal = AgenCShutdownSignal;
   const listeners = new Map<TestDaemonSignal, Set<() => void>>();
+  /** Signals emitted before any listener (startup race); flushed on once(). */
+  const pending = new Set<TestDaemonSignal>();
+  const deliver = (signal: TestDaemonSignal): void => {
+    for (const listener of [...(listeners.get(signal) ?? [])]) {
+      listener();
+    }
+  };
   const addListener = (signal: TestDaemonSignal, listener: () => void) => {
     let set = listeners.get(signal);
     if (set === undefined) {
@@ -530,6 +537,9 @@ function createSignalProcess() {
       listeners.set(signal, set);
     }
     set.add(listener);
+    if (pending.delete(signal)) {
+      deliver(signal);
+    }
   };
   return {
     once: (signal: AgenCShutdownSignal, listener: () => void) => {
@@ -539,9 +549,12 @@ function createSignalProcess() {
       listeners.get(signal)?.delete(listener);
     },
     emit(signal: TestDaemonSignal): void {
-      for (const listener of [...(listeners.get(signal) ?? [])]) {
-        listener();
+      const set = listeners.get(signal);
+      if (set !== undefined && set.size > 0) {
+        deliver(signal);
+        return;
       }
+      pending.add(signal);
     },
   };
 }
@@ -963,6 +976,29 @@ async function resolveRealtimeHeadersForTest(
 ): Promise<Readonly<Record<string, string>>> {
   return typeof provider === "function" ? provider(sessionConfig) : provider;
 }
+
+describe("daemon-cli test signal process (#2033)", () => {
+  it("delivers SIGTERM emitted before shutdown handlers install", () => {
+    const signalProcess = createSignalProcess();
+    let deliveries = 0;
+    signalProcess.emit("SIGTERM");
+    signalProcess.once("SIGTERM", () => {
+      deliveries += 1;
+    });
+    expect(deliveries).toBe(1);
+  });
+
+  it("does not drop live emits after handlers install", () => {
+    const signalProcess = createSignalProcess();
+    let deliveries = 0;
+    signalProcess.once("SIGTERM", () => {
+      deliveries += 1;
+    });
+    signalProcess.emit("SIGTERM");
+    signalProcess.emit("SIGTERM");
+    expect(deliveries).toBe(2);
+  });
+});
 
 describe("AgenC daemon readiness timeout resolution", () => {
   it("raises the default cold-start budget to at least 30s", () => {

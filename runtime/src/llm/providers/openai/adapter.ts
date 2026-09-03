@@ -821,6 +821,9 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   private resolveChatCompletionsMaxTokenField(): ChatCompletionsMaxTokenField {
+    if (this.name === "meta") {
+      return "max_completion_tokens";
+    }
     if (this.name !== "openai" || isLocalBaseURL(this.config.baseURL)) {
       return "max_tokens";
     }

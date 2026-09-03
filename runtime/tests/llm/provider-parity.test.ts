@@ -12,6 +12,7 @@ import {
 import { AnthropicProvider } from "./providers/anthropic/adapter.js";
 import { BedrockProvider } from "./providers/bedrock/index.js";
 import { DeepSeekProvider } from "./providers/deepseek/index.js";
+import { MetaProvider } from "./providers/meta/index.js";
 import { GeminiProvider } from "./providers/gemini/index.js";
 import { createGeminiEndpointPlan } from "./providers/gemini/endpoint-plan.js";
 import { GrokProvider } from "./providers/grok/adapter.js";
@@ -788,6 +789,23 @@ const PROVIDERS: readonly ProviderParityEntry[] = [
             fetchImpl,
           }),
         payload: buildChatCompletionsPayload("deepseek-v4-pro", parityCase),
+      }),
+  },
+  {
+    provider: "meta",
+    model: "muse-spark-1.3",
+    apiKey: "meta-test",
+    env: { MODEL_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new MetaProvider({
+            apiKey: "meta-test",
+            model: "muse-spark-1.3",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("muse-spark-1.3", parityCase),
       }),
   },
   {

@@ -116,6 +116,14 @@ export const MODEL_TOKENIZER_CONFIGS: readonly ModelTokenizerConfig[] = [
     supportsCode: true,
   },
   {
+    modelFamily: "meta",
+    providerNames: ["meta"],
+    modelMatchers: [/muse-spark/i],
+    bytesPerToken: DEFAULT_BYTES_PER_TOKEN,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
     modelFamily: "deepseek",
     providerNames: ["deepseek"],
     modelMatchers: [/deepseek/i],

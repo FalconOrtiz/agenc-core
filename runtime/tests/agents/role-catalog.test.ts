@@ -124,6 +124,25 @@ describe("AgentRoleCatalog", () => {
     expect(Object.isFrozen(role.config)).toBe(true);
   });
 
+  it("preserves Meta's minimal reasoning effort in executable roles", () => {
+    const workspace = createAgentRoleWorkspace(process.cwd());
+    const definition: AgentDefinition = {
+      agentType: "meta-fast",
+      whenToUse: "Use minimal Meta reasoning",
+      source: "userSettings",
+      baseDir: "workspace-role",
+      effort: "minimal",
+      roleDefinitionPrompt: "Reply briefly.",
+      getSystemPrompt: () => "Reply briefly.",
+    };
+    const catalog = new AgentRoleCatalog(workspace, {
+      agentRoleWorkspaceId: workspace.id,
+      activeAgents: [...builtIns(), definition],
+    });
+
+    expect(catalog.require("meta-fast").config.reasoningEffort).toBe("minimal");
+  });
+
   it("preserves exact built-in and programmatic role-only policy", () => {
     const workspace = createAgentRoleWorkspace(process.cwd());
     registerAgentRole(workspace, {

@@ -118,16 +118,11 @@ describe("retired config surface authority", () => {
     ["advisorModel", 'advisorModel = "reviewer"'],
     ["approvals_reviewer", 'approvals_reviewer = "guardian_subagent"'],
     ["service_tier", 'service_tier = "fast"'],
-    ["reasoning_effort", 'reasoning_effort = "minimal"'],
     [
       "profiles.audit.approvals_reviewer",
       '[profiles.audit]\napprovals_reviewer = "guardian_subagent"',
     ],
     ["profiles.audit.service_tier", '[profiles.audit]\nservice_tier = "fast"'],
-    [
-      "profiles.audit.reasoning_effort",
-      '[profiles.audit]\nreasoning_effort = "minimal"',
-    ],
   ])("strict schema v2 rejects %s", async (field, body) => {
     const root = temporaryRoot("agenc-retired-v2");
     const path = join(root, "config.toml");
@@ -578,7 +573,7 @@ describe("retired config surface authority", () => {
     ]));
   });
 
-  test("explicit migration canonicalizes plugin booleans and retired value aliases", async () => {
+  test("explicit migration preserves minimal effort while canonicalizing retired aliases", async () => {
     const root = temporaryRoot("agenc-retired-value-aliases");
     const home = join(root, "home");
     write(join(home, "config.toml"), [
@@ -608,10 +603,10 @@ describe("retired config surface authority", () => {
     const migrated = parseToml(configWrite?.content ?? "") as Record<string, unknown>;
     expect(migrated).toMatchObject({
       service_tier: "priority",
-      reasoning_effort: "low",
+      reasoning_effort: "minimal",
       plugins: { plugins: { formatter: { enabled: false } } },
       profiles: {
-        audit: { service_tier: "priority", reasoning_effort: "low" },
+        audit: { service_tier: "priority", reasoning_effort: "minimal" },
       },
     });
     expect(plan.notices).toEqual(expect.arrayContaining([
@@ -622,10 +617,6 @@ describe("retired config surface authority", () => {
       expect.objectContaining({
         field: "service_tier",
         target: "service_tier=priority",
-      }),
-      expect.objectContaining({
-        field: "reasoning_effort",
-        target: "reasoning_effort=low",
       }),
     ]));
   });

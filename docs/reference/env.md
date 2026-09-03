@@ -25,7 +25,7 @@ Boolean-like values that go through `applyEnvOverrides` treat
 | `AGENC_WORKSPACE` | Workspace root override |
 | `AGENC_MODEL` | Session model (`grok-4.6` when unset and config is fresh) |
 | `AGENC_PROVIDER` | Canonical provider slug. Retired selector spellings are rejected; use `grok` and `openai-compatible` directly |
-| `AGENC_EFFORT_LEVEL` | Reasoning effort captured into canonical session config: `low`, `medium`, `high`, `xhigh`, or `none`; other values are rejected |
+| `AGENC_EFFORT_LEVEL` | Reasoning effort captured into canonical session config: `minimal`, `low`, `medium`, `high`, `xhigh`, or `none`; other values are rejected |
 | `AGENC_PROFILE` | Named config profile (`--profile`) |
 | `AGENC_AUTONOMOUS` | Truthy enables autonomous tick mode |
 | `AGENC_MAX_OUTPUT_TOKENS` | Positive integer output-token budget |
@@ -34,7 +34,7 @@ Boolean-like values that go through `applyEnvOverrides` treat
 | `AGENC_MAX_TURNS` | Positive integer turn-loop cap when `max_turns` is not in TOML |
 | `AGENC_AGENT_MAX_DEPTH` | Non-negative subagent nesting cap projected to `agent_max_depth`; `0` disables spawning |
 | `AGENC_COORDINATOR_MODE` | Overrides `coordinator_mode` both ways when the `COORDINATOR_MODE` build flag is on (it is on in `runtime/src/build/feature.ts`). `0` / `false` / `off` force off |
-| `AGENC_STREAM_IDLE_TIMEOUT_MS` | Stream idle deadline in milliseconds. Unset or `0` means no idle deadline |
+| `AGENC_STREAM_IDLE_TIMEOUT_MS` | Stream idle deadline in milliseconds. Unset keeps the `600000` config default; `0` means no idle deadline |
 | `AGENC_MARKETPLACE_CLI` | Path to marketplace-cli (`[protocol].cli_path`) |
 
 ## Provider credentials and endpoints
@@ -53,6 +53,7 @@ Credential values are not written into the canonical config snapshot.
 | OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `AGENC_OPENROUTER_HTTP_REFERER`, `AGENC_OPENROUTER_TITLE` |
 | Groq | `GROQ_API_KEY`, `GROQ_BASE_URL` |
 | DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` |
+| Meta | `MODEL_API_KEY`, `META_BASE_URL` |
 | Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_ACCESS_TOKEN`, `GEMINI_AUTH_MODE` (`api-key`, `access-token`, or `adc`), `GEMINI_BASE_URL`, `GEMINI_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`, `GEMINI_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, `GEMINI_CACHED_CONTENT` |
 | Mistral | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL` |
 | NVIDIA NIM | `NVIDIA_API_KEY`, `NVIDIA_BASE_URL` |
@@ -221,6 +222,8 @@ These have their own pages. Short map:
 | Heartbeat | `AGENC_HEARTBEAT`, `AGENC_HEARTBEAT_INTERVAL`, `AGENC_HEARTBEAT_ACTIVE_HOURS`, `AGENC_HEARTBEAT_TARGET`. `skip_when_busy` has no env (TOML only, default true) | [autonomy.md](autonomy.md) |
 | Transaction guard | `AGENC_TRANSACTION_GUARD`, `AGENC_TRANSACTION_GUARD_MODEL`, `AGENC_TRANSACTION_GUARD_OLLAMA_URL`, `AGENC_TRANSACTION_GUARD_FAIL_MODE`, `AGENC_TRANSACTION_GUARD_TIMEOUT_MS`, `AGENC_TRANSACTION_GUARD_MAX_DOCKET_BYTES` | [slm-transaction-guard.md](../security/slm-transaction-guard.md) |
 | Web search | `AGENC_WEB_SEARCH_ENDPOINT`, `AGENC_WEB_SEARCH_KIND`, `AGENC_WEB_SEARCH_API_KEY` | [config.md](config.md) |
+| xAI incremental continuation | `AGENC_XAI_INCREMENTAL` (boolean-like; projects to `providers.grok.incremental_continuation`, off by default). Streaming Grok turns then send `previous_response_id` plus the items added since the last completed response instead of the full history | [providers.md](providers.md) |
+| Provider trace | `AGENC_PROVIDER_TRACE` (truthy). Writes one JSON line per model request and per response or error, without message bodies (model, `prompt_cache_key`, `previous_response_id`, `reasoning`, `parallel_tool_calls`, `max_output_tokens`, usage, stream event count, elapsed ms), to `<AGENC_HOME>/agent-logs/<conversation>/llm-<seq>.jsonl` | [providers.md](providers.md) |
 | Trajectories | `AGENC_TRAJECTORY_EXPORT_DIR`, `AGENC_TRAJECTORY_EXPORT_PATH` | [trajectory-training-data.md](../trajectory-training-data.md) |
 
 ## TUI and BUFFER
@@ -348,7 +351,7 @@ The sections above explain the common operator controls. The index below makes t
 
 ### AGENC_M*
 
-`AGENC_MANAGED_HOME`, `AGENC_MANAGED_INSTRUCTIONS`, `AGENC_MAX_CONTEXT_TOKENS`, `AGENC_MAX_SESSION_READ_CONTENT_BYTES`, `AGENC_MAX_TOOL_DRAIN_MS`, `AGENC_MAX_TOOL_RESULT_WINDOW_FRACTION`, `AGENC_MAX_TOOL_USE_CONCURRENCY`, `AGENC_MCP_INSTR_DELTA`, `AGENC_MESSAGING_SOCKET`, `AGENC_MICROCOMPACT_CLEAR_AFTER_MS`, `AGENC_MICROCOMPACT_CLEAR_THINKING`, `AGENC_MICROCOMPACT_CLEAR_TOOL_RESULTS`, `AGENC_MICROCOMPACT_CLEAR_TOOL_USES`.
+`AGENC_MANAGED_HOME`, `AGENC_MANAGED_INSTRUCTIONS`, `AGENC_MAX_CONTEXT_TOKENS`, `AGENC_MAX_SESSION_READ_CONTENT_BYTES`, `AGENC_MAX_SKILL_FILES_PER_ROOT`, `AGENC_MAX_TOOL_DRAIN_MS`, `AGENC_MAX_TOOL_RESULT_WINDOW_FRACTION`, `AGENC_MAX_TOOL_USE_CONCURRENCY`, `AGENC_MCP_INSTR_DELTA`, `AGENC_MESSAGING_SOCKET`, `AGENC_MICROCOMPACT_CLEAR_AFTER_MS`, `AGENC_MICROCOMPACT_CLEAR_THINKING`, `AGENC_MICROCOMPACT_CLEAR_TOOL_RESULTS`, `AGENC_MICROCOMPACT_CLEAR_TOOL_USES`.
 
 ### AGENC_O*
 

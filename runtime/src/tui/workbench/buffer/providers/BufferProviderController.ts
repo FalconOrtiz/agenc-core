@@ -51,6 +51,16 @@ import { emptyProviderSnapshot, INLINE_BUFFER_CAPABILITIES } from "./types.js";
 
 type SelectionFactory = () => Promise<BufferProviderSelection>;
 
+/**
+ * Who owns ordinary keyboard input for a focused BUFFER surface.
+ * `transition` means consume without mutating or replaying: the provider is
+ * absent, still opening, or mid-replacement.
+ */
+export type BufferOrdinaryInputOwnership =
+  | "provider"
+  | "transition"
+  | "none";
+
 export type BufferProviderRuntimeContext = {
   readonly workspaceRoot?: string;
   readonly agencHome?: string;
@@ -83,6 +93,7 @@ export class BufferProviderController {
   #lastOpen: BufferProviderOpenOptions | null = null;
   #lastSize: BufferProviderResize | null = null;
   #openGeneration = 0;
+  #openInFlight = false;
   #cleanupPromise: Promise<void> | null = null;
   #replacementPromise: Promise<boolean> | null = null;
   #restartPromise: Promise<boolean> | null = null;
@@ -146,6 +157,17 @@ export class BufferProviderController {
 
   getSnapshot = (): BufferProviderSnapshot => this.#snapshot;
 
+  getOrdinaryInputOwnership(): BufferOrdinaryInputOwnership {
+    if (this.#replacementPromise !== null || this.#openInFlight) {
+      return "transition";
+    }
+    if (this.#provider !== null) return "provider";
+    if (this.#lastOpen !== null || this.#cleanupPromise !== null) {
+      return "transition";
+    }
+    return "none";
+  }
+
   getVisibleLines(): readonly BufferVisibleLine[] {
     return this.#provider?.getVisibleLines() ?? [];
   }
@@ -166,6 +188,20 @@ export class BufferProviderController {
     const generation = this.#openGeneration + 1;
     this.#openGeneration = generation;
     this.#lastOpen = { filePath, line };
+    this.#openInFlight = true;
+    try {
+      await this.#openGenerationBody(filePath, line, generation, selectionFactory);
+    } finally {
+      if (generation === this.#openGeneration) this.#openInFlight = false;
+    }
+  }
+
+  async #openGenerationBody(
+    filePath: string,
+    line: number,
+    generation: number,
+    selectionFactory: SelectionFactory,
+  ): Promise<void> {
     const cleanupPromise = this.#cleanupPromise;
     if (cleanupPromise) {
       try {
@@ -711,6 +747,7 @@ export class BufferProviderController {
   async close(options: BufferProviderCloseOptions = {}): Promise<boolean> {
     const generation = this.#openGeneration + 1;
     this.#openGeneration = generation;
+    this.#openInFlight = false;
     const replacementPromise = this.#replacementPromise;
     if (replacementPromise) {
       try {
@@ -785,6 +822,9 @@ export class BufferProviderController {
     onInlineCommand?: (command: BufferVimCommand) => void,
     isPaste = false,
   ): boolean {
+    if (this.getOrdinaryInputOwnership() === "transition") {
+      return true;
+    }
     return (
       this.#provider?.handleInput({
         input,
@@ -812,6 +852,7 @@ export class BufferProviderController {
   async cleanup(options: BufferProviderCleanupOptions = {}): Promise<void> {
     const generation = this.#openGeneration + 1;
     this.#openGeneration = generation;
+    this.#openInFlight = false;
     const replacementPromise = this.#replacementPromise;
     if (replacementPromise) {
       // A replacement owns teardown until it settles. This cleanup generation

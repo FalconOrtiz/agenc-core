@@ -17,6 +17,7 @@
 import { createHash } from "node:crypto";
 
 import type { LLMChatOptions, LLMMessage, LLMProvider } from "../llm/types.js";
+import { STREAM_IDLE_ABORT_REASON } from "../llm/stream-watchdog.js";
 import {
   createProvider,
   preserveProviderFactoryState,
@@ -456,6 +457,14 @@ export interface AgenCDelegateThread {
 interface InternalDelegateThread extends AgenCDelegateThread {
   lastAssistantText(): string | null;
   error(): Error | null;
+  /**
+   * Whether the child stream was cut short by the stream-idle watchdog. The
+   * watchdog aborts the provider call, not this delegate's controller, so the
+   * failure arrives here as a plain provider error; this flag is what lets the
+   * classifier tell "the socket went silent past its deadline" apart from "the
+   * reviewer failed".
+   */
+  streamIdleAborted(): boolean;
 }
 
 const DELEGATE_EVENT_QUEUE_DEPTH = 1_000;
@@ -643,6 +652,16 @@ function buildChildServices(
     // service would make the child ignore `provider` above and route review
     // traffic through the parent's active model instead.
     providerService: undefined,
+    // A delegate also owns its deadline: `req.timeoutMs` (unbounded when the
+    // caller omits it) aborts with reason `"timeout"` and is classified as the
+    // `timeout` verdict. The ambient stream-idle watchdog would abort the same
+    // turn first with reason `stream_idle`, which reaches the caller as a
+    // generic review failure — the guardian reviewer turns that into a
+    // high-risk denial of the user's tool call. Opt out so a stalled socket
+    // cannot masquerade as a safety verdict. This opts out of the ambient
+    // default only; an operator-configured `stream_watchdog_timeout_ms` is
+    // still applied to the child stream.
+    streamIdleWatchdogDisabled: true,
     admissionRequired: parent.services.admissionRequired !== false,
     ...(parent.services.executionAdmission !== undefined
       ? {
@@ -824,6 +843,7 @@ export async function spawnAgenCDelegateThread(
   let spawnSettled = false;
   let assistantText: string | null = null;
   let runError: Error | null = null;
+  let streamIdleAborted = false;
   let delegateInputStarted = false;
   const terminalResult = (): ChildRunTerminalResult => {
     if (childController.signal.aborted) {
@@ -1050,6 +1070,13 @@ export async function spawnAgenCDelegateThread(
     if (event.msg.type === "agent_message") {
       assistantText = event.msg.payload.message;
     }
+    if (
+      event.msg.type === "stream_error" &&
+      (event.msg.payload as { cause?: unknown }).cause ===
+        STREAM_IDLE_ABORT_REASON
+    ) {
+      streamIdleAborted = true;
+    }
     if (shouldQueueDelegateEvent(event)) {
       rxEvent.send(event);
     }
@@ -1160,6 +1187,7 @@ export async function spawnAgenCDelegateThread(
     completion,
     lastAssistantText: () => assistantText,
     error: () => runError,
+    streamIdleAborted: () => streamIdleAborted,
     shutdown: async (reason?: unknown) => {
       if (!childController.signal.aborted) {
         childController.abort(reason ?? "shutdown");
@@ -1319,7 +1347,15 @@ export async function runAgenCReviewOneShot(
     // Provider failed without returning any content. Classify as a
     // "fail" verdict (the review could not complete), surface the
     // typed error in `error` so the caller can telemetry-route.
-    verdict = "fail";
+    //
+    // Except when the stream-idle watchdog is what ended it: that is a
+    // deadline on provider silence, so it belongs on this delegate's
+    // `timeout` verdict alongside `req.timeoutMs`. Routed to `fail` instead,
+    // a dead socket reaches the guardian approval reviewer as a failed review
+    // and is rendered to the user as a high-risk denial of their own tool
+    // call. The watchdog aborts the provider call rather than
+    // `childController`, so the abort is only visible as this flag.
+    verdict = thread?.streamIdleAborted() === true ? "timeout" : "fail";
     output = emptyReviewOutput();
     error = providerError;
   } else {
@@ -1395,7 +1431,8 @@ export async function runAgenCReviewOneShot(
  * `reason` values:
  *   - `"completed"` — reviewer produced output; `reviewOutput` is the
  *     structured findings + explanation.
- *   - `"timeout"` — the `timeoutMs` budget elapsed.
+ *   - `"timeout"` — the `timeoutMs` budget elapsed, or the stream-idle
+ *     watchdog ended the child stream on operator-configured silence.
  *   - `"aborted"` — parent abort signal fired (session teardown,
  *     session.abortAllTasks, user interrupt).
  */

@@ -48,6 +48,7 @@ import { LMStudioProvider } from "./providers/lmstudio/index.js";
 import { OpenRouterProvider } from "./providers/openrouter/index.js";
 import { GroqProvider } from "./providers/groq/index.js";
 import { DeepSeekProvider } from "./providers/deepseek/index.js";
+import { MetaProvider } from "./providers/meta/index.js";
 import { MistralProvider } from "./providers/mistral/index.js";
 import { NvidiaNimProvider } from "./providers/nvidia-nim/index.js";
 import { MiniMaxProvider } from "./providers/minimax/index.js";
@@ -131,6 +132,8 @@ export type ProviderRuntimeExtra = Partial<
     readonly azureApiVersion?: string;
   };
   readonly gemini?: GeminiRuntimeOptions;
+  /** Grok-only opt-in for streaming previous_response_id continuation. */
+  readonly incrementalContinuation?: boolean;
   readonly grokAcp?: {
     readonly binaryPath?: string;
     readonly allowPermissions?: boolean;
@@ -1149,6 +1152,9 @@ function readRuntimeExtra(
     ...(readBoolean(extra, "parallelToolCalls") !== undefined
       ? { parallelToolCalls: readBoolean(extra, "parallelToolCalls") }
       : {}),
+    ...(readBoolean(extra, "incrementalContinuation") !== undefined
+      ? { incrementalContinuation: readBoolean(extra, "incrementalContinuation") }
+      : {}),
     ...(readString(extra, "visionModel") !== undefined
       ? { visionModel: readString(extra, "visionModel") }
       : {}),
@@ -1307,6 +1313,7 @@ function buildOpenAICompatibleProvider(
     | "openrouter"
     | "groq"
     | "deepseek"
+    | "meta"
     | "mistral"
     | "nvidia-nim"
     | "minimax"
@@ -1614,6 +1621,9 @@ export function createProvider(
         ...(extra.parallelToolCalls !== undefined
           ? { parallelToolCalls: extra.parallelToolCalls }
           : {}),
+        ...(extra.incrementalContinuation !== undefined
+          ? { incrementalContinuation: extra.incrementalContinuation }
+          : {}),
         ...(extra.visionModel ? { visionModel: extra.visionModel } : {}),
         ...(extra.webSearch !== undefined
           ? { webSearch: extra.webSearch }
@@ -1891,6 +1901,12 @@ export function createProvider(
         apiKeyMode: "required",
         useResponsesApi: false,
         providerCtor: DeepSeekProvider,
+      });
+    case "meta":
+      return buildOpenAICompatibleProvider("meta", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: MetaProvider,
       });
     case "mistral":
       return buildOpenAICompatibleProvider("mistral", opts, {

@@ -686,6 +686,7 @@ function createStoreHarness() {
     click: vi.fn(() => false),
     focus: vi.fn(),
     getShowTabsMode: vi.fn<() => "auto" | "always" | "never">(() => "auto"),
+    getOrdinaryInputOwnership: vi.fn(() => "provider" as const),
     getSnapshot: vi.fn(() => bufferHarness.snapshot),
     getVisibleLines: vi.fn(() => bufferHarness.visibleLines),
     goToDefinition: vi.fn(async () => false),

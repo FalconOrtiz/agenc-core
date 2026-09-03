@@ -259,7 +259,14 @@ const isFileSystemSandboxPolicy = objectShape({
 const isCollaborationMode = objectShape(
   { model: isString },
   {
-    reasoningEffort: oneOf("low", "medium", "high", "xhigh", "none"),
+    reasoningEffort: oneOf(
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "none",
+    ),
     developerInstructions: isString,
   },
 );

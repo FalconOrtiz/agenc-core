@@ -55,6 +55,12 @@ const PROVIDER_CASES: ReadonlyArray<{
     apiKey: () => process.env.DEEPSEEK_API_KEY,
   },
   {
+    provider: "meta",
+    model: process.env.AGENC_META_INTEGRATION_MODEL ?? "muse-spark-1.3",
+    enabled: RUN_REMOTE && Boolean(process.env.MODEL_API_KEY),
+    apiKey: () => process.env.MODEL_API_KEY,
+  },
+  {
     provider: "gemini",
     model: process.env.AGENC_GEMINI_INTEGRATION_MODEL ?? "gemini-2.5-pro",
     enabled: RUN_REMOTE && Boolean(process.env.GEMINI_API_KEY),

@@ -4,7 +4,7 @@ interface TableColumnRow {
   readonly name: string;
 }
 
-export const DROP_THREADS_LAST_ITEM_INDEX_SCHEMA_VERSION = 31;
+export const DROP_THREADS_LAST_ITEM_INDEX_SCHEMA_VERSION = 32;
 
 /**
  * Drops the vestigial `threads.last_item_index` column.

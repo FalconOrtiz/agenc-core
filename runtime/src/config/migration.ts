@@ -1149,31 +1149,6 @@ function migrateRetiredServiceTierAlias(
   }
 }
 
-function migrateRetiredReasoningEffortAlias(
-  config: JsonRecord,
-  scope: ConfigMigrationScope,
-  sourcePath: string,
-  notices: ConfigMigrationNotice[],
-): void {
-  const migrate = (record: JsonRecord, field: string): void => {
-    if (record.reasoning_effort !== "minimal") return;
-    record.reasoning_effort = "low";
-    notices.push(Object.freeze({
-      scope,
-      sourcePath,
-      field,
-      action: "migrate",
-      target: `${field}=low`,
-    }));
-  };
-  migrate(config, "reasoning_effort");
-  if (!isPlainRecord(config.profiles)) return;
-  for (const [profileName, profile] of Object.entries(config.profiles)) {
-    if (!isPlainRecord(profile)) continue;
-    migrate(profile, `profiles.${profileName}.reasoning_effort`);
-  }
-}
-
 function migrateRetiredProviderFallbackModels(
   config: JsonRecord,
   scope: ConfigMigrationScope,
@@ -1851,7 +1826,6 @@ function convertV1Config(
     notices,
   );
   migrateRetiredServiceTierAlias(migrated, scope, sourcePath, notices);
-  migrateRetiredReasoningEffortAlias(migrated, scope, sourcePath, notices);
   dropRetiredInactiveConfigFields(migrated, scope, sourcePath, notices);
   return migrated;
 }
@@ -3707,7 +3681,6 @@ async function loadTarget(
   migrateRetiredProtocolNoOps(raw, scope, targetPath, notices);
   migrateRetiredApprovalsReviewerAlias(raw, scope, targetPath, notices);
   migrateRetiredServiceTierAlias(raw, scope, targetPath, notices);
-  migrateRetiredReasoningEffortAlias(raw, scope, targetPath, notices);
   dropRetiredInactiveConfigFields(raw, scope, targetPath, notices);
   return {
     scope,
@@ -4771,12 +4744,6 @@ export async function checkConfigV2Migration(
       notices,
     );
     migrateRetiredServiceTierAlias(
-      accumulator.raw,
-      accumulator.scope,
-      accumulator.targetPath,
-      notices,
-    );
-    migrateRetiredReasoningEffortAlias(
       accumulator.raw,
       accumulator.scope,
       accumulator.targetPath,

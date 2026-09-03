@@ -82,7 +82,7 @@ describe("schema: defaultConfig", () => {
     expect(cfg.max_turns).toBeUndefined();
     expect(cfg.agent_max_threads).toBeUndefined();
     expect(cfg.agent_max_depth).toBe(1);
-    expect(cfg.stream_watchdog_timeout_ms).toBeUndefined();
+    expect(cfg.stream_watchdog_timeout_ms).toBe(600_000);
     expect(cfg.auth?.backend).toBe("remote");
     expect(cfg.auth?.managedKeys?.enabled).toBe(true);
     expect(cfg.plugins?.enabled).toBe(false);
@@ -1599,6 +1599,9 @@ describe("env: resolvers", () => {
   test("applyEnvOverrides captures only canonical AGENC_EFFORT_LEVEL values", () => {
     const base = mergeConfigs(defaultConfig(), { reasoning_effort: "low" });
     expect(
+      applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "minimal" }).reasoning_effort,
+    ).toBe("minimal");
+    expect(
       applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "xhigh" }).reasoning_effort,
     ).toBe("xhigh");
     expect(
@@ -1606,13 +1609,13 @@ describe("env: resolvers", () => {
     ).toBe("none");
   });
 
-  test.each(["minimal", "max", "auto", "unset", "warp", ""])(
+  test.each(["max", "auto", "unset", "warp", ""])(
     "applyEnvOverrides rejects non-canonical AGENC_EFFORT_LEVEL=%j",
     (value) => {
       expect(() => applyEnvOverrides(
         mergeConfigs(defaultConfig(), { reasoning_effort: "low" }),
         { AGENC_EFFORT_LEVEL: value },
-      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*low, medium, high, xhigh, or none/u);
+      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*minimal, low, medium, high, xhigh, or none/u);
     },
   );
 
@@ -1707,6 +1710,49 @@ describe("env: resolvers", () => {
     expect(disabled.stream_watchdog_timeout_ms).toBe(0);
   });
 
+  test("applyEnvOverrides folds AGENC_XAI_INCREMENTAL into providers.grok", () => {
+    const base = normalizeRawConfig({
+      providers: { grok: { timeout_ms: 5_000 } },
+    });
+    const on = applyEnvOverrides(base, { AGENC_XAI_INCREMENTAL: "1" });
+    expect(on.providers?.grok).toEqual({
+      timeout_ms: 5_000,
+      incremental_continuation: true,
+    });
+    const off = applyEnvOverrides(on, { AGENC_XAI_INCREMENTAL: "off" });
+    expect(off.providers?.grok?.incremental_continuation).toBe(false);
+
+    const warnings: string[] = [];
+    const invalid = applyEnvOverrides(
+      base,
+      { AGENC_XAI_INCREMENTAL: "sometimes" },
+      (message) => warnings.push(message),
+    );
+    expect(invalid.providers?.grok?.incremental_continuation).toBeUndefined();
+    expect(warnings).toEqual([
+      '[agenc:config] invalid AGENC_XAI_INCREMENTAL="sometimes"; expected boolean-like value',
+    ]);
+    // The flag is off unless set.
+    expect(defaultConfig().providers?.grok?.incremental_continuation).toBeUndefined();
+  });
+
+  test("providers.<provider>.incremental_continuation is a Grok-only boolean", () => {
+    expect(
+      normalizeRawConfig({
+        providers: { grok: { incremental_continuation: true } },
+      }).providers?.grok,
+    ).toEqual({ incremental_continuation: true });
+    expect(
+      validateProviderConfig({ grok: { incremental_continuation: true } }),
+    ).toEqual({ grok: { incremental_continuation: true } });
+    expect(() =>
+      validateProviderConfig({ grok: { incremental_continuation: "yes" } }),
+    ).toThrow(InvalidProviderConfigError);
+    expect(() =>
+      validateProviderConfig({ openai: { incremental_continuation: true } }),
+    ).toThrow(/allowed only under providers.grok/u);
+  });
+
   test("applyEnvOverrides diagnoses invalid loop, coordinator, and watchdog values", () => {
     const warnings: string[] = [];
     const out = applyEnvOverrides(
@@ -1720,7 +1766,8 @@ describe("env: resolvers", () => {
     );
     expect(out.max_turns).toBeUndefined();
     expect(out.coordinator_mode).toBeUndefined();
-    expect(out.stream_watchdog_timeout_ms).toBeUndefined();
+    // An invalid override leaves the ten-minute default in place.
+    expect(out.stream_watchdog_timeout_ms).toBe(600_000);
     expect(warnings).toEqual([
       '[agenc:config] invalid AGENC_MAX_TURNS="0"; expected a positive integer',
       '[agenc:config] invalid AGENC_COORDINATOR_MODE="sometimes"; expected boolean-like value',

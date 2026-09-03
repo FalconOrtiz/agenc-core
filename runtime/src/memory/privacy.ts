@@ -30,6 +30,8 @@ import {
   windowsPathToPosixPath,
 } from '../utils/windowsPaths.js'
 
+export { redactSecrets } from '../secrets/sanitizer.js'
+
 type SecretRule = {
   id: string
   source: string
@@ -498,23 +500,6 @@ export function scanForSecrets(content: string): SecretMatch[] {
 
 export function getSecretLabel(ruleId: string): string {
   return ruleIdToLabel(ruleId)
-}
-
-let redactRules: RegExp[] | null = null
-
-/**
- * Redact matched secret spans while preserving surrounding boundary text.
- */
-export function redactSecrets(content: string): string {
-  redactRules ??= SECRET_RULES.map(
-    r => new RegExp(r.source, (r.flags ?? '').replace('g', '') + 'g'),
-  )
-  for (const re of redactRules) {
-    content = content.replace(re, (match, g1) =>
-      typeof g1 === 'string' ? match.replace(g1, '[REDACTED]') : '[REDACTED]',
-    )
-  }
-  return content
 }
 
 /**

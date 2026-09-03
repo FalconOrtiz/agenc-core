@@ -133,10 +133,12 @@ not change their public shapes independently:
 
 - `packages/agenc-sdk/src/transcript-v2.generated.ts` mirrors the daemon
   `SessionTranscriptV2*` result interfaces and is re-exported from `protocol.ts`.
-  Verify its exact content with
+  Refresh it with
+  `npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types -- --write`,
+  then verify its exact content with
   `npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types`. See
   [Transcript v2 generated mirror](#transcript-v2-generated-mirror) for the
-  manual refresh steps.
+  refresh rules.
 - `packages/agenc-sdk/src/workflow-result.generated.ts` mirrors workflow result
   contracts whose source schemas live under `runtime/src/agents/`. The same
   generated-type command checks selected version and outcome markers. See
@@ -521,21 +523,19 @@ interfaces, which must `extend JsonObject`:
 - `SessionTranscriptV2Result`
 
 It rewrites the heritage to a local `TranscriptV2JsonObject` so the SDK
-stays zero-dependency, then compares against
-`packages/agenc-sdk/src/transcript-v2.generated.ts`. The checker does **not**
-write the file. The current refresh is a synchronized manual replacement from
-the runtime authority. The generated header's `Do not edit` instruction means
-that its public shapes must not change independently of that authority.
+stays zero-dependency. The default command compares the rendered text against
+`packages/agenc-sdk/src/transcript-v2.generated.ts` without writing. The
+explicit `--write` mode uses the same renderer and atomically replaces only
+that generated file with LF line endings.
 
 Refresh after a protocol edit:
 
 1. Keep those four interfaces `extends JsonObject`. Any other heritage fails
    the check.
-2. Manually replace the committed generated module from the updated runtime
-   declaration text. Keep the three-line `@generated` header and the local
-   `TranscriptV2Json*` aliases; copy the four declarations in that order,
-   changing `extends JsonObject` to `extends TranscriptV2JsonObject`. Preserve
-   property order, member comments, optionality, and unions.
+2. Run
+   `npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types -- --write`.
+   The command renders the complete module, including the generated header,
+   local aliases, and the four declarations in their fixed order.
 3. Run `npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types`.
 4. `runtime/tests/sdk-package/transcript-v2.contract.test.ts` also compares
    property names/types of `SessionTranscriptV2TurnResult` and
@@ -544,9 +544,11 @@ Refresh after a protocol edit:
 
 Constraints:
 
-- Comparison is exact after a single `CRLF` / bare `CR` to `LF` pass on both
-  the runtime authority and the committed file. Windows checkouts must pass
-  the same content. Do not change line endings solely to satisfy the check.
+- Check mode compares content after one `CRLF` or bare `CR` to `LF` pass on
+  both the runtime authority and the committed file. Check mode never writes.
+- Write mode normalizes the runtime authority before rendering and writes LF
+  bytes. Running write mode again produces the same bytes and reports that the
+  file is already current.
 - Changes to fields, optionality, unions, member comments, or ordering inside
   the extracted interface declarations fail until the generated file is
   refreshed. Leading interface JSDoc is outside the extracted declaration

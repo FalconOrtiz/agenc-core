@@ -5,7 +5,7 @@
  * prompt, and reads a memory file as a resource; excluded/secret
  * content stays out.
  */
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ import {
   createMemoryResourceProvider,
   createSkillPromptProvider,
 } from "../../src/mcp/server/content-providers.js";
+import { canonicalRedactionFixtures } from "../secrets/canonical-redaction-corpus.js";
 
 let root: string;
 
@@ -139,40 +140,59 @@ describe("MCP prompts backed by skills", () => {
 });
 
 describe("MCP resources backed by memory + instruction files", () => {
+  it("imports the canonical secret sanitizer for resource egress", async () => {
+    const source = await readFile(
+      new URL("../../src/mcp/server/content-providers.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(source).toContain(
+      'import { redactSecrets } from "../../secrets/sanitizer.js";',
+    );
+  });
+
   async function makeResourceServer(
-    readResourceContent?: (canonicalPath: string) => Promise<string>,
+    setup: {
+      /** Body written into deploy-notes.md and AGENC.md before serving. */
+      body?: string;
+      /** Fires only when a resource body is actually read from its handle. */
+      beforeReadForTesting?: (path: string) => void;
+    } = {},
   ): Promise<{
     server: McpServerFramework;
     memoryDir: string;
   }> {
-    const memoryDir = join(root, "memory");
-    await mkdir(memoryDir, { recursive: true });
-    await writeFile(
-      join(memoryDir, "MEMORY.md"),
-      "- [Deploy notes](deploy-notes.md)",
-    );
-    await writeFile(
-      join(memoryDir, "deploy-notes.md"),
+    const body =
+      setup.body ??
       [
         "---",
         "name: deploy-notes",
         "description: How deploys work",
         "---",
         "Use the staging pipeline. Token: ghp_0123456789abcdefABCDEF0123456789abcdef",
-      ].join("\n"),
+      ].join("\n");
+    const memoryDir = join(root, "memory");
+    await mkdir(memoryDir, { recursive: true });
+    await writeFile(
+      join(memoryDir, "MEMORY.md"),
+      "- [Deploy notes](deploy-notes.md)",
     );
+    await writeFile(join(memoryDir, "deploy-notes.md"), body);
     // Session memory lives under the config home's session-memory dir; it
     // must never be listed even if a memory dir points at it.
     const sessionDir = join(root, "session-memory");
     await mkdir(sessionDir, { recursive: true });
     await writeFile(join(sessionDir, "leak.md"), "session transcript notes");
-    await writeFile(join(root, "AGENC.md"), "# Project instructions\nhello");
+    await writeFile(
+      join(root, "AGENC.md"),
+      setup.body ?? "# Project instructions\nhello",
+    );
     const server = new McpServerFramework({
       resourceProvider: createMemoryResourceProvider({
         configHomeDir: root,
         memoryDirs: [memoryDir, sessionDir],
         instructionFiles: [join(root, "AGENC.md")],
-        readResourceContent,
+        beforeReadForTesting: setup.beforeReadForTesting,
       }),
     });
     return { server, memoryDir };
@@ -199,20 +219,24 @@ describe("MCP resources backed by memory + instruction files", () => {
   });
 
   it("does not read resource bodies while listing", async () => {
-    const readResourceContent = vi.fn(async () => "selected body");
-    const { server } = await makeResourceServer(readResourceContent);
+    let bodyReads = 0;
+    const { server } = await makeResourceServer({
+      beforeReadForTesting: () => {
+        bodyReads += 1;
+      },
+    });
     await initialized(server);
 
     const list = await request(server, "resources/list");
     expect(list.result.resources.length).toBeGreaterThan(0);
-    expect(readResourceContent).not.toHaveBeenCalled();
+    expect(bodyReads).toBe(0);
 
     const note = list.result.resources.find(
       (resource: any) => resource.name === "deploy-notes.md",
     );
     const read = await request(server, "resources/read", { uri: note.uri });
-    expect(read.result.contents[0].text).toBe("selected body");
-    expect(readResourceContent).toHaveBeenCalledOnce();
+    expect(read.result.contents[0].text).toContain("staging pipeline");
+    expect(bodyReads).toBe(1);
   });
 
   it("reads a memory file with secrets redacted", async () => {
@@ -227,6 +251,33 @@ describe("MCP resources backed by memory + instruction files", () => {
     expect(text).toContain("staging pipeline");
     expect(text).not.toContain("ghp_0123456789abcdef");
   });
+
+  it.each(canonicalRedactionFixtures)(
+    "applies canonical egress redaction to memory and instructions: $name",
+    async ({ input, expected, secretFragments, preservedFragments }) => {
+      const { server } = await makeResourceServer({ body: input });
+      await initialized(server);
+      const list = await request(server, "resources/list");
+
+      for (const name of ["deploy-notes.md", "AGENC.md"]) {
+        const resource = list.result.resources.find(
+          (candidate: any) => candidate.name === name,
+        );
+        const out = await request(server, "resources/read", {
+          uri: resource.uri,
+        });
+        const text = out.result.contents[0].text;
+
+        expect(text).toBe(expected);
+        for (const secret of secretFragments) {
+          expect(text).not.toContain(secret);
+        }
+        for (const preserved of preservedFragments) {
+          expect(text).toContain(preserved);
+        }
+      }
+    },
+  );
 
   it("rejects URIs it did not mint (path bounding)", async () => {
     const { server } = await makeResourceServer();

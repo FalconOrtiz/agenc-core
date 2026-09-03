@@ -447,7 +447,7 @@ output, low/medium/high/xhigh effort with high default); `grok-4.5` remains a
 selectable entry. Model metadata
 and cost assumptions: [`reference/providers.md`](reference/providers.md).
 
-There are **16 built-in provider slugs**. Full table, env vars, base URLs,
+There are **17 built-in provider slugs**. Full table, env vars, base URLs,
 and how local servers publish a context window:
 [`reference/providers.md`](reference/providers.md).
 `session.snapshot.contextBreakdown` gives a rough category estimate for the

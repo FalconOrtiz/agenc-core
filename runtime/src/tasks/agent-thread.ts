@@ -68,6 +68,7 @@ export interface AgentThreadTaskHandle {
   readonly worktreeBranch?: string;
   readonly messages?: ReadonlyArray<LLMMessage>;
   readonly summaryMessages?: ReadonlyArray<Message>;
+  readonly summaryRevision?: number;
   readonly summaryCacheSafeParams?: CacheSafeParams;
   onSummaryCacheSafeParams?(
     listener: (params: CacheSafeParams) => void,
@@ -471,9 +472,15 @@ export function registerAgentThreadTask(
 
 function agentTranscriptFromThread(thread: AgentThreadTaskHandle): {
   readonly messages: readonly Message[];
+  readonly revision?: number;
 } {
   if (thread.summaryMessages !== undefined) {
-    return { messages: [...thread.summaryMessages] };
+    return {
+      messages: [...thread.summaryMessages],
+      ...(thread.summaryRevision !== undefined
+        ? { revision: thread.summaryRevision }
+        : {}),
+    };
   }
   return {
     messages: (thread.messages ?? []).map(llmMessageToAgentSummaryMessage),

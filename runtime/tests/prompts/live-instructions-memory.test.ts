@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getProjectRoot, setProjectRoot } from "../bootstrap/state.js";
 import { ConfigStore } from "../config/store.js";
+import { REDACTED_SECRET } from "../secrets/index.js";
 import {
   getGlobalMemoryEntrypoint,
   getGlobalMemoryPath,
@@ -165,7 +166,7 @@ describe("live instructions memory indexes", () => {
 
     const envelope = await resolveEnvelope();
 
-    expect(envelope.memoryText).toContain("token=[REDACTED]");
+    expect(envelope.memoryText).toContain(`token=${REDACTED_SECRET}`);
     expect(envelope.memoryText).not.toContain(token);
   });
 

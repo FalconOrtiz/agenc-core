@@ -22,6 +22,7 @@ vi.mock("../../utils/settings/settings.js", async (importOriginal) => {
 
 import { getProjectRoot, setProjectRoot } from "../../bootstrap/state.js";
 import { ConfigStore } from "../../config/store.js";
+import { REDACTED_SECRET } from "../../secrets/index.js";
 import {
   getAttachmentTrackingState,
   resetRelevantMemoryBudget,
@@ -482,7 +483,7 @@ describe("relevantMemoriesProducer", () => {
     if (out[0]?.kind !== "relevant_memories") {
       throw new Error("expected relevant_memories");
     }
-    expect(out[0].memories[0]?.content).toContain("token=[REDACTED]");
+    expect(out[0].memories[0]?.content).toContain(`token=${REDACTED_SECRET}`);
     expect(out[0].memories[0]?.content).not.toContain(token);
   });
 

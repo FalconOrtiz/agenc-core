@@ -25,6 +25,12 @@ import type {
 } from "../budget/admission-client.js";
 import type { AdmissionLease } from "../budget/admission-types.js";
 import { WorkflowHandoffSpool } from "../agents/workflow-handoff-spool.js";
+import { defaultConfig } from "../config/schema.js";
+import { STREAM_IDLE_ABORT_REASON } from "../llm/stream-watchdog.js";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { isRetryableStreamError } from "../session/run-turn.js";
 import { OpenAIProvider } from "../llm/providers/openai/adapter.js";
 
 const streamedDispatchCalls: string[] = [];
@@ -96,6 +102,7 @@ vi.mock("./execute-tools.js", () => ({
 import {
   streamModel,
   type StreamModelRequestContract,
+  StreamModelError,
 } from "./stream-model.js";
 
 const TEST_CONTEXT_WINDOW_TOKENS = 131_072;
@@ -477,6 +484,393 @@ describe("streamModel — live assistant text sanitization", () => {
       serviceTier: "priority",
       parallelToolCalls: false,
     });
+  });
+
+  test("routes every provider request with the session conversation id as the prompt cache key", async () => {
+    // xAI prefix caching is routed by `prompt_cache_key`; without it 77 of
+    // 220 calls in the reviewed desktop session lost part of the cached
+    // prefix and re-prefilled 20k-150k tokens.
+    const ctx = mkCtx("chat");
+    const seenOptions: Array<Record<string, unknown> | undefined> = [];
+    const provider = mkProvider(async (_messages, _onChunk, options) => {
+      seenOptions.push(options as Record<string, unknown> | undefined);
+      return {
+        content: "ok",
+        toolCalls: [],
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        model: "test-model",
+        finishReason: "stop",
+      };
+    });
+    const { session } = mkSession(provider);
+
+    await streamModel(
+      mkState(ctx),
+      ctx,
+      session,
+      mkRequest([{ role: "user", content: "hello" }]),
+    );
+
+    expect(seenOptions[0]).toMatchObject({ promptCacheKey: "conv-stream" });
+  });
+
+  test("the default ten-minute stream watchdog aborts a stalled provider with a retryable stream_idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      // A provider that opened but never emits a chunk; it honours the abort
+      // signal the way the adapters do.
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      (session.services as { configStore?: unknown }).configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: defaultConfig().stream_watchdog_timeout_ms,
+        }),
+      };
+
+      const outcome = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(600_000 - 1);
+      expect(events.some((event) => event.msg.type === "stream_error")).toBe(
+        false,
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await outcome;
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          msg: {
+            type: "stream_error",
+            payload: expect.objectContaining({ cause: "stream_idle" }),
+          },
+        }),
+      );
+      expect(error).toBeInstanceOf(StreamModelError);
+      expect((error as Error).message).toMatch(/^stream_idle: no data for 600000ms/);
+      expect(isRetryableStreamError(error)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a session that owns its own deadline opts out of the ambient watchdog", async () => {
+    // The one-shot review delegate sets `streamIdleWatchdogDisabled` on its
+    // child services because it owns the review deadline
+    // (`AgenCReviewOneShotRequest.timeoutMs`, unbounded when the caller omits
+    // it) and classifies its expiry as a `timeout` verdict. A `stream_idle`
+    // abort on the same turn reaches the caller as an untyped review failure,
+    // which the guardian reviewer can only report as a high-risk denial of the
+    // user's tool call, so the ambient default must not apply there.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const sixHoursMs = 6 * 60 * 60 * 1_000;
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+            setTimeout(
+              () =>
+                resolve({
+                  content: "ok",
+                  toolCalls: [],
+                  usage: {
+                    promptTokens: 1,
+                    completionTokens: 1,
+                    totalTokens: 2,
+                  },
+                  model: "test-model",
+                  finishReason: "stop",
+                }),
+              sixHoursMs,
+            );
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: defaultConfig().stream_watchdog_timeout_ms,
+        }),
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const outcome = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      );
+
+      await vi.advanceTimersByTimeAsync(sixHoursMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+      expect(events.some((event) => event.msg.type === "stream_error")).toBe(
+        false,
+      );
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(outcome).resolves.toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an operator-configured watchdog still applies to a session that owns its deadline", async () => {
+    // `streamIdleWatchdogDisabled` opts a review delegate out of the ambient
+    // *default*, not out of the documented setting. An operator who sets
+    // `stream_watchdog_timeout_ms` (config.toml or AGENC_STREAM_IDLE_TIMEOUT_MS)
+    // asked for that idle deadline; before the opt-out existed the child
+    // inherited it through the parent's configStore, and it must keep doing so.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const configuredWatchdogMs = 60_000;
+      expect(configuredWatchdogMs).not.toBe(
+        defaultConfig().stream_watchdog_timeout_ms,
+      );
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+            // Never answers: a dead socket, which is what the watchdog is for.
+          }),
+      );
+      const { session, events } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({
+          stream_watchdog_timeout_ms: configuredWatchdogMs,
+        }),
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const settled = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(configuredWatchdogMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+      expect(providerSignal?.aborted).toBe(true);
+      expect(providerSignal?.reason).toBe(STREAM_IDLE_ABORT_REASON);
+      expect(
+        events.some(
+          (event) =>
+            event.msg.type === "stream_error" &&
+            (event.msg.payload as { cause?: string }).cause ===
+              STREAM_IDLE_ABORT_REASON,
+        ),
+      ).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a configured watchdog that matches the default value is honoured by provenance", async () => {
+    // The value alone cannot separate "operator wrote 600000" from "nobody
+    // wrote anything"; the config store's provenance can, and names the layer.
+    // A key attributed to a real layer is an operator choice and applies even
+    // inside a session that owns its own deadline.
+    vi.useFakeTimers();
+    try {
+      const ctx = mkCtx("chat");
+      const watchdogMs = defaultConfig().stream_watchdog_timeout_ms as number;
+      let providerSignal: AbortSignal | undefined;
+      const provider = mkProvider(
+        (_messages, _onChunk, options) =>
+          new Promise<LLMResponse>((_resolve, reject) => {
+            providerSignal = options?.signal;
+            options?.signal?.addEventListener(
+              "abort",
+              () => reject(new Error(String(options.signal?.reason))),
+              { once: true },
+            );
+          }),
+      );
+      const { session } = mkSession(provider);
+      const services = session.services as {
+        configStore?: unknown;
+        streamIdleWatchdogDisabled?: boolean;
+      };
+      services.configStore = {
+        current: () => ({ stream_watchdog_timeout_ms: watchdogMs }),
+        provenance: (key: string) =>
+          key === "stream_watchdog_timeout_ms"
+            ? { scope: "user", label: "~/.agenc/config.toml" }
+            : undefined,
+      };
+      services.streamIdleWatchdogDisabled = true;
+
+      const settled = streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ).then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(watchdogMs - 1);
+      expect(providerSignal?.aborted).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await settled;
+      expect(providerSignal?.reason).toBe(STREAM_IDLE_ABORT_REASON);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("closes thinking blocks left open by a failed attempt before the error propagates", async () => {
+    // A retried attempt (reconnect ladder) re-streams reasoning from scratch;
+    // without the synthetic block_stop the UI keeps the first attempt's block
+    // open and the second attempt's deltas duplicate what was already shown.
+    const ctx = mkCtx("chat");
+    const provider = mkProvider(async (_messages, onChunk) => {
+      onChunk({
+        content: "",
+        done: false,
+        reasoningSummaryDelta: { delta: "thinking about it", summaryIndex: 0 },
+      });
+      throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    });
+    const { session, events } = mkSession(provider);
+
+    await expect(
+      streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      ),
+    ).rejects.toBeInstanceOf(StreamModelError);
+
+    const thinkingEvents = events
+      .map((event) => event.msg.type)
+      .filter((type) => type.startsWith("assistant_thinking_"));
+    expect(thinkingEvents).toEqual([
+      "assistant_thinking_block_start",
+      "assistant_thinking_delta",
+      "assistant_thinking_block_stop",
+    ]);
+  });
+
+  test("AGENC_PROVIDER_TRACE=1 writes the adapter's trace events under agent-logs/<conv>", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agenc-provider-trace-"));
+    vi.stubEnv("AGENC_PROVIDER_TRACE", "1");
+    try {
+      const ctx = mkCtx("chat");
+      const provider = mkProvider(async (_messages, _onChunk, options) => {
+        // The Grok adapter emits these through options.trace; a stub provider
+        // stands in for it here.
+        options?.trace?.onProviderTraceEvent?.({
+          kind: "request",
+          transport: "chat_stream",
+          provider: "stub-provider",
+          model: "test-model",
+          payload: {
+            model: "test-model",
+            input: [{ role: "user", content: "hello" }],
+            prompt_cache_key: options.promptCacheKey,
+            reasoning: { effort: options.reasoningEffort ?? "high" },
+          },
+        });
+        options?.trace?.onProviderTraceEvent?.({
+          kind: "response",
+          transport: "chat_stream",
+          provider: "stub-provider",
+          model: "test-model",
+          payload: { id: "resp_1", usage: { input_tokens: 5, output_tokens: 2 } },
+        });
+        return {
+          content: "ok",
+          toolCalls: [],
+          usage: { promptTokens: 5, completionTokens: 2, totalTokens: 7 },
+          model: "test-model",
+          finishReason: "stop",
+        };
+      });
+      const { session } = mkSession(provider);
+      (session.services as { configStore?: unknown }).configStore = {
+        current: () => ({}),
+        homeContext: { path: home },
+      };
+
+      await streamModel(
+        mkState(ctx),
+        ctx,
+        session,
+        mkRequest([{ role: "user", content: "hello" }]),
+      );
+
+      const directory = join(home, "agent-logs", "conv-stream");
+      expect(readdirSync(directory)).toEqual(["llm-00001.jsonl"]);
+      const lines = readFileSync(join(directory, "llm-00001.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatchObject({
+        kind: "request",
+        seq: 1,
+        conversationId: "conv-stream",
+        params: { prompt_cache_key: "conv-stream", input_items: 1 },
+      });
+      expect(JSON.stringify(lines[0])).not.toContain('"content":"hello"');
+      expect(lines[1]).toMatchObject({
+        kind: "response",
+        seq: 1,
+        response: { id: "resp_1", usage: { input_tokens: 5, output_tokens: 2 } },
+      });
+      expect(typeof lines[1]?.elapsedMs).toBe("number");
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("keeps base instructions out of provider transcript messages", async () => {

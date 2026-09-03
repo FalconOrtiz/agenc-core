@@ -23,6 +23,7 @@ function credentialHome() {
 export type { EffortLevel }
 
 export const EFFORT_LEVELS = [
+  'minimal',
   'low',
   'medium',
   'high',
@@ -49,15 +50,32 @@ function supportsOpenAiReasoningEffort(model: string): boolean {
   return /^gpt-5(?:[.-]|$)/.test(base)
 }
 
-function getRegisteredGrokEffortLevels(
+function inferCatalogProvider(
   model: string,
+  context?: ProviderAuthReadContext,
+): string | undefined {
+  const provider = context?.provider.trim().toLowerCase()
+  if (provider !== undefined && provider.length > 0) {
+    return provider === 'xai' ? 'grok' : provider
+  }
+  const normalizedModel = model.trim().toLowerCase()
+  if (normalizedModel.startsWith('grok-')) return 'grok'
+  if (normalizedModel.startsWith('muse-spark-')) return 'meta'
+  return undefined
+}
+
+function getRegisteredEffortLevels(
+  model: string,
+  context?: ProviderAuthReadContext,
 ): AvailableEffortLevel[] | undefined {
+  const provider = inferCatalogProvider(model, context)
+  if (provider === undefined) return undefined
   const entry = resolveRegisteredModelCatalogEntry({
-    provider: 'grok',
+    provider,
     model,
   })
   if (entry === undefined) return undefined
-  return entry.supportedReasoningLevels.filter(isOpenAIEffortLevel)
+  return entry.supportedReasoningLevels.filter(isAvailableEffortLevel)
 }
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
@@ -70,13 +88,12 @@ function modelSupportsEffortForOptionalContext(
   if (supported3P !== undefined) {
     return supported3P
   }
-  // Grok reasoning models: the model catalog is the source of truth. Entries
-  // without levels (e.g. grok-composer) correctly return false.
-  if (m.startsWith('grok-')) {
-    const levels = getRegisteredGrokEffortLevels(model)
-    if (levels !== undefined) {
-      return levels.length > 0
-    }
+  // Registered provider models use the catalog as the exact source of truth.
+  // This keeps Meta's `minimal`..`xhigh` enum and Grok's model-specific enums
+  // aligned with the values that the wire layer accepts.
+  const registeredLevels = getRegisteredEffortLevels(model, context)
+  if (registeredLevels !== undefined) {
+    return registeredLevels.length > 0
   }
   if (
     modelUsesOpenAIEffortForOptionalContext(model, context) &&
@@ -199,9 +216,9 @@ function getAvailableEffortLevelsForOptionalContext(
   model: string,
   context?: ProviderAuthReadContext,
 ): AvailableEffortLevel[] {
-  const grokLevels = getRegisteredGrokEffortLevels(model)
-  if (grokLevels !== undefined) {
-    return grokLevels
+  const registeredLevels = getRegisteredEffortLevels(model, context)
+  if (registeredLevels !== undefined) {
+    return registeredLevels
   }
   if (!modelSupportsEffortForOptionalContext(model, context)) {
     return []
@@ -242,6 +259,7 @@ export function openAIEffortToStandard(level: OpenAIEffortLevel): EffortLevel {
 
 export function standardEffortToOpenAI(level: EffortLevel): OpenAIEffortLevel {
   if (level === 'max') return 'xhigh'
+  if (level === 'minimal') return 'low'
   return level as OpenAIEffortLevel
 }
 
@@ -276,7 +294,12 @@ export function parseEffortValue(value: unknown): EffortValue | undefined {
 export function toPersistableEffort(
   value: EffortValue | undefined,
 ): EffortLevel | undefined {
-  if (value === 'low' || value === 'medium' || value === 'high') {
+  if (
+    value === 'minimal' ||
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high'
+  ) {
     return value
   }
   if (value === 'max') {
@@ -301,7 +324,7 @@ export function reasoningEffortToEffortLevel(
 
 export function effortValueToReasoningEffort(
   value: EffortValue | undefined,
-): "low" | "medium" | "high" | "xhigh" | undefined {
+): "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
   const persistable = toPersistableEffort(value)
   return persistable === "max" ? "xhigh" : persistable
 }
@@ -330,7 +353,7 @@ function resolveAppliedEffortForOptionalContext(
   if (resolved === 'max') {
     // The persisted cross-provider vocabulary calls its top tier `max`, while
     // xAI calls Grok 4.6's catalogued top tier `xhigh`.
-    if (getRegisteredGrokEffortLevels(model)?.includes('xhigh')) {
+    if (getRegisteredEffortLevels(model, context)?.includes('xhigh')) {
       return 'xhigh'
     }
     // API rejects 'max' on non-Opus-4.6 models — downgrade to 'high'.
@@ -458,6 +481,8 @@ export function convertEffortValueToLevelForContext(
  */
 export function getEffortLevelDescription(level: AvailableEffortLevel): string {
   switch (level) {
+    case 'minimal':
+      return 'Fastest response with the least reasoning overhead'
     case 'low':
       return 'Quick, straightforward implementation with minimal overhead'
     case 'medium':
@@ -537,6 +562,20 @@ function getDefaultEffortForModelForOptionalContext(
     }
     // Always default ants to undefined/high
     return undefined
+  }
+
+  const registeredProvider = inferCatalogProvider(model, context)
+  const registeredEntry = registeredProvider === 'meta'
+    ? resolveRegisteredModelCatalogEntry({
+        provider: registeredProvider,
+        model,
+      })
+    : undefined
+  if (
+    registeredEntry?.defaultReasoningLevel !== undefined &&
+    isAvailableEffortLevel(registeredEntry.defaultReasoningLevel)
+  ) {
+    return registeredEntry.defaultReasoningLevel
   }
 
   // IMPORTANT: Do not change the default effort level without notifying

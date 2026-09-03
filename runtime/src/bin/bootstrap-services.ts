@@ -26,7 +26,10 @@ import {
 import { Policy } from "../sandbox/execpolicy/policy.js";
 import { createLocalSkillsServices } from "../skills/local-loader.js";
 import { createGuardianRejectionCircuitBreaker } from "../permissions/guardian/rejection-circuit-breaker.js";
-import { createDefaultGuardianApprovalReviewer } from "../permissions/guardian/reviewer.js";
+import {
+  createDefaultGuardianApprovalReviewer,
+  PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+} from "../permissions/guardian/reviewer.js";
 import { ReviewManager } from "../session/review.js";
 import { createMcpStartupCancellationToken } from "../session/mcp-startup.js";
 import {
@@ -894,7 +897,14 @@ export function buildBootstrapSessionServices(
     },
     guardianRejections: new Map(),
     guardianRejectionCircuitBreaker: createGuardianRejectionCircuitBreaker(),
-    guardianApprovalReviewer: createDefaultGuardianApprovalReviewer(),
+    // Bounded on purpose: this reviewer fronts an approval the user is
+    // waiting on, and the review delegate opts out of the ambient stream-idle
+    // watchdog, so this deadline is the only thing between a dead provider
+    // socket and an approval that hangs until the user cancels. Expiry lands
+    // on the reviewer's typed `timed_out` decision, not a risk verdict.
+    guardianApprovalReviewer: createDefaultGuardianApprovalReviewer({
+      timeoutMs: PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+    }),
     reviewManager: new ReviewManager(),
     skillsManager: skillsServices.skillsManager,
     pluginsManager: skillsServices.pluginsManager,

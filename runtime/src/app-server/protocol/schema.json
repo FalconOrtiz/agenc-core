@@ -250,6 +250,14 @@
         "instructions": {
           "type": "string"
         },
+        "addDirs": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "unattendedAllow": {
           "type": "array",
           "items": {

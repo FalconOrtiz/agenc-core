@@ -31,8 +31,13 @@ import {
   stopOwnedDaemon,
 } from "./run-required-gates.mjs";
 import {
+  buildContextSeedCredentialCommand,
+} from "./local-gate-context-seed.mjs";
+import {
   buildSystemdJobMountCommand,
   buildSystemdJobUnmountCommand,
+  buildSystemdHardeningProperties,
+  buildSystemdPublisherCommand,
   buildSystemdWorkerCommand,
   assertCgroupAncestorCapacity,
   assertCgroupResourceProfile,
@@ -40,6 +45,8 @@ import {
   LOCAL_GATE_AGGREGATE_LIMITS,
   LOCAL_GATE_AGGREGATE_SLICE,
   LOCAL_GATE_COMBINED_LIMITS,
+  SYSTEMD_HARDENING_BASELINE,
+  SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS,
 } from "./systemd-worker-sandbox.mjs";
 import {
   assertRequiredGateRedProbePolicyClosure,
@@ -74,6 +81,53 @@ function waitForOutput(stream, pattern, timeoutMs = 2_000) {
       stream.off("data", onData);
     };
     stream.on("data", onData);
+  });
+}
+
+function systemdProperties(invocation) {
+  const prefix = "--property=";
+  return invocation.args
+    .filter((value) => value.startsWith(prefix))
+    .map((value) => value.slice(prefix.length));
+}
+
+function systemdHardeningFixtures() {
+  const workerCommon = {
+    unitName: "agenc-local-gate-deadbeef",
+    parentUnit: "agenc-local-gate-dispatcher@pr-1505.service",
+    uid: 992,
+    gid: 992,
+    cwd: "/var/lib/agenc-local-gatekeeper/job/source",
+    environment: { CI: "1", PATH: "/opt/node/bin:/usr/bin:/bin" },
+    command: "/opt/node/bin/node",
+    args: [
+      "/opt/node/lib/node_modules/npm/bin/npm-cli.js",
+      "run",
+      "typecheck",
+    ],
+    readWritePaths: [
+      "/var/lib/agenc-local-gatekeeper/job/runs/typecheck",
+    ],
+    inaccessiblePaths: ["/var/lib/agenc-gate-worker"],
+    runtimeMaxSeconds: 300,
+  };
+  return Object.freeze({
+    worker: buildSystemdWorkerCommand(workerCommon),
+    publisher: buildSystemdPublisherCommand({
+      jobId: "a".repeat(32),
+      subjectLabel: "pr-1505",
+      parentUnit: "agenc-local-gate-dispatcher@pr-1505.service",
+      nodePath: "/opt/agenc-local-gatekeeper/node/bin/node",
+      scriptPath:
+        "/opt/agenc-local-gatekeeper/repo/scripts/local-gatekeeper.mjs",
+      credentialPath:
+        "/etc/credstore.encrypted/agenc-local-gatekeeper-app-key",
+      cwd: "/var/lib/agenc-local-gatekeeper",
+    }),
+    "context-seed-credential": buildContextSeedCredentialCommand({
+      action: "seed",
+      jobId: "b".repeat(32),
+    }),
   });
 }
 
@@ -401,6 +455,225 @@ test("gate environment strips credentials and isolates writable state", () => {
     }
     rmSync(root, { force: true, recursive: true });
   }
+});
+
+test("systemd hardening profiles preserve the exact transient-unit policies", () => {
+  const fixtures = systemdHardeningFixtures();
+  assert.deepEqual(systemdProperties(fixtures.worker), [
+    "Type=exec",
+    "ExitType=main",
+    "KillMode=control-group",
+    "SendSIGKILL=yes",
+    "TimeoutStopSec=30s",
+    "RuntimeMaxSec=300s",
+    "Restart=no",
+    "BindsTo=agenc-local-gate-dispatcher@pr-1505.service",
+    "PartOf=agenc-local-gate-dispatcher@pr-1505.service",
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "SupplementaryGroups=992",
+    "ProtectSystem=strict",
+    "ProtectHome=yes",
+    "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=512M,nr_inodes=65536,mode=1777",
+    "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=128M,nr_inodes=16384,mode=1777",
+    "PrivateDevices=yes",
+    "PrivateIPC=yes",
+    "ProtectHostname=yes",
+    "KeyringMode=private",
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectControlGroups=yes",
+    "ProtectClock=yes",
+    "ProtectProc=invisible",
+    "ProcSubset=pid",
+    "PrivateNetwork=yes",
+    "IPAddressDeny=any",
+    "RestrictAddressFamilies=AF_UNIX",
+    "RestrictNamespaces=yes",
+    "RestrictSUIDSGID=yes",
+    "LockPersonality=yes",
+    "RestrictRealtime=yes",
+    "SystemCallArchitectures=native",
+    "TasksMax=4096",
+    "CPUQuota=800%",
+    "MemoryMax=16G",
+    "MemorySwapMax=0",
+    "OOMPolicy=kill",
+    "LimitFSIZE=128M",
+    "LimitCORE=0",
+    "LimitNOFILE=4096",
+    "UMask=0077",
+    "TemporaryFileSystem=/run:ro",
+    "InaccessiblePaths=-/run/dbus/system_bus_socket",
+    "InaccessiblePaths=-/run/systemd/private",
+    "InaccessiblePaths=/var/lib/agenc-gate-worker",
+    "ReadWritePaths=/var/lib/agenc-local-gatekeeper/job/runs/typecheck",
+    "InaccessiblePaths=-/var/run/docker.sock",
+    "InaccessiblePaths=-/run/docker.sock",
+  ]);
+  assert.deepEqual(systemdProperties(fixtures.publisher), [
+    "Type=exec",
+    "ExitType=main",
+    "KillMode=control-group",
+    "SendSIGKILL=yes",
+    "TimeoutStopSec=30s",
+    "RuntimeMaxSec=300s",
+    "Restart=no",
+    "BindsTo=agenc-local-gate-dispatcher@pr-1505.service",
+    "PartOf=agenc-local-gate-dispatcher@pr-1505.service",
+    "LoadCredentialEncrypted=github-app-private-key:/etc/credstore.encrypted/agenc-local-gatekeeper-app-key",
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "SupplementaryGroups=0",
+    "ProtectSystem=strict",
+    "ProtectHome=yes",
+    "PrivateTmp=yes",
+    "PrivateDevices=yes",
+    "PrivateIPC=yes",
+    "ProtectHostname=yes",
+    "KeyringMode=private",
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectControlGroups=yes",
+    "ProtectClock=yes",
+    "ProtectProc=invisible",
+    "ProcSubset=pid",
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    "RestrictNamespaces=yes",
+    "RestrictSUIDSGID=yes",
+    "LockPersonality=yes",
+    "RestrictRealtime=yes",
+    "SystemCallArchitectures=native",
+    "TasksMax=64",
+    "CPUQuota=100%",
+    "MemoryMax=512M",
+    "MemorySwapMax=0",
+    "OOMPolicy=kill",
+    "LimitFSIZE=16M",
+    "LimitCORE=0",
+    "LimitNOFILE=1024",
+    "UMask=0077",
+    "InaccessiblePaths=-/var/run/docker.sock",
+    "InaccessiblePaths=-/run/docker.sock",
+    "InaccessiblePaths=-/run/dbus/system_bus_socket",
+    "InaccessiblePaths=-/run/systemd/private",
+  ]);
+  assert.deepEqual(systemdProperties(fixtures["context-seed-credential"]), [
+    "Type=exec",
+    "ExitType=main",
+    "KillMode=control-group",
+    "SendSIGKILL=yes",
+    "TimeoutStopSec=30s",
+    "RuntimeMaxSec=600s",
+    "Restart=no",
+    "BindsTo=agenc-local-gate-context-seed@seed.service",
+    "PartOf=agenc-local-gate-context-seed@seed.service",
+    "LoadCredentialEncrypted=github-app-private-key:/etc/credstore.encrypted/agenc-local-gatekeeper-app-key",
+    "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=",
+    "AmbientCapabilities=",
+    "SupplementaryGroups=",
+    "ProtectSystem=strict",
+    "ProtectHome=yes",
+    "PrivateTmp=yes",
+    "PrivateDevices=yes",
+    "PrivateIPC=yes",
+    "ProtectHostname=yes",
+    "KeyringMode=private",
+    "ProtectKernelTunables=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectControlGroups=yes",
+    "ProtectClock=yes",
+    "ProtectProc=invisible",
+    "ProcSubset=pid",
+    "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    "RestrictNamespaces=yes",
+    "RestrictSUIDSGID=yes",
+    "LockPersonality=yes",
+    "RestrictRealtime=yes",
+    "SystemCallArchitectures=native",
+    "TasksMax=64",
+    "CPUQuota=100%",
+    "MemoryMax=512M",
+    "MemorySwapMax=0",
+    "OOMPolicy=kill",
+    "LimitFSIZE=16M",
+    "LimitCORE=0",
+    "LimitNOFILE=1024",
+    "UMask=0077",
+    "ReadOnlyPaths=/run/agenc-local-gate-context-seed",
+    "InaccessiblePaths=-/var/lib/agenc-local-gatekeeper",
+    "InaccessiblePaths=-/var/log/agenc-local-gatekeeper",
+    "InaccessiblePaths=-/var/lib/agenc-gate-worker",
+    "InaccessiblePaths=-/run/agenc-local-gatekeeper",
+    "InaccessiblePaths=-/var/run/docker.sock",
+    "InaccessiblePaths=-/run/docker.sock",
+    "InaccessiblePaths=-/run/dbus/system_bus_socket",
+    "InaccessiblePaths=-/run/systemd/private",
+  ]);
+});
+
+test("systemd hardening baseline is frozen, propagated, and override-allowlisted", () => {
+  assert.ok(Object.isFrozen(SYSTEMD_HARDENING_BASELINE));
+  for (const slot of Object.values(SYSTEMD_HARDENING_BASELINE)) {
+    assert.ok(Object.isFrozen(slot));
+    assert.ok(Object.isFrozen(slot.values));
+  }
+  assert.ok(Object.isFrozen(SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS));
+  assert.deepEqual(Object.keys(SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS), [
+    "worker",
+    "publisher",
+    "context-seed-credential",
+  ]);
+  for (const keys of Object.values(SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS)) {
+    assert.ok(Object.isFrozen(keys));
+  }
+
+  const fixtures = systemdHardeningFixtures();
+  for (const [profileName, invocation] of Object.entries(fixtures)) {
+    const emitted = systemdProperties(invocation);
+    const replacedSlots = new Set(
+      SYSTEMD_HARDENING_PROFILE_OVERRIDE_KEYS[profileName],
+    );
+    for (const [slotName, slot] of Object.entries(SYSTEMD_HARDENING_BASELINE)) {
+      if (slot.values.length === 0 || replacedSlots.has(slotName)) continue;
+      for (const value of slot.values) {
+        assert.ok(
+          emitted.includes(`${slot.property}=${value}`),
+          `${profileName} omitted invariant baseline slot ${slotName}`,
+        );
+      }
+    }
+  }
+
+  const publisherOverrides = {
+    runtimeMaxSec: ["300s"],
+    bindsTo: ["agenc-local-gate-dispatcher@pr-1505.service"],
+    partOf: ["agenc-local-gate-dispatcher@pr-1505.service"],
+    loadCredentialEncrypted: [
+      "github-app-private-key:/etc/credstore.encrypted/agenc-local-gatekeeper-app-key",
+    ],
+    supplementaryGroups: ["0"],
+  };
+  const snapshot = structuredClone(publisherOverrides);
+  const built = buildSystemdHardeningProperties(
+    "publisher",
+    publisherOverrides,
+  );
+  assert.ok(Object.isFrozen(built));
+  assert.deepEqual(publisherOverrides, snapshot);
+  assert.throws(
+    () => buildSystemdHardeningProperties("publisher", {
+      ...publisherOverrides,
+      noNewPrivileges: ["no"],
+    }),
+    /publisher profile cannot override noNewPrivileges/u,
+  );
 });
 
 test("transient systemd workers bind to the dispatcher and expose Docker only to the stable gate", () => {

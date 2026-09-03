@@ -63,6 +63,7 @@ export type SettingSource =
   | 'flagSettings'
 
 export type EffortValue =
+  | 'minimal'
   | 'low'
   | 'medium'
   | 'high'
@@ -244,7 +245,15 @@ const MEMORY_TOOLS = [
   FILE_EDIT_TOOL_NAME,
   FILE_READ_TOOL_NAME,
 ] as const
-const EFFORT_LEVELS = ['none', 'low', 'medium', 'high', 'max', 'xhigh'] as const
+const EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'max',
+  'xhigh',
+] as const
 const HOOK_EVENTS = new Set([
   'PreToolUse',
   'PostToolUse',

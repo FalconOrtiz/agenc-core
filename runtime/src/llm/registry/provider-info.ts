@@ -432,6 +432,14 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
     baseURLEnvVars: ["DEEPSEEK_BASE_URL"],
     onboarding: onboardingInfo(90, "api-key"),
   }),
+  meta: providerDefinition({
+    name: "Meta",
+    defaultModel: "muse-spark-1.3",
+    baseURL: "https://api.meta.ai/v1",
+    credentials: apiKeyCredentials(["MODEL_API_KEY"]),
+    baseURLEnvVars: ["META_BASE_URL"],
+    onboarding: onboardingInfo(95, "api-key"),
+  }),
   gemini: providerDefinition({
     name: "Gemini",
     // gemini-2.5-pro is retired for new keys (404 pointing at the 3.x
@@ -625,6 +633,9 @@ export const BUILT_IN_PROVIDER_MODEL_CATALOG: Readonly<
     "llama-3.1-8b-instant",
   ]),
   deepseek: Object.freeze(["deepseek-v4-flash", "deepseek-v4-pro"]),
+  // `/models` also advertises image generation and voice transcription.
+  // Those are not chat-completion LLMs and deliberately stay out of this list.
+  meta: mergeDerivedProviderModels("meta"),
   gemini: Object.freeze([
     "gemini-3.1-pro-preview",
     "gemini-3.7-flash",

@@ -59,6 +59,9 @@ import {
   AgenCBackgroundAgentSuspensionShutdownError,
 } from "./background-agent-runner.js";
 import { resolveAgentRuntimeOptions } from "../session/runtime-options.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../contracts/additional-working-directories.js";
 
 function sequence(values: readonly string[]): () => string {
   let index = 0;
@@ -2506,6 +2509,7 @@ describe("AgenC background agent lifecycle", () => {
       createTestAgent(agents, {
         cwd: process.cwd(),
         objective: "  build the parser  ",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         metadata: { ticket: "F-06a" },
       }),
     ).resolves.toEqual({
@@ -2520,6 +2524,7 @@ describe("AgenC background agent lifecycle", () => {
       activeSessionIds: ["session_1"],
       metadata: {
         ticket: "F-06a",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         unattendedAllow: [],
         unattendedDeny: [],
         runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -2530,8 +2535,10 @@ describe("AgenC background agent lifecycle", () => {
       {
         objective: "build the parser",
         cwd: process.cwd(),
+        addDirs: ["../shared workspace", "/tmp/shared"],
         metadata: {
           ticket: "F-06a",
+          addDirs: ["../shared workspace", "/tmp/shared"],
           unattendedAllow: [],
           unattendedDeny: [],
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -2552,6 +2559,7 @@ describe("AgenC background agent lifecycle", () => {
       cwd: process.cwd(),
       metadata: {
         ticket: "F-06a",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         objective: "build the parser",
         source: "agent.start",
         unattendedAllow: [],
@@ -2573,6 +2581,7 @@ describe("AgenC background agent lifecycle", () => {
           activeSessionIds: ["session_1"],
           metadata: {
             ticket: "F-06a",
+            addDirs: ["../shared workspace", "/tmp/shared"],
             unattendedAllow: [],
             unattendedDeny: [],
             runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -2602,6 +2611,7 @@ describe("AgenC background agent lifecycle", () => {
           cwd: process.cwd(),
           metadata: {
             ticket: "F-06a",
+            addDirs: ["../shared workspace", "/tmp/shared"],
             objective: "build the parser",
             source: "agent.start",
             unattendedAllow: [],
@@ -2870,6 +2880,7 @@ describe("AgenC background agent lifecycle", () => {
         cwd: fixture.cwd,
         model: "grok-4.3",
         provider: "grok",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         permissionMode: "acceptEdits",
         envOverrides: { AGENC_MODEL: "grok-4.3" },
       }),
@@ -2880,6 +2891,7 @@ describe("AgenC background agent lifecycle", () => {
       activeSessionIds: ["session_resumed"],
       metadata: {
         resumedFromSessionId: "conv-retained1",
+        addDirs: ["../shared workspace", "/tmp/shared"],
       },
     });
     expect(startAgent).not.toHaveBeenCalled();
@@ -2902,6 +2914,7 @@ describe("AgenC background agent lifecycle", () => {
         agentPath: "/root",
         model: "grok-4.3",
         provider: "grok",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         permissionMode: "acceptEdits",
         unattendedAllow: [],
         unattendedDeny: [],
@@ -2912,6 +2925,7 @@ describe("AgenC background agent lifecycle", () => {
       explicitColdResume: true,
       model: "grok-4.3",
       provider: "grok",
+      addDirs: ["../shared workspace", "/tmp/shared"],
       permissionMode: "acceptEdits",
       envOverrides: { AGENC_MODEL: "grok-4.3" },
       runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -2924,6 +2938,75 @@ describe("AgenC background agent lifecycle", () => {
           objective: "retained canonical objective",
         },
       },
+    );
+  });
+
+  it("restores retained additional directories on a flagless cold resume", async () => {
+    const fixture = createResumeFixture("conv-retained-add-dirs");
+    const freshRunner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => ({
+        agentId: "conv-retained-add-dirs",
+        agentPath: "/root",
+        startedAt: "2026-05-01T12:30:00.000Z",
+        status: "running",
+      }),
+    };
+    const freshAgents = new AgenCDaemonAgentManager({
+      now: () => "2026-05-01T12:30:00.000Z",
+      runner: freshRunner,
+    });
+    const fresh = await createTestAgent(freshAgents, {
+      cwd: fixture.cwd,
+      objective: "retained canonical objective",
+      addDirs: ["../shared workspace", "/tmp/shared", "/tmp/shared"],
+    });
+
+    expect(fresh.metadata).toMatchObject({
+      addDirs: ["../shared workspace", "/tmp/shared"],
+    });
+
+    const restoreAgent = vi.fn(async () => true);
+    const resumedAgents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: async () => ({
+          agentId: "unexpected-fresh-agent",
+          startedAt: "2026-05-01T12:30:00.000Z",
+          status: "running",
+        }),
+        restoreAgent,
+      },
+    });
+    await resumedAgents.restoreAgent({
+      agentId: "conv-retained-add-dirs",
+      objective: "retained canonical objective",
+      status: "idle",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      sessionIds: [],
+      runtimeAvailable: false,
+      metadata: {
+        ...fresh.metadata,
+        agentPath: "/root",
+      },
+    });
+
+    await createTestAgent(resumedAgents, {
+      resumeSessionId: "conv-retained-add-dirs",
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    });
+
+    expect(restoreAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "conv-retained-add-dirs",
+        addDirs: ["../shared workspace", "/tmp/shared"],
+        metadata: expect.objectContaining({
+          addDirs: ["../shared workspace", "/tmp/shared"],
+        }),
+      }),
     );
   });
 
@@ -6092,6 +6175,11 @@ describe("AgenC background agent lifecycle", () => {
         params: {
           objective: "ship a daemon task",
           cwd: process.cwd(),
+          addDirs: [
+            "../shared workspace",
+            "/tmp/shared",
+            "../shared workspace",
+          ],
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
         },
       }),
@@ -6107,6 +6195,7 @@ describe("AgenC background agent lifecycle", () => {
         lastActiveAt: "2026-05-01T12:00:00.500Z",
         cwd: process.cwd(),
         metadata: {
+          addDirs: ["../shared workspace", "/tmp/shared"],
           unattendedAllow: [],
           unattendedDeny: [],
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -6125,6 +6214,10 @@ describe("AgenC background agent lifecycle", () => {
       FIRECRAWL_API_KEY: "",
       WEB_SEARCH_PROVIDER: "",
     });
+    expect(rawCreateParams?.addDirs).toEqual([
+      "../shared workspace",
+      "/tmp/shared",
+    ]);
 
     await expect(
       connection.dispatch({
@@ -6147,12 +6240,57 @@ describe("AgenC background agent lifecycle", () => {
             lastActiveAt: "2026-05-01T12:00:00.500Z",
             cwd: process.cwd(),
             metadata: {
+              addDirs: ["../shared workspace", "/tmp/shared"],
               unattendedAllow: [],
               unattendedDeny: [],
               runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
             },
           },
         ],
+      },
+    });
+    await expect(
+      connection.dispatch({
+        jsonrpc: JSON_RPC_VERSION,
+        id: "bad-add-dirs",
+        method: "agent.create",
+        params: {
+          cwd: process.cwd(),
+          objective: "ship",
+          addDirs: ["/tmp/shared", 42],
+        },
+      }),
+    ).resolves.toEqual({
+      jsonrpc: JSON_RPC_VERSION,
+      id: "bad-add-dirs",
+      error: {
+        code: -32602,
+        message: "agent.create param 'addDirs' must be an array of strings",
+        data: { code: "INVALID_ARGUMENT" },
+      },
+    });
+
+    await expect(
+      connection.dispatch({
+        jsonrpc: JSON_RPC_VERSION,
+        id: "too-many-add-dirs",
+        method: "agent.create",
+        params: {
+          cwd: process.cwd(),
+          objective: "ship",
+          addDirs: Array.from(
+            { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+            (_, index) => `/tmp/shared-${index}`,
+          ),
+        },
+      }),
+    ).resolves.toEqual({
+      jsonrpc: JSON_RPC_VERSION,
+      id: "too-many-add-dirs",
+      error: {
+        code: -32602,
+        message: `agent.create param 'addDirs' accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+        data: { code: "INVALID_ARGUMENT" },
       },
     });
 

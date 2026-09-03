@@ -38,6 +38,7 @@ const LIVE_METADATA_PROVIDERS = new Set([
   "ollama",
   "groq",
   "deepseek",
+  "meta",
 ]);
 
 export type ModelMetadataSource =
@@ -468,6 +469,7 @@ const OPENAI_COMPATIBLE_METADATA_PROVIDERS = new Set([
   "openrouter",
   "groq",
   "deepseek",
+  "meta",
   "gemini",
   "ollama",
 ]);

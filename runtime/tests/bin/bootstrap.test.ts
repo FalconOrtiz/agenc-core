@@ -42,6 +42,9 @@ import {
   createSessionTranscriptStateForTesting,
 } from "../tui/session-transcript.js";
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "../prompts/system-prompt-boundary.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../contracts/additional-working-directories.js";
 
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), {
@@ -54,6 +57,19 @@ function offlineFetchFixture(): typeof fetch {
   return vi
     .fn<typeof fetch>()
     .mockRejectedValue(new Error("offline bootstrap fixture"));
+}
+
+async function installBootstrapProviderStub(): Promise<void> {
+  const providerModule = await import("../llm/provider.js");
+  const chat = vi.fn().mockResolvedValue({
+    content: "ok",
+    toolCalls: [],
+    usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+  });
+  vi.spyOn(providerModule, "createProvider").mockReturnValue({
+    name: "stub",
+    chat,
+  } as never);
 }
 
 function clearProcessEnv(keys: readonly string[]): () => void {
@@ -129,6 +145,46 @@ describe("readStartupCliFlags", () => {
     });
   });
 
+  it("preserves spaced, equals, and repeated additional-directory flags", () => {
+    expect(
+      readStartupCliFlags([
+        "node",
+        "agenc",
+        "--add-dir",
+        "../shared workspace",
+        "--add-dir=/tmp/shared",
+        "--add-dir=/tmp/shared",
+        "--add-dir=-third",
+        "build",
+        "the app",
+      ]),
+    ).toMatchObject({
+      addDirs: ["../shared workspace", "/tmp/shared", "-third"],
+    });
+  });
+
+  it("rejects raw additional-directory overflow before duplicate collapse and bootstrap work", async () => {
+    const addDirArgs = Array.from(
+      { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+      () => "--add-dir=/tmp/repeated",
+    );
+
+    expect(() =>
+      readStartupCliFlags(["node", "agenc", ...addDirArgs]),
+    ).toThrow(
+      `agenc --add-dir accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+    );
+    await expect(
+      bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: process.cwd(),
+        argv: ["node", "agenc", ...addDirArgs],
+      }),
+    ).rejects.toThrow(
+      `agenc --add-dir accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+    );
+  });
+
   it("rejects internal modes at the startup permission surface", () => {
     expect(() =>
       readStartupCliFlags([
@@ -145,6 +201,162 @@ describe("bootstrapLocalRuntimeSession", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     _resetAgentRolesForTesting();
+  });
+
+  it("projects CLI additional directories into permissions and the sandbox authority", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-add-dir-home-"));
+    const workspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-ws-"),
+    );
+    const firstAdditional = join(workspace, "shared workspace");
+    const secondAdditional = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-external-"),
+    );
+    const regularFile = join(workspace, "not-a-directory.txt");
+    await mkdir(join(workspace, ".git"));
+    await mkdir(firstAdditional);
+    await writeFile(regularFile, "not a directory", "utf8");
+    trustWorkspaceForTest(home, workspace);
+
+    await installBootstrapProviderStub();
+    vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+    let shutdown: (() => Promise<void>) | null = null;
+    try {
+      const boot = await bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: workspace,
+        argv: [
+          "node",
+          "agenc",
+          "--add-dir",
+          "shared workspace",
+          "--add-dir=shared workspace",
+          `--add-dir=${secondAdditional}`,
+          "--add-dir",
+          regularFile,
+        ],
+        env: {
+          ...process.env,
+          AGENC_HOME: home,
+          HOME: home,
+        },
+      });
+      shutdown = boot.shutdown;
+      const additionalDirectories = [
+        ...boot.session.permissionModeRegistry
+          .current()
+          .additionalWorkingDirectories.values(),
+      ];
+      expect(additionalDirectories).toEqual([
+        { path: firstAdditional, source: "cliArg" },
+        { path: secondAdditional, source: "cliArg" },
+      ]);
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).toEqual([workspace, firstAdditional, secondAdditional]);
+      expect(
+        boot.session.permissionModeRegistry
+          .current()
+          .additionalWorkingDirectories.has(regularFile),
+      ).toBe(false);
+      expect(
+        boot.session.services.sandboxExecutionBroker?.mode,
+      ).toBe("workspace_write");
+    } finally {
+      await shutdown?.().catch(() => {});
+      await rm(home, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+      await rm(secondAdditional, { recursive: true, force: true });
+    }
+  });
+
+  it("commits and rolls back CLI directory authority from the staged permission context", async () => {
+    const home = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-home-"),
+    );
+    const workspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-ws-"),
+    );
+    const rebasedWorkspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-rebased-"),
+    );
+    const additionalDirectory = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-extra-"),
+    );
+    await mkdir(join(workspace, ".git"));
+    await mkdir(join(rebasedWorkspace, ".git"));
+    trustWorkspaceForTest(home, workspace);
+    trustWorkspaceForTest(home, rebasedWorkspace);
+
+    await installBootstrapProviderStub();
+    vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+    let shutdown: (() => Promise<void>) | null = null;
+    try {
+      const boot = await bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: workspace,
+        argv: ["node", "agenc", "--add-dir", additionalDirectory],
+        env: {
+          ...process.env,
+          AGENC_HOME: home,
+          HOME: home,
+        },
+      });
+      shutdown = boot.shutdown;
+      const withoutCliDirectories = {
+        additionalWorkingDirectories: new Map(),
+      };
+      const config = boot.configStore.current();
+
+      const rolledBack = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      expect(
+        rolledBack.authority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      rolledBack.commit();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      rolledBack.rollback();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).toContain(additionalDirectory);
+
+      const revoked = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      revoked.commit();
+      await transitionSandboxExecutionBroker(
+        boot.session.services.sandboxExecutionBroker!,
+        rebasedWorkspace,
+      );
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+
+      const laterReload = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      expect(
+        laterReload.authority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      laterReload.commit();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+    } finally {
+      await shutdown?.().catch(() => {});
+      await rm(home, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+      await rm(rebasedWorkspace, { recursive: true, force: true });
+      await rm(additionalDirectory, { recursive: true, force: true });
+    }
   });
 
   it("resolves mode, trust, and reloaded-config authority from the live broker cwd after rebase", async () => {
@@ -211,16 +423,19 @@ describe("bootstrapLocalRuntimeSession", () => {
         boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
       ).toEqual([rebasedWorkspace]);
 
-      const prepared = boot.prepareConfiguredExecutionAuthority({
-        ...boot.configStore.current(),
-        sandbox_mode: "workspace-write",
-        sandbox: {
-          ...boot.configStore.current().sandbox,
-          filesystem: {
-            allowWrite: ["./relative-grant"],
+      const prepared = boot.prepareConfiguredExecutionAuthority(
+        {
+          ...boot.configStore.current(),
+          sandbox_mode: "workspace-write",
+          sandbox: {
+            ...boot.configStore.current().sandbox,
+            filesystem: {
+              allowWrite: ["./relative-grant"],
+            },
           },
         },
-      });
+        boot.session.permissionModeRegistry.current(),
+      );
       expect(prepared.authority.fileSystemSandboxPolicy.allowWrite).toEqual([
         rebasedWorkspace,
         join(rebasedWorkspace, "relative-grant"),

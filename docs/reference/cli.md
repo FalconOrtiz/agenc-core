@@ -517,8 +517,8 @@ order stays private; keyless providers omit the field.
 | `--no-local-check` | Skip localhost health probes |
 
 Built-in provider slugs: `grok`, `openai`, `anthropic`, `ollama`, `lmstudio`,
-`openai-compatible`, `openrouter`, `groq`, `deepseek`, `gemini`, `mistral`,
-`nvidia-nim`, `minimax`, `github`, `amazon-bedrock`, `agenc`.
+`openai-compatible`, `openrouter`, `groq`, `deepseek`, `meta`, `gemini`,
+`mistral`, `nvidia-nim`, `minimax`, `github`, `amazon-bedrock`, `agenc`.
 
 ---
 

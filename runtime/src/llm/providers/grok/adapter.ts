@@ -265,6 +265,16 @@ interface RequestTimeoutResolution {
   readonly source: RequestTimeoutSource;
 }
 
+/**
+ * Request-open (headers) deadline applied when no operator timeout exists.
+ * A stream that has not even opened after two minutes is a dead or
+ * half-open socket, not a thinking model; the abort maps to a retryable
+ * LLMTimeoutError so the reconnect ladder replaces the connection instead of
+ * the turn hanging until the user cancels. An explicit `timeout_ms`
+ * (including `0` to disable) always wins over this default.
+ */
+export const DEFAULT_REQUEST_OPEN_TIMEOUT_MS = 120_000;
+
 function normalizeConfiguredTimeoutMs(
   timeoutMs: number | undefined,
 ): number | null {
@@ -1190,7 +1200,7 @@ export class GrokProvider implements LLMProvider {
       // (called from AgenC post-compact cleanup) zeros this on every
       // compaction.
       this.noteIncrementalRequest(
-        plan.requestMessages ?? messages,
+        plan.incrementalBaseline ?? plan.requestMessages ?? messages,
         plan.params as Record<string, unknown>,
       );
 
@@ -1246,7 +1256,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            retryPlan.requestMessages ?? messages,
+            retryPlan.incrementalBaseline ?? retryPlan.requestMessages ?? messages,
             retryPlan.params as Record<string, unknown>,
           );
           const parsed = await retryWithAuthRefresh(
@@ -1323,7 +1333,7 @@ export class GrokProvider implements LLMProvider {
     const client = await this.ensureClient();
     let plan = this.buildRequestPlan(messages, options);
     this.noteIncrementalRequest(
-      plan.requestMessages ?? messages,
+      plan.incrementalBaseline ?? plan.requestMessages ?? messages,
       plan.params as Record<string, unknown>,
     );
     let params: Record<string, unknown> = { ...plan.params, stream: true };
@@ -1337,11 +1347,18 @@ export class GrokProvider implements LLMProvider {
       options?.timeoutMs,
     );
     const streamTimeout = resolvedStreamTimeout;
-    // There is no implicit request-open or inter-chunk deadline. A healthy
-    // xAI stream can emit zero bytes for hours while reasoning or generating
-    // one large function-call argument payload. When an operator explicitly
-    // configures timeout_ms, that value remains an inter-chunk idle timeout
-    // rather than a total-stream deadline.
+    // There is no implicit inter-chunk deadline. A healthy xAI stream can
+    // emit zero bytes for hours while reasoning or generating one large
+    // function-call argument payload, so idle policy belongs to the session
+    // watchdog. When an operator explicitly configures timeout_ms, that value
+    // remains an inter-chunk idle timeout rather than a total-stream deadline.
+    // The request-open phase is different: headers that never arrive are a
+    // dead socket, so it gets a bounded default unless the operator set a
+    // timeout (or disabled timeouts with 0) themselves.
+    const requestOpenTimeout: RequestTimeoutResolution =
+      streamTimeout.source === "provider_default"
+        ? { ...streamTimeout, timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS }
+        : streamTimeout;
 
     let consecutiveFallbackFailures = 0;
     while (true) {
@@ -1367,6 +1384,9 @@ export class GrokProvider implements LLMProvider {
       let streamIterator: AsyncIterator<any> | null = null;
       let responseTracePayload: Record<string, unknown> | undefined;
       let streamResponseMeta: ProviderResponseTraceMeta | undefined;
+      let completedResponseId: string | undefined;
+      // Deadline in force for the current phase, reported on a mapped timeout.
+      let attemptPhaseTimeoutMs = requestOpenTimeout.timeoutMs;
       try {
       // OAuth pre-flight (same as the chat path): admitted turns stream with
       // singleWireAttempt, so the in-band 401 retry never runs here — the
@@ -1375,7 +1395,7 @@ export class GrokProvider implements LLMProvider {
       // Each wire attempt gets the full resolved timeout for the open phase;
       // a configured-fallback retry must not inherit a nearly-spent budget
       // from the previous attempt.
-      const requestAttemptTimeout = streamTimeout;
+      const requestAttemptTimeout = requestOpenTimeout;
       emitProviderTraceEvent(options, {
         kind: "request",
         transport: "chat_stream",
@@ -1408,11 +1428,21 @@ export class GrokProvider implements LLMProvider {
         );
       } catch (err) {
         if (
-          options?.singleWireAttempt !== true &&
           isContinuationRetrievalFailure(err) &&
           "previous_response_id" in params
         ) {
           this.incrementalTracker.clearResponseId();
+          if (options?.singleWireAttempt === true) {
+            // The admission boundary forbids an in-band retry. Clearing the
+            // continuation here is what lets the ladder's next admitted
+            // attempt rebuild the request with full history instead of
+            // resending the same rejected id until the ladder exhausts.
+            this.emitRuntimeWarning(
+              "previous_response_id_expired",
+              `${this.name} rejected previous_response_id; continuation state cleared, the next admitted attempt resends full history`,
+            );
+            throw err;
+          }
           this.emitRuntimeWarning(
             "previous_response_id_expired",
             `${this.name} rejected previous_response_id; clearing continuation state and retrying once with full history`,
@@ -1421,7 +1451,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            plan.requestMessages ?? messages,
+            plan.incrementalBaseline ?? plan.requestMessages ?? messages,
             plan.params as Record<string, unknown>,
           );
           params = { ...plan.params, stream: true };
@@ -1442,6 +1472,7 @@ export class GrokProvider implements LLMProvider {
         }
       }
       const stream = result.data;
+      attemptPhaseTimeoutMs = streamTimeout.timeoutMs;
       streamResponseMeta = buildProviderResponseMeta({
         response: result.response,
         requestId: result.requestId,
@@ -1676,6 +1707,10 @@ export class GrokProvider implements LLMProvider {
         if (event.type === "response.completed") {
           receivedTerminalEvent = true;
           const response = event.response ?? {};
+          completedResponseId =
+            typeof response.id === "string" && response.id.length > 0
+              ? response.id
+              : undefined;
 
           streamResponseMeta = {
             ...(streamResponseMeta ?? {}),
@@ -1773,6 +1808,25 @@ export class GrokProvider implements LLMProvider {
       const toolCalls = Array.from(toolCallAccum.values());
       if (toolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
 
+      // Opt-in continuation (AGENC_XAI_INCREMENTAL): remember the completed
+      // response so the next compatible request sends previous_response_id
+      // plus the delta instead of the full history. Only stored responses can
+      // be continued, and a failed response has nothing to continue from.
+      if (
+        this.config.incrementalContinuation === true &&
+        completedResponseId !== undefined &&
+        params.store !== false &&
+        finishReason !== "error"
+      ) {
+        this.noteIncrementalResponse(completedResponseId, [
+          {
+            role: "assistant",
+            content,
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+        ]);
+      }
+
       onChunk({ content: "", done: true, toolCalls });
 
       // Materialise the streamed reasoning summaries into the LLMResponse
@@ -1856,7 +1910,7 @@ export class GrokProvider implements LLMProvider {
       }
       consecutiveFallbackFailures = 0;
       this.notifyCapabilityDrift(err);
-      const mappedError = this.mapError(err, streamTimeout.timeoutMs);
+      const mappedError = this.mapError(err, attemptPhaseTimeoutMs);
       this.logPromptOverflowDiagnostics(mappedError, params);
       if (content.length > 0) {
         const partialToolCalls: LLMToolCall[] = Array.from(toolCallAccum.values());
@@ -2005,6 +2059,7 @@ export class GrokProvider implements LLMProvider {
     toolSelection: ToolSelectionDiagnostics;
     compactionDiagnostics?: LLMCompactionDiagnostics;
     requestMessages?: readonly LLMMessage[];
+    incrementalBaseline?: readonly LLMMessage[];
   } {
     const compactionDiagnostics = undefined;
     const toolSelection = this.resolveResponseTools(
@@ -2036,6 +2091,7 @@ export class GrokProvider implements LLMProvider {
       toolSelection: built.toolSelection,
       compactionDiagnostics,
       requestMessages: built.requestMessages,
+      incrementalBaseline: built.incrementalBaseline,
     };
   }
 
@@ -2077,6 +2133,7 @@ export class GrokProvider implements LLMProvider {
     params: Record<string, unknown>;
     toolSelection: ToolSelectionDiagnostics;
     requestMessages: readonly LLMMessage[];
+    incrementalBaseline: readonly LLMMessage[];
   } {
     const visionModel = this.config.visionModel ?? DEFAULT_VISION_MODEL;
     // Prefix-cache split: xAI caching is prefix-based ("never modify
@@ -2222,19 +2279,42 @@ export class GrokProvider implements LLMProvider {
         currentInput: repairedMessages,
       });
       if (decision.kind === "reuse" && previousResponseId) {
-        const deltaBuilt = this.buildParams(decision.delta, {
-          ...options,
-          disableIncremental: true,
-        });
-        params.input = deltaBuilt.params.input;
+        if (this.config.incrementalContinuation === true) {
+          // The delta is a validated suffix of the full sequence: send its
+          // items as they are. Rebuilding it through buildParams would
+          // prepend the static system prompt (already part of the stored
+          // response) and re-validate a suffix that can legitimately open
+          // with tool output.
+          params.input = buildXaiResponsesInputItems(decision.delta).input;
+        } else {
+          const deltaBuilt = this.buildParams(decision.delta, {
+            ...options,
+            disableIncremental: true,
+          });
+          params.input = deltaBuilt.params.input;
+        }
         params.previous_response_id = previousResponseId;
       }
     }
+
+    // Baseline for the incremental tracker. The trailing dynamic system
+    // message (timestamp, git state) changes every call, so recording it
+    // would fail the next request's prefix check at that position and force
+    // a full resend; the fresh dynamic tail travels in the delta instead.
+    const trailing = repairedMessages.at(-1);
+    const incrementalBaseline =
+      this.config.incrementalContinuation === true &&
+      dynamicSystemPrompt !== undefined &&
+      trailing?.role === "system" &&
+      trailing.content === dynamicSystemPrompt
+        ? repairedMessages.slice(0, -1)
+        : repairedMessages;
 
     return {
       params,
       toolSelection: selectedTools,
       requestMessages: repairedMessages,
+      incrementalBaseline,
     };
   }
 
