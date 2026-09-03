@@ -682,6 +682,27 @@ describe("extract memories service", () => {
     expect(runChild.mock.calls[1]![0].prompt).toContain("~2 model-visible");
   });
 
+  it("coalesces requests that initialize the same extraction lane", async () => {
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+    });
+
+    const messages: LLMMessage[] = [
+      { role: "user", content: "remember concurrent initialization" },
+      { role: "assistant", content: "ok" },
+    ];
+    await Promise.all([
+      executeExtractMemories(extractionContext({ cwd: root, messages })),
+      executeExtractMemories(extractionContext({ cwd: root, messages })),
+    ]);
+
+    expect(runChild).toHaveBeenCalledOnce();
+  });
+
   it("coalesces concurrent extraction requests and keeps the newest trailing context", async () => {
     let resolveFirst!: () => void;
     const runChild = vi
@@ -1029,6 +1050,57 @@ describe("extract memories service", () => {
       expect.stringContaining("~2 model-visible"),
       expect.stringContaining("~2 model-visible"),
     ]);
+  });
+
+  it("does not seed cadence from a different memory root", async () => {
+    type TriggerBag = {
+      memoryExtractionTrigger?: {
+        processedVisibleCount: number;
+        turnsSinceLastExtraction: number;
+        memoryRoot?: string;
+      };
+    };
+    const stateBag: TriggerBag = {};
+    const session = {
+      conversationId: "root-scoped-cadence-session",
+      services: { runtimeOptions: defaultRuntimeOptions },
+      state: {
+        with: async <T>(fn: (s: TriggerBag) => T): Promise<T> => fn(stateBag),
+      },
+    } as unknown as Session;
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    let activeMemoryDir = memoryDir;
+    const turn = async (n: number) => {
+      const messages: LLMMessage[] = [];
+      for (let i = 1; i <= n; i += 1) {
+        messages.push({ role: "user", content: `fact ${i}` });
+        messages.push({ role: "assistant", content: `ack ${i}` });
+      }
+      await executeExtractMemories(
+        extractionContext({ cwd: root, messages, session }),
+      );
+    };
+
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 2,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: activeMemoryDir }),
+      runChild,
+    });
+    await turn(1);
+    expect(stateBag.memoryExtractionTrigger?.turnsSinceLastExtraction).toBe(1);
+
+    activeMemoryDir = join(root, "other-memory");
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 2,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: activeMemoryDir }),
+      runChild,
+    });
+    await turn(2);
+
+    expect(runChild).not.toHaveBeenCalled();
+    expect(stateBag.memoryExtractionTrigger?.memoryRoot).toBe(activeMemoryDir);
   });
 
   it("continues eligible-turn cadence across a re-init from restored session state", async () => {

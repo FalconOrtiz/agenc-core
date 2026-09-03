@@ -532,6 +532,7 @@ export function initExtractMemories(
 
   async function readSeededTrigger(
     session: Session,
+    memoryDir: string,
   ): Promise<MemoryExtractionTriggerState | undefined> {
     const stateLock = session.state;
     if (!stateLock?.with) return undefined;
@@ -539,7 +540,7 @@ export function initExtractMemories(
       const stored = (
         s as { memoryExtractionTrigger?: MemoryExtractionTriggerPersisted }
       ).memoryExtractionTrigger;
-      if (!stored) return undefined;
+      if (!stored || stored.memoryRoot !== memoryRoot(memoryDir)) return undefined;
       return {
         processedVisibleCount: stored.processedVisibleCount,
         turnsSinceLastExtraction: stored.turnsSinceLastExtraction,
@@ -550,10 +551,12 @@ export function initExtractMemories(
   async function persistTrigger(
     session: Session,
     trigger: MemoryExtractionTriggerState,
+    memoryDir: string,
   ): Promise<void> {
     const snapshot: MemoryExtractionTriggerPersisted = {
       processedVisibleCount: trigger.processedVisibleCount,
       turnsSinceLastExtraction: trigger.turnsSinceLastExtraction,
+      memoryRoot: memoryRoot(memoryDir),
     };
     const stateLock = session.state;
     if (stateLock?.with) {
@@ -581,7 +584,12 @@ export function initExtractMemories(
       existing.lastAccessedAt = Date.now();
       return existing;
     }
-    const seeded = await readSeededTrigger(session);
+    const seeded = await readSeededTrigger(session, memoryDir);
+    const raced = lanes.get(key);
+    if (raced) {
+      raced.lastAccessedAt = Date.now();
+      return raced;
+    }
     const created: ExtractionLane = {
       trigger: seeded ?? createMemoryExtractionTriggerState(),
       inProgress: false,
@@ -640,7 +648,7 @@ export function initExtractMemories(
         "memory_extraction_skipped",
         "main agent already wrote memory in this range",
       );
-      await persistTrigger(queued.context.session, lane.trigger);
+      await persistTrigger(queued.context.session, lane.trigger, memoryDir);
       return;
     }
 
@@ -655,7 +663,7 @@ export function initExtractMemories(
         "memory_extraction_skipped",
         `deferred by eligible-turn cadence (${cadence.waiting}/${Math.max(1, Math.trunc(deps.minEligibleTurns ?? DEFAULT_MIN_ELIGIBLE_TURNS))} eligible turns)`,
       );
-      await persistTrigger(queued.context.session, lane.trigger);
+      await persistTrigger(queued.context.session, lane.trigger, memoryDir);
       return;
     }
 
@@ -706,7 +714,7 @@ export function initExtractMemories(
         "memory_extraction_failed",
         detail + "; " + newMessageCount + " message(s) stay queued for the next run",
       );
-      await persistTrigger(queued.context.session, lane.trigger);
+      await persistTrigger(queued.context.session, lane.trigger, memoryDir);
       return;
     }
 
@@ -718,7 +726,7 @@ export function initExtractMemories(
       );
     }
     lane.trigger.processedVisibleCount = range.currentVisibleCount;
-    await persistTrigger(queued.context.session, lane.trigger);
+    await persistTrigger(queued.context.session, lane.trigger, memoryDir);
     const savedPaths = [...tracker.savedPaths].filter(
       (path) => basename(path) !== AUTO_MEMORY_INDEX_FILE,
     );

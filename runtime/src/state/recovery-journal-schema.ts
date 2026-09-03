@@ -249,16 +249,21 @@ const isSessionAgentTask = objectShape({
   registeredAt: isString,
 });
 
-const isMemoryExtractionTriggerPersisted = objectShape({
-  processedVisibleCount: isNumber,
-  turnsSinceLastExtraction: isNumber,
-});
+const isMemoryExtractionTriggerPersisted = objectShape(
+  {
+    processedVisibleCount: isNumber,
+    turnsSinceLastExtraction: isNumber,
+  },
+  { memoryRoot: isString },
+);
 
-const isSessionAgentTaskOrNull: Validator<unknown> = (value) =>
-  value === null || isSessionAgentTask(value);
+const isSessionAgentTaskOrNull: Validator<
+  NonNullable<RolloutPayload<"session_state">["agentTask"]> | null
+> = (value) => value === null || isSessionAgentTask(value);
 
-const isMemoryExtractionTriggerOrNull: Validator<unknown> = (value) =>
-  value === null || isMemoryExtractionTriggerPersisted(value);
+const isMemoryExtractionTriggerOrNull: Validator<
+  NonNullable<RolloutPayload<"session_state">["memoryExtractionTrigger"]> | null
+> = (value) => value === null || isMemoryExtractionTriggerPersisted(value);
 
 const isFileSystemSandboxPolicy = objectShape({
   allowWrite: isStringArray,

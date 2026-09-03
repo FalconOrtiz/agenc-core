@@ -46,6 +46,8 @@ import {
 export interface MemoryExtractionTriggerPersisted {
   readonly processedVisibleCount: number;
   readonly turnsSinceLastExtraction: number;
+  /** Normalized memory root this cadence cursor belongs to. */
+  readonly memoryRoot?: string;
 }
 
 /**
