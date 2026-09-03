@@ -7,7 +7,7 @@ Prerequisites: `tar` and a way to reach a model — BYOK
 (xAI / OpenAI / Anthropic / OpenRouter / …), a local Ollama or LM Studio
 endpoint, or an AgenC login for managed OpenRouter (including free hosted
 `:free` routes). The standalone installer supplies its own verified Node 26.5.0
-runtime; npm and SDK installs require host Node **>=26.5 <27**. Sixteen built-in
+runtime; npm and SDK installs require host Node **>=26.5 <27**. Seventeen built-in
 providers are supported.
 
 Related: [INDEX](INDEX.md) · [install](install.md) · [onboarding](onboarding.md) ·

@@ -808,6 +808,7 @@ describe("first-run onboarding wizard", () => {
     "openrouter",
     "groq",
     "deepseek",
+    "meta",
     "gemini",
     "mistral",
     "nvidia-nim",
@@ -1473,6 +1474,7 @@ describe("first-run onboarding wizard", () => {
     "openrouter",
     "groq",
     "deepseek",
+    "meta",
     "gemini",
   ] as const)("verifies and saves approved BYOK keys for %s", async (provider) => {
     const agencHome = mkdtempSync(join(tmpdir(), "agenc-onboarding-byok-"));

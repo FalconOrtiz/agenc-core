@@ -30,6 +30,7 @@ export const PROVIDERS = [
   'openrouter',
   'groq',
   'deepseek',
+  'meta',
   'gemini',
   'mistral',
   'nvidia-nim',

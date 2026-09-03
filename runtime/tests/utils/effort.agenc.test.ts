@@ -152,3 +152,32 @@ test('grok models without catalog reasoning levels do not expose effort', async 
 
   expect(modelSupportsEffort('grok-composer-2.5-fast')).toBe(false)
 })
+
+test('Meta Muse models expose and apply their exact catalog effort levels', async () => {
+  const {
+    effortValueToReasoningEffort,
+    getAvailableEffortLevelsForContext,
+    getDefaultEffortForModelForContext,
+    modelSupportsEffortForContext,
+    reasoningEffortToEffortLevel,
+    resolveAppliedEffortForContext,
+  } = await importFreshEffortModule({ provider: 'xai' })
+  const context = {
+    home: {},
+    environment: {},
+    provider: 'meta',
+  } as never
+
+  expect(modelSupportsEffortForContext('muse-spark-1.3', context)).toBe(true)
+  expect(
+    getAvailableEffortLevelsForContext('muse-spark-1.3', context),
+  ).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh'])
+  expect(
+    getDefaultEffortForModelForContext('muse-spark-1.3', context),
+  ).toBe('medium')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.3', 'max', context),
+  ).toBe('xhigh')
+  expect(effortValueToReasoningEffort('minimal')).toBe('minimal')
+  expect(reasoningEffortToEffortLevel('minimal')).toBe('minimal')
+})

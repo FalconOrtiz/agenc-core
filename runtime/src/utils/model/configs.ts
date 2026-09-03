@@ -259,6 +259,7 @@ export function modelConfigIdForProvider(
       case 'openrouter':
       case 'groq':
       case 'deepseek':
+      case 'meta':
         return 'openai'
       default:
         return provider

@@ -178,7 +178,12 @@ export function buildChatCompletionsRequest(
   });
   if (tools.length > 0) body.tools = tools;
   if (input.options?.toolChoice !== undefined) {
-    body.tool_choice = parseOpenAIToolChoice(input.options.toolChoice);
+    const requestedToolChoice = input.options.toolChoice;
+    body.tool_choice =
+      requestedToolChoice === "required" &&
+      input.providerCapabilityHints?.requiredToolChoiceFallback !== undefined
+        ? input.providerCapabilityHints.requiredToolChoiceFallback
+        : parseOpenAIToolChoice(requestedToolChoice);
   }
   if (input.options?.parallelToolCalls !== undefined) {
     body.parallel_tool_calls = input.options.parallelToolCalls;

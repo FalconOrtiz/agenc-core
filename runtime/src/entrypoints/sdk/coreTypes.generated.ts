@@ -1166,7 +1166,7 @@ export type ModelInfo = {
   displayName: string
   description: string
   supportsEffort?: boolean
-  supportedEffortLevels?: "low" | "medium" | "high" | "max"[]
+  supportedEffortLevels?: "minimal" | "low" | "medium" | "high" | "max"[]
   supportsAdaptiveThinking?: boolean
   supportsAutoMode?: boolean
 }
@@ -1223,7 +1223,7 @@ export type AgentDefinition = {
   maxTurns?: number
   background?: boolean
   memory?: "user" | "project" | "local"
-  effort?: "low" | "medium" | "high" | "max" | number
+  effort?: "minimal" | "low" | "medium" | "high" | "max" | number
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk"
 }
 

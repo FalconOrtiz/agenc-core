@@ -107,6 +107,8 @@ export interface EnvSnapshot {
   readonly GROQ_BASE_URL?: string;
   readonly DEEPSEEK_API_KEY?: string;
   readonly DEEPSEEK_BASE_URL?: string;
+  readonly MODEL_API_KEY?: string;
+  readonly META_BASE_URL?: string;
   readonly GEMINI_API_KEY?: string;
   readonly GEMINI_BASE_URL?: string;
   readonly GOOGLE_API_KEY?: string;
@@ -351,14 +353,14 @@ export function applyEnvOverrides(
   if (e.AGENC_EFFORT_LEVEL !== undefined) {
     const effort = readNonEmpty(e.AGENC_EFFORT_LEVEL)?.toLowerCase();
     if (
-      effort === "low" || effort === "medium" ||
+      effort === "minimal" || effort === "low" || effort === "medium" ||
       effort === "high" || effort === "xhigh" || effort === "none"
     ) {
       override.reasoning_effort = effort;
     } else {
       throw new Error(
         `invalid AGENC_EFFORT_LEVEL="${e.AGENC_EFFORT_LEVEL}"; ` +
-          "expected one of low, medium, high, xhigh, or none",
+          "expected one of minimal, low, medium, high, xhigh, or none",
       );
     }
   }

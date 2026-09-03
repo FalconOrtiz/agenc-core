@@ -426,6 +426,11 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     "nvidia/llama-3.1-nemotron-70b-instruct": DEFAULT_UNKNOWN_MODEL_COST,
     "minimax:MiniMax-M2.5": DEFAULT_UNKNOWN_MODEL_COST,
     "MiniMax-M2.5": DEFAULT_UNKNOWN_MODEL_COST,
+    // Meta has not published authoritative per-token Muse pricing. Register
+    // the default against the existing unknown-price sentinel so hard-budget
+    // accounting remains conservative without presenting an invented rate.
+    "meta:muse-spark-1.3": DEFAULT_UNKNOWN_MODEL_COST,
+    "muse-spark-1.3": DEFAULT_UNKNOWN_MODEL_COST,
     "amazon-bedrock:amazon.nova-pro-v1:0": DEFAULT_UNKNOWN_MODEL_COST,
     "amazon.nova-pro-v1:0": DEFAULT_UNKNOWN_MODEL_COST,
     "agenc:agenc": DEFAULT_UNKNOWN_MODEL_COST,

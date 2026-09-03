@@ -43,6 +43,12 @@ export interface ChatCompletionsCapabilityHints {
    */
   readonly reasoningEffortAllowedValues?: ReadonlySet<string>;
   /**
+   * Replacement for `tool_choice: "required"` when a compatible provider
+   * rejects that mode. `auto` preserves tool availability without emitting a
+   * request value the destination cannot parse.
+   */
+  readonly requiredToolChoiceFallback?: "auto";
+  /**
    * If `false`, `service_tier` is stripped. The field is recognized
    * only on a single upstream provider; non-matching providers
    * either reject it or silently ignore it.
@@ -85,6 +91,17 @@ export interface ChatCompletionsCapabilityHints {
 // Providers that document `service_tier` on chat-completions.
 // branding-scan: allow real provider identifiers in capability matrix
 const SERVICE_TIER_PROVIDERS = new Set(["openai", "azure-openai"]);
+
+// Meta Model API rejects `none` and `max`, but accepts the five levels below
+// for every Muse Spark chat model. Keep this allowlist fail-closed because the
+// shared ReasoningEffort type also contains both rejected values.
+const META_REASONING_EFFORT_VALUES = new Set([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
 
 // Providers explicitly known to reject `stream_options.include_usage`.
 // Currently empty by design: the default is "include" because losing
@@ -232,11 +249,9 @@ export function chatCompletionsCapabilityHintsForProvider(
 ): ChatCompletionsCapabilityHints {
   const slug = normalizeProviderIdentity(providerName, "capability gate") ?? "";
 
-  // reasoning_effort: documented for the upstream-provider reasoning
-  // model family and for documented xAI Grok reasoning variants. Every
-  // other provider/model combination either rejects it or silently
-  // ignores it. Default to the safe "strip" for anything
-  // unrecognized.
+  // reasoning_effort: allow only provider/model combinations with a verified
+  // contract. Every other destination either rejects it or silently ignores
+  // it, so unrecognized combinations default to the safe "strip" behavior.
   // branding-scan: allow factual reference to real provider in routing comment
   let acceptsReasoningEffort = false;
   let reasoningEffortAllowedValues: ReadonlySet<string> | undefined;
@@ -244,6 +259,9 @@ export function chatCompletionsCapabilityHintsForProvider(
     acceptsReasoningEffort = isUpstreamReasoningModel(model);
   } else if (slug === "grok") {
     acceptsReasoningEffort = supportsXaiReasoningEffortParam(model);
+  } else if (slug === "meta" && /(?:^|[/:])muse-spark-/i.test(model ?? "")) {
+    reasoningEffortAllowedValues = META_REASONING_EFFORT_VALUES;
+    acceptsReasoningEffort = true;
   } else if (slug === "nvidia-nim") {
     reasoningEffortAllowedValues = nimReasoningEffortValues(model);
     acceptsReasoningEffort = reasoningEffortAllowedValues !== undefined;
@@ -290,6 +308,7 @@ export function chatCompletionsCapabilityHintsForProvider(
     ...(reasoningEffortAllowedValues !== undefined
       ? { reasoningEffortAllowedValues }
       : {}),
+    ...(slug === "meta" ? { requiredToolChoiceFallback: "auto" as const } : {}),
     acceptsServiceTier,
     acceptsStreamUsage,
     requiresGrammarSafeToolSchemas,

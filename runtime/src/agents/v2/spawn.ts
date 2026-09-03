@@ -108,6 +108,7 @@ The new agent's canonical task name will be provided to it along with the messag
 
 function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (
+    value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||

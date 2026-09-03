@@ -1599,6 +1599,9 @@ describe("env: resolvers", () => {
   test("applyEnvOverrides captures only canonical AGENC_EFFORT_LEVEL values", () => {
     const base = mergeConfigs(defaultConfig(), { reasoning_effort: "low" });
     expect(
+      applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "minimal" }).reasoning_effort,
+    ).toBe("minimal");
+    expect(
       applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "xhigh" }).reasoning_effort,
     ).toBe("xhigh");
     expect(
@@ -1606,13 +1609,13 @@ describe("env: resolvers", () => {
     ).toBe("none");
   });
 
-  test.each(["minimal", "max", "auto", "unset", "warp", ""])(
+  test.each(["max", "auto", "unset", "warp", ""])(
     "applyEnvOverrides rejects non-canonical AGENC_EFFORT_LEVEL=%j",
     (value) => {
       expect(() => applyEnvOverrides(
         mergeConfigs(defaultConfig(), { reasoning_effort: "low" }),
         { AGENC_EFFORT_LEVEL: value },
-      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*low, medium, high, xhigh, or none/u);
+      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*minimal, low, medium, high, xhigh, or none/u);
     },
   );
 
