@@ -1495,7 +1495,7 @@ async function stopDaemonAgentBestEffort(params: {
 }
 
 type DaemonOneShotFinalStatus = {
-  readonly code: number;
+  readonly code: 0 | 1 | 130;
   readonly message?: string;
 };
 
@@ -1684,7 +1684,7 @@ function daemonOneShotFinalStatus(
         : undefined;
     return { code: 0, ...(message !== undefined ? { message } : {}) };
   }
-  if (transcriptEvent.type === "error") {
+  if (transcriptEvent.type === "turn_failed") {
     const message =
       payload !== null && typeof payload.message === "string"
         ? payload.message

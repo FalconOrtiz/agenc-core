@@ -69,11 +69,13 @@ function withTurnId(
 function optionalFields(
   fields: Readonly<Partial<Pick<TurnLifecycleTerminal, "message" | "completedAt" | "durationMs">>>,
 ): Partial<TurnLifecycleTerminal> {
-  const out: Partial<TurnLifecycleTerminal> = {};
-  if (fields.message !== undefined) out.message = fields.message;
-  if (fields.completedAt !== undefined) out.completedAt = fields.completedAt;
-  if (fields.durationMs !== undefined) out.durationMs = fields.durationMs;
-  return out;
+  return {
+    ...(fields.message !== undefined ? { message: fields.message } : {}),
+    ...(fields.completedAt !== undefined
+      ? { completedAt: fields.completedAt }
+      : {}),
+    ...(fields.durationMs !== undefined ? { durationMs: fields.durationMs } : {}),
+  };
 }
 
 function fromTurnComplete(

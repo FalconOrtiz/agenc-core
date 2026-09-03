@@ -5639,7 +5639,7 @@ function messageTerminalFromLifecycle(
   ) {
     return undefined;
   }
-  let code = 1;
+  let code: 0 | 1 | 130 = 1;
   if (terminal.kind === "completed") code = 0;
   else if (terminal.kind === "aborted") code = 130;
   return {
