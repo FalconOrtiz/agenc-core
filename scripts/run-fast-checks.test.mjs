@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +12,7 @@ import {
   deletedRuntimeFallbackPlan,
   parseNulNames,
   readChangedFiles,
+  resolveGitExecutable,
   runCommand,
 } from "./run-fast-checks.mjs";
 
@@ -274,5 +275,27 @@ test("runtime lock and toolchain files do not select policy tests", () => {
     assert.equal(plan.policy, false, file);
     assert.equal(plan.typecheck, true, file);
     assert.deepEqual(commandsForPlan(plan).map((command) => command.args), typecheckOnlyArgs, file);
+  }
+});
+
+test("resolveGitExecutable keeps Nix-style PATH entries (no short PATH rewrite)", () => {
+  const source = readFileSync(path.join(repositoryRoot, "scripts/run-fast-checks.mjs"), "utf8");
+  assert.equal(source.includes("fixedPathEnv"), false);
+  assert.equal(source.includes(String.raw`C:\Program Files\Git\cmd`), false);
+
+  const realGit = resolveGitExecutable();
+  const nixGitDir = path.join(repositoryRoot, "scripts", ".tmp-nix-git-bin");
+  const nixGit = path.join(nixGitDir, process.platform === "win32" ? "git.exe" : "git");
+  rmSync(nixGitDir, { recursive: true, force: true });
+  mkdirSync(nixGitDir, { recursive: true });
+  try {
+    copyFileSync(realGit, nixGit);
+    const resolved = resolveGitExecutable({
+      ...process.env,
+      PATH: [nixGitDir, process.env.PATH ?? ""].join(path.delimiter),
+    });
+    assert.equal(resolved, nixGit);
+  } finally {
+    rmSync(nixGitDir, { recursive: true, force: true });
   }
 });
