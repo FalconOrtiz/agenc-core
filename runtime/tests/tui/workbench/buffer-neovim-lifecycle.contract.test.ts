@@ -963,6 +963,7 @@ describe("embedded Neovim lifecycle", () => {
       5,
       null,
       onFatalError,
+      10,
     );
 
     await expect(session.input("i")).rejects.toBeInstanceOf(
