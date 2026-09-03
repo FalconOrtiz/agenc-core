@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+﻿import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
@@ -750,13 +750,13 @@ describe("embedded Neovim lifecycle", () => {
       5,
     );
 
-    await expect(session.input("éK")).resolves.toBe(true);
+    await expect(session.input("Ã©K")).resolves.toBe(true);
 
     expect(
       rpc.request.mock.calls
         .filter((call) => call[0] === "nvim_input")
         .map((call) => call[1]),
-    ).toEqual([["éK"], ["éK"], ["K"]]);
+    ).toEqual([["Ã©K"], ["Ã©K"], ["K"]]);
     expect(acceptedByteCounts).toEqual([]);
     await session.cleanup();
   });
@@ -790,7 +790,7 @@ describe("embedded Neovim lifecycle", () => {
       5,
       10_000,
       null,
-      onFatalError,
+      { onFatalError },
     );
 
     await expect(session.input("ab")).rejects.toMatchObject({
@@ -861,7 +861,7 @@ describe("embedded Neovim lifecycle", () => {
       5,
       10,
       null,
-      onFatalError,
+      { onFatalError },
     );
 
     await expect(session.click(4, 9)).rejects.toBeInstanceOf(
@@ -910,7 +910,7 @@ describe("embedded Neovim lifecycle", () => {
       5,
       50,
       null,
-      onFatalError,
+      { onFatalError },
     );
 
     const navigation = session.openFile("/workspace/next file.ts", 8, 3);
@@ -962,8 +962,7 @@ describe("embedded Neovim lifecycle", () => {
       2,
       5,
       null,
-      onFatalError,
-      10,
+      { onFatalError, recoveryPreservationTimeoutMs: 10 },
     );
 
     await expect(session.input("i")).rejects.toBeInstanceOf(
@@ -991,7 +990,7 @@ describe("embedded Neovim lifecycle", () => {
         5,
         10,
         null,
-        onFatalError,
+        { onFatalError },
       );
       return { handle, onFatalError, rpc, session };
     };
@@ -1126,8 +1125,7 @@ describe("embedded Neovim lifecycle", () => {
       1_000,
       10_000,
       null,
-      undefined,
-      2_500,
+      { recoveryPreservationTimeoutMs: 2_500 },
     );
 
     const cleaning = session.cleanup({ preserveRecovery: true });
@@ -1178,8 +1176,7 @@ describe("embedded Neovim lifecycle", () => {
       1_000,
       10_000,
       null,
-      undefined,
-      40,
+      { recoveryPreservationTimeoutMs: 40 },
     );
 
     await expect(session.cleanup({ preserveRecovery: true })).rejects.toThrow(

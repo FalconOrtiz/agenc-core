@@ -620,6 +620,11 @@ export class NeovimStartupCleanupError extends AggregateError {
   }
 }
 
+export type EmbeddedNeovimSessionHooks = {
+  readonly onFatalError?: (error: Error) => void;
+  readonly recoveryPreservationTimeoutMs?: number;
+};
+
 export class EmbeddedNeovimSession {
   readonly #handle: NeovimProcessHandle;
   readonly #rpc: NeovimRpcTransport;
@@ -645,17 +650,18 @@ export class EmbeddedNeovimSession {
     cleanupTimeoutMs: number,
     operationTimeoutMs = DEFAULT_OPERATION_TIMEOUT_MS,
     recovery: EmbeddedNeovimRecoveryInfo | null = null,
-    onFatalError?: (error: Error) => void,
-    recoveryPreservationTimeoutMs = DEFAULT_RECOVERY_PRESERVATION_TIMEOUT_MS,
+    hooks: EmbeddedNeovimSessionHooks = {},
   ) {
     this.#handle = handle;
     this.#rpc = rpc;
     this.#ui = ui;
     this.#cleanupTimeoutMs = cleanupTimeoutMs;
-    this.#recoveryPreservationTimeoutMs = recoveryPreservationTimeoutMs;
+    this.#recoveryPreservationTimeoutMs =
+      hooks.recoveryPreservationTimeoutMs ??
+      DEFAULT_RECOVERY_PRESERVATION_TIMEOUT_MS;
     this.#operationTimeoutMs = operationTimeoutMs;
     this.#recovery = recovery;
-    this.#onFatalError = onFatalError;
+    this.#onFatalError = hooks.onFatalError;
   }
 
   get pid(): number {
@@ -1895,9 +1901,11 @@ export async function startEmbeddedNeovim(
         options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS,
         options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS,
         preparation?.recovery ?? null,
-        options.onFatalError,
-        options.recoveryPreservationTimeoutMs ??
-          DEFAULT_RECOVERY_PRESERVATION_TIMEOUT_MS,
+        {
+          onFatalError: options.onFatalError,
+          recoveryPreservationTimeoutMs:
+            options.recoveryPreservationTimeoutMs,
+        },
       );
     } finally {
       startupAbort.signal.removeEventListener("abort", abortStartup);
