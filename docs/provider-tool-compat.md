@@ -113,9 +113,11 @@ the host default runs. Out-of-enum values are not translated.
 
 Meta Muse Spark chat models forward `reasoning_effort` only for `minimal`,
 `low`, `medium`, `high`, and `xhigh`; `none` and `max` are stripped because the
-Model API rejects them. Meta also rejects `tool_choice: "required"`, so AgenC
-uses `auto` when an internal workflow (including plan mode) requests required
-tool use. Meta requests use `max_completion_tokens`.
+Model API rejects them. Meta accepts only `tool_choice: "auto"`: required and
+named choices are normalized to `auto`, while `none` removes tools from the
+request. Caller-supplied stop sequences are stripped because Meta rejects the
+`stop` field. Meta requests use `max_completion_tokens`; Muse Spark supports
+image input, JSON-schema structured output, and parallel function calls.
 
 ## Gemini native JSON Schema
 

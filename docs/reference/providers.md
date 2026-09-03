@@ -211,9 +211,12 @@ Meta Model API uses `MODEL_API_KEY` and the OpenAI-compatible
 not offered as session LLMs. Muse Spark is registered with a 1,048,576-token
 context window and a 131,072-token maximum output. Its supported reasoning
 levels are `minimal`, `low`, `medium`, `high`, and `xhigh` (default `medium`);
-`none` and `max` are rejected by the API. Exact per-token pricing is not
-published in the authoritative provider documentation, so AgenC uses its
-existing unknown-price sentinel instead of claiming a made-up rate.
+`none` and `max` are rejected by the API. The chat models accept image input,
+JSON-schema structured output, and parallel function calls. Meta accepts only
+`tool_choice: "auto"` and rejects `stop`, so AgenC normalizes those controls
+before sending a request. Exact per-token pricing is not published in the
+authoritative provider documentation, so AgenC reports the cost as unknown
+instead of treating its conservative fallback estimate as authoritative.
 
 ## Local context windows
 
@@ -469,7 +472,8 @@ rejects or silently ignores. An undefined `acceptsX` flag still means
 | Field | Who gets it |
 | --- | --- |
 | `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. Meta Muse Spark models for `minimal`, `low`, `medium`, `high`, and `xhigh` only. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
-| `tool_choice: "required"` | Meta rejects this mode, so its adapter sends `auto`; other compatible providers keep the requested value. |
+| `tool_choice` | Meta accepts only `auto`. `required` and named choices are normalized to `auto`; `none` omits both the tools and choice fields. Other compatible providers keep the requested value. |
+| `stop` | Meta rejects stop sequences, so its adapter strips them. Other compatible providers keep caller-supplied sequences. |
 | `service_tier` | `openai` and `azure-openai` only |
 | `stream_options.include_usage` | Default **on**. `STREAM_USAGE_INCOMPATIBLE_PROVIDERS` is currently empty, and no operator or per-instance override is wired. |
 
