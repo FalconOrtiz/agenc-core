@@ -22,12 +22,16 @@ import {
 import { isSettingSourceEnabled } from "../utils/settings/constants.js";
 import {
   assembleTieredInstructions,
+  assembleTieredInstructionsWithSourceSegments,
   formatTieredInstructionWarnings,
   loadTieredInstructions,
   type InstructionTier,
   type TieredInstructions,
 } from "./agenc-md.js";
-import { findProjectRoot } from "./project-instructions.js";
+import {
+  DEFAULT_PROJECT_DOC_MAX_BYTES,
+  findProjectRoot,
+} from "./project-instructions.js";
 import {
   LIVE_INSTRUCTION_PRECEDENCE,
   type LiveInstructionPolicy,
@@ -184,6 +188,91 @@ async function loadMemoryEntrypointsText(): Promise<string> {
   return [PERSISTENT_MEMORY_CONTEXT_PROMPT, ...blocks].join("\n\n");
 }
 
+function instructionPathKey(path: string): string {
+  const canonicalPath = resolve(path);
+  return process.platform === "win32"
+    ? canonicalPath.toLowerCase()
+    : canonicalPath;
+}
+
+interface InstructionSourceSegment {
+  readonly path: string;
+  readonly start: number;
+  readonly end: number;
+}
+
+function sanitizeTieredInstructionsWithSourceSegments(
+  tiers: TieredInstructions,
+): {
+  readonly text: string;
+  readonly sourceSegments: readonly InstructionSourceSegment[];
+} {
+  const assembled = assembleTieredInstructionsWithSourceSegments(tiers);
+  const canonicalText = sanitizeRepositoryAuthorityMarkup(assembled.text);
+  if (assembled.sourceSegments.length === 0) {
+    return { text: canonicalText, sourceSegments: [] };
+  }
+
+  let text = "";
+  let cursor = 0;
+  const sourceSegments: InstructionSourceSegment[] = [];
+  for (const segment of assembled.sourceSegments) {
+    if (
+      segment.start < cursor ||
+      segment.end <= segment.start ||
+      segment.end > assembled.text.length
+    ) {
+      return { text: canonicalText, sourceSegments: [] };
+    }
+    text += sanitizeRepositoryAuthorityMarkup(
+      assembled.text.slice(cursor, segment.start),
+    );
+    const start = text.length;
+    text += sanitizeRepositoryAuthorityMarkup(
+      assembled.text.slice(segment.start, segment.end),
+    );
+    if (text.length > start) {
+      sourceSegments.push({ path: segment.path, start, end: text.length });
+    }
+    cursor = segment.end;
+  }
+  text += sanitizeRepositoryAuthorityMarkup(assembled.text.slice(cursor));
+
+  // Segment-local sanitization must never alter canonical whole-prompt output.
+  // If a future sanitizer rule crosses a segment boundary, preserve the prompt
+  // byte-for-byte and fail closed on partial-source attribution.
+  return text === canonicalText
+    ? { text, sourceSegments }
+    : { text: canonicalText, sourceSegments: [] };
+}
+
+function sourcesFromRetainedTierPrefix(input: {
+  readonly tiers: TieredInstructions;
+  readonly sourceSegments: readonly InstructionSourceSegment[];
+  readonly assembled: string;
+  readonly retained: string;
+}): LiveInstructionSource[] {
+  const sources = sourcesFromTiers({ tiers: input.tiers });
+  if (input.retained === input.assembled) return sources;
+  const retainedSourceKeys = new Set(
+    input.sourceSegments
+      .filter((segment) => input.retained.length > segment.start)
+      .map((segment) => instructionPathKey(segment.path)),
+  );
+  return sources.filter((source) =>
+    retainedSourceKeys.has(instructionPathKey(source.path))
+  );
+}
+
+function truncateUtf8ToBudget(content: string, maximumBytes: number): string {
+  if (maximumBytes <= 0) return "";
+  const encoded = Buffer.from(content, "utf8");
+  if (encoded.length <= maximumBytes) return content;
+  let end = maximumBytes;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end -= 1;
+  return encoded.subarray(0, end).toString("utf8");
+}
+
 /** Frame a repository-defined agent prompt without allowing tag breakout. */
 export function frameWorkspaceAgentRoleGuidance(content: string): string {
   if (content.trim().length === 0) return "";
@@ -228,9 +317,10 @@ export async function resolveLiveInstructionEnvelope(input: {
     );
   }
   const config = configStore.current();
-  const discoveryDisabled =
-    isEnvTruthy(process.env.AGENC_DISABLE_AGENC_MDS) ||
-    isBareMode();
+  const discoveryDisabledByEnvironment = isEnvTruthy(
+    process.env.AGENC_DISABLE_AGENC_MDS,
+  );
+  const discoveryDisabled = discoveryDisabledByEnvironment || isBareMode();
   const enabledTiers: InstructionTier[] = discoveryDisabled
     ? []
     : [
@@ -301,15 +391,118 @@ export async function resolveLiveInstructionEnvelope(input: {
       };
     }
   }
+  const additionalTierSets: TieredInstructions[] = [];
+  const additionalSources: LiveInstructionSource[] = [];
+  const additionalInstructionParts: string[] = [];
+  const additionalInstructionBudget =
+    config?.project_doc_max_bytes ?? DEFAULT_PROJECT_DOC_MAX_BYTES;
+  let additionalInstructionBytes = 0;
+  let additionalInstructionsTruncated = false;
+  if (
+    !discoveryDisabledByEnvironment &&
+    isEnvTruthy(process.env.AGENC_ADDITIONAL_DIRECTORIES_AGENC_MD)
+  ) {
+    const seenDirectories = new Set([
+      process.platform === "win32"
+        ? resolve(input.ctx.cwd).toLowerCase()
+        : resolve(input.ctx.cwd),
+    ]);
+    for (const directory of input.session.permissionModeRegistry
+      .current()
+      .additionalWorkingDirectories.values()) {
+      if (directory.source !== "cliArg") continue;
+      const canonicalDirectory = resolve(directory.path);
+      const comparisonKey =
+        process.platform === "win32"
+          ? canonicalDirectory.toLowerCase()
+          : canonicalDirectory;
+      if (seenDirectories.has(comparisonKey)) continue;
+      seenDirectories.add(comparisonKey);
+      if (additionalInstructionBytes >= additionalInstructionBudget) {
+        additionalInstructionsTruncated = true;
+        break;
+      }
+      const tierSet = await loadTieredInstructions({
+        cwd: canonicalDirectory,
+        configHomeDir: configStore.homeContext.path,
+        managedPath: configStore.managedPaths.instructions,
+        enabledTiers: ["project"],
+        projectRootMarkers: [],
+        ...(input.session.services.externalInstructionApprovals !== undefined
+          ? {
+              externalApprovals:
+                input.session.services.externalInstructionApprovals,
+            }
+          : {}),
+        ...(config?.project_doc_max_bytes !== undefined
+          ? { projectDocMaxBytes: config.project_doc_max_bytes }
+          : {}),
+      });
+      const assembled = sanitizeRepositoryAuthorityMarkup(
+        assembleTieredInstructions(tierSet),
+      );
+      if (assembled.trim().length === 0) {
+        additionalTierSets.push(tierSet);
+        continue;
+      }
+      const separatorBytes = additionalInstructionParts.length > 0 ? 2 : 0;
+      const remaining = Math.max(
+        0,
+        additionalInstructionBudget -
+          additionalInstructionBytes -
+          separatorBytes,
+      );
+      const retained = truncateUtf8ToBudget(assembled, remaining);
+      if (retained.length > 0) {
+        additionalTierSets.push(tierSet);
+        if (retained === assembled) {
+          additionalSources.push(...sourcesFromTiers({ tiers: tierSet }));
+        } else {
+          const assembledWithSources =
+            sanitizeTieredInstructionsWithSourceSegments(tierSet);
+          additionalSources.push(
+            ...sourcesFromRetainedTierPrefix({
+              tiers: tierSet,
+              sourceSegments: assembledWithSources.sourceSegments,
+              assembled: assembledWithSources.text,
+              retained,
+            }),
+          );
+        }
+        additionalInstructionParts.push(retained);
+        additionalInstructionBytes +=
+          separatorBytes + Buffer.byteLength(retained, "utf8");
+      }
+      if (retained !== assembled) {
+        additionalInstructionsTruncated = true;
+        break;
+      }
+    }
+  }
+  const tierSets = [tiers, ...additionalTierSets];
+  const primaryInstructionText = assembleTieredInstructions(tiers);
+  const additionalInstructionText = additionalInstructionParts.join("\n\n");
   const workspaceText = frameWorkspaceGuidance(
-    assembleTieredInstructions(tiers),
+    [primaryInstructionText, additionalInstructionText]
+      .filter((text) => text.trim().length > 0)
+      .join("\n\n"),
   );
+  const warnings = [
+    ...tierSets.flatMap((tierSet) =>
+      formatTieredInstructionWarnings(tierSet),
+    ),
+    ...(additionalInstructionsTruncated
+      ? [
+          `Additional-directory instructions exceeded the ${additionalInstructionBudget}-byte aggregate UTF-8 budget and were truncated`,
+        ]
+      : []),
+  ];
   const memoryText = await loadMemoryEntrypointsText();
-  const warnings = formatTieredInstructionWarnings(tiers);
   input.session.setProjectMemoryWarnings(warnings);
-  const sources = sourcesFromTiers({
-    tiers,
-  });
+  const sources = [
+    ...sourcesFromTiers({ tiers }),
+    ...additionalSources,
+  ];
 
   // The trusted role/base prompt is last and therefore cannot be textually
   // shadowed by lower-authority repository guidance or by persisted memory.

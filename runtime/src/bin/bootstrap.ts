@@ -648,6 +648,10 @@ export interface LocalRuntimeBootstrap {
   /** Stage a configured baseline for the registry publication transaction. */
   readonly prepareConfiguredExecutionAuthority: (
     config: AgenCConfig,
+    permissionContext: Pick<
+      ToolPermissionContext,
+      "additionalWorkingDirectories"
+    >,
   ) => PreparedConfiguredExecutionAuthority;
   readonly workspaceRoot: string;
   readonly conversationId: string;
@@ -903,14 +907,39 @@ async function bootstrapLocalRuntimeSessionScoped(
     projectRootMarkers: config.project_root_markers,
   });
   let configuredExecutionConfig = startup.config;
+  let additionalWorkingDirectoryAllowWrite: readonly string[] = [];
+  const withAdditionalWorkingDirectories = (
+    authority: SessionExecutionAuthority,
+    allowWrite: readonly string[] = additionalWorkingDirectoryAllowWrite,
+  ): SessionExecutionAuthority => {
+    if (
+      authority.sandboxPolicy.value !== "workspace_write" ||
+      allowWrite.length === 0
+    ) {
+      return authority;
+    }
+    return Object.freeze({
+      ...authority,
+      fileSystemSandboxPolicy: Object.freeze({
+        ...authority.fileSystemSandboxPolicy,
+        allowWrite: Object.freeze([
+          ...new Set([
+            ...authority.fileSystemSandboxPolicy.allowWrite,
+            ...allowWrite,
+          ]),
+        ]),
+      }),
+    });
+  };
   let configuredExecutionAuthorityCwd = workspaceRoot;
   let configuredExecutionAuthorityProjectTrust = projectTrust;
-  let configuredExecutionAuthority =
+  let configuredExecutionAuthority = withAdditionalWorkingDirectories(
     sessionExecutionAuthorityFromAgenCConfig({
       config: configuredExecutionConfig,
       workspaceRoot: configuredExecutionAuthorityCwd,
       projectTrust,
-    });
+    }),
+  );
   const currentConfiguredExecutionAuthority = (): SessionExecutionAuthority => {
     const currentCwd = sandboxExecutionBroker.cwd;
     const currentProjectTrust = executionProjectTrust(
@@ -923,31 +952,47 @@ async function bootstrapLocalRuntimeSessionScoped(
     ) {
       return configuredExecutionAuthority;
     }
-    configuredExecutionAuthority = sessionExecutionAuthorityFromAgenCConfig({
-      config: configuredExecutionConfig,
-      workspaceRoot: currentCwd,
-      projectTrust: currentProjectTrust,
-    });
+    configuredExecutionAuthority = withAdditionalWorkingDirectories(
+      sessionExecutionAuthorityFromAgenCConfig({
+        config: configuredExecutionConfig,
+        workspaceRoot: currentCwd,
+        projectTrust: currentProjectTrust,
+      }),
+    );
     configuredExecutionAuthorityCwd = currentCwd;
     configuredExecutionAuthorityProjectTrust = currentProjectTrust;
     return configuredExecutionAuthority;
   };
   const prepareConfiguredExecutionAuthority = (
     canonicalConfig: AgenCConfig,
+    permissionContext: Pick<
+      ToolPermissionContext,
+      "additionalWorkingDirectories"
+    >,
   ): PreparedConfiguredExecutionAuthority => {
     const previousConfig = configuredExecutionConfig;
     const previous = currentConfiguredExecutionAuthority();
     const previousProjectTrust = configuredExecutionAuthorityProjectTrust;
+    const previousAdditionalWorkingDirectoryAllowWrite =
+      additionalWorkingDirectoryAllowWrite;
+    const preparedAdditionalWorkingDirectoryAllowWrite = Object.freeze(
+      [...permissionContext.additionalWorkingDirectories.values()]
+        .filter((directory) => directory.source === "cliArg")
+        .map((directory) => directory.path),
+    );
     const preparedCwd = sandboxExecutionBroker.cwd;
     const preparedProjectTrust = executionProjectTrust(
       canonicalConfig,
       preparedCwd,
     );
-    const authority = sessionExecutionAuthorityFromAgenCConfig({
-      config: canonicalConfig,
-      workspaceRoot: preparedCwd,
-      projectTrust: preparedProjectTrust,
-    });
+    const authority = withAdditionalWorkingDirectories(
+      sessionExecutionAuthorityFromAgenCConfig({
+        config: canonicalConfig,
+        workspaceRoot: preparedCwd,
+        projectTrust: preparedProjectTrust,
+      }),
+      preparedAdditionalWorkingDirectoryAllowWrite,
+    );
     let committed = false;
     return Object.freeze({
       authority,
@@ -955,6 +1000,15 @@ async function bootstrapLocalRuntimeSessionScoped(
         if (configuredExecutionConfig !== previousConfig && !committed) {
           throw new Error(
             "configured execution authority changed before staged commit",
+          );
+        }
+        if (
+          additionalWorkingDirectoryAllowWrite !==
+            previousAdditionalWorkingDirectoryAllowWrite &&
+          !committed
+        ) {
+          throw new Error(
+            "configured additional-directory authority changed before staged commit",
           );
         }
         if (sandboxExecutionBroker.cwd !== preparedCwd && !committed) {
@@ -972,6 +1026,8 @@ async function bootstrapLocalRuntimeSessionScoped(
           );
         }
         configuredExecutionConfig = canonicalConfig;
+        additionalWorkingDirectoryAllowWrite =
+          preparedAdditionalWorkingDirectoryAllowWrite;
         configuredExecutionAuthority = authority;
         configuredExecutionAuthorityCwd = preparedCwd;
         configuredExecutionAuthorityProjectTrust = preparedProjectTrust;
@@ -984,7 +1040,17 @@ async function bootstrapLocalRuntimeSessionScoped(
             "configured execution authority changed before staged rollback",
           );
         }
+        if (
+          additionalWorkingDirectoryAllowWrite !==
+          preparedAdditionalWorkingDirectoryAllowWrite
+        ) {
+          throw new Error(
+            "configured additional-directory authority changed before staged rollback",
+          );
+        }
         configuredExecutionConfig = previousConfig;
+        additionalWorkingDirectoryAllowWrite =
+          previousAdditionalWorkingDirectoryAllowWrite;
         const currentCwd = sandboxExecutionBroker.cwd;
         const currentProjectTrust = executionProjectTrust(
           previousConfig,
@@ -994,11 +1060,14 @@ async function bootstrapLocalRuntimeSessionScoped(
           currentCwd === preparedCwd &&
             currentProjectTrust === previousProjectTrust
             ? previous
-            : sessionExecutionAuthorityFromAgenCConfig({
-                config: previousConfig,
-                workspaceRoot: currentCwd,
-                projectTrust: currentProjectTrust,
-              });
+            : withAdditionalWorkingDirectories(
+                sessionExecutionAuthorityFromAgenCConfig({
+                  config: previousConfig,
+                  workspaceRoot: currentCwd,
+                  projectTrust: currentProjectTrust,
+                }),
+                previousAdditionalWorkingDirectoryAllowWrite,
+              );
         configuredExecutionAuthorityCwd = currentCwd;
         configuredExecutionAuthorityProjectTrust = currentProjectTrust;
         committed = false;
@@ -1012,12 +1081,23 @@ async function bootstrapLocalRuntimeSessionScoped(
       configStore,
     },
     providerEnvironment,
+    ...(cli.addDirs !== undefined ? { addDirs: cli.addDirs } : {}),
     ...(cli.permissionMode ? { permissionMode: cli.permissionMode } : {}),
     ...(runtimeOptions.dangerouslyBypassApprovalsAndSandbox
       ? { allowDangerouslySkipPermissions: true }
       : {}),
     projectTrust,
   });
+  additionalWorkingDirectoryAllowWrite = Object.freeze(
+    [
+      ...permissionInit.toolPermissionContext.additionalWorkingDirectories.values(),
+    ]
+      .filter((directory) => directory.source === "cliArg")
+      .map((directory) => directory.path),
+  );
+  configuredExecutionAuthority = withAdditionalWorkingDirectories(
+    configuredExecutionAuthority,
+  );
   const autoModeEnabled =
     permissionInit.toolPermissionContext.isAutoModeAvailable === true &&
     isAutoModeGateEnabled(providerEnvironment);

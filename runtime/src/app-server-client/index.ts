@@ -63,6 +63,9 @@ import {
   RUN_RUNTIME_SERVICE_TIERS,
   type RunRuntimeSettingsSnapshot,
 } from "../contracts/run-contracts.js";
+import {
+  validateAndDedupeAdditionalWorkingDirectoryInputs,
+} from "../contracts/additional-working-directories.js";
 import { canonicalizeBypassPermissionsCwd } from "../permissions/bypass-consent-state.js";
 import type { SessionConfiguration } from "../session/turn-context.js";
 
@@ -85,6 +88,7 @@ export interface AgenCDaemonPromptAgentOptions {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly initialContent?: string | readonly MessageContentBlock[];
   readonly deferInitialTurn?: boolean;
   readonly initialDisplayUserMessage?: string | null;
@@ -124,6 +128,7 @@ export interface ResumeAgenCDaemonPromptAgentOptions {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly permissionMode?:
     | "default"
     | "plan"
@@ -131,6 +136,18 @@ export interface ResumeAgenCDaemonPromptAgentOptions {
     | "bypassPermissions"
     | "dontAsk"
     | "auto";
+}
+
+function additionalDirectoryCreateParams(
+  addDirs: readonly string[] | undefined,
+): { readonly addDirs?: readonly string[] } {
+  if (addDirs === undefined) return {};
+  return {
+    addDirs: validateAndDedupeAdditionalWorkingDirectoryInputs(
+      addDirs,
+      "daemon client addDirs",
+    ),
+  };
 }
 
 export async function startAgenCDaemonPromptAgent(
@@ -158,6 +175,7 @@ export async function startAgenCDaemonPromptAgent(
     ...(options.configPath !== undefined
       ? { configPath: resolvePath(cwd, options.configPath) }
       : {}),
+    ...additionalDirectoryCreateParams(options.addDirs),
     ...(options.initialContent !== undefined
       ? { initialContent: options.initialContent }
       : {}),
@@ -212,6 +230,7 @@ export async function resumeAgenCDaemonPromptAgent(
     ...(options.configPath !== undefined
       ? { configPath: resolvePath(cwd, options.configPath) }
       : {}),
+    ...additionalDirectoryCreateParams(options.addDirs),
     ...(options.permissionMode !== undefined
       ? { permissionMode: options.permissionMode }
       : {}),
