@@ -540,7 +540,7 @@ export function initExtractMemories(
       const stored = (
         s as { memoryExtractionTrigger?: MemoryExtractionTriggerPersisted }
       ).memoryExtractionTrigger;
-      if (!stored || stored.memoryRoot !== memoryRoot(memoryDir)) return undefined;
+      if (stored?.memoryRoot !== memoryRoot(memoryDir)) return undefined;
       return {
         processedVisibleCount: stored.processedVisibleCount,
         turnsSinceLastExtraction: stored.turnsSinceLastExtraction,
