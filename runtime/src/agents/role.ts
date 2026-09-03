@@ -64,6 +64,7 @@ export type { AgentRoleWorkspace } from "./role-workspace.js";
 
 export type AgentReasoningEffort =
   | "none"
+  | "minimal"
   | "low"
   | "medium"
   | "high"
@@ -956,6 +957,7 @@ function asAgentReasoningEffort(
 ): AgentReasoningEffort | undefined {
   if (
     value === "none" ||
+    value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||

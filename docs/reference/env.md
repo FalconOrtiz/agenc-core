@@ -25,7 +25,7 @@ Boolean-like values that go through `applyEnvOverrides` treat
 | `AGENC_WORKSPACE` | Workspace root override |
 | `AGENC_MODEL` | Session model (`grok-4.6` when unset and config is fresh) |
 | `AGENC_PROVIDER` | Canonical provider slug. Retired selector spellings are rejected; use `grok` and `openai-compatible` directly |
-| `AGENC_EFFORT_LEVEL` | Reasoning effort captured into canonical session config: `low`, `medium`, `high`, `xhigh`, or `none`; other values are rejected |
+| `AGENC_EFFORT_LEVEL` | Reasoning effort captured into canonical session config: `minimal`, `low`, `medium`, `high`, `xhigh`, or `none`; other values are rejected |
 | `AGENC_PROFILE` | Named config profile (`--profile`) |
 | `AGENC_AUTONOMOUS` | Truthy enables autonomous tick mode |
 | `AGENC_MAX_OUTPUT_TOKENS` | Positive integer output-token budget |
@@ -53,6 +53,7 @@ Credential values are not written into the canonical config snapshot.
 | OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `AGENC_OPENROUTER_HTTP_REFERER`, `AGENC_OPENROUTER_TITLE` |
 | Groq | `GROQ_API_KEY`, `GROQ_BASE_URL` |
 | DeepSeek | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` |
+| Meta | `MODEL_API_KEY`, `META_BASE_URL` |
 | Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_ACCESS_TOKEN`, `GEMINI_AUTH_MODE` (`api-key`, `access-token`, or `adc`), `GEMINI_BASE_URL`, `GEMINI_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_QUOTA_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`, `GEMINI_VERTEX_LOCATION`, `GOOGLE_CLOUD_LOCATION`, `GEMINI_CACHED_CONTENT` |
 | Mistral | `MISTRAL_API_KEY`, `MISTRAL_BASE_URL` |
 | NVIDIA NIM | `NVIDIA_API_KEY`, `NVIDIA_BASE_URL` |

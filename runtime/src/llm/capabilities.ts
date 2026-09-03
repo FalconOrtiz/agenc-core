@@ -253,6 +253,13 @@ function isGeminiThinkingModel(model: string): boolean {
   return matchesModelFamily(model, /(?:^|[/:])gemini-2\.5(?:$|[-_.:])/);
 }
 
+function isMetaMuseSparkModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])muse-spark-(?:1\.3(?:-contributor)?|1\.2(?:-contributor)?|1\.1)$/,
+  );
+}
+
 const HOSTED_CHAT_COMPATIBLE_CAPABILITIES = {
   supportsToolUse: true,
   supportsPromptCaching: false,
@@ -390,6 +397,14 @@ const PROVIDER_CAPABILITIES: Readonly<Record<string, ProviderCapabilityDefinitio
     acceptsAudioHistory: false,
     acceptsThinkingHistory: isDeepSeekThinkingModel,
     acceptsReasoningEffort: false,
+  },
+  meta: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isMetaMuseSparkModel,
+    supportsStructuredOutput: isMetaMuseSparkModel,
+    supportsStructuredOutputWithTools: isMetaMuseSparkModel,
+    acceptsImageHistory: isMetaMuseSparkModel,
+    acceptsReasoningEffort: isMetaMuseSparkModel,
   },
   gemini: {
     supportsToolUse: true,

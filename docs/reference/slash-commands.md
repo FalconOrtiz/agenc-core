@@ -32,7 +32,7 @@ Order matches `buildDefaultRegistry`.
 | `/cost` | `stats` | Show session cost, token usage, and per-agent spend |
 | `/model` | | Switch the model (picker or pass a name) |
 | `/provider` | | Switch the LLM provider for subsequent turns |
-| `/effort` | | Show or set reasoning effort for the current model (`low` / `medium` / `high` / `xhigh` when the catalog allows it; `default` restores the model default) |
+| `/effort` | | Show or set reasoning effort for the current model (the exact model catalog levels, including `minimal` where supported; `default` restores the model default) |
 | `/resolve` | `resolve-effects` | Resolve a blocked unknown-outcome tool effect in the **live** session (`<call-id> <disposition> <evidence-ref> <evidence-sha256>`). Resume a settled terminal first. |
 | `/swarm` | | Show or set conservative adaptive routing (`on`, `off`, `status`) |
 | `/ledger` | `wallet` | Ledger wallet CLI: `status`, `install`, `session`, `discover`, `balances`, `operations`, `receive`, `send`, `swap`, `earn`, `ring`, `help` |

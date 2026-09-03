@@ -109,6 +109,16 @@ that enum (`kimi-k3`, `deepseek-v4-{pro,flash}`, `gpt-oss-<digits>b`,
 `nemotron-3-super`, `nemotron-3-ultra`). Other NIM families strip the field so
 the host default runs. Out-of-enum values are not translated.
 
+### Meta Muse request controls
+
+Meta Muse Spark chat models forward `reasoning_effort` only for `minimal`,
+`low`, `medium`, `high`, and `xhigh`; `none` and `max` are stripped because the
+Model API rejects them. Meta accepts only `tool_choice: "auto"`: required and
+named choices are normalized to `auto`, while `none` removes tools from the
+request. Caller-supplied stop sequences are stripped because Meta rejects the
+`stop` field. Meta requests use `max_completion_tokens`; Muse Spark supports
+image input, JSON-schema structured output, and parallel function calls.
+
 ## Gemini native JSON Schema
 
 Gemini requests use the provider's JSON Schema fields. AgenC does not convert

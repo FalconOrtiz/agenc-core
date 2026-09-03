@@ -157,6 +157,7 @@ export function apiProviderForProvider(provider: string): APIProvider {
     case 'openrouter':
     case 'groq':
     case 'deepseek':
+    case 'meta':
     default:
       return 'openai'
   }

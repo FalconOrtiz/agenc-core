@@ -48,6 +48,7 @@ import { LMStudioProvider } from "./providers/lmstudio/index.js";
 import { OpenRouterProvider } from "./providers/openrouter/index.js";
 import { GroqProvider } from "./providers/groq/index.js";
 import { DeepSeekProvider } from "./providers/deepseek/index.js";
+import { MetaProvider } from "./providers/meta/index.js";
 import { MistralProvider } from "./providers/mistral/index.js";
 import { NvidiaNimProvider } from "./providers/nvidia-nim/index.js";
 import { MiniMaxProvider } from "./providers/minimax/index.js";
@@ -1312,6 +1313,7 @@ function buildOpenAICompatibleProvider(
     | "openrouter"
     | "groq"
     | "deepseek"
+    | "meta"
     | "mistral"
     | "nvidia-nim"
     | "minimax"
@@ -1899,6 +1901,12 @@ export function createProvider(
         apiKeyMode: "required",
         useResponsesApi: false,
         providerCtor: DeepSeekProvider,
+      });
+    case "meta":
+      return buildOpenAICompatibleProvider("meta", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: MetaProvider,
       });
     case "mistral":
       return buildOpenAICompatibleProvider("mistral", opts, {

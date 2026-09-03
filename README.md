@@ -81,7 +81,7 @@ Documentation map: [`docs/INDEX.md`](docs/INDEX.md). Architecture:
 - **In-terminal workbench** — project explorer, code preview, and editable
   `BUFFER` (embedded `nvim --embed` preferred). See
   [`docs/embedded-neovim-buffer.md`](docs/embedded-neovim-buffer.md).
-- **16 built-in providers** — default provider **grok**; fresh-config session
+- **17 built-in providers** — default provider **grok**; fresh-config session
   model **grok-4.6** (fresh config and direct-provider map). **Grok 4.6** has a
   500k context window, low/medium/high/xhigh reasoning (catalog
   `defaultReasoningLevel` is high; `defaultConfig().reasoning_effort` is
@@ -89,7 +89,8 @@ Documentation map: [`docs/INDEX.md`](docs/INDEX.md). Architecture:
   vision, tools, and structured output; **Grok 4.5** and **Grok 4.3** remain
   selectable in the catalog; also
   openai, anthropic, ollama, lmstudio, openai-compatible, openrouter, groq,
-  deepseek, gemini, mistral, nvidia-nim, minimax, github, amazon-bedrock, agenc.
+  deepseek, meta, gemini, mistral, nvidia-nim, minimax, github,
+  amazon-bedrock, agenc.
   See [`docs/reference/providers.md`](docs/reference/providers.md).
 - **Grok OAuth:** sign in with X during onboarding, via `/grok-login`, or `agenc grok-login` for
   subscription Grok access without an API key
@@ -275,6 +276,7 @@ shared NFS/SMB/multi-host container volumes are rejected for runtime locks.
 | --- | --- |
 | `AGENC_HOME` | Root for on-disk state (default `~/.agenc`) |
 | `XAI_API_KEY` / `GROK_API_KEY` | Default provider credentials |
+| `MODEL_API_KEY` | Meta Model API credentials (`AGENC_PROVIDER=meta`) |
 | `AGENC_MODEL` | Override default model (`grok-4.6`) |
 | `AGENC_AUTH_BACKEND` | `local` or `remote` |
 | `AGENC_DAEMON_AUTOSTART=0` | Disable launcher daemon autostart |

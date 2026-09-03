@@ -213,6 +213,7 @@ function asAgentReasoningEffort(
   value: AgentDefinition["effort"],
 ): AgentReasoningEffort | undefined {
   return value === "none" ||
+    value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||

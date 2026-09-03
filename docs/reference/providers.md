@@ -93,7 +93,7 @@ the Grok 4.6 default and capability change.
 they run only through the Grok Build CLI ACP path. See
 [grok-oauth.md](../grok-oauth.md#composer-models-acp).
 
-## Built-in providers (16)
+## Built-in providers (17)
 
 | Slug | Display name | Default model | Default base URL | Ordered credential env aliases | Ordered endpoint env aliases | Onboarding access |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -106,6 +106,7 @@ they run only through the Grok Build CLI ACP path. See
 | `openrouter` | OpenRouter | `x-ai/grok-4.5` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | `api-key` |
 | `groq` | Groq | `llama-3.3-70b-versatile` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `GROQ_BASE_URL` | `api-key` |
 | `deepseek` | DeepSeek | `deepseek-v4-flash` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | `api-key` |
+| `meta` | Meta | `muse-spark-1.3` | `https://api.meta.ai/v1` | `MODEL_API_KEY` | `META_BASE_URL` | `api-key` |
 | `gemini` | Gemini | `gemini-3.1-pro-preview` | `https://generativelanguage.googleapis.com/v1beta` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `GEMINI_BASE_URL` | `api-key` |
 | `mistral` | Mistral | `mistral-medium-latest` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` | `api-key` |
 | `nvidia-nim` | NVIDIA NIM | `nvidia/llama-3.1-nemotron-70b-instruct` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | `api-key` |
@@ -202,6 +203,21 @@ consumed by this direct SigV4 provider. Bedrock model discovery and token
 counting receive the same captured credentials explicitly; they do not invoke
 the AWS SDK profile, shared-file, instance-metadata, or web-identity chains.
 
+Meta Model API uses `MODEL_API_KEY` and the OpenAI-compatible
+`/chat/completions` transport. Its LLM catalog includes `muse-spark-1.3`,
+`muse-spark-1.3-contributor`, `muse-spark-1.2`,
+`muse-spark-1.2-contributor`, and `muse-spark-1.1`. The `/models` entries
+`muse-image-1.0` and `muse-voice-transcribe-1.0` are media APIs, so they are
+not offered as session LLMs. Muse Spark is registered with a 1,048,576-token
+context window and a 131,072-token maximum output. Its supported reasoning
+levels are `minimal`, `low`, `medium`, `high`, and `xhigh` (default `medium`);
+`none` and `max` are rejected by the API. The chat models accept image input,
+JSON-schema structured output, and parallel function calls. Meta accepts only
+`tool_choice: "auto"` and rejects `stop`, so AgenC normalizes those controls
+before sending a request. Exact per-token pricing is not published in the
+authoritative provider documentation, so AgenC reports the cost as unknown
+instead of treating its conservative fallback estimate as authoritative.
+
 ## Local context windows
 
 How AgenC learns the token budget for a local or OpenAI-compatible model.
@@ -250,7 +266,8 @@ explicit config, the built-in heuristic, or 128k. The admitted session window
 can therefore be smaller than the picker after the live probe returns.
 
 Live metadata providers: `grok`, `openai`, `ollama`, `lmstudio`,
-`openai-compatible`, `groq`, `deepseek`. Grok / OpenAI / Groq / DeepSeek
+`openai-compatible`, `groq`, `deepseek`, `meta`. Grok / OpenAI / Groq /
+DeepSeek / Meta
 are probed only when `providers.<slug>.base_url` or that provider's endpoint
 env is set.
 
@@ -454,7 +471,9 @@ rejects or silently ignores. An undefined `acceptsX` flag still means
 
 | Field | Who gets it |
 | --- | --- |
-| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
+| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. Meta Muse Spark models for `minimal`, `low`, `medium`, `high`, and `xhigh` only. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
+| `tool_choice` | Meta accepts only `auto`. `required` and named choices are normalized to `auto`; `none` omits both the tools and choice fields. Other compatible providers keep the requested value. |
+| `stop` | Meta rejects stop sequences, so its adapter strips them. Other compatible providers keep caller-supplied sequences. |
 | `service_tier` | `openai` and `azure-openai` only |
 | `stream_options.include_usage` | Default **on**. `STREAM_USAGE_INCOMPATIBLE_PROVIDERS` is currently empty, and no operator or per-instance override is wired. |
 
@@ -481,8 +500,9 @@ For `lmstudio` and `openai-compatible` only
   `maxOutputTokens` option and `max_output_tokens` setting supply the requested
   value. Non-local OpenAI chat-completions requests use
   `max_completion_tokens`. The runtime default remains
-  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); this ceiling applies only to the
-  two grammar-constrained slugs.
+  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); Meta also uses
+  `max_completion_tokens`. This ceiling applies only to the two
+  grammar-constrained slugs.
 - **`/no_think` system suffix** when the model slug matches `qwen3` /
   `qwen-3`. Qwen3 hybrid thinking honors that line. LM Studio ignores
   `chat_template_kwargs.enable_thinking`, so this path uses the prompt
