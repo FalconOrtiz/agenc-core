@@ -58,6 +58,19 @@ export interface SupervisedProcessControl {
   stop(reason?: "consumer_limit"): void;
 }
 
+/**
+ * Deterministic prepared-spawn settlement for authority tests. When set, the
+ * supervisor skips spawning and resolves with this cleanup verdict under the
+ * active broker lease.
+ */
+export interface SupervisedProcessDeterministicSettlement {
+  readonly backstopExpired: boolean;
+  readonly processTreeCleanupProven: boolean;
+  readonly stopReason?: SupervisedProcessStopReason;
+  readonly forced?: boolean;
+  readonly error?: Error;
+}
+
 export interface SupervisedProcessOptions {
   /** Optional caller-supplied deadline. Omitted means unbounded. */
   readonly timeoutMs?: number;
@@ -77,6 +90,12 @@ export interface SupervisedProcessOptions {
   readonly settleBackstopMs?: number;
   /** Select the Linux containment backend explicitly for deterministic tests. */
   readonly linuxContainment?: "auto" | "subreaper";
+  /**
+   * Test-only settlement that replaces real process cleanup. Production
+   * callers must omit this; prepared-spawn authority tests use it to enter
+   * the unproven-cleanup path without racing OS exit timing.
+   */
+  readonly deterministicSettlement?: SupervisedProcessDeterministicSettlement;
   readonly onStdout?: (
     chunk: Buffer,
     control: SupervisedProcessControl,
@@ -1494,6 +1513,59 @@ export function windowsCommandLineUtf16CodeUnits(
   );
 }
 
+/**
+ * True when prepared-spawn cleanup authority failed and the broker must close.
+ * Kept dependency-light so authority tests can fabricate the same verdict the
+ * supervisor produces after a real backstop or boundary protocol failure.
+ */
+export function isPreparedSpawnCleanupUnproven(
+  result: Pick<
+    SupervisedProcessResult,
+    "backstopExpired" | "processTreeCleanupProven"
+  >,
+): boolean {
+  return (
+    result.backstopExpired === true ||
+    result.processTreeCleanupProven === false
+  );
+}
+
+/** Throw when prepared-spawn cleanup could not be proven under the broker lease. */
+export function throwIfPreparedSpawnCleanupUnproven(
+  result: SupervisedProcessResult,
+): void {
+  if (!isPreparedSpawnCleanupUnproven(result)) {
+    return;
+  }
+  const terminal =
+    result.backstopExpired === true
+      ? "backstop"
+      : "unproven_tree";
+  throw new SandboxExecutionLeaseCleanupError(
+    `sandbox lifecycle could not prove supervised process-tree cleanup (${terminal})`,
+    result.error === undefined ? undefined : { cause: result.error },
+  );
+}
+
+function resolveDeterministicSettlement(
+  settlement: SupervisedProcessDeterministicSettlement,
+): SupervisedProcessResult {
+  return {
+    exitCode: null,
+    signal: null,
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
+    ...(settlement.stopReason !== undefined
+      ? { stopReason: settlement.stopReason }
+      : {}),
+    forced: settlement.forced === true,
+    backstopExpired: settlement.backstopExpired,
+    processTreeCleanupProven: settlement.processTreeCleanupProven,
+    ...(settlement.error !== undefined ? { error: settlement.error } : {}),
+    processStarted: true,
+  };
+}
+
 /** Run a native helper with bounded output and process-tree cleanup. */
 export function runSupervisedProcess(
   command: SupervisedProcessCommand | SandboxPreparedSpawn,
@@ -1505,19 +1577,14 @@ export function runSupervisedProcess(
         options.signal === undefined
           ? lifecycleSignal
           : AbortSignal.any([options.signal, lifecycleSignal]);
-      const result = await runSupervisedProcessCommand(preparedCommand, {
-        ...options,
-        signal,
-      });
-      if (
-        result.backstopExpired ||
-        result.processTreeCleanupProven === false
-      ) {
-        throw new SandboxExecutionLeaseCleanupError(
-          "sandbox lifecycle could not prove supervised process-tree cleanup",
-          result.error === undefined ? undefined : { cause: result.error },
-        );
-      }
+      const result =
+        options.deterministicSettlement !== undefined
+          ? resolveDeterministicSettlement(options.deterministicSettlement)
+          : await runSupervisedProcessCommand(preparedCommand, {
+              ...options,
+              signal,
+            });
+      throwIfPreparedSpawnCleanupUnproven(result);
       return result;
     });
   }
