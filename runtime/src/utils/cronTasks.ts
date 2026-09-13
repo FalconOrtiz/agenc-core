@@ -476,6 +476,11 @@ export async function listAllCronTasks(
 ): Promise<CronTask[]> {
   const fileTasks = await readCronTasks(dir);
   if (conversationId === undefined) return fileTasks;
+  return [...fileTasks, ...listSessionCronTasks(conversationId)];
+}
+
+/** In-memory ownership lookup; must never fall through to the durable file. */
+export function listSessionCronTasks(conversationId: string): CronTask[] {
   const sessionTasks = getSessionCronTasks()
     .filter((t) => t.queueOwner.conversationId === conversationId)
     .map((t) => ({
@@ -483,7 +488,7 @@ export async function listAllCronTasks(
       queueOwner: { ...t.queueOwner },
       durable: false as const,
     }));
-  return [...fileTasks, ...sessionTasks];
+  return sessionTasks;
 }
 
 /**

@@ -146,6 +146,8 @@ import {
   waitForInitialization,
 } from "../services/lsp/manager.js";
 import { readSandboxExecutionBroker } from "../sandbox/execution-broker.js";
+import { readToolRuntimeContext } from "../tools/runtimes/context.js";
+import { registerSessionCronMutation } from "../tools/runtimes/session-cron.js";
 import { openStateDatabases } from "../state/sqlite-driver.js";
 import { resolveSecureStorageHome } from "../utils/secureStorage/home.js";
 import { getCACertificates } from "../utils/caCerts.js";
@@ -4614,6 +4616,7 @@ export async function startCronSchedulerRunner(opts: {
   readonly workspaceRoot: string;
   readonly signal?: AbortSignal;
   readonly session?: Session;
+  readonly sessionOnly?: boolean;
 }): Promise<void> {
   opts.signal?.throwIfAborted();
   if (opts.conversationId.trim().length === 0) {
@@ -4634,7 +4637,9 @@ export async function startCronSchedulerRunner(opts: {
     const { startSessionCronScheduler } =
       await import("../session/session-cron-scheduler.js");
     opts.signal?.throwIfAborted();
-    await startSessionCronScheduler(opts.session, opts.workspaceRoot);
+    await startSessionCronScheduler(opts.session, opts.workspaceRoot, {
+      sessionOnly: opts.sessionOnly === true,
+    });
     opts.signal?.throwIfAborted();
     return;
   }
@@ -4645,6 +4650,7 @@ export async function startCronSchedulerRunner(opts: {
       conversationId: opts.conversationId,
     },
     workspaceRoot: opts.workspaceRoot,
+    sessionOnly: opts.sessionOnly === true,
   });
   await scheduler.reschedule();
   opts.signal?.throwIfAborted();
@@ -4653,12 +4659,12 @@ export async function startCronSchedulerRunner(opts: {
 function createCronAndWorkflowTools(
   opts: ModelFacingToolOptions,
 ): readonly Tool[] {
-  return [
+  const tools: Tool[] = [
     {
       name: "CronCreate",
       admissionEstimate: () => ({ maxInputTokens: 0, maxOutputTokens: 0, maxCostUsd: 0 }),
       description:
-        "Schedule a recurring (or one-shot) prompt on a five-field cron expression. Jobs are executed by the runtime's own scheduler: when a job comes due its prompt is enqueued as a new turn in this session. Durable jobs persist in .agenc/scheduled_tasks.json and re-arm on restart; non-durable jobs die with the session. Delivery-routed jobs (announceChannel/webhook) instead run in an isolated gateway session and post their result to that channel/webhook — they require durable and a running `agenc gateway run`.",
+        "Schedule a recurring (or one-shot) prompt on a five-field cron expression. Jobs are executed by the runtime's own scheduler: when a job comes due its prompt is enqueued as a new turn in this session. Durable jobs persist in .agenc/scheduled_tasks.json and re-arm on restart; non-durable jobs die with the session. Workspace-write sandbox mode supports only non-durable session jobs. Delivery-routed jobs (announceChannel/webhook) instead run in an isolated gateway session and post their result to that channel/webhook — they require durable and a running `agenc gateway run`.",
       metadata: toolMetadata("workflow", {
         mutating: true,
         deferred: true,
@@ -4738,6 +4744,10 @@ function createCronAndWorkflowTools(
         // task file — they must be durable or the gateway can never see them.
         const durable =
           deliver !== undefined ? true : (boolValue(args.durable) ?? false);
+        const sessionOnly = readToolRuntimeContext(args)?.sandboxMode === "workspace_write";
+        if (sessionOnly && durable) {
+          return refusal({ error: "Sandboxed CronCreate supports session-only jobs; durable and delivery jobs require filesystem authority" });
+        }
         const id = await addCronTask(
           schedule,
           prompt,
@@ -4755,6 +4765,7 @@ function createCronAndWorkflowTools(
           conversationId,
           workspaceRoot: opts.workspaceRoot,
           session: session ?? undefined,
+          sessionOnly,
         });
         return json({
           cron: {
@@ -4771,7 +4782,7 @@ function createCronAndWorkflowTools(
     {
       name: "CronDelete",
       admissionEstimate: () => ({ maxInputTokens: 0, maxOutputTokens: 0, maxCostUsd: 0 }),
-      description: "Delete a scheduled prompt job by id.",
+      description: "Delete a scheduled prompt job by id. In workspace-write sandbox mode, delete only this session's non-durable jobs; other ids return deleted:false.",
       metadata: toolMetadata("workflow", {
         mutating: true,
         deferred: true,
@@ -4792,6 +4803,17 @@ function createCronAndWorkflowTools(
         }
         const id = stringValue(args.id);
         if (!id) return json({ error: "id is required" }, true);
+        if (readToolRuntimeContext(args)?.sandboxMode === "workspace_write") {
+          const { removeSessionCronTasks } = await import("../bootstrap/state.js");
+          const deleted = removeSessionCronTasks([id], conversationId) > 0;
+          await startCronSchedulerRunner({
+            conversationId,
+            workspaceRoot: opts.workspaceRoot,
+            session: session ?? undefined,
+            sessionOnly: true,
+          });
+          return json({ deleted, id });
+        }
         const { listAllCronTasks, removeCronTasks } =
           await import("../utils/cronTasks.js");
         const before = await listAllCronTasks(
@@ -4948,6 +4970,10 @@ function createCronAndWorkflowTools(
       },
     },
   ];
+  return tools.map((tool) => registerSessionCronMutation(
+    tool,
+    () => opts.getSession()?.conversationId,
+  ));
 }
 
 function findPowerShell(env: NodeJS.ProcessEnv): string | null {

@@ -15,6 +15,7 @@ type SessionCronOwner = {
   readonly workspaceRoot: string;
   closed: boolean;
   ready: boolean;
+  sessionOnly: boolean;
 };
 
 const sessionOwners = new WeakMap<Session, SessionCronOwner>();
@@ -36,8 +37,8 @@ async function claimScheduledOccurrence(
   workspaceRoot: string,
   assertActive: () => void,
 ): Promise<boolean> {
+  assertActive();
   if (task.durable === false) {
-    assertActive();
     const current = getSessionCronTasks().find((candidate) =>
       candidate.queueOwner.conversationId === conversationId &&
       matchesScheduledOccurrence(candidate, task),
@@ -60,6 +61,7 @@ async function claimScheduledOccurrence(
 export async function startSessionCronScheduler(
   session: Session,
   workspaceRoot: string,
+  options: { readonly sessionOnly?: boolean } = {},
 ): Promise<CronScheduler> {
   session.abortController.signal.throwIfAborted();
   const startupSignal = session.services.mcpStartupCancellationToken.signal;
@@ -77,13 +79,16 @@ export async function startSessionCronScheduler(
       loadTasks: async (directory, conversationId) => {
         const tasks = await listAllCronTasks(directory, conversationId);
         if (currentOwner.closed) return [];
-        const ownsDurableTasks = [...owners].find((candidate) => candidate.ready) === currentOwner;
+        const ownsDurableTasks = [...owners].find((candidate) => candidate.ready && !candidate.sessionOnly) === currentOwner;
         return tasks.filter((task) => task.durable === false || ownsDurableTasks);
       },
       enqueue: async (command, task, firedAt) => {
         let accepted = false;
         const assertActive = (): void => {
           if (currentOwner.closed) throw new Error("Cron scheduler session is closed");
+          if (currentOwner.sessionOnly && task.durable !== false) {
+            throw new ScheduledTaskCancelled();
+          }
           session.abortController.signal.throwIfAborted();
           startupSignal?.throwIfAborted();
         };
@@ -115,7 +120,7 @@ export async function startSessionCronScheduler(
         return "accepted" as const;
       },
     });
-    currentOwner = { scheduler, workspaceRoot: canonicalRoot, closed: false, ready: false };
+    currentOwner = { scheduler, workspaceRoot: canonicalRoot, closed: false, ready: false, sessionOnly: options.sessionOnly === true };
     owner = currentOwner;
     owners.add(owner);
     sessionOwners.set(session, owner);
@@ -133,7 +138,9 @@ export async function startSessionCronScheduler(
         owners.delete(currentOwner);
         sessionOwners.delete(session);
         if (owners.size === 0) workspaceOwners.delete(canonicalRoot);
-        await Promise.all([...owners].map((remaining) => remaining.scheduler.reschedule()));
+        if (!currentOwner.sessionOnly) {
+          await Promise.all([...owners].map((remaining) => remaining.scheduler.reschedule()));
+        }
       });
       return closePromise;
     };
@@ -151,17 +158,24 @@ export async function startSessionCronScheduler(
       scheduler.start({
         queueOwner: { kind: "session", conversationId: session.conversationId },
         workspaceRoot: canonicalRoot,
+        sessionOnly: currentOwner.sessionOnly,
       });
     });
   }
+  owner.sessionOnly = options.sessionOnly === true;
   if (owner.ready) {
     owner.scheduler.start({
       queueOwner: { kind: "session", conversationId: session.conversationId },
       workspaceRoot: canonicalRoot,
+      sessionOnly: owner.sessionOnly,
     });
   }
-  await Promise.all(
-    [...(workspaceOwners.get(canonicalRoot) ?? [])].map((current) => current.scheduler.reschedule()),
-  );
+  if (owner.sessionOnly) {
+    await owner.scheduler.reschedule();
+  } else {
+    await Promise.all(
+      [...(workspaceOwners.get(canonicalRoot) ?? [])].map((current) => current.scheduler.reschedule()),
+    );
+  }
   return owner.scheduler;
 }
