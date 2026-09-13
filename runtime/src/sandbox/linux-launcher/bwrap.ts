@@ -5,6 +5,7 @@ import { canonicalAuthorityPath, isWithinAuthorityPath } from "../desktop-author
 import {
   hasFullDiskReadAccess,
   hasFullDiskWriteAccess,
+  canWritePathWithCwd,
   getReadableRootsWithCwd,
   getUnreadableGlobsWithCwd,
   getUnreadableRootsWithCwd,
@@ -12,6 +13,7 @@ import {
   includePlatformDefaults,
   normalizePathForPolicy,
   pathStartsWith,
+  resolvePermissionPath,
   type FileSystemSandboxPolicy,
   type WritableRoot,
 } from "../engine/index.js";
@@ -92,7 +94,11 @@ export function createBwrapCommandArgs(
         options,
         protectedCreateTargets,
       );
-  return { args, usesBubblewrap: true, protectedCreateTargets };
+  return {
+    args,
+    usesBubblewrap: true,
+    protectedCreateTargets,
+  };
 }
 
 export function insertInnerCommandArgv0(
@@ -140,15 +146,17 @@ function createBwrapFlags(
   options: BwrapOptions,
   protectedCreateTargets: string[],
 ): string[] {
+  const filesystem = createFilesystemArgs(
+    fileSystemSandboxPolicy,
+    sandboxPolicyCwd,
+    commandCwd,
+    options,
+    protectedCreateTargets,
+  );
   const args = [
     "--new-session",
     "--die-with-parent",
-    ...createFilesystemArgs(
-      fileSystemSandboxPolicy,
-      sandboxPolicyCwd,
-      options,
-      protectedCreateTargets,
-    ),
+    ...filesystem.args,
     "--unshare-user",
     "--unshare-pid",
   ];
@@ -156,7 +164,7 @@ function createBwrapFlags(
   const normalizedCommandCwd =
     options.inheritedReadOnlyCwd === true
       ? INHERITED_CWD_SANDBOX_PATH
-      : normalizeExistingPath(commandCwd);
+      : filesystem.commandCwd;
   if (
     options.inheritedReadOnlyCwd === true ||
     normalizedCommandCwd !== normalizePathForPolicy(commandCwd)
@@ -194,15 +202,17 @@ function appendNamespaceArgs(args: string[], options: BwrapOptions): void {
 function createFilesystemArgs(
   policy: FileSystemSandboxPolicy,
   sandboxPolicyCwd: string,
+  commandCwd: string,
   options: BwrapOptions,
   protectedCreateTargets: string[],
-): string[] {
+): { readonly args: string[]; readonly commandCwd: string } {
   const args: string[] = [];
   const writableRoots = getWritableRootsWithCwd(
     policy,
     sandboxPolicyCwd,
     options.sessionTempRoot,
   );
+  assertAliasedCarveouts(policy, writableRoots, sandboxPolicyCwd, options.sessionTempRoot);
   if (
     options.inheritedReadOnlyCwd === true &&
     writableRoots.length > 0
@@ -265,7 +275,9 @@ function createFilesystemArgs(
     ),
   ];
   const isNestedUnreadable = (target: string) =>
-    writableRoots.some((root) => pathStartsWith(target, root.root));
+    writableRoots.some((root) => isWithinAuthorityPath(
+      canonicalAuthorityPath(target), canonicalAuthorityPath(root.root),
+    ));
   for (const root of unreadableTargets.filter((target) => !isNestedUnreadable(target))) {
     appendMask(args, root, writableRoots);
   }
@@ -285,7 +297,212 @@ function createFilesystemArgs(
   for (const root of unreadableTargets.filter(isNestedUnreadable)) {
     appendMask(args, root, writableRoots);
   }
-  return args;
+  return physicalFilesystemArgs(
+    args,
+    [sandboxPolicyCwd, commandCwd, ...protectedCreateTargets],
+    [...writableRoots.map((root) => root.root), ...(options.extraWritableBindRoots ?? [])],
+    commandCwd,
+    protectedCreateTargets,
+  );
+}
+
+function assertAliasedCarveouts(
+  policy: FileSystemSandboxPolicy,
+  roots: readonly WritableRoot[],
+  cwd: string,
+  temp: string,
+): void {
+  // The engine deliberately preserves lexical policy paths. Do not let a
+  // physical mount overwrite a differently spelled restriction that the
+  // engine could not associate with its writable root.
+  for (const entry of policy.entries) {
+    if (entry.access === "write") continue;
+    const target = resolvePermissionPath(entry.path, cwd, temp);
+    if (target === null || canWritePathWithCwd(policy, target, cwd, temp)) continue;
+    const physical = canonicalAuthorityPath(target);
+    for (const root of roots) {
+      rejectSymlinkCrossing(target, root.root, "restricted path");
+      if (!isWithinAuthorityPath(physical, canonicalAuthorityPath(root.root))) continue;
+      if (root.readOnlySubpaths.some((carveout) =>
+        isWithinAuthorityPath(physical, canonicalAuthorityPath(carveout))
+      )) continue;
+      throw new Error(`cannot enforce differently spelled restriction inside aliased writable root: ${target}`);
+    }
+  }
+}
+
+interface AliasObservation {
+  readonly target: string;
+  readonly device: number;
+  readonly inode: number;
+}
+
+interface FilesystemAliasSnapshot {
+  readonly aliases: ReadonlyMap<string, AliasObservation>;
+  readonly physicalPaths: ReadonlyMap<string, string>;
+}
+
+function isNamespaceFilesystemPath(target: string): boolean {
+  return ["/", "/proc", "/dev", "/dev/null", INHERITED_CWD_SANDBOX_PATH].includes(target);
+}
+
+function captureFilesystemAliases(
+  hostPaths: readonly string[],
+  writablePaths: readonly string[],
+): FilesystemAliasSnapshot {
+  const aliases = new Map<string, AliasObservation>();
+  const observed = new Set<string>();
+  const physicalPaths = new Map<string, string>();
+  const writableAuthorities = writablePaths.map((root) => ({
+    lexical: normalizePathForPolicy(root),
+    physical: canonicalAuthorityPath(root),
+  }));
+  const observeAliases = (target: string): void => {
+    const normalized = normalizePathForPolicy(target);
+    if (observed.has(normalized)) return;
+    observed.add(normalized);
+    let current: string = path.sep;
+    for (const part of normalized.split(path.sep).filter(Boolean)) {
+      current = path.join(current, part);
+      let metadata: fs.Stats;
+      try { metadata = fs.lstatSync(current); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+      if (!metadata.isSymbolicLink()) continue;
+      const physicalParent = canonicalAuthorityPath(path.dirname(current));
+      const location = path.join(physicalParent, path.basename(current));
+      // The link's target may be read-only while its directory entry remains
+      // replaceable through another writable grant. Refuse that topology.
+      if (writableAuthorities.some((root) =>
+        isWithinAuthorityPath(current, root.lexical) ||
+        isWithinAuthorityPath(path.dirname(current), root.lexical) ||
+        isWithinAuthorityPath(location, root.physical) ||
+        isWithinAuthorityPath(physicalParent, root.physical)
+      )) {
+        throw new Error(`cannot enforce sandbox alias inside writable authority: ${current}`);
+      }
+      const observation = {
+        target: fs.readlinkSync(current), device: metadata.dev, inode: metadata.ino,
+      };
+      const previous = aliases.get(location);
+      if (previous !== undefined && (
+        previous.target !== observation.target || previous.device !== observation.device ||
+        previous.inode !== observation.inode
+      )) throw new Error(`sandbox alias changed while planning: ${current}`);
+      aliases.set(location, observation);
+      if (aliases.size > 256) throw new Error("sandbox alias expansion exceeded 256 links");
+      observeAliases(path.resolve(path.dirname(current), observation.target));
+    }
+  };
+  for (const target of new Set([...hostPaths, ...writablePaths])) {
+    if (isNamespaceFilesystemPath(target)) continue;
+    observeAliases(target);
+    physicalPaths.set(target, canonicalAuthorityPath(target));
+  }
+  // Verify that the separately observed links actually explain every realpath.
+  // A link disappearing between realpath/lstat must not hide an alias race.
+  for (const [target, physical] of physicalPaths) {
+    let pending = normalizePathForPolicy(target).split(path.sep).filter(Boolean);
+    let resolved: string = path.sep;
+    let followed = 0;
+    while (pending.length > 0) {
+      resolved = path.join(resolved, pending.shift()!);
+      const alias = aliases.get(resolved);
+      if (alias === undefined) continue;
+      if (++followed > 256) throw new Error("sandbox alias resolution exceeded 256 links");
+      pending = [
+        ...path.resolve(path.dirname(resolved), alias.target).split(path.sep).filter(Boolean),
+        ...pending,
+      ];
+      resolved = path.sep;
+    }
+    if (resolved !== physical) throw new Error(`sandbox alias changed while planning: ${target}`);
+  }
+  return { aliases, physicalPaths };
+}
+
+function assertFilesystemAliasesUnchanged(
+  before: FilesystemAliasSnapshot,
+  after: FilesystemAliasSnapshot,
+): void {
+  if (before.aliases.size !== after.aliases.size || before.physicalPaths.size !== after.physicalPaths.size) {
+    throw new Error("sandbox alias changed while planning");
+  }
+  for (const [target, physical] of before.physicalPaths) {
+    if (after.physicalPaths.get(target) !== physical) throw new Error(`sandbox alias changed while planning: ${target}`);
+  }
+  for (const [location, alias] of before.aliases) {
+    const current = after.aliases.get(location);
+    if (current?.target !== alias.target || current.device !== alias.device || current.inode !== alias.inode) {
+      throw new Error(`sandbox alias changed while planning: ${location}`);
+    }
+  }
+}
+
+function physicalFilesystemArgs(
+  args: readonly string[],
+  aliasPaths: readonly string[],
+  writablePaths: readonly string[],
+  commandCwd: string,
+  protectedCreateTargets: string[],
+): { readonly args: string[]; readonly commandCwd: string } {
+  const narrow = args[0] === "--tmpfs" && args[1] === "/";
+  const hostPaths = [...aliasPaths];
+  const translate = (physical: (target: string) => string): string[] => {
+    const translated: string[] = [];
+    for (let index = 0; index < args.length;) {
+      const flag = args[index++]!;
+      translated.push(flag);
+      switch (flag) {
+        case "--bind":
+        case "--ro-bind":
+          translated.push(physical(args[index++]!), physical(args[index++]!));
+          break;
+        case "--dev-bind":
+        case "--ro-bind-fd":
+          translated.push(args[index++]!, args[index++]!);
+          break;
+        case "--dir":
+        case "--tmpfs":
+        case "--remount-ro":
+          translated.push(physical(args[index++]!));
+          break;
+        case "--dev":
+          translated.push(args[index++]!);
+          break;
+        default:
+          throw new Error(`unsupported sandbox filesystem flag: ${flag}`);
+      }
+    }
+    return translated;
+  };
+  translate((target) => { hostPaths.push(target); return target; });
+  const snapshot = captureFilesystemAliases(hostPaths, writablePaths);
+  const physical = (target: string): string => {
+    if (isNamespaceFilesystemPath(target)) return target;
+    const resolved = snapshot.physicalPaths.get(target);
+    if (resolved === undefined) throw new Error(`unobserved sandbox filesystem path: ${target}`);
+    return resolved;
+  };
+  const translated = translate(physical);
+  const physicalCommandCwd = physical(commandCwd);
+  const physicalProtectedTargets = protectedCreateTargets.map(physical);
+  const scaffold: string[] = [];
+  if (narrow) {
+    for (const [location, alias] of snapshot.aliases) {
+      appendParentDirs(scaffold, location);
+      scaffold.push("--symlink", alias.target, location);
+    }
+  }
+  assertFilesystemAliasesUnchanged(snapshot, captureFilesystemAliases(hostPaths, writablePaths));
+  protectedCreateTargets.splice(0, protectedCreateTargets.length, ...physicalProtectedTargets);
+  // Construct aliases in the private root before any host directory is bound.
+  // Only empty directories and links are added, never access to their parents.
+  return {
+    args: narrow ? [...translated.slice(0, 2), ...scaffold, ...translated.slice(2)] : translated,
+    commandCwd: physicalCommandCwd,
+  };
 }
 
 function appendInheritedReadOnlyCwd(args: string[]): void {
@@ -362,15 +579,17 @@ function appendMask(
   target: string,
   writableRoots: readonly WritableRoot[],
 ): void {
-  const writableRoot = writableRoots.find((root) => pathStartsWith(target, root.root));
+  for (const root of writableRoots) {
+    rejectSymlinkCrossing(target, root.root, "unreadable path");
+  }
+  const writableRoot = writableRoots.find((root) => isWithinAuthorityPath(
+    canonicalAuthorityPath(target), canonicalAuthorityPath(root.root),
+  ));
   if (!fs.existsSync(target)) {
     if (writableRoot !== undefined) {
       appendReadOnlyEmptyDirectory(args, target);
     }
     return;
-  }
-  if (writableRoot !== undefined) {
-    rejectSymlinkCrossing(target, writableRoot.root, "unreadable path");
   }
   appendParentDirs(args, target);
   const stat = fs.statSync(target);
@@ -568,8 +787,19 @@ function hasAncestorMetadata(root: string, name: string): boolean {
 
 function rejectSymlinkCrossing(target: string, writableRoot: string, label: string): void {
   const normalizedTarget = normalizePathForPolicy(target);
-  const normalizedRoot = normalizePathForPolicy(writableRoot);
-  if (!pathStartsWith(normalizedTarget, normalizedRoot)) return;
+  let normalizedRoot = normalizePathForPolicy(writableRoot);
+  if (!pathStartsWith(normalizedTarget, normalizedRoot)) {
+    const physicalRoot = canonicalAuthorityPath(writableRoot);
+    let ancestor = path.dirname(normalizedTarget);
+    while (canonicalAuthorityPath(ancestor) !== physicalRoot) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return;
+      ancestor = parent;
+    }
+    // Keep the descendant spelling intact: resolving the target itself
+    // would erase a hostile symlink below this authority boundary.
+    normalizedRoot = ancestor;
+  }
   const relative = path.relative(normalizedRoot, normalizedTarget);
   let current = normalizedRoot;
   for (const part of relative.split(path.sep).filter(Boolean)) {
@@ -586,13 +816,5 @@ function rejectSymlinkCrossing(target: string, writableRoot: string, label: stri
       }
       return;
     }
-  }
-}
-
-function normalizeExistingPath(target: string): string {
-  try {
-    return normalizePathForPolicy(fs.realpathSync(target));
-  } catch {
-    return normalizePathForPolicy(target);
   }
 }
