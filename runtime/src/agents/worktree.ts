@@ -30,6 +30,7 @@
 
 import {
   existsSync,
+  lstatSync,
   readdirSync,
   realpathSync,
   readFileSync,
@@ -38,7 +39,15 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { createToolEffectDispositionEvidence } from "../tools/effect-boundary.js";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute as isAbsolutePath,
+  join,
+  relative as pathRelative,
+  resolve as resolvePath,
+  sep as pathSeparator,
+} from "node:path";
 import { AsyncLock } from "./_deps/async-lock.js";
 import type { SandboxExecutionBrokerLike } from "../sandbox/execution-broker.js";
 import { gitChildEnvironment } from "../sandbox/git-environment.js";
@@ -50,11 +59,21 @@ import {
   runSupervisedProcess,
   type SupervisedProcessResult,
 } from "../utils/supervisedProcess.js";
-import type { AdditionalPermissionProfile } from "../sandbox/engine/index.js";
+import {
+  canWritePathWithCwd,
+  getUnreadableGlobsWithCwd,
+  getWritableRootsWithCwd,
+  resolvePermissionPath,
+  type AdditionalPermissionProfile,
+} from "../sandbox/engine/index.js";
+import { effectivePermissionProfile } from "../sandbox/engine/policy-transforms.js";
+import { canonicalAuthorityPath } from "../sandbox/desktop-authority-protection.js";
+import { readBoundedRegularFileSync } from "../utils/bounded-regular-file.js";
 import {
   hardenGitWorktreeMutationArgs,
   worktreeCheckoutPermissions,
   worktreeMutationPermissions,
+  resolveGitMetadataRoot,
 } from "../sandbox/worktree-permissions.js";
 
 // ─────────────────────────────────────────────────────────────────────
@@ -236,6 +255,15 @@ function resolveCanonicalGitRoot(gitRoot: string): string {
   }
 }
 
+function sameExistingDirectory(left: string | null, right: string): boolean {
+  if (left === null) return false;
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
+  }
+}
+
 function resolveWorktreeGitDir(worktreePath: string): string | null {
   const dotGit = join(worktreePath, ".git");
   try {
@@ -364,7 +392,7 @@ export async function getOrCreateWorktree(
     // Fast resume.
     if (existsSync(path) && existsSync(join(path, ".git"))) {
       const existingGitRoot = findGitRoot(path);
-      if (existingGitRoot === opts.gitRoot) {
+      if (sameExistingDirectory(existingGitRoot, opts.gitRoot)) {
         touchWorktreeMtime(path);
         return { path, branch, gitRoot: opts.gitRoot, created: false };
       }
@@ -573,10 +601,7 @@ export async function captureWorktreeTurnEvidence(
     return unverifiable("base commit is not a full Git object id");
   }
   const canonicalGitRoot = findGitRoot(locator.path);
-  if (
-    canonicalGitRoot === null ||
-    resolvePath(canonicalGitRoot) !== resolvePath(locator.gitRoot)
-  ) {
+  if (!sameExistingDirectory(canonicalGitRoot, locator.gitRoot)) {
     return unverifiable(
       "worktree locator does not match its canonical Git root",
     );
@@ -810,6 +835,7 @@ export async function removeAgentWorktree(
   opts: RemoveWorktreeOpts,
 ): Promise<void> {
   return gitMutationLock.with(async () => {
+    assertWorktreeRemovalBoundary(opts);
     // I-35: sparse-checkout teardown verify.
     const gitDir = resolveWorktreeGitDir(opts.path);
     const sparseFile =
@@ -845,7 +871,6 @@ export async function removeAgentWorktree(
       opts.gitRoot,
       opts.sandboxExecutionBroker,
       opts.gitRoot,
-      [opts.path],
     );
     if (remove.code !== 0) {
       throw new Error(
@@ -878,6 +903,95 @@ export async function removeAgentWorktree(
       );
     }
   });
+}
+
+function assertWorktreeRemovalBoundary(opts: RemoveWorktreeOpts): void {
+  const runtime = opts.sandboxExecutionBroker.runtimeSandbox("child_agent");
+  if (runtime === undefined) return;
+  const target = resolvePath(opts.path);
+  let canonicalTarget: string;
+  const refuse = (reason: string): never => {
+    throw new WorktreePreconditionError(
+      `worktree removal refused before mutation: ${reason}`,
+    );
+  };
+  // Only a verified registered linked worktree can use the common metadata
+  // mutation grant. Do not let a crafted .git pointer select another tree.
+  try {
+    if (!lstatSync(target).isDirectory()) {
+      refuse("target is not a non-symlink directory");
+    }
+    canonicalTarget = realpathSync(target);
+    const marker = readBoundedRegularFileSync(join(target, ".git"), 4096).trim();
+    if (!marker.startsWith("gitdir: ") || /[\0\r\n]/u.test(marker)) {
+      refuse("invalid linked-worktree pointer");
+    }
+    const common = realpathSync(
+      resolveGitMetadataRoot(findGitRoot(opts.gitRoot) ?? opts.gitRoot),
+    );
+    const worktrees = join(common, "worktrees");
+    const adminPath = resolvePath(target, marker.slice("gitdir: ".length));
+    if (
+      !lstatSync(adminPath).isDirectory() ||
+      !lstatSync(dirname(adminPath)).isDirectory()
+    ) refuse("linked-worktree metadata is not a non-symlink directory");
+    const admin = realpathSync(adminPath);
+    if (
+      dirname(admin) !== worktrees ||
+      realpathSync(dirname(adminPath)) !== worktrees ||
+      realpathSync(worktrees) !== worktrees
+    ) {
+      refuse("linked-worktree metadata is outside the registered common directory");
+    }
+    const commonPointer = readBoundedRegularFileSync(join(admin, "commondir"), 4096).trim();
+    const backlink = readBoundedRegularFileSync(join(admin, "gitdir"), 4096).trim();
+    if (
+      realpathSync(resolvePath(admin, commonPointer)) !== common ||
+      realpathSync(resolvePath(admin, backlink)) !== realpathSync(join(target, ".git"))
+    ) refuse("linked-worktree metadata does not match its target");
+  } catch (error) {
+    if (error instanceof WorktreePreconditionError) throw error;
+    refuse("linked-worktree identity could not be verified");
+  }
+
+  const profile = effectivePermissionProfile(
+    runtime.permissionProfile,
+    worktreeMutationPermissions(opts.gitRoot),
+  );
+  const cwd = runtime.sandboxPolicyCwd;
+  const temp = runtime.sessionTempRoot;
+  if (
+    !canWritePathWithCwd(profile.fileSystem, dirname(target), cwd, temp) ||
+    !canWritePathWithCwd(profile.fileSystem, target, cwd, temp)
+  ) refuse("target and parent need existing workspace write authority");
+
+  const withinTarget = (candidate: string): boolean => {
+    const relative = pathRelative(canonicalTarget, canonicalAuthorityPath(candidate));
+    return relative !== ".." &&
+      !relative.startsWith(`..${pathSeparator}`) &&
+      !isAbsolutePath(relative);
+  };
+  for (const root of getWritableRootsWithCwd(profile.fileSystem, cwd, temp)) {
+    if (withinTarget(root.root) || root.readOnlySubpaths.some(withinTarget)) {
+      refuse("target contains a sandbox mount or protected path");
+    }
+  }
+  // A policy may name a protected descendant through another spelling of an
+  // ancestor symlink. Compare physical identities without rewriting grants.
+  if (profile.fileSystem.kind === "restricted") {
+    for (const entry of profile.fileSystem.entries) {
+      if (entry.access === "write") continue;
+      const protectedPath = resolvePermissionPath(entry.path, cwd, temp);
+      if (protectedPath !== null && withinTarget(protectedPath)) {
+        refuse("target contains a sandbox mount or protected path");
+      }
+    }
+  }
+  if (getUnreadableGlobsWithCwd(profile.fileSystem, cwd).length > 0) {
+    refuse("glob read restrictions cannot prove an unmounted deletion target");
+  }
+  // No extra target/parent grant is added. Binding the deletion target itself
+  // makes rmdir fail with EBUSY after Git has already removed files/metadata.
 }
 
 // ─────────────────────────────────────────────────────────────────────
