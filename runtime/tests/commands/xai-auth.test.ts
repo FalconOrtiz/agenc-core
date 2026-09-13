@@ -63,6 +63,7 @@ import {
   grokLoginCommand,
   grokLogoutCommand,
 } from "../../src/commands/xai-auth.js";
+import { XaiOauthError } from "../../src/services/xai/oauth.js";
 
 type CommandConfigStore = Pick<ConfigStore, "current" | "homeContext">;
 
@@ -100,7 +101,11 @@ afterEach(() => {
 });
 
 describe("xAI auth command authority", () => {
-  test.each(["\x1b", "\x03"])("cancels a pending device login on %j without storing tokens", async (key) => {
+  test.each([
+    { flow: "device", key: "\x1b" }, { flow: "device", key: "\x03" },
+    { flow: "browser", key: "\x1b" }, { flow: "browser", key: "\x03" },
+    { flow: "discovery", key: "\x1b" }, { flow: "discovery", key: "\x03" },
+  ])("cancels a pending $flow login on $key without storing tokens", async ({ flow, key }) => {
     const stdin = Object.assign(new PassThrough(), {
       isTTY: true, ref() {}, unref() {}, setRawMode() {},
     });
@@ -116,13 +121,19 @@ describe("xAI auth command authority", () => {
     });
     let signal: AbortSignal | undefined;
     let finishLogin: (() => void) | undefined;
-    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
+    const loginMock = flow === "device" ? mocks.runXaiDeviceLogin : mocks.runXaiBrowserLogin;
+    loginMock.mockImplementationOnce(async (options?: {
       signal?: AbortSignal;
-      onUserCode: (info: { userCode: string; verificationUri: string }) => Promise<void>;
+      onUserCode?: (info: { userCode: string; verificationUri: string }) => void | Promise<void>;
+      onAuthorizeUrl?: (url: string) => void | Promise<void>;
     }) => {
-      signal = options.signal;
-      await options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
-      return new Promise((resolve, reject) => {
+      signal = options?.signal;
+      if (flow === "device") {
+        await options?.onUserCode?.({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      } else if (flow === "browser") {
+        await options?.onAuthorizeUrl?.("https://auth.x.ai/oauth2/authorize");
+      }
+      return new Promise<{ identity: { sub: string }; tokenEndpoint: string; tokens: { accessToken: string } }>((resolve, reject) => {
         finishLogin = () => resolve({
           identity: { sub: "cancelled-user" },
           tokenEndpoint: "https://auth.x.ai/oauth2/token",
@@ -131,7 +142,7 @@ describe("xAI auth command authority", () => {
         signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
       });
     });
-    const ctx = { ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX } };
+    const ctx = { ...commandContext(Object.freeze({})), argsRaw: flow === "device" ? "device" : "", appState: { setToolJSX } };
     const pending = grokLoginCommand.execute(ctx);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
@@ -141,6 +152,7 @@ describe("xAI auth command authority", () => {
       await expect(pending).resolves.toEqual({ kind: "text", text: "xAI sign-in cancelled." });
       expect(mocks.saveXaiOauthCredentials).not.toHaveBeenCalled();
       expect(mocks.applyProviderSwitch).not.toHaveBeenCalled();
+      if (flow !== "device") expect(mocks.runXaiDeviceLogin).not.toHaveBeenCalled();
       expect(setToolJSX).toHaveBeenLastCalledWith({
         jsx: null, shouldHidePromptInput: false, clearLocalJSX: true,
       });
@@ -153,12 +165,35 @@ describe("xAI auth command authority", () => {
     }
   });
 
-  test("does not save a late device result after cancellation", async () => {
+  test("retains device fallback and the same cancellation signal when the callback port is unavailable", async () => {
+    let browserSignal: AbortSignal | undefined;
+    mocks.runXaiBrowserLogin.mockImplementationOnce(async (options?: { signal?: AbortSignal }) => {
+      browserSignal = options?.signal;
+      throw new XaiOauthError("callback_failed", "Test callback port unavailable");
+    });
+    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: { signal?: AbortSignal }) => {
+      expect(options.signal).toBe(browserSignal);
+      expect(options.signal?.aborted).toBe(false);
+      return {
+        identity: { sub: "xai-user" }, tokenEndpoint: "https://auth.x.ai/oauth2/token",
+        tokens: { accessToken: "oauth-token" },
+      };
+    });
+    await expect(grokLoginCommand.execute(commandContext(Object.freeze({}))))
+      .resolves.toMatchObject({ kind: "text" });
+    expect(mocks.runXaiDeviceLogin).toHaveBeenCalledOnce();
+    expect(mocks.saveXaiOauthCredentials).toHaveBeenCalledOnce();
+  });
+
+  test.each(["device", "browser"])("does not save a late %s result after cancellation", async (flow) => {
     const setToolJSX = vi.fn();
-    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
-      onUserCode: (info: { userCode: string; verificationUri: string }) => void;
+    const loginMock = flow === "device" ? mocks.runXaiDeviceLogin : mocks.runXaiBrowserLogin;
+    loginMock.mockImplementationOnce(async (options?: {
+      onUserCode?: (info: { userCode: string; verificationUri: string }) => void;
+      onAuthorizeUrl?: (url: string) => void;
     }) => {
-      options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      if (flow === "device") options?.onUserCode?.({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      else options?.onAuthorizeUrl?.("https://auth.x.ai/oauth2/authorize");
       const notice = setToolJSX.mock.calls.at(-1)?.[0] as { jsx: { props: { onCancel: () => void } } };
       notice.jsx.props.onCancel();
       // Simulate a provider completing despite cancellation of its request.
@@ -169,7 +204,7 @@ describe("xAI auth command authority", () => {
       };
     });
     const result = await grokLoginCommand.execute({
-      ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX },
+      ...commandContext(Object.freeze({})), argsRaw: flow === "device" ? "device" : "", appState: { setToolJSX },
     });
     expect(result).toEqual({ kind: "text", text: "xAI sign-in cancelled." });
     expect(mocks.saveXaiOauthCredentials).not.toHaveBeenCalled();
@@ -197,16 +232,19 @@ describe("xAI auth command authority", () => {
     })).resolves.toMatchObject({ kind: "text" });
   });
 
-  test("continues device login while the browser opener is pending and ignores its late failure", async () => {
+  test.each(["device", "browser"])("continues %s login while the browser opener is pending and ignores its late failure", async (flow) => {
     const setToolJSX = vi.fn();
     let rejectBrowser: ((error: Error) => void) | undefined;
     mocks.openUrlInBrowser.mockImplementationOnce(() => new Promise((_resolve, reject) => {
       rejectBrowser = reject;
     }));
-    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
-      onUserCode: (info: { userCode: string; verificationUri: string }) => void;
+    const loginMock = flow === "device" ? mocks.runXaiDeviceLogin : mocks.runXaiBrowserLogin;
+    loginMock.mockImplementationOnce(async (options?: {
+      onUserCode?: (info: { userCode: string; verificationUri: string }) => void | Promise<void>;
+      onAuthorizeUrl?: (url: string) => void | Promise<void>;
     }) => {
-      await options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      if (flow === "device") await options?.onUserCode?.({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      else await options?.onAuthorizeUrl?.("https://auth.x.ai/oauth2/authorize");
       return {
         identity: { sub: "xai-user" }, tokenEndpoint: "https://auth.x.ai/oauth2/token",
         tokens: { accessToken: "oauth-token" },
@@ -214,7 +252,7 @@ describe("xAI auth command authority", () => {
     });
     let completed = false;
     const pending = grokLoginCommand.execute({
-      ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX },
+      ...commandContext(Object.freeze({})), argsRaw: flow === "device" ? "device" : "", appState: { setToolJSX },
     }).then((result) => { completed = true; return result; });
     try {
       await new Promise((resolve) => setTimeout(resolve, 20));

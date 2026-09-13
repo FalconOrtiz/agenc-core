@@ -152,30 +152,38 @@ async function runBrowserFlowWithDeviceFallback(
   ctx: SlashCommandContext,
   controller: AbortController,
 ): Promise<XaiBrowserLoginResult> {
+  const onCancel = () => controller.abort();
+  let pending = true;
+  showLoginNotice(ctx, {
+    heading: "Preparing xAI browser sign-in...", url: "", onCancel,
+  });
   try {
     return await runXaiBrowserLogin({
-      onAuthorizeUrl: async (url) => {
+      signal: controller.signal,
+      onAuthorizeUrl: (url) => {
         showLoginNotice(ctx, {
           heading: "Sign in with your X / xAI account to continue.",
-          url,
+          url, onCancel,
         });
-        try {
-          await openUrlInBrowser(url);
-        } catch {
+        // Browser startup must not delay the callback wait or cancellation.
+        void openUrlInBrowser(url).catch(() => {
+          if (!pending || controller.signal.aborted) return;
           showLoginNotice(ctx, {
             heading: "Open this URL in your browser to sign in:",
-            url,
+            url, onCancel,
           });
-        }
+        });
       },
     });
   } catch (error) {
     // Loopback unavailable (e.g. the Grok CLI holds port 56121, or a
     // headless host): fall back to the device-code flow.
-    if (error instanceof XaiOauthError && error.code === "callback_failed") {
+    if (!controller.signal.aborted && error instanceof XaiOauthError && error.code === "callback_failed") {
       return runDeviceFlow(ctx, controller);
     }
     throw error;
+  } finally {
+    pending = false;
   }
 }
 
