@@ -6401,12 +6401,20 @@ if (isDirectInvocation()) {
     // Only on direct invocation — tests import main() and must keep vitest's
     // own rejection detection intact.
     installGlobalErrorNet();
+    let code: number;
     try {
-      const code = await main();
-      process.exit(code);
+      code = await main();
     } catch (error) {
       process.stderr.write(`agenc: ${cliStartupErrorMessage(error)}\n`);
-      process.exit(1);
+      code = 1;
     }
+    // Pipe writes can still be buffered when main returns. Wait for both
+    // streams before forcing exit so large JSON and errors arrive intact.
+    await Promise.all(
+      [process.stdout, process.stderr].map(
+        (stream) => new Promise<void>((resolve) => stream.write("", () => resolve())),
+      ),
+    );
+    process.exit(code);
   })();
 }
