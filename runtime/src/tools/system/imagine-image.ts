@@ -31,6 +31,7 @@ import type { Tool, ToolResult } from "../types.js";
 import { validationErrorToolResult } from "../results.js";
 import { safeStringify } from "../types.js";
 import type { HomeContext } from "../../config/home.js";
+import { redactSensitiveAPIText } from "../../errors/api.js";
 
 export interface ImagineImageToolOptions {
   readonly workspaceRoot: string;
@@ -741,6 +742,21 @@ function imageBackendLabel(backend: ImageBackend): string {
   }
 }
 
+function imageRequestError(
+  payload: { readonly error?: string | { readonly message?: string }; readonly message?: string },
+  backend: ImageBackend,
+  status: number,
+): string {
+  // xAI media refusals can use a bare error string instead of error.message.
+  const detail = stringValue(typeof payload.error === "string"
+    ? payload.error
+    : payload.error?.message) ?? stringValue(payload.message);
+  if (detail === undefined) return `${imageBackendLabel(backend)} HTTP ${status}`;
+  // Redact before truncation so the limit cannot expose a credential prefix.
+  const redacted = redactSensitiveAPIText(detail.replaceAll(backend.bearer, "[REDACTED]"));
+  return redacted.length > 4_096 ? `${redacted.slice(0, 4_093)}...` : redacted;
+}
+
 /**
  * The extension a saved file gets before any download reports its own
  * content type. Electron's agenc-media protocol derives the rendered content
@@ -1338,7 +1354,7 @@ export function createImagineImageTool(opts: ImagineImageToolOptions): Tool {
           data?:
             | readonly { b64_json?: string; url?: string }[]
             | { image_base64?: readonly string[] };
-          error?: { message?: string };
+          error?: string | { message?: string };
           code?: string;
           message?: string;
           // OpenAI echoes the encoding it chose; MiniMax answers HTTP 200
@@ -1361,10 +1377,7 @@ export function createImagineImageTool(opts: ImagineImageToolOptions): Tool {
         if (!res.ok) {
           return json(
             {
-              error:
-                payload.error?.message ??
-                payload.message ??
-                `${imageBackendLabel(backend)} HTTP ${res.status}`,
+              error: imageRequestError(payload, backend, res.status),
             },
             true,
           );
