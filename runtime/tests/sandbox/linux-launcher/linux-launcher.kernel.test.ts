@@ -46,6 +46,87 @@ const builtLauncher = join(
   "main.js",
 );
 
+test.each([false, true])("supports an aliased command cwd without expanding filesystem access (narrow=%s)", { timeout: 30_000 }, async (narrow) => {
+  const root = realpathSync(mkdtempSync(join("/var/tmp", "agenc-alias-cwd-kernel-")));
+  const physical = join(root, "real", "project");
+  const alias = join(root, "alias");
+  const chainedAlias = join(root, "alias-again");
+  const cwd = join(chainedAlias, "project");
+  const temporary = join(root, "temp");
+  const outside = join(root, "real", "ungranted.txt");
+  mkdirSync(join(physical, ".git"), { recursive: true });
+  mkdirSync(temporary);
+  symlinkSync(join(root, "real"), alias, "dir");
+  symlinkSync("alias", chainedAlias, "dir");
+  writeFileSync(join(physical, "readable.txt"), "readable");
+  writeFileSync(join(physical, "locked.txt"), "locked");
+  writeFileSync(join(physical, "secret.txt"), "secret");
+  writeFileSync(join(physical, ".git", "config"), "protected");
+  writeFileSync(outside, "outside");
+  const environment = { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: root, AGENC_HOME: join(root, "home") };
+  try {
+    const broker = new SandboxExecutionBroker({
+      mode: "workspace_write", cwd, env: environment, sessionTempRoot: temporary,
+      agencLinuxSandboxExe: launcherEntry,
+      permissionProfile: {
+        fileSystem: { kind: "restricted", includePlatformDefaults: true, entries: [
+          ...(!narrow ? [{ path: { kind: "special" as const, value: { kind: "root" as const } }, access: "read" as const }] : []),
+          { path: { kind: "path", path: cwd }, access: "write" },
+          { path: { kind: "path", path: temporary }, access: "write" },
+          { path: { kind: "path", path: join(runtimeRoot, "node_modules") }, access: "read" },
+          { path: { kind: "path", path: join(dirname(runtimeRoot), "node_modules") }, access: "read" },
+          { path: { kind: "path", path: join(cwd, "locked.txt") }, access: "read" },
+          { path: { kind: "path", path: join(cwd, "secret.txt") }, access: "none" },
+        ] },
+        network: "disabled",
+      },
+    });
+    const result = await broker.prepareSpawn("tool", {
+      program: process.execPath,
+      args: ["--input-type=module", "--eval", `
+        import fs from 'node:fs';
+        const [alias, outside] = process.argv.slice(1);
+        const attempt = (fn) => { try { fn(); return 'ALLOWED'; } catch (error) { return error.code; } };
+        process.stdout.write(JSON.stringify({
+          cwd: process.cwd(),
+          readable: fs.readFileSync('readable.txt', 'utf8'),
+          relativeWrite: attempt(() => fs.writeFileSync('relative.txt', 'relative')),
+          aliasWrite: attempt(() => fs.writeFileSync(alias + '/absolute.txt', 'absolute')),
+          lockedWrite: attempt(() => fs.writeFileSync('locked.txt', 'forged')),
+          secretRead: attempt(() => fs.readFileSync('secret.txt')),
+          metadataWrite: attempt(() => fs.writeFileSync('.git/config', 'forged')),
+          outsideRead: attempt(() => fs.readFileSync(outside)),
+          outsideWrite: attempt(() => fs.writeFileSync(outside, 'forged')),
+        }));
+      `, cwd, outside],
+      cwd, env: environment,
+    }).run(async (command) => spawnSync(command.program, [...command.args], {
+      cwd: command.cwd, env: command.env, encoding: "utf8", timeout: 10_000,
+    }));
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const evidence = JSON.parse(result.stdout);
+    expect(evidence).toMatchObject({ cwd: physical, readable: "readable", relativeWrite: "ALLOWED", aliasWrite: "ALLOWED" });
+    for (const key of ["lockedWrite", "secretRead", "metadataWrite"]) {
+      expect(evidence[key], JSON.stringify(evidence)).not.toBe("ALLOWED");
+    }
+    if (narrow) {
+      expect(evidence.outsideRead).not.toBe("ALLOWED");
+      // The private tmpfs may accept a new file at this spelling. It must
+      // neither reveal nor overwrite the host file, checked below.
+    } else {
+      expect(evidence.outsideWrite).not.toBe("ALLOWED");
+    }
+    expect(readFileSync(join(physical, "relative.txt"), "utf8")).toBe("relative");
+    expect(readFileSync(join(physical, "absolute.txt"), "utf8")).toBe("absolute");
+    expect(readFileSync(join(physical, "locked.txt"), "utf8")).toBe("locked");
+    expect(readFileSync(join(physical, ".git", "config"), "utf8")).toBe("protected");
+    expect(readFileSync(outside, "utf8")).toBe("outside");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("removes a verified clean worktree without a deletion-target mount or peer damage", { timeout: 30_000 }, async () => {
   expect(process.platform).toBe("linux");
   const root = realpathSync(mkdtempSync(join("/var/tmp", "agenc-remove-worktree-kernel-")));
@@ -402,6 +483,7 @@ test(
         `timedOut=${String(result.timedOut)}`,
         `stdout=${JSON.stringify(result.stdout)}`,
         `stderr=${JSON.stringify(result.stderr)}`,
+        `evidence=${existsSync(evidencePath) ? readFileSync(evidencePath, "utf8") : "missing"}`,
       ].join("\n");
 
       expect(result.timedOut, diagnostics).toBe(false);
