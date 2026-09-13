@@ -1072,6 +1072,89 @@ describe("ImagineImage tool", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { error: "Image generation requires an active subscription." },
+    { error: { message: "Image generation requires an active subscription." } },
+    { message: "Image generation requires an active subscription." },
+  ])("preserves the provider's image refusal reason: %j", async (payload) => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-refusal-"));
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(payload), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { XAI_API_KEY: "test-xai-media-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "one image" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({
+      error: "Image generation requires an active subscription.",
+    });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(String(fetchImpl.mock.calls[0]?.[0]))
+      .toBe("https://api.x.ai/v1/images/generations");
+    expect(result.effectDisposition).toBeUndefined();
+  });
+
+  it("redacts credentials before bounding an image refusal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-refusal-redaction-"));
+    const bearer = "test-xai-media-key";
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        error: `Rejected ${bearer}. Bearer other-secret-token. ${"detail ".repeat(1_000)}`,
+      }), { status: 400 }),
+    );
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { XAI_API_KEY: bearer },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "one image" });
+    const { error } = JSON.parse(result.content) as { error: string };
+
+    expect(result.isError).toBe(true);
+    expect(error).toContain("Rejected [REDACTED]. Bearer [REDACTED]");
+    expect(error).not.toContain(bearer);
+    expect(error).not.toContain("other-secret-token");
+    expect(error.length).toBeLessThanOrEqual(4_096);
+    expect(error).toMatch(/\.\.\.$/u);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ error: "  " }, { error: {} }, {}])(
+    "keeps an HTTP fallback when the image refusal has no message: %j",
+    async (payload) => {
+      const root = await mkdtemp(join(tmpdir(), "imagine-refusal-empty-"));
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify(payload), { status: 400 }),
+      );
+      const tool = createImagineImageTool({
+        workspaceRoot: root,
+        home: testHome(root),
+        getSession: () => null,
+        env: { XAI_API_KEY: "test-xai-media-key" },
+        fetchImpl,
+      });
+
+      const result = await tool.execute({ prompt: "one image" });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content)).toEqual({ error: "Imagine HTTP 400" });
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    },
+  );
+
   it("accepts session OAuth bearer when BYOK env is unset (subscription path)", async () => {
     // Session provider already holds /grok-login bearer as factory apiKey —
     // same as Grok Build subscription users without a metered XAI_API_KEY.

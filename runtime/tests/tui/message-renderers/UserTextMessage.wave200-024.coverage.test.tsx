@@ -18,7 +18,7 @@ import { UserTextMessage } from './UserTextMessage.js'
 const originalAgentTeams = process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS
 
 afterEach(() => {
-  if (originalUserType === undefined) {
+  if (originalAgentTeams === undefined) {
     delete process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS
   } else {
     process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS = originalAgentTeams

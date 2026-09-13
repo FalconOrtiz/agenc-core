@@ -216,6 +216,7 @@ const PROVIDER_RUNTIME_EXTRA_KEYS = [
   "contextManagement",
   "contextWindowTokens",
   "parallelToolCalls",
+  "incrementalContinuation",
   "visionModel",
   "webSearch",
   "searchMode",
@@ -1735,7 +1736,13 @@ export function createProvider(
         ...(cfg as unknown as Record<string, unknown>),
         ...(extra.authMode !== undefined ? { authMode: extra.authMode } : {}),
       });
-      return markFactoryProvider(grokProvider, {
+      // Recreate through the factory so child sessions own both continuation
+      // state and the OAuth refresh callback bound to their provider instance.
+      const sessionProvider = Object.assign(grokProvider, {
+        forkForSession: () =>
+          createProvider("grok", readProviderFactoryOptions(grokProvider)),
+      });
+      return markFactoryProvider(sessionProvider, {
         provider: "grok",
         options: {
           ...(opts.credentialHome !== undefined

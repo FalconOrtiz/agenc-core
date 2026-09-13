@@ -90,8 +90,8 @@ const moduleWithLoad = Module as ModuleWithLoad
 const originalModuleLoad = moduleWithLoad._load
 const originalAgentTeams = process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS
 
-function resetUserType(): void {
-  if (originalUserType === undefined) {
+function resetAgentTeams(): void {
+  if (originalAgentTeams === undefined) {
     delete process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS
   } else {
     process.env.AGENC_EXPERIMENTAL_AGENT_TEAMS = originalAgentTeams
@@ -131,7 +131,7 @@ function expectCachedElement(
 beforeEach(() => {
   state.cache.length = 0
   state.features.clear()
-  resetUserType()
+  resetAgentTeams()
 
   moduleWithLoad._load = function loadDynamicRenderer(
     request: string,
@@ -162,7 +162,7 @@ beforeEach(() => {
 
 afterAll(() => {
   moduleWithLoad._load = originalModuleLoad
-  resetUserType()
+  resetAgentTeams()
 })
 
 describe('UserTextMessage swarm 018 coverage', () => {

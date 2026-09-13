@@ -5,10 +5,11 @@ media backends. The provider that performs the reasoning turn does **not** gate
 these tools: Meta, OpenAI, Grok, and any other tool-capable model can invoke
 them when the corresponding media backend is configured.
 
-Because one registry survives in-session provider switches, bootstrap keeps a
-universal `ImagineImage` entry deferred even before a session or saved BYOK is
-attached. Discovering it after a switch re-resolves the current backend; an
-unconfigured or Coding-Plan-only session fails closed without making HTTP.
+Because one registry survives in-session provider switches, bootstrap keeps
+universal `ImagineImage` and `ImagineVideo` entries deferred even before a
+session or media credential is attached. Discovering them after login or a
+provider switch re-resolves the current backend; an unconfigured or
+Coding-Plan-only session fails closed without making HTTP.
 
 | Tool | Backend availability |
 | --- | --- |

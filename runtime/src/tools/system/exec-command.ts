@@ -351,7 +351,7 @@ export function confirmedNoEffectDisposition(
 
 /** A detached service that was still running when its yield window closed. */
 function isDetachedAndRunning(output: ExecCommandToolOutput): boolean {
-  return output.detached === true && output.exitCode === null;
+  return output.detached === true && output.exitCode === null && output.pid !== undefined;
 }
 
 /**

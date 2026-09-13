@@ -16,6 +16,72 @@ import {
 } from "./media-test-helpers.js";
 
 describe("ImagineVideo catalog gate", () => {
+  it("keeps video available when Grok credentials arrive after registry construction", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-video-late-login-"));
+    let session: Session | null = null;
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ request_id: "late-video" })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: "done",
+        video: { url: "https://vidgen.x.ai/late-video.mp4" },
+      })))
+      .mockResolvedValueOnce(new Response(Uint8Array.from([0x00, 0x00, 0x00, 0x18])));
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", fetchImpl);
+    try {
+      const tools = createModelFacingTools({
+        workspaceRoot: root,
+        agencHome: join(root, ".agenc-test-home"),
+        getSession: () => session,
+        env: {},
+      });
+      const tool = tools.find((candidate) => candidate.name === "ImagineVideo");
+      expect(tool).toBeDefined();
+      if (tool === undefined) throw new Error("ImagineVideo was not registered");
+      expect(tool.metadata?.deferred).toBe(true);
+      expect(tool.requiresApproval).toBe(true);
+      expect(tool.recoveryCategory).toBe("side-effecting");
+      const unconfigured = await tool.execute({ prompt: "one short video" });
+      expect(unconfigured.isError).toBe(true);
+      expect(unconfigured.effectDisposition?.disposition).toBe("confirmed_no_effect");
+      expect(fetchImpl).not.toHaveBeenCalled();
+
+      // The same registry survives login; only the owning session changes.
+      const provider = createProvider("grok", {
+        apiKey: "late-session-oauth-bearer",
+        model: "grok-4.6",
+        baseURL: "https://api.x.ai/v1",
+      });
+      session = { services: { provider } } as unknown as Session;
+      const result = await tool.execute({
+        prompt: "one short video",
+        duration: 3,
+        resolution: "480p",
+      });
+      expect(result.isError).toBeUndefined();
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+      expect(fetchImpl.mock.calls[0]?.[0])
+        .toBe("https://api.x.ai/v1/videos/generations");
+      expect(fetchImpl.mock.calls[0]?.[1]?.headers)
+        .toMatchObject({ authorization: "Bearer late-session-oauth-bearer" });
+      const { path, request_id } = JSON.parse(result.content) as {
+        path: string;
+        request_id: string;
+      };
+      expect(request_id).toBe("late-video");
+      expect(path.startsWith(join(root, ".agenc", "imagine"))).toBe(true);
+      expect(await readFile(path)).toEqual(Buffer.from([0x00, 0x00, 0x00, 0x18]));
+
+      session = null;
+      const unavailableAgain = await tool.execute({ prompt: "no credentials" });
+      expect(unavailableAgain.isError).toBe(true);
+      expect(unavailableAgain.effectDisposition?.disposition).toBe("confirmed_no_effect");
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.stubGlobal("fetch", originalFetch);
+    }
+  });
+
   it("is registered for non-Grok sessions with independent xAI credentials", () => {
     expect(isModelFacingToolRegistered("ImagineVideo", {
       workspaceRoot: process.cwd(),
@@ -36,7 +102,7 @@ describe("ImagineVideo catalog gate", () => {
     expect(tools.some((t) => t.name === "ImagineVideo")).toBe(true);
   });
 
-  it("is not registered when the configured xAI media host is not direct", () => {
+  it("keeps an unusable non-direct xAI backend deferred and refuses execution", async () => {
     const tools = createModelFacingTools({
       workspaceRoot: process.cwd(),
       getSession: () => null,
@@ -46,7 +112,14 @@ describe("ImagineVideo catalog gate", () => {
       },
     });
 
-    expect(tools.some((t) => t.name === "ImagineVideo")).toBe(false);
+    const tool = tools.find((candidate) => candidate.name === "ImagineVideo");
+    if (tool === undefined) throw new Error("ImagineVideo was not registered");
+    expect(tool.metadata?.deferred).toBe(true);
+    expect(tool.requiresApproval).toBe(true);
+    const result = await tool.execute({ prompt: "must not use proxy credential" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("must use a direct xAI host");
+    expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
   });
 
   it("is registered with a direct Grok factory bearer and no env key", async () => {

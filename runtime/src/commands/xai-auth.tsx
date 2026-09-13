@@ -9,7 +9,7 @@
  * because xAI's shared CLI OAuth client is used.
  */
 
-import { Box, Text } from "../tui/ink.js";
+import { Box, Text, useInput } from "../tui/ink.js";
 import {
   runXaiBrowserLogin,
   runXaiDeviceLogin,
@@ -93,11 +93,20 @@ async function executeGrokLogin(
       };
     }
 
+    const controller = new AbortController();
     let login: XaiBrowserLoginResult;
     try {
       login = arg === "device"
-        ? await runDeviceFlow(ctx)
-        : await runBrowserFlowWithDeviceFallback(ctx);
+        ? await runDeviceFlow(ctx, controller)
+        : await runBrowserFlowWithDeviceFallback(ctx, controller);
+      if (controller.signal.aborted) {
+        return { kind: "text", text: "xAI sign-in cancelled." };
+      }
+    } catch (error) {
+      if (controller.signal.aborted) {
+        return { kind: "text", text: "xAI sign-in cancelled." };
+      }
+      throw error;
     } finally {
       clearLoginNotice(ctx);
     }
@@ -141,70 +150,107 @@ async function executeGrokLogin(
 
 async function runBrowserFlowWithDeviceFallback(
   ctx: SlashCommandContext,
+  controller: AbortController,
 ): Promise<XaiBrowserLoginResult> {
+  const onCancel = () => controller.abort();
+  let pending = true;
+  showLoginNotice(ctx, {
+    heading: "Preparing xAI browser sign-in...", url: "", onCancel,
+  });
   try {
     return await runXaiBrowserLogin({
-      onAuthorizeUrl: async (url) => {
+      signal: controller.signal,
+      onAuthorizeUrl: (url) => {
         showLoginNotice(ctx, {
           heading: "Sign in with your X / xAI account to continue.",
-          url,
+          url, onCancel,
         });
-        try {
-          await openUrlInBrowser(url);
-        } catch {
+        // Browser startup must not delay the callback wait or cancellation.
+        void openUrlInBrowser(url).catch(() => {
+          if (!pending || controller.signal.aborted) return;
           showLoginNotice(ctx, {
             heading: "Open this URL in your browser to sign in:",
-            url,
+            url, onCancel,
           });
-        }
+        });
       },
     });
   } catch (error) {
     // Loopback unavailable (e.g. the Grok CLI holds port 56121, or a
     // headless host): fall back to the device-code flow.
-    if (error instanceof XaiOauthError && error.code === "callback_failed") {
-      return runDeviceFlow(ctx);
+    if (!controller.signal.aborted && error instanceof XaiOauthError && error.code === "callback_failed") {
+      return runDeviceFlow(ctx, controller);
     }
     throw error;
+  } finally {
+    pending = false;
   }
 }
 
 async function runDeviceFlow(
   ctx: SlashCommandContext,
+  controller: AbortController,
 ): Promise<XaiBrowserLoginResult> {
-  return runXaiDeviceLogin({
-    onUserCode: async ({ userCode, verificationUri, verificationUriComplete }) => {
-      const url = verificationUriComplete ?? verificationUri;
-      showLoginNotice(ctx, {
-        heading: "Sign in with your X / xAI account to continue.",
-        url,
-        userCode,
-      });
-      try {
-        await openUrlInBrowser(url);
-      } catch {
-        // URL is already displayed; nothing else to do.
-      }
-    },
+  const onCancel = () => controller.abort();
+  let pending = true;
+  showLoginNotice(ctx, {
+    heading: "Requesting an xAI device sign-in code...", url: "", onCancel,
   });
+  try {
+    return await runXaiDeviceLogin({
+      signal: controller.signal,
+      onUserCode: ({ userCode, verificationUri, verificationUriComplete }) => {
+        const url = verificationUriComplete ?? verificationUri;
+        showLoginNotice(ctx, {
+          heading: "Sign in with your X / xAI account to continue.",
+          url, userCode, onCancel,
+        });
+        // Browser startup must not delay polling or prevent cancellation.
+        void openUrlInBrowser(url).catch(() => {
+          if (!pending || controller.signal.aborted) return;
+          showLoginNotice(ctx, {
+            heading: "Open this URL in your browser to sign in:",
+            url, userCode, onCancel,
+          });
+        });
+      },
+    });
+  } finally {
+    pending = false;
+  }
+}
+
+type LoginNoticeInfo = {
+  heading: string;
+  url: string;
+  userCode?: string;
+  onCancel?: () => void;
+};
+
+function LoginNotice(info: LoginNoticeInfo) {
+  useInput((input, key) => {
+    if (key.escape || (key.ctrl && input === "c")) info.onCancel?.();
+  }, { isActive: info.onCancel !== undefined });
+  return (
+    <Box flexDirection="column" paddingX={1} borderStyle="round">
+      <Text>{info.heading}</Text>
+      <Text dimColor>
+        The consent page may say "Grok Build" — that is xAI's shared sign-in.
+      </Text>
+      {info.userCode ? <Text>Code: {info.userCode}</Text> : null}
+      {info.url ? <Text dimColor>URL: {info.url}</Text> : null}
+      {info.onCancel ? <Text dimColor>Esc or Ctrl+C to cancel</Text> : null}
+    </Box>
+  );
 }
 
 function showLoginNotice(
   ctx: SlashCommandContext,
-  info: { heading: string; url: string; userCode?: string },
+  info: LoginNoticeInfo,
 ): void {
   openLocalJsxCommand(
     ctx,
-    () => (
-      <Box flexDirection="column" paddingX={1} borderStyle="round">
-        <Text>{info.heading}</Text>
-        <Text dimColor>
-          The consent page may say "Grok Build" — that is xAI's shared sign-in.
-        </Text>
-        {info.userCode ? <Text>Code: {info.userCode}</Text> : null}
-        <Text dimColor>URL: {info.url}</Text>
-      </Box>
-    ),
+    () => <LoginNotice {...info} />,
     { shouldHidePromptInput: false },
   );
 }

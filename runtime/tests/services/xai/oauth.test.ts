@@ -173,6 +173,45 @@ describe('authorization code exchange', () => {
 })
 
 describe('device flow', () => {
+  test('does not poll an already cancelled device login', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      access_token: 'late-access', refresh_token: 'late-refresh', expires_in: 21600,
+    }))
+    await expect(pollXaiDeviceToken({
+      tokenEndpoint: 'https://auth.x.ai/oauth2/token',
+      deviceCode: {
+        deviceCode: 'dev-cancelled', userCode: 'TEST-CODE',
+        verificationUri: 'https://auth.x.ai/activate', expiresIn: 30, interval: 1,
+      },
+      signal: controller.signal,
+      fetchImpl,
+    })).rejects.toMatchObject({ code: 'cancelled' })
+    expect(fetchImpl).not.toHaveBeenCalled()
+  })
+
+  test('rejects tokens returned after an in-flight device poll was cancelled', async () => {
+    const controller = new AbortController()
+    const fetchImpl = vi.fn(async (_input, init?: RequestInit) => {
+      controller.abort()
+      return jsonResponse({
+        access_token: 'late-access', refresh_token: 'late-refresh', expires_in: 21600,
+      })
+    })
+    await expect(pollXaiDeviceToken({
+      tokenEndpoint: 'https://auth.x.ai/oauth2/token',
+      deviceCode: {
+        deviceCode: 'dev-cancelled', userCode: 'TEST-CODE',
+        verificationUri: 'https://auth.x.ai/activate', expiresIn: 30, interval: 1,
+      },
+      signal: controller.signal,
+      fetchImpl,
+    })).rejects.toMatchObject({ code: 'cancelled' })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(fetchImpl.mock.calls[0]?.[1]?.signal).toBe(controller.signal)
+  })
+
   test('requests and parses a device code', async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse({
