@@ -983,6 +983,10 @@ export function createDaemonTuiSession<
     }
     const payload = (event as { readonly payload?: unknown }).payload;
     if (typeof payload !== "object" || payload === null) return;
+    if (
+      isJsonObject(payload) && typeof payload.agentId === "string" &&
+      payload.agentId !== realtimeThreadId
+    ) return;
     const status = (payload as { readonly status?: unknown }).status;
     const turnId = (payload as { readonly turnId?: unknown }).turnId;
     if (typeof status !== "string") return;
@@ -2795,7 +2799,7 @@ function subscribeToDaemonEvents(
         mcpProjection.invalidate(event.params.revision);
         return;
       }
-      const transcriptEvent = toTranscriptEvent(event, activeTurnId?.());
+      const transcriptEvent = toTranscriptEvent(event, activeTurnId?.(), realtimeThreadId);
       if (
         transcriptSnapshot !== undefined &&
         daemonTranscriptSnapshotCoversEvent(transcriptSnapshot, event, transcriptEvent)
@@ -3165,7 +3169,11 @@ function transcriptEventFromSessionEvent(params: JsonObject): JsonObject | null 
   };
 }
 
-function toTranscriptEvent(event: JsonObject, activeTurnId?: string): JsonObject {
+function toTranscriptEvent(
+  event: JsonObject,
+  activeTurnId?: string,
+  agentId?: string,
+): JsonObject {
   const msg = event.msg;
   if (isJsonObject(msg)) {
     return msg;
@@ -3207,7 +3215,27 @@ function toTranscriptEvent(event: JsonObject, activeTurnId?: string): JsonObject
     return transcriptEventFromMcpElicitationRequest(params) ?? event;
   }
   if (method === "event.agent_status") {
-    return transcriptEventFromAgentStatus(params, activeTurnId);
+    const ownsTurn = typeof params.agentId !== "string" || agentId === undefined || params.agentId === agentId;
+    const turnEvent = params.turnEvent;
+    if (
+      agentId !== undefined && params.agentId === agentId &&
+      isJsonObject(turnEvent) && isJsonObject(turnEvent.payload) &&
+      typeof params.turnId === "string" && params.turnId.trim().length > 0 &&
+      turnEvent.payload.turnId === params.turnId &&
+      ((turnEvent.type === "turn_started" && params.status === "running") ||
+        ((turnEvent.type === "turn_complete" || turnEvent.type === "turn_aborted") &&
+          params.status === "idle" &&
+          classifyTurnTerminal({ type: turnEvent.type, payload: turnEvent.payload }) !== undefined))
+    ) {
+      return {
+        id: daemonTranscriptEventId(params, params.turnId),
+        ...(typeof params.eventId === "string" ? { eventId: params.eventId } : {}),
+        ...(typeof params.clientMessageId === "string" ? { clientMessageId: params.clientMessageId } : {}),
+        type: turnEvent.type,
+        payload: turnEvent.payload,
+      };
+    }
+    return transcriptEventFromAgentStatus(params, activeTurnId, ownsTurn);
   }
   if (method === "event.session_event") {
     return transcriptEventFromSessionEvent(params) ?? event;
@@ -3325,13 +3353,17 @@ function nextRealtimeEventId(
   return `realtime:${method}:${String(threadId ?? "thread")}:${nextRealtimeTranscriptEventSequence}`;
 }
 
-function transcriptEventFromAgentStatus(params: JsonObject, activeTurnId?: string): JsonObject {
+function transcriptEventFromAgentStatus(
+  params: JsonObject,
+  activeTurnId?: string,
+  ownsTurn = true,
+): JsonObject {
   const status = params.status;
   const turnId = stringParam(
     params.turnId,
     activeTurnId ?? stringParam(params.eventId, "status"),
   );
-  if (status === "error") {
+  if (status === "error" && ownsTurn) {
     const failed = createTurnFailedEvent({
       turnId,
       code: "background_agent_error",

@@ -464,7 +464,7 @@ export function notificationFromDaemonEvent(
   const terminal = classifyTurnTerminal(event);
   if (
     (event.type === "turn_started" ||
-      (terminal !== undefined && terminal.outcome !== "errored")) &&
+      ((event.type === "turn_complete" || event.type === "turn_aborted") && terminal !== undefined)) &&
     event.statusProjection !== "session_only" &&
     isJsonObject(payload)
   ) {
@@ -476,6 +476,12 @@ export function notificationFromDaemonEvent(
         agentId: base.agentId ?? sessionId,
         status: event.type === "turn_started" ? "running" : "idle",
         runStatus: event.type === "turn_started" ? "running" : "completed",
+        // Joining clients have no message.stream response to close their
+        // hydrated turn. Preserve the boundary alongside the status projection.
+        turnEvent: {
+          type: event.type,
+          payload,
+        },
         ...(typeof payload.turnId === "string"
           ? { turnId: payload.turnId }
           : {}),

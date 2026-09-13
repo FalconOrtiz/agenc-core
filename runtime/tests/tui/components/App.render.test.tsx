@@ -8741,6 +8741,67 @@ describeWithVitestMocks("AgenCTuiApp render smoke", () => {
     }
   });
 
+  test("drains one queued prompt when an attached daemon turn completes", async () => {
+    const { AgenCTuiApp } = await import("./App.js");
+    const { createDaemonTuiSessionFixture } = await import("../../helpers/daemon-tui-session.js");
+    const { notificationFromDaemonEvent } = await import("../../app-server/background-agent-runner/daemon-events.js");
+    const { enqueue, getCommandQueueSnapshot, getSoleActiveCommandQueueOwnerForTesting, resetCommandQueueForTesting } =
+      await import("../../utils/messageQueueManager.js");
+    const sessionId = "attached-queue-session";
+    const agentId = "attached-queue-agent";
+    const turnId = "attached-queue-turn";
+    const listeners = new Set<(event: Record<string, unknown>) => void>();
+    let finishSubmission!: () => void;
+    const submission = new Promise<void>((resolve) => { finishSubmission = resolve; });
+    const request = vi.fn(async (method: string) => {
+      if (method === "message.stream") await submission;
+      return {};
+    });
+    const session = createDaemonTuiSessionFixture({
+      baseSession: createSession(), sessionId, conversationId: agentId, clientId: "attached-queue-client",
+      client: {
+        request,
+        subscribeToSessionEvents: (_id: string, listener: (event: Record<string, unknown>) => void) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      } as never,
+      transcriptSnapshot: {
+        schemaVersion: 2, sessionId, runId: agentId, historyEpoch: "initial",
+        asOfSequence: 10, messages: [], activeTurn: { turnId },
+      },
+    });
+    resetShellSurfaceProbe();
+    resetCommandQueueForTesting();
+    try {
+      await withRenderedApp(<AgenCTuiApp session={session} isInteractive={false} />, async () => {
+        enqueue({
+          value: "continue the workflow", mode: "prompt",
+          queueOwner: getSoleActiveCommandQueueOwnerForTesting(),
+        });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(getCommandQueueSnapshot()).toHaveLength(1);
+        expect(request.mock.calls.filter(([method]) => method === "message.stream")).toHaveLength(0);
+        const terminal = notificationFromDaemonEvent(sessionId, agentId, {
+          id: "event:11", eventId: "event:11", sequence: 11,
+          type: "turn_complete", payload: { turnId, lastAgentMessage: "Done" },
+        });
+        for (const listener of listeners) listener(terminal);
+        await vi.waitFor(() => {
+          expect(request.mock.calls.filter(([method]) => method === "message.stream")).toHaveLength(1);
+          expect(getCommandQueueSnapshot()).toHaveLength(0);
+        });
+        for (const listener of listeners) listener(terminal);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(request.mock.calls.filter(([method]) => method === "message.stream")).toHaveLength(1);
+        finishSubmission();
+      });
+    } finally {
+      finishSubmission();
+      resetCommandQueueForTesting();
+    }
+  });
+
   test("queues slash command prompt results for next-turn drain", async () => {
     const { enqueueSlashPromptResult } = await import("./App.js");
     const { getCommandQueueSnapshot, resetCommandQueueForTesting } =
