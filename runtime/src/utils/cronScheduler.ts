@@ -95,6 +95,8 @@ export type CronSchedulerDeps = {
   clearTimer: (handle: ReturnType<typeof setTimeout>) => void;
   /** Load the currently-enabled tasks (file-backed + session). */
   loadTasks: (dir: string, conversationId: string) => Promise<CronTask[]>;
+  /** Visible owner diagnostics; a failed load must never look like an empty schedule. */
+  onLoadError: (error: unknown, activation: CronSchedulerActivation) => void;
   enqueue: CronEnqueue;
 };
 
@@ -104,6 +106,10 @@ const defaultDeps: CronSchedulerDeps = {
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (handle) => clearTimeout(handle),
   loadTasks: (dir, conversationId) => listAllCronTasks(dir, conversationId),
+  onLoadError: (error) => logForDebugging(
+    `[CronScheduler] durable scheduled tasks unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    { level: "warn" },
+  ),
   enqueue: () => {
     // Default stub: never invokes the model. The real call site overrides this
     // with the TUI command queue (enqueuePendingNotification). Keeping a no-op
@@ -332,7 +338,7 @@ export class CronScheduler {
     const generation = ++this.scheduleGeneration;
     this.clearTimer();
 
-    const dueAt = await this.earliestDueAt(activation);
+    const dueAt = await this.earliestDueAt(activation, generation);
     if (
       !this.isCurrentActivation(activation, generation) ||
       this.paused ||
@@ -411,13 +417,24 @@ export class CronScheduler {
    */
   private async loadRunnableTasks(
     activation: CronSchedulerActivation,
+    generation: number,
   ): Promise<CronTask[]> {
-    const tasks = activation.sessionOnly === true
-      ? listSessionCronTasks(activation.queueOwner.conversationId)
-      : await this.deps.loadTasks(
-        activation.workspaceRoot,
-        activation.queueOwner.conversationId,
-      );
+    let tasks: CronTask[];
+    try {
+      tasks = activation.sessionOnly === true
+        ? listSessionCronTasks(activation.queueOwner.conversationId)
+        : await this.deps.loadTasks(
+          activation.workspaceRoot,
+          activation.queueOwner.conversationId,
+        );
+    } catch (error) {
+      if (!this.isCurrentActivation(activation, generation)) return [];
+      this.deps.onLoadError(error, activation);
+      // Unavailable durable storage must not suppress independently owned
+      // in-memory jobs. Keep durable reads/listing failures visible and admit
+      // only this conversation's memory tasks through the normal filters.
+      tasks = listSessionCronTasks(activation.queueOwner.conversationId);
+    }
     return tasks.filter(
       (task) =>
         task.deliver === undefined &&
@@ -437,7 +454,7 @@ export class CronScheduler {
     generation: number,
   ): Promise<void> {
     const now = this.deps.now();
-    const tasks = await this.loadRunnableTasks(activation);
+    const tasks = await this.loadRunnableTasks(activation, generation);
     // loadTasks may cross a session switch. A stale wake must leave no queue
     // item, rate accounting, lease, or task-file mutation behind.
     if (!this.isCurrentActivation(activation, generation) || this.paused)
@@ -635,9 +652,10 @@ export class CronScheduler {
    */
   private async earliestDueAt(
     activation: CronSchedulerActivation,
+    generation: number,
   ): Promise<number | null> {
     const now = this.deps.now();
-    const tasks = await this.loadRunnableTasks(activation);
+    const tasks = await this.loadRunnableTasks(activation, generation);
     let earliest: number | null = null;
     for (const task of tasks) {
       const due = this.nextDueForTask(task, now);
