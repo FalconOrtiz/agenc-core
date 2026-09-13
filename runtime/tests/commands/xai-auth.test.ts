@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import type { ReactNode } from "react";
+import { PassThrough } from "node:stream";
+import { createRoot } from "../../src/tui/ink.js";
 
 import type { EnvSnapshot } from "../../src/config/env.js";
 import { resolveHomeContext } from "../../src/config/home.js";
@@ -97,6 +100,139 @@ afterEach(() => {
 });
 
 describe("xAI auth command authority", () => {
+  test.each(["\x1b", "\x03"])("cancels a pending device login on %j without storing tokens", async (key) => {
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true, ref() {}, unref() {}, setRawMode() {},
+    });
+    const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 120, rows: 30 });
+    stdout.resume();
+    const root = await createRoot({
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      exitOnCtrlC: false, patchConsole: false,
+    });
+    const setToolJSX = vi.fn((value: unknown) => {
+      root.render((value as { jsx: ReactNode }).jsx);
+    });
+    let signal: AbortSignal | undefined;
+    let finishLogin: (() => void) | undefined;
+    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
+      signal?: AbortSignal;
+      onUserCode: (info: { userCode: string; verificationUri: string }) => Promise<void>;
+    }) => {
+      signal = options.signal;
+      await options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      return new Promise((resolve, reject) => {
+        finishLogin = () => resolve({
+          identity: { sub: "cancelled-user" },
+          tokenEndpoint: "https://auth.x.ai/oauth2/token",
+          tokens: { accessToken: "late-token" },
+        });
+        signal?.addEventListener("abort", () => reject(signal?.reason), { once: true });
+      });
+    });
+    const ctx = { ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX } };
+    const pending = grokLoginCommand.execute(ctx);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      stdin.write(key);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(signal?.aborted).toBe(true);
+      await expect(pending).resolves.toEqual({ kind: "text", text: "xAI sign-in cancelled." });
+      expect(mocks.saveXaiOauthCredentials).not.toHaveBeenCalled();
+      expect(mocks.applyProviderSwitch).not.toHaveBeenCalled();
+      expect(setToolJSX).toHaveBeenLastCalledWith({
+        jsx: null, shouldHidePromptInput: false, clearLocalJSX: true,
+      });
+    } finally {
+      finishLogin?.();
+      await pending;
+      root.unmount();
+      stdin.destroy();
+      stdout.destroy();
+    }
+  });
+
+  test("does not save a late device result after cancellation", async () => {
+    const setToolJSX = vi.fn();
+    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
+      onUserCode: (info: { userCode: string; verificationUri: string }) => void;
+    }) => {
+      options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      const notice = setToolJSX.mock.calls.at(-1)?.[0] as { jsx: { props: { onCancel: () => void } } };
+      notice.jsx.props.onCancel();
+      // Simulate a provider completing despite cancellation of its request.
+      return {
+        identity: { sub: "cancelled-user" },
+        tokenEndpoint: "https://auth.x.ai/oauth2/token",
+        tokens: { accessToken: "late-token" },
+      };
+    });
+    const result = await grokLoginCommand.execute({
+      ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX },
+    });
+    expect(result).toEqual({ kind: "text", text: "xAI sign-in cancelled." });
+    expect(mocks.saveXaiOauthCredentials).not.toHaveBeenCalled();
+    expect(mocks.applyProviderSwitch).not.toHaveBeenCalled();
+  });
+
+  test("shows a manual-open hint when device browser startup fails", async () => {
+    const setToolJSX = vi.fn();
+    mocks.openUrlInBrowser.mockRejectedValueOnce(new Error("No graphical browser environment"));
+    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
+      onUserCode: (info: { userCode: string; verificationUri: string }) => void;
+    }) => {
+      await options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      const notices = JSON.stringify(setToolJSX.mock.calls);
+      expect(notices).toContain("Open this URL in your browser to sign in:");
+      expect(notices).toContain("https://auth.x.ai/activate");
+      expect(notices).toContain("TEST-CODE");
+      return {
+        identity: { sub: "xai-user" }, tokenEndpoint: "https://auth.x.ai/oauth2/token",
+        tokens: { accessToken: "oauth-token" },
+      };
+    });
+    await expect(grokLoginCommand.execute({
+      ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX },
+    })).resolves.toMatchObject({ kind: "text" });
+  });
+
+  test("continues device login while the browser opener is pending and ignores its late failure", async () => {
+    const setToolJSX = vi.fn();
+    let rejectBrowser: ((error: Error) => void) | undefined;
+    mocks.openUrlInBrowser.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectBrowser = reject;
+    }));
+    mocks.runXaiDeviceLogin.mockImplementationOnce(async (options: {
+      onUserCode: (info: { userCode: string; verificationUri: string }) => void;
+    }) => {
+      await options.onUserCode({ userCode: "TEST-CODE", verificationUri: "https://auth.x.ai/activate" });
+      return {
+        identity: { sub: "xai-user" }, tokenEndpoint: "https://auth.x.ai/oauth2/token",
+        tokens: { accessToken: "oauth-token" },
+      };
+    });
+    let completed = false;
+    const pending = grokLoginCommand.execute({
+      ...commandContext(Object.freeze({})), argsRaw: "device", appState: { setToolJSX },
+    }).then((result) => { completed = true; return result; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(completed).toBe(true);
+      await expect(pending).resolves.toMatchObject({ kind: "text" });
+      expect(setToolJSX).toHaveBeenLastCalledWith({
+        jsx: null, shouldHidePromptInput: false, clearLocalJSX: true,
+      });
+      const notices = setToolJSX.mock.calls.length;
+      rejectBrowser?.(new Error("late browser failure"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(setToolJSX).toHaveBeenCalledTimes(notices);
+    } finally {
+      rejectBrowser?.(new Error("test cleanup"));
+      await pending;
+    }
+  });
+
   test.each([
     ["login", grokLoginCommand],
     ["logout", grokLogoutCommand],

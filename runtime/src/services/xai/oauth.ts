@@ -98,6 +98,7 @@ export type XaiOauthErrorCode =
   | 'expired_token'
   | 'malformed_response'
   | 'callback_failed'
+  | 'cancelled'
   | 'timeout'
   | 'oauth_error'
 
@@ -115,10 +116,32 @@ export class XaiOauthError extends Error {
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
+function throwIfLoginCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new XaiOauthError('cancelled', 'xAI sign-in was cancelled.')
+  }
+}
+
+/** Keep one device-login attempt's cancellation attached to every request. */
+function deviceLoginFetch(fetchFn: FetchLike, signal?: AbortSignal): FetchLike {
+  if (signal === undefined) return fetchFn
+  return async (input, init) => {
+    throwIfLoginCancelled(signal)
+    try {
+      const response = await fetchFn(input, { ...init, signal })
+      throwIfLoginCancelled(signal)
+      return response
+    } catch (error) {
+      throwIfLoginCancelled(signal)
+      throw error
+    }
+  }
+}
+
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(new XaiOauthError('timeout', 'xAI login aborted'))
+      reject(new XaiOauthError('cancelled', 'xAI sign-in was cancelled.'))
       return
     }
     const timer = setTimeout(() => {
@@ -127,7 +150,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms)
     const onAbort = () => {
       clearTimeout(timer)
-      reject(new XaiOauthError('timeout', 'xAI login aborted'))
+      reject(new XaiOauthError('cancelled', 'xAI sign-in was cancelled.'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
@@ -503,7 +526,8 @@ export async function pollXaiDeviceToken(params: {
   fetchImpl?: FetchLike
   signal?: AbortSignal
 }): Promise<XaiOauthTokens> {
-  const fetchFn = params.fetchImpl ?? fetch
+  const fetchFn = deviceLoginFetch(params.fetchImpl ?? fetch, params.signal)
+  throwIfLoginCancelled(params.signal)
   let intervalS = Math.max(MIN_DEVICE_POLL_INTERVAL_S, params.deviceCode.interval)
   // +3s margin past the server-declared expiry so a final in-flight approval
   // still lands.
@@ -519,6 +543,7 @@ export async function pollXaiDeviceToken(params: {
       }),
       fetchFn,
     )
+    throwIfLoginCancelled(params.signal)
     const err = typeof data.error === 'string' ? data.error : undefined
     if (err === undefined) {
       return parseTokenResponse(data, { requireRefreshToken: true })
@@ -737,7 +762,10 @@ export async function runXaiDeviceLogin(params: {
   fetchImpl?: FetchLike
   signal?: AbortSignal
 }): Promise<XaiDeviceLoginResult> {
-  const endpoints = await discoverXaiOauthEndpoints(params.fetchImpl)
+  const fetchFn = deviceLoginFetch(params.fetchImpl ?? fetch, params.signal)
+  throwIfLoginCancelled(params.signal)
+  const endpoints = await discoverXaiOauthEndpoints(fetchFn)
+  throwIfLoginCancelled(params.signal)
   const deviceEndpoint =
     endpoints.deviceAuthorizationEndpoint ??
     XAI_OAUTH_FALLBACK_ENDPOINTS.deviceAuthorizationEndpoint
@@ -746,8 +774,9 @@ export async function runXaiDeviceLogin(params: {
   }
   const deviceCode = await requestXaiDeviceCode({
     deviceAuthorizationEndpoint: deviceEndpoint,
-    ...(params.fetchImpl ? { fetchImpl: params.fetchImpl } : {}),
+    fetchImpl: fetchFn,
   })
+  throwIfLoginCancelled(params.signal)
   await params.onUserCode({
     userCode: deviceCode.userCode,
     verificationUri: deviceCode.verificationUri,
@@ -755,6 +784,7 @@ export async function runXaiDeviceLogin(params: {
       ? { verificationUriComplete: deviceCode.verificationUriComplete }
       : {}),
   })
+  throwIfLoginCancelled(params.signal)
   const tokens = await pollXaiDeviceToken({
     tokenEndpoint: endpoints.tokenEndpoint,
     deviceCode,

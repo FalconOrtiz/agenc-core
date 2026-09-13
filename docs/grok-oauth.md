@@ -39,6 +39,9 @@ Inside the TUI:
 /grok-logout         # delete the stored tokens
 ```
 
+During device-code sign-in, press Esc or Ctrl+C to cancel the pending attempt.
+If no browser opens, use the URL and code shown in the terminal.
+
 The browser flow opens `auth.x.ai` and returns through a loopback callback
 on `127.0.0.1:56121`. On headless/SSH hosts (or when that port is taken,
 e.g. by the Grok CLI) the device-code flow is used automatically.
