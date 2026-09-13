@@ -33,7 +33,7 @@ import {
   decodeMcpToolNameFromWire,
   encodeMcpToolNameForWire,
 } from "../../wire/mcp-tool-naming.js";
-import { LLMProviderError, LLMStreamTruncatedError, mapLLMError,
+import { LLMProviderError, LLMServerError, LLMStreamTruncatedError, mapLLMError,
   LLMRequestRebuiltError,
 } from "../../errors.js";
 import { ensureLazyImport } from "../../lazy-import.js";
@@ -824,6 +824,25 @@ function errorMessageFromStreamEvent(event: unknown): string {
     : "Provider stream returned an error event";
 }
 
+/**
+ * The first field that holds an explicit numeric HTTP status, in the order given.
+ * A non-numeric value (a response status such as "failed", or a symbolic code
+ * such as "server_error") is skipped rather than ending the search, so a later
+ * explicit 4xx is never hidden behind it.
+ */
+function firstNumericStatus(...values: readonly unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed =
+      typeof value === "number"
+        ? value
+        : typeof value === "string"
+          ? Number.parseInt(value, 10)
+          : Number.NaN;
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function statusFromStreamEvent(event: unknown): number | undefined {
   if (!event || typeof event !== "object") return undefined;
   const record = event as Record<string, unknown>;
@@ -833,17 +852,59 @@ function statusFromStreamEvent(event: unknown): number | undefined {
     !Array.isArray(record.error)
       ? (record.error as Record<string, unknown>)
       : undefined;
-  const raw =
-    record.status ??
-    record.status_code ??
-    record.statusCode ??
-    nestedError?.status ??
-    nestedError?.status_code ??
-    nestedError?.statusCode ??
-    nestedError?.code;
-  const parsed =
-    typeof raw === "number" ? raw : Number.parseInt(String(raw ?? ""), 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return firstNumericStatus(
+    record.status,
+    record.status_code,
+    record.statusCode,
+    nestedError?.status,
+    nestedError?.status_code,
+    nestedError?.statusCode,
+    nestedError?.code,
+  );
+}
+
+function codeFromStreamEvent(event: unknown): unknown {
+  if (!event || typeof event !== "object") return undefined;
+  const record = event as Record<string, unknown>;
+  const nestedError =
+    record.error &&
+    typeof record.error === "object" &&
+    !Array.isArray(record.error)
+      ? (record.error as Record<string, unknown>)
+      : undefined;
+  return record.code ?? nestedError?.code;
+}
+
+const XAI_SERVER_FAILURE_CODES = new Set([
+  "server_error",
+  "internal_error",
+  "internal_server_error",
+]);
+const XAI_GENERATION_FAILURE_RE = /\binternal error during token generation\b/i;
+
+/**
+ * xAI can fail a sample on its own side inside an HTTP 200 stream, as an
+ * `error` event or `response.failed` that carries no numeric status: only a
+ * symbolic server code, or the text "Internal error during token generation".
+ * Nothing about the request was wrong, so it is typed as a server error, which
+ * the turn's bounded reconnect ladder retries. A numeric status keeps its own
+ * mapping (5xx server, 4xx terminal), and any other failure is left untyped.
+ */
+function xaiStatuslessServerFailure(
+  providerName: string,
+  message: string,
+  status: number | undefined,
+  code: unknown,
+): LLMServerError | undefined {
+  if (status !== undefined) return undefined;
+  const symbolic = typeof code === "string" ? code.trim().toLowerCase() : "";
+  if (
+    XAI_SERVER_FAILURE_CODES.has(symbolic) ||
+    XAI_GENERATION_FAILURE_RE.test(message)
+  ) {
+    return new LLMServerError(providerName, 500, message);
+  }
+  return undefined;
 }
 
 function errorFromStreamEvent(event: unknown): Error {
@@ -1469,6 +1530,10 @@ export class GrokProvider implements LLMProvider {
       let model = this.config.model;
       let finishReason: LLMResponse["finishReason"] = "stop";
       let responseError: Error | undefined;
+      // Set when a stream failure arrives after a tool call already streamed:
+      // the executor may have dispatched it, so the failed response is marked
+      // partial and never replayed by the reconnect ladder.
+      let failedAfterStreamedToolCall = false;
       let usage: LLMUsage = coerceUsage({});
       let providerEvidence: LLMResponse["providerEvidence"];
       let encryptedReasoning: LLMResponse["encryptedReasoning"];
@@ -1840,10 +1905,15 @@ export class GrokProvider implements LLMProvider {
             ),
           });
           finishReason = "error";
-          responseError = this.mapError(
-            errorFromStreamEvent(event),
-            streamTimeout.timeoutMs,
-          );
+          failedAfterStreamedToolCall = toolCallAccum.size > 0;
+          responseError =
+            xaiStatuslessServerFailure(
+              this.name,
+              errorMessageFromStreamEvent(event),
+              statusFromStreamEvent(event),
+              codeFromStreamEvent(event),
+            ) ??
+            this.mapError(errorFromStreamEvent(event), streamTimeout.timeoutMs);
           break;
         }
 
@@ -1928,6 +1998,7 @@ export class GrokProvider implements LLMProvider {
             ),
           });
           finishReason = "error";
+          failedAfterStreamedToolCall = toolCallAccum.size > 0;
           responseError =
             this.extractResponseError(failedResponse, "error") ??
             new LLMProviderError(this.name, "Provider returned status failed");
@@ -2009,6 +2080,7 @@ export class GrokProvider implements LLMProvider {
         finishReason,
         ...(thinking.length > 0 ? { thinking } : {}),
         ...(responseError ? { error: responseError } : {}),
+        ...(responseError && failedAfterStreamedToolCall ? { partial: true } : {}),
       };
       emitProviderTraceEvent(options, {
         kind: "response",
@@ -3220,15 +3292,25 @@ export class GrokProvider implements LLMProvider {
             ? "Provider returned failed response status"
             : "Provider returned error response")
     );
-    const codeRaw = errorObj?.code ?? errorObj?.status ?? errorObj?.statusCode;
-    const statusCode = typeof codeRaw === "number"
-      ? codeRaw
-      : Number.parseInt(String(codeRaw ?? ""), 10);
-    return new LLMProviderError(
+    // Explicit status fields take precedence over `code`: a symbolic code must
+    // never override an explicit 4xx, and a numeric code is only a fallback.
+    const statusCode = firstNumericStatus(
+      errorObj?.status,
+      errorObj?.statusCode,
+      errorObj?.status_code,
+      errorObj?.code,
+    );
+    const serverFailure = xaiStatuslessServerFailure(
       this.name,
       message,
-      Number.isFinite(statusCode) ? statusCode : undefined,
+      statusCode,
+      errorObj?.code,
     );
+    if (serverFailure) return serverFailure;
+    if (statusCode !== undefined && statusCode >= 500) {
+      return new LLMServerError(this.name, statusCode, message);
+    }
+    return new LLMProviderError(this.name, message, statusCode);
   }
 
   private mapError(err: unknown, timeoutMs?: number): Error {
