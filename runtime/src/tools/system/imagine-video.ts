@@ -1276,9 +1276,20 @@ export function createImagineVideoTool(opts: ImagineVideoToolOptions): Tool {
     advertised !== undefined && "backend" in advertised
       ? advertised.backend.kind
       : undefined;
+  const deferredUntilDiscovered =
+    opts.getSession() === null && !hasImagineVideoBackend(opts);
   return {
     name: "ImagineVideo",
     description: imagineVideoDescription(advertisedKind),
+    metadata: {
+      family: "media",
+      source: "builtin",
+      hiddenByDefault: false,
+      mutating: true,
+      deferred: deferredUntilDiscovered,
+      keywords: ["video", "generate", "media"],
+      preferredProfiles: ["coding", "operator", "general"],
+    },
     isReadOnly: false,
     requiresApproval: true,
     concurrencyClass: { kind: "exclusive" },

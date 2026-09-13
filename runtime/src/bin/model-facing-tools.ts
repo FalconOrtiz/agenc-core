@@ -5042,12 +5042,13 @@ export function createModelFacingTools(
     env: scopedOpts.env!,
   } as const;
   // Bootstrap constructs one registry before Session attachment and keeps it
-  // across /provider switches. Preserve a universal, deferred ImagineImage in
+  // across /provider switches. Preserve universal, deferred media tools in
   // that lifecycle state; execution resolves current isolated authority and
   // fails closed if the selected backend still has no media credential.
   const includeImagineImage =
     scopedOpts.getSession() === null || hasImagineImageBackend(imagineOptions);
-  const includeImagineVideo = hasImagineVideoBackend(imagineOptions);
+  const includeImagineVideo =
+    scopedOpts.getSession() === null || hasImagineVideoBackend(imagineOptions);
 
   return [
     ...createMultiAgentV2RuntimeTools(scopedOpts),
