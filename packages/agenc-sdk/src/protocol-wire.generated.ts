@@ -2456,6 +2456,11 @@ export interface EventAgentStatusParams extends AgenCEventBaseParams {
     readonly runStatus?: AgentRunStatus;
     readonly turnId?: string;
     readonly message?: string;
+    /** Original turn boundary when this status projects a canonical session event. */
+    readonly turnEvent?: {
+        readonly type: "turn_started" | "turn_complete" | "turn_aborted";
+        readonly payload: JsonObject;
+    };
 }
 
 export interface EventSessionEventParams extends AgenCEventBaseParams {
