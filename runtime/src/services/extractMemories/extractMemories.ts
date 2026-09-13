@@ -49,6 +49,8 @@ import type {
 import type { delegate as delegateFn } from "../../agents/delegate.js";
 import type { ensureAgentControl as ensureAgentControlFn } from "../../bin/delegate-tool.js";
 import { withSignedAllowedRoots } from "../../agents/_deps/filesystem-args.js";
+import { canWritePathWithCwd } from "../../sandbox/engine/index.js";
+import { permissionProfileForLiveSandboxPolicies } from "../../tools/runtimes/sandboxing.js";
 import type { AgentPath } from "../../agents/registry.js";
 import {
   createMemoryExtractionTriggerState,
@@ -880,6 +882,29 @@ export function initExtractMemories(
         "memory_extraction_skipped",
         `deferred by eligible-turn cadence (${cadence.waiting}/${Math.max(1, Math.trunc(deps.minEligibleTurns ?? DEFAULT_MIN_ELIGIBLE_TURNS))} eligible turns)`,
       );
+      return;
+    }
+
+    const ctx = queued.context.ctx;
+    const profile = permissionProfileForLiveSandboxPolicies(
+      ctx.sandboxPolicy.value,
+      ctx.cwd,
+      ctx.fileSystemSandboxPolicy,
+      ctx.networkSandboxPolicy,
+    );
+    if (ctx.sandboxPolicy.value === "read_only" || !canWritePathWithCwd(
+      profile.fileSystem,
+      memoryDir,
+      ctx.cwd,
+      session.services.runtimeOptions.sessionTempRoot,
+    )) {
+      // A child path allowlist cannot grant filesystem authority. Do not
+      // spend provider turns retrying writes the inherited sandbox denies.
+      // As with approval deferral, retire this batch without requesting input.
+      lane.trigger.processedVisibleCount = batchEnd;
+      lane.failedRuns = 0;
+      emitExtractionWarning(session, "memory_extraction_skipped",
+        "memory directory is not writable under the current sandbox; background memory stopped before dispatch");
       return;
     }
 
