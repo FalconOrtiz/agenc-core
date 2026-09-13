@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   setScheduledTasksEnabled,
   resetStateForTests,
+  addSessionCronTask,
 } from "src/bootstrap/state.js";
 import {
   CronScheduler,
@@ -151,6 +152,33 @@ describe("CronScheduler", () => {
   afterEach(() => {
     resetStateForTests();
     vi.restoreAllMocks();
+  });
+
+  test("narrowing to session tasks retires an outstanding durable load", async () => {
+    const clock = new FakeClock(90_000);
+    const deferred = Promise.withResolvers<CronTask[]>();
+    const loadTasks = vi.fn(() => deferred.promise);
+    const enqueue = vi.fn();
+    addSessionCronTask({
+      id: "session-only", cron: "* * * * *", prompt: "memory prompt",
+      createdAt: 0, recurring: true, queueOwner: TEST_ACTIVATION.queueOwner,
+    });
+    const scheduler = new CronScheduler({
+      now: () => clock.nowMs, monotonicNow: () => clock.monoMs,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+      loadTasks, enqueue,
+    }, { minIntervalFloorMs: 1_000 });
+    scheduler.start(TEST_ACTIVATION);
+    expect(loadTasks).toHaveBeenCalled();
+    scheduler.start({ ...TEST_ACTIVATION, sessionOnly: true });
+    deferred.resolve([task({ id: "durable", cron: "* * * * *", durable: undefined })]);
+    await flush();
+    await advanceAndFlush(clock, 1_000);
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(enqueue.mock.calls[0]?.[1]).toMatchObject({ id: "session-only", durable: false });
+    expect(loadTasks).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+    await scheduler.drain();
   });
 
   test("idle: ZERO enqueues across a simulated idle window when nothing is due", async () => {

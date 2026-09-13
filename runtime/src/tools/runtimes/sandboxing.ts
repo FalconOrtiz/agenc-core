@@ -34,6 +34,7 @@ import type { ToolRuntimeAttemptContext } from "./context.js";
 import { analyzeApplyPatchRuntimeWrites } from "./apply-patch.js";
 import { resolveRuntimePathTarget } from "./paths.js";
 import { analyzeShellRuntimeAccess } from "./shell.js";
+import { isSessionCronMemoryMutation } from "./session-cron.js";
 import { desktopAuthorityRoot, overlapsDesktopAuthority, protectDesktopAuthority } from "../../sandbox/desktop-authority-protection.js";
 
 export interface RuntimeSandboxProfileOptions {
@@ -396,7 +397,9 @@ export function enforceRuntimeSandboxAttempt(
     return;
   }
   if (!toolMayMutate(input.tool)) return;
-  const writes = analyzeWrites(input.tool, input.args, cwd);
+  const writes = isSessionCronMemoryMutation(input.tool, input.args, input.context)
+    ? { targets: [], indeterminate: false, knownSafeWhenTargetless: false }
+    : analyzeWrites(input.tool, input.args, cwd);
   const authorityRoot = runtimeDesktopAuthorityRoot(input.context);
   for (const target of writes.targets) {
     if (overlapsDesktopAuthority(target, authorityRoot)) {
