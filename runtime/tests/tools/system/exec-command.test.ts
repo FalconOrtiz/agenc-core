@@ -891,6 +891,40 @@ describe("exec_command tool", () => {
       expect(result.content).toContain("detached=true");
     });
 
+    test.skipIf(process.platform === "win32")("reports a detached process killed by a signal as an error", async () => {
+      const manager = new UnifiedExecProcessManager({
+        cwd: root,
+        sessionTempRoot: root,
+        shellPath: "/bin/sh",
+      });
+      const tool = createExecCommandTool({
+        cwd: root,
+        allowedPaths: [root],
+        unifiedExecManager: manager,
+      });
+
+      try {
+        const result = await tool.execute(
+          fullAccessArgs({ cmd: "kill -TERM $$", detach: true, yield_time_ms: 2_000 }),
+        );
+
+        expect(result.content).toContain("signal_terminated=true");
+        expect(result.content).not.toContain("running=true");
+        expect(result.isError).toBe(true);
+        expect(result.codeModeResult).toMatchObject({
+          detached: true,
+          signal_terminated: true,
+        });
+        expect(result.metadata?.pid).toBeUndefined();
+        expect(result.effectDisposition).toMatchObject({
+          disposition: "confirmed_committed",
+          evidenceRef: "tool:system.exec-command:process-exit",
+        });
+      } finally {
+        await manager.closeAll("test_cleanup");
+      }
+    });
+
     test("refuses detach under a sandbox and names the flag and the alternative", async () => {
       const startDetachedProcess = vi.fn<
         NonNullable<UnifiedExecProcessManagerLike["startDetachedProcess"]>
