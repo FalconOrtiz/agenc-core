@@ -134,6 +134,20 @@ const RAW_REASONING_SUMMARY_INDEX_OFFSET = 10_000;
  * can opt out with `AGENC_XAI_STORE=0` (or "false"/"off"), which restores
  * the old behavior at the documented speed cost.
  */
+/**
+ * xAI refuses to persist a response above its storage limit ("Response is
+ * too large to store. You can avoid this error by setting `store` to false in
+ * your request."). Storing is only the speed preference behind
+ * {@link xaiResponseStoreDefault}, so the same request goes out once more
+ * unstored instead of ending the turn (seen on Terminal-Bench 4.0: a
+ * heat-pump-warranty session died with that text as its last line).
+ */
+function isResponseTooLargeToStore(err: unknown): boolean {
+  const message =
+    err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return /too large to store/i.test(message);
+}
+
 export function xaiResponseStoreDefault(): boolean {
   const raw = getSelectedProviderEnvironment().AGENC_XAI_STORE?.trim().toLowerCase();
   return raw !== "0" && raw !== "false" && raw !== "off";
@@ -1010,6 +1024,26 @@ export class GrokProvider implements LLMProvider {
     this.incrementalTracker.recordResponse(snapshot);
   }
 
+  /**
+   * One unstored retry of the same request after xAI refused to store the
+   * response: full history (an unstored response cannot be continued) and
+   * `store: false`. Shared by the non-streaming and streaming paths.
+   */
+  private unstoredRetryPlan(
+    messages: readonly LLMMessage[],
+    options: LLMChatOptions | undefined,
+  ): ReturnType<GrokProvider["buildRequestPlan"]> {
+    this.emitRuntimeWarning(
+      "xai_store_too_large",
+      `${this.name} could not store the response; retrying once with store: false`,
+    );
+    const plan = this.buildRequestPlan(messages, options, {
+      disableIncremental: true,
+    });
+    (plan.params as Record<string, unknown>).store = false;
+    return plan;
+  }
+
   private emitRuntimeWarning(cause: string, message: string): void {
     this.config.emitWarning?.({ cause, message });
   }
@@ -1254,6 +1288,18 @@ export class GrokProvider implements LLMProvider {
       } catch (err: unknown) {
       if (
         options?.singleWireAttempt !== true &&
+        isResponseTooLargeToStore(err) &&
+        (plan.params as Record<string, unknown>).store !== false
+      ) {
+        const retryPlan = this.unstoredRetryPlan(messages, options);
+        return await retryWithAuthRefresh(
+          String(this.config.apiKey),
+          async () => run(retryPlan),
+          this.authRefreshCallbacks,
+        );
+      }
+      if (
+        options?.singleWireAttempt !== true &&
         isContinuationRetrievalFailure(err) &&
         "previous_response_id" in plan.params
       ) {
@@ -1441,6 +1487,25 @@ export class GrokProvider implements LLMProvider {
         );
       } catch (err) {
         if (
+          options?.singleWireAttempt !== true &&
+          isResponseTooLargeToStore(err) &&
+          params.store !== false
+        ) {
+          plan = this.unstoredRetryPlan(messages, options);
+          params = { ...plan.params, stream: true };
+          result = await withTimeout(
+            async (signal) =>
+              createWithResponseMetadata<AsyncIterable<any>>(
+                client,
+                params,
+                signal,
+                options?.singleWireAttempt,
+              ),
+            requestAttemptTimeout.timeoutMs,
+            this.name,
+            options?.signal,
+          );
+        } else if (
           isContinuationRetrievalFailure(err) &&
           "previous_response_id" in params
         ) {
