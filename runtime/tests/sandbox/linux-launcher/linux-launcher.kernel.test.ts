@@ -417,9 +417,42 @@ test(
         readFileSync("/proc/self/attr/current", "utf8").trim(),
       ).toBe("agenc-native-userns (unconfined)");
 
+      // AppArmor may transition /usr/bin/bwrap and stack its child under the
+      // distro's unpriv_bwrap profile. Measure that transition independently
+      // of AgenC, using the same parent profile and child executable.
+      const profileProbe = spawnSync(bubblewrap!, [
+        "--die-with-parent", "--new-session",
+        "--unshare-user", "--unshare-pid", "--unshare-net",
+        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+        "--", process.execPath, "--input-type=module", "--eval",
+        'import { readFileSync } from "node:fs"; process.stdout.write(readFileSync("/proc/self/attr/current", "utf8"));',
+      ], {
+        cwd: workspace,
+        env: childEnv,
+        encoding: "utf8",
+        timeout: 5_000,
+        maxBuffer: 4_096,
+      });
+      const profileDiagnostics = `direct bubblewrap AppArmor probe: ${JSON.stringify({
+        status: profileProbe.status,
+        signal: profileProbe.signal,
+        error: profileProbe.error?.message,
+        stdout: profileProbe.stdout,
+        stderr: profileProbe.stderr,
+      })}`;
+      expect(profileProbe.error, profileDiagnostics).toBeUndefined();
+      expect(profileProbe.signal, profileDiagnostics).toBeNull();
+      expect(profileProbe.status, profileDiagnostics).toBe(0);
+      const expectedAppArmorProfile = profileProbe.stdout.trim();
+      expect([
+        "agenc-native-userns (unconfined)",
+        "bwrap//&unpriv_bwrap (enforce)",
+      ], profileDiagnostics).toContain(expectedAppArmorProfile);
+
       const payload = Buffer.from(
         JSON.stringify({
           allowedWrite,
+          expectedAppArmorProfile,
           descendantLeakMarker,
           descendantReadyMarker,
           descendantScript: Buffer.from(
@@ -471,6 +504,7 @@ test(
       const diagnostics = [
         `bubblewrap=${bubblewrap}`,
         `version=${version.stdout.trim()}`,
+        profileDiagnostics,
         `broker=${JSON.stringify(status)}`,
         `prepared=${JSON.stringify({
           program: prepared.program,
@@ -521,9 +555,7 @@ test(
         };
       };
       expect(evidence.allowedWrite).toBe(true);
-      expect(evidence.appArmorProfile).toBe(
-        "agenc-native-userns (unconfined)",
-      );
+      expect(evidence.appArmorProfile).toBe(expectedAppArmorProfile);
       expect(readFileSync(allowedWrite, "utf8")).toBe("workspace-write-ok");
       expect(evidence.hostReadOnly).toEqual({
         content: "host-read-only",
@@ -855,7 +887,7 @@ function kernelProbeScript(): string {
       launcherRoot.content === "launcher-read-only" &&
       launcherRoot.writeError === "EROFS" &&
       launcherRoot.createError === "EROFS" &&
-      evidence.appArmorProfile === "agenc-native-userns (unconfined)" &&
+      evidence.appArmorProfile === payload.expectedAppArmorProfile &&
       network.blocked === true &&
       network.error === "EPERM" &&
       descendantReady === true &&
