@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { resolveHomeContext } from '../../src/config/home.js'
+import { SandboxExecutionBroker } from '../../src/sandbox/execution-broker.js'
 
 /**
  * Factory wiring for Sign in with X / xAI OAuth: with no API key, the grok
@@ -287,6 +288,89 @@ test('a provider re-created from recorded factory options after a refresh carrie
   expect(
     (second as unknown as { oauthCallbacksInstalled: boolean }).oauthCallbacksInstalled,
   ).toBe(true)
+})
+
+test('a session fork preserves configuration and refreshes only its own OAuth client', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, readProviderFactoryOptions } = await importProviderModule()
+  const parent = createProviderRaw('grok', {
+    model: 'grok-4.5',
+    credentialHome: CREDENTIAL_HOME,
+    baseURL: 'https://cli-chat-proxy.grok.com/v1',
+    timeoutMs: 12000,
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'inspect_file',
+        description: 'Inspect a file',
+        parameters: { type: 'object', properties: {} },
+      },
+    }],
+    extra: {
+      authMode: 'oauth',
+      incrementalContinuation: true,
+      parallelToolCalls: false,
+      temperature: 0.2,
+    },
+  })
+  storedAccessToken = 'oauth-bearer-2'
+  const child = parent.forkForSession!({
+    cwd: process.cwd(),
+    sandboxExecutionBroker: new SandboxExecutionBroker({
+      mode: 'danger_full_access',
+      cwd: process.cwd(),
+    }),
+  })
+  type OAuthProviderState = {
+    client: { apiKey: string }
+    config: { apiKey: string }
+    authRefreshCallbacks: {
+      refreshBearer: (ctx: unknown) => Promise<{ kind: string; bearer?: string }>
+    }
+  }
+  const parentState = parent as unknown as OAuthProviderState
+  const childState = child as unknown as OAuthProviderState
+  const parentClient = { apiKey: 'oauth-bearer-1' }
+  const childClient = { apiKey: 'oauth-bearer-2' }
+  parentState.client = parentClient
+  childState.client = childClient
+  try {
+    expect(child).not.toBe(parent)
+    expect(readProviderFactoryOptions(child)).toMatchObject({
+      credentialHome: CREDENTIAL_HOME,
+      model: 'grok-4.5',
+      baseURL: 'https://cli-chat-proxy.grok.com/v1',
+      timeoutMs: 12000,
+      tools: [{ function: { name: 'inspect_file' } }],
+      extra: {
+        authMode: 'oauth',
+        incrementalContinuation: true,
+        parallelToolCalls: false,
+        temperature: 0.2,
+      },
+    })
+    expect(readProviderFactoryOptions(child)).toEqual({
+      ...readProviderFactoryOptions(parent),
+      apiKey: 'oauth-bearer-2',
+    })
+    expect(forceRefreshMock).not.toHaveBeenCalled()
+
+    forceRefreshMock.mockResolvedValue({ accessToken: 'oauth-bearer-3' })
+    const outcome = await childState.authRefreshCallbacks.refreshBearer({
+      attempt: 1,
+      previousError: Object.assign(new Error('401'), { status: 401 }),
+    })
+
+    expect(outcome).toEqual({ kind: 'refreshed', bearer: 'oauth-bearer-3' })
+    expect(forceRefreshMock).toHaveBeenCalledExactlyOnceWith(CREDENTIAL_HOME)
+    expect(childClient.apiKey).toBe('oauth-bearer-3')
+    expect(childState.config.apiKey).toBe('oauth-bearer-3')
+    expect(parentClient.apiKey).toBe('oauth-bearer-1')
+    expect(parentState.config.apiKey).toBe('oauth-bearer-1')
+  } finally {
+    await child.dispose?.()
+    await parent.dispose?.()
+  }
 })
 
 test('explicit API-key selection survives the raw factory and recorded-option recreation', async () => {
