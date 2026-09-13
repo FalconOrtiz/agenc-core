@@ -174,14 +174,14 @@ describe("/effort Grok catalog levels", () => {
   test("validates effort against the complete pair staged for the next turn", async () => {
     const { context } = commandContext("grok-4.5", "xhigh", {
       provider: "grok",
-      pendingSelection: { provider: "openai", model: "gpt-5" },
+      pendingSelection: { provider: "openai", model: "gpt-5.2" },
     });
 
     const result = await effortCommand.execute(context);
 
     expect(result).toMatchObject({ kind: "text" });
     if (result.kind === "text") {
-      expect(result.text).toContain("xhigh effort set for gpt-5");
+      expect(result.text).toContain("xhigh effort set for gpt-5.2");
     }
     expect(settings.update).toHaveBeenCalledWith("userSettings", {
       reasoning_effort: "xhigh",
