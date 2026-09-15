@@ -64,7 +64,7 @@ import {
   isAgentNamespacePath,
 } from "./agent-path-hints.js";
 import { checkToolPathPermission } from "../../permissions/path-validation.js";
-import { createToolEffectDispositionEvidence } from "../effect-boundary.js";
+import { createToolEffectDispositionEvidence, settledNoEffectToolResult } from "../effect-boundary.js";
 import { collectEditFeedback } from "../../services/lsp/fileNotifications.js";
 import {
   prepareWorkspaceMutation,
@@ -73,7 +73,9 @@ import {
   workspaceMutationAdmissionToolResult,
 } from "../../workspace/mutation-coordinator.js";
 import {
+  describeWorkspaceMutationNoEffect,
   executeWorkspaceFileMutation,
+  workspaceMutationNoEffectEvidence,
   type WorkspaceFileMutationTestHooks,
 } from "../../workspace/file-mutation-transaction.js";
 import { logForDebugging } from "../../utils/debug.js";
@@ -190,6 +192,28 @@ function preMutationErrorResult(message: string): ToolResult {
       evidenceMaterial: message,
     }),
   };
+}
+
+/**
+ * A failure thrown by the mutation transaction: settled as no-effect when the
+ * transaction proved the file unchanged, otherwise an unknown outcome.
+ */
+function formatWriteFailure(err: unknown, filePath: string): string {
+  if (err instanceof WorkspaceMutationCoordinatorError) return err.message;
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code
+    ? `${code}: failed to write ${filePath}`
+    : `failed to write ${filePath}`;
+}
+
+function mutationErrorResult(err: unknown, message: string): ToolResult {
+  const evidence = workspaceMutationNoEffectEvidence(err);
+  if (evidence === undefined) return errorResult(message);
+  return settledNoEffectToolResult({
+    toolName: FILE_WRITE_TOOL_NAME,
+    message: `${message} ${describeWorkspaceMutationNoEffect(evidence)}`,
+    evidence,
+  });
 }
 
 /** Attach pre-mutation no-effect evidence to an already-built refusal. */
@@ -583,15 +607,7 @@ export function createFileWriteTool(config: FileWriteToolConfig = {}): Tool {
           testHooks: config,
         });
       } catch (err) {
-        if (err instanceof WorkspaceMutationCoordinatorError) {
-          return errorResult(err.message);
-        }
-        const code = (err as NodeJS.ErrnoException)?.code;
-        return errorResult(
-          code
-            ? `${code}: failed to write ${filePath}`
-            : `failed to write ${filePath}`,
-        );
+        return mutationErrorResult(err, formatWriteFailure(err, filePath));
       }
 
       const lspFeedback = await collectEditFeedback(absolutePath, content);
