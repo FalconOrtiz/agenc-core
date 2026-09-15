@@ -1970,6 +1970,43 @@ describe("main() smoke", () => {
     }
   });
 
+  it.each([
+    {
+      name: "sends a text-only prompt byte for byte as initialContent",
+      prompt: "  keep this indentation\n\tand the final newline\n",
+      sendsInitialContent: true,
+    },
+    {
+      name: "sends no initialContent for a whitespace-only prompt",
+      prompt: " \n\t\n",
+      sendsInitialContent: false,
+    },
+  ])("oneShotCLI $name", async ({ prompt, sendsInitialContent }) => {
+    // The daemon trims agent.create's objective and, without initialContent,
+    // sends that trimmed objective as the first user message. A prompt with
+    // visible text therefore also travels as initialContent, unchanged, while
+    // a whitespace-only prompt still meets the daemon's non-empty check.
+    await withOneShotTestEnvironment("agenc-exact-prompt-", async ({ cwd, run }) => {
+      const scope = { agentId: "agent_exact", sessionId: "session_exact" };
+      const daemon = installDaemonCliDepsForTest({
+        ...scope,
+        cwd,
+        oneShotEvents: [
+          { method: "event.message_chunk", params: { ...scope, eventId: "delta_exact", delta: "done" } },
+          { method: "event.agent_status", params: { ...scope, eventId: "complete_exact", status: "idle", runStatus: "completed" } },
+        ],
+      });
+      expect(await run(() => oneShotCLI(prompt), 4000)).toBe(0);
+      const create = daemon.requests.find((request) => request.method === "agent.create");
+      expect(create?.params).toMatchObject({ objective: prompt, instructions: prompt });
+      if (sendsInitialContent) {
+        expect(create?.params).toMatchObject({ initialContent: prompt });
+      } else {
+        expect(create?.params).not.toHaveProperty("initialContent");
+      }
+    });
+  });
+
   it("oneShotCLI writes the answer once when the daemon streams deltas and then the complete message", async () => {
     // The daemon path emits every assistant message twice: as streamed
     // deltas (event.message_chunk / agent_message_delta) and then as one
