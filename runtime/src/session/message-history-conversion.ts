@@ -5,6 +5,11 @@ import type {
 } from "../llm/types.js";
 import { assertAgentInvocationChannelMessage } from "../contracts/agent-invocation-envelope.js";
 import { redactSecretsInValue } from "../secrets/index.js";
+import {
+  OMITTED_BINARY_CARRIER_TEXT,
+  omitAlteredBinaryCarriers,
+  validatedBinaryCarrierBody,
+} from "../llm/content-conversion.js";
 import type { ResponseItem } from "./rollout-item.js";
 import {
   deterministicToolResultId,
@@ -117,7 +122,21 @@ export function llmMessageToReplacementResponseItem(
 export function responseItemToLlmMessage(item: ResponseItem): LLMMessage {
   const message: LLMMessage = {
     role: item.role,
-    content: cloneContent(item.content),
+    // A rollout written before binary carriers were protected can hold an
+    // already-damaged payload. Replaying it fails the next provider call, so a
+    // carrier that is no longer canonical is omitted on the way out. The
+    // durable record is not rewritten.
+    //
+    // A sealed tool result is left exactly as persisted: its integrity record
+    // covers these bytes, so omitting them here would leave a body the seal no
+    // longer verifies, and re-digesting would authenticate whatever the record
+    // now contains, including tampering. Such a result still replays broken and
+    // fails at the provider, which is the honest outcome for a seal we must not
+    // silently void.
+    content:
+      item.toolResultIntegrity === undefined
+        ? withoutBrokenBinaryCarriers(cloneContent(item.content))
+        : cloneContent(item.content),
     ...(item.toolCalls !== undefined
       ? {
           toolCalls: item.toolCalls.map((call) => ({
@@ -329,6 +348,7 @@ function redactResponseItemForPersistence(
     const { providerReasoning: _droppedReplay, ...withoutReplay } = redacted;
     redacted = withoutReplay as ResponseItem;
   }
+  redacted = withoutAlteredBinaryCarriers(item, redacted);
   assertResponseAgentInvocationItem(redacted);
   if (integrity === undefined) return redacted;
   if (redacted.role !== "tool" || redacted.toolCallId === undefined) {
@@ -364,6 +384,59 @@ function redactResponseItemForPersistence(
     }
   }
   return { ...redacted, toolResultIntegrity: durableIntegrity };
+}
+
+/**
+ * Secret redaction is text-oriented, and a long base64 payload can contain a
+ * run that matches a credential heuristic by chance: a Solana secret key is an
+ * unbroken 80-90 character base58 run, and base58 is a subset of the base64
+ * alphabet, so a large enough inline image will eventually contain one. Marking
+ * it rewrites bytes inside the payload, and the provider then rejects the whole
+ * request with "Invalid base64 data", losing the turn.
+ *
+ * Persisting the original is not acceptable either: the match may be a real
+ * secret. So a carrier whose validated binary redaction would alter is dropped
+ * and replaced with a text omission, exactly as an altered opaque replay is
+ * dropped. Only carriers that are canonical base64 to begin with are treated
+ * as binary, so plaintext wearing a `data:image/png;base64,` label stays
+ * redacted as text rather than passing through.
+ */
+/** Drop carriers already damaged on disk, so historical rollouts still replay. */
+function withoutBrokenBinaryCarriers(
+  content: LLMMessage["content"],
+): LLMMessage["content"] {
+  if (!Array.isArray(content)) return content;
+  const kept = content.map((part) => {
+    const record = part as unknown as Record<string, unknown>;
+    // Only inline payloads can be damaged by text redaction. A remote https
+    // image carries no bytes here, so it must survive untouched.
+    const image = record.image_url as Record<string, unknown> | undefined;
+    const source = record.source as Record<string, unknown> | undefined;
+    const isInline =
+      (record.type === "image_url" &&
+        typeof image?.url === "string" &&
+        image.url.startsWith("data:")) ||
+      (record.type === "document" &&
+        source?.type === "base64" &&
+        typeof source.data === "string");
+    if (!isInline) return part;
+    return validatedBinaryCarrierBody(part) === null
+      ? ({ type: "text", text: OMITTED_BINARY_CARRIER_TEXT } as typeof part)
+      : part;
+  });
+  return kept as LLMMessage["content"];
+}
+
+function withoutAlteredBinaryCarriers(
+  original: ResponseItem,
+  redacted: ResponseItem,
+): ResponseItem {
+  const { content, omitted } = omitAlteredBinaryCarriers(
+    original.content,
+    redacted.content,
+    (body) => redactSecretsInValue(body) !== body,
+  );
+  return omitted ? ({ ...redacted, content } as ResponseItem) : redacted;
 }
 
 function assertResponseAgentInvocationItem(item: ResponseItem): void {
