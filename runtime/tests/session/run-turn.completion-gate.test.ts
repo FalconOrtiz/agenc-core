@@ -57,7 +57,10 @@ function scriptedProvider(script: readonly Partial<LLMResponse>[]) {
 }
 
 function toolRegistry(
-  execute: Tool["execute"] = async () => ({ content: "ok", isError: false }),
+  execute: Tool["execute"] = async () => ({
+    content: "/app/out.txt contains done; pytest tests pass 3 passed; checked",
+    isError: false,
+  }),
 ): ToolRegistry {
   const tool: Tool = {
     name: "completion_probe",
@@ -128,6 +131,36 @@ function lastUserText(request: readonly LLMMessage[]): string {
   return typeof last?.content === "string" ? last.content : JSON.stringify(last?.content ?? "");
 }
 
+/**
+ * The unavailable-leftover scenarios build the same provider, registry and
+ * session and then drive one turn. Only the script and the tool output differ,
+ * so spelling the construction out per test duplicated it verbatim.
+ */
+async function runGateScenario(
+  script: readonly Partial<LLMResponse>[],
+  toolContents: readonly string[],
+) {
+  const { provider, requests } = scriptedProvider(script);
+  const { registry } = queuedToolRegistry(
+    toolContents.map((content) => ({ content, isError: false })),
+  );
+  const { session, events } = headlessSession(provider, true, registry);
+  await collect(session);
+  return { requests, events };
+}
+
+/** The gate's first two payloads when it asks for proof of an unavailable item. */
+function unavailablePromptedPrefix(item: string) {
+  return [
+    expect.objectContaining({ outcome: "injected", reason: "initial" }),
+    expect.objectContaining({
+      outcome: "injected",
+      reason: "unavailable_unproven",
+      unmetItems: [item],
+    }),
+  ];
+}
+
 async function collect(session: ReturnType<typeof mkSession>["session"], ctx = mkCtx()) {
   const phases: PhaseEvent[] = [];
   for await (const phase of runTurn(session, ctx, TASK)) phases.push(phase);
@@ -195,7 +228,7 @@ describe("completion gate in the turn loop", () => {
     const { registry, execute } = queuedToolRegistry([
       { content: "Wrote /app/out.txt", isError: false },
       { content: "Verification command failed", isError: true },
-      { content: "done\n3 passed", isError: false },
+      { content: "/app/out.txt contains done; pytest 3 passed", isError: false },
     ]);
     const { session, events, state } = headlessSession(provider, true, registry);
     const phases = await collect(session);
@@ -225,7 +258,7 @@ describe("completion gate in the turn loop", () => {
       expect.objectContaining({
         toolCallId: "verify-failed", content: expect.stringContaining("Verification command failed"),
       }),
-      expect.objectContaining({ toolCallId: "verify-success", content: expect.stringContaining("done\n3 passed") }),
+      expect.objectContaining({ toolCallId: "verify-success", content: expect.stringContaining("/app/out.txt contains done; pytest 3 passed") }),
     ]);
     const injections = state.history.filter(
       (message) => message.role === "user" && String(message.content).includes("<completion_gate"),
@@ -275,24 +308,72 @@ describe("completion gate in the turn loop", () => {
 
   test("a blocked checklist item prevents verification even when another item is checked", async () => {
     const blockedItem = "tests: pytest is unavailable";
-    const { provider, requests } = scriptedProvider([
+    const { requests, events } = await runGateScenario([
       toolStep("work-1"),
       textStep("Done."),
       toolStep("verify-1"),
       textStep(`- [x] /app/out.txt contains done: cat showed done\n- [-] ${blockedItem}`),
       toolStep("verify-2"),
       textStep("- [x] /app/out.txt contains done: cat showed done\n- [x] tests: pytest, 3 passed"),
+    ], [
+      "/app/out.txt contains done",
+      "/app/out.txt contains done",
+      "/app/out.txt contains done; pytest 3 passed",
     ]);
-    const { session, events } = headlessSession(provider, true);
-    await collect(session);
 
     expect(requests).toHaveLength(6);
     expect(gatePayloads(events)).toEqual([
-      expect.objectContaining({ outcome: "injected", reason: "initial" }),
-      expect.objectContaining({ outcome: "injected", reason: "unmet_items", unmetItems: [blockedItem] }),
+      ...unavailablePromptedPrefix(blockedItem),
       expect.objectContaining({ outcome: "verified", reason: "verified_with_tools" }),
     ]);
     expect(lastUserText(requests[4] ?? [])).toContain(blockedItem);
+    expect(lastUserText(requests[4] ?? [])).toContain("not itself evidence");
+    expectCompletedTurn(events);
+  });
+
+  test("an unavailable leftover keeps being asked and settles as partial at the round cap", async () => {
+    const unavailable = "Official oracle is unavailable in this environment.";
+    const { requests, events } = await runGateScenario([
+      toolStep("work-1"),
+      textStep("Done."),
+      toolStep("smoke-1"),
+      textStep(`- [x] /app/out.txt contains done: cat showed done\n- [-] ${unavailable}`),
+      toolStep("smoke-2"),
+      textStep(`- [x] /app/out.txt contains done: cat showed done\n- [-] ${unavailable}`),
+      toolStep("smoke-3"),
+      textStep(`- [x] /app/out.txt contains done: cat showed done\n- [-] ${unavailable}`),
+    ], [
+      "/app/out.txt contains done",
+      "/app/out.txt contains done; local smoke passed",
+      "/app/out.txt contains done; local smoke passed",
+      "/app/out.txt contains done; local smoke passed",
+    ]);
+
+    // Successful local smoke work does not establish that the oracle is absent,
+    // so the gate re-asks instead of settling and the leftover reaches the cap.
+    // The model keeps re-checking the item it can verify, which is what keeps
+    // the outcome partial: a final round with no work leaves nothing verified
+    // since the latest request and is reported as exhausted instead.
+    expect(requests).toHaveLength(8);
+    expect(gatePayloads(events)).toEqual([
+      ...unavailablePromptedPrefix(unavailable),
+      expect.objectContaining({
+        outcome: "injected",
+        reason: "unavailable_unproven",
+        unmetItems: [unavailable],
+      }),
+      expect.objectContaining({
+        outcome: "partial",
+        reason: "unavailable_checks",
+        unmetItems: [unavailable],
+      }),
+    ]);
+    expect(events.some((event) =>
+      event.msg.type === "warning" && event.msg.payload.cause === "completion_gate_partial",
+    )).toBe(true);
+    for (const payload of gatePayloads(events)) {
+      expect(isCanonicalEventPayload("completion_gate", payload)).toBe(true);
+    }
     expectCompletedTurn(events);
   });
 
@@ -350,7 +431,7 @@ describe("completion gate in the turn loop", () => {
   });
 
   test("completion_gate.mode overrides the session default in both directions", async () => {
-    const always = scriptedProvider([toolStep("w"), textStep("Done."), toolStep("v"), textStep("- [x] ok")]);
+    const always = scriptedProvider([toolStep("w"), textStep("Done."), toolStep("v"), textStep("- [x] /app/out.txt contains done")]);
     const alwaysSession = headlessSession(always.provider, false);
     const ctx = mkCtx();
     await collect(alwaysSession.session, {
@@ -447,7 +528,7 @@ describe("completion gate in the turn loop", () => {
       textStep("Now I'll create the file."),
       textStep("Done."),
       toolStep("verify-1"),
-      textStep("- [x] verified"),
+      textStep("- [x] /app/out.txt contains done"),
     ]);
     const { session, events } = headlessSession(provider, true);
     await collect(session);
@@ -515,6 +596,27 @@ describe("completion gate in the turn loop", () => {
         reason: "initial",
         toolCallsSinceInjection: 0,
         unmetItems: ["x"],
+      }),
+    ).toBe(true);
+    expect(
+      isCanonicalEventPayload("completion_gate", {
+        turnId: "t",
+        round: 2,
+        maxRounds: 3,
+        outcome: "partial",
+        reason: "unavailable_checks",
+        toolCallsSinceInjection: 1,
+        unmetItems: ["oracle unavailable"],
+      }),
+    ).toBe(true);
+    expect(
+      isCanonicalEventPayload("completion_gate", {
+        turnId: "t",
+        round: 2,
+        maxRounds: 3,
+        outcome: "injected",
+        reason: "unavailable_unproven",
+        toolCallsSinceInjection: 1,
       }),
     ).toBe(true);
   });
