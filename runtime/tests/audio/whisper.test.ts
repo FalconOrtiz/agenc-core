@@ -94,6 +94,63 @@ describe("Whisper installation boundary", () => {
     expect(await readdir(join(root, "whisper"))).toEqual([]);
     await expect(service.transcribe(params(), new AbortController().signal)).rejects.toMatchObject({ code: "WHISPER_MODEL_UNAVAILABLE" });
   });
+  /** A body that opens, aborts like fetch does, and delivers only when asked. */
+  const controllableDownload = () => {
+    let deliver: (() => void) | undefined;
+    const stub = vi.fn((_url: unknown, init: RequestInit) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          init.signal?.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+          deliver = () => controller.enqueue(new Uint8Array([0]));
+        },
+      });
+      return Promise.resolve(new Response(body));
+    });
+    vi.stubGlobal("fetch", stub);
+    return { stub, deliver: () => deliver?.() };
+  };
+
+  /** Start an install and assert it ends as a stall, not a cancellation. */
+  const expectStall = async (root: string, stub: ReturnType<typeof vi.fn>) => {
+    const service = new LocalWhisperService({ home: root, env: { AGENC_WHISPER_CLI: process.execPath } });
+    const rejected = expect(service.install({ model: "base" }, new AbortController().signal)).rejects.toMatchObject({
+      code: "WHISPER_DOWNLOAD_FAILED",
+      message: expect.stringContaining("stopped receiving data"),
+    });
+    // The idle clock is armed only once the request is in flight.
+    for (let tick = 0; tick < 50 && stub.mock.calls.length === 0; tick += 1) await vi.advanceTimersByTimeAsync(100);
+    expect(stub).toHaveBeenCalledOnce();
+    return { rejected };
+  };
+
+  it("ends a download that stops delivering, and calls it a failure rather than a cancellation", async () => {
+    vi.useFakeTimers();
+    try {
+      const root = await home();
+      const { stub } = controllableDownload();
+      const { rejected } = await expectStall(root, stub);
+      await vi.advanceTimersByTimeAsync(61_000);
+      await rejected;
+      expect(await readdir(join(root, "whisper"))).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+  it("restarts its patience on every chunk, so a slow but live download survives", async () => {
+    vi.useFakeTimers();
+    try {
+      const root = await home();
+      const { stub, deliver } = controllableDownload();
+      const { rejected } = await expectStall(root, stub);
+      // A byte just before each window closes, for far longer than the ten
+      // minute deadline this replaced.
+      for (let minute = 0; minute < 15; minute += 1) {
+        await vi.advanceTimersByTimeAsync(50_000);
+        deliver();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      await vi.advanceTimersByTimeAsync(61_000);
+      await rejected;
+    } finally { vi.useRealTimers(); }
+  });
   it("status never downloads, creates directories, or trusts arbitrary PATH", async () => {
     const root = await home(); const fetch = vi.fn(); vi.stubGlobal("fetch", fetch);
     const service = new LocalWhisperService({ home: root, env: { AGENC_WHISPER_CLI: "relative/whisper-cli", PATH: "/malicious" } });
