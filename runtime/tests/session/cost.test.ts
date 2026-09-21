@@ -441,6 +441,15 @@ describe("cost helpers", () => {
       });
   });
 
+  test("Grok 4.7 uses the documented base token rates", () => {
+    const match = resolveModelCostEntry({ model: "grok-4.7", provider: "grok" }, DEFAULT_MODEL_COSTS);
+    expect(match?.entry).toMatchObject({
+      inputUsdPer1K: 0.002,
+      cachedInputUsdPer1K: 0.0005,
+      outputUsdPer1K: 0.006,
+    });
+  });
+
   test("default + catalog grok models price as known and non-reasoning ones are not charged the reasoning surcharge", () => {
     // grok-4.3 is the grok provider default (provider-info.ts). Both it and
     // grok-build-0.1 used to mis-resolve: grok-4.3 collapsed onto the
@@ -448,6 +457,7 @@ describe("cost helpers", () => {
     // DEFAULT_UNKNOWN_MODEL_COST. Since DEFAULT_MODEL_COSTS feeds dollar_cap
     // enforcement, mispricing here enforces budgets at the wrong threshold.
     const nonReasoningModels = [
+      "grok-4.7",
       "grok-4.6",
       "grok-4.5",
       "grok-4.3",
