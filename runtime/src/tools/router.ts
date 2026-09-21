@@ -31,6 +31,12 @@
  * @module
  */
 
+import {
+  buildPayloadForArgs,
+  stringifyToolArgsWithBigInt,
+  invocationForArgs,
+} from "./execution-invocation.js";
+
 import type { LLMTool, LLMToolCall } from "../llm/types.js";
 import type { ToolDispatchResult, ToolRegistry } from "../tool-registry.js";
 import {
@@ -77,6 +83,7 @@ import {
   type ModalDecision,
   parseToolArgsWithBigInt,
   validateToolPreflight,
+  prepareModelToolArgs,
   type ToolProgressCallback,
 } from "./execution.js";
 import type {
@@ -529,7 +536,8 @@ export class ToolRouter {
       // TRUSTED INTERNAL channel for runtime-injected filesystem scoping
       // and must never be supplied by the model; runtime values are
       // merged in later (execution.ts / filesystemRootsForDispatch).
-      let executionArgs = stripModelSuppliedAgenCInternalArgs(args);
+      let executionArgs = stripModelSuppliedAgenCInternalArgs({ ...args });
+      prepareModelToolArgs(spec.tool, executionArgs, invocation.session.eventLog, invocation.callId);
       const initialPreflight = preflightToolCall(spec.tool, executionArgs, invocation);
       if (initialPreflight !== null) return initialPreflight;
       let forcedApprovalReason: string | undefined;
@@ -875,6 +883,7 @@ export class ToolRouter {
     // the allowed roots that reach tool.execute. (The validator-only
     // strip in execution.ts left the tool body exposed.)
     let executionArgs = stripModelSuppliedAgenCInternalArgs(parsedArgs);
+    prepareModelToolArgs(spec.tool, executionArgs, invocation.session.eventLog, invocation.callId);
     const initialPreflight = preflightToolCall(spec.tool, executionArgs, invocation, opts);
     if (initialPreflight !== null) return initialPreflight;
     let forcedApprovalReason: string | undefined;
@@ -1470,37 +1479,6 @@ function rawPayloadArguments(payload: ToolPayload): string {
   }
 }
 
-function buildPayloadForArgs(
-  payload: ToolPayload,
-  args: Record<string, unknown>,
-): ToolPayload {
-  const serialized = stringifyToolArgsWithBigInt(args);
-  switch (payload.kind) {
-    case "function":
-      return { kind: "function", arguments: serialized };
-    case "mcp":
-      return {
-        kind: "mcp",
-        server: payload.server,
-        tool: payload.tool,
-        rawArguments: serialized,
-      };
-    case "custom":
-    case "tool_search":
-    case "local_shell":
-      return payload;
-  }
-}
-
-function stringifyToolArgsWithBigInt(args: Record<string, unknown>): string {
-  const { rawJSON } = JSON as typeof JSON & {
-    rawJSON: (text: string) => unknown;
-  };
-  return JSON.stringify(args, (_key, value: unknown) =>
-    typeof value === "bigint" ? rawJSON(value.toString()) : value,
-  );
-}
-
 const AGENC_INTERNAL_ARG_PREFIX = "__agenc";
 
 /**
@@ -1766,7 +1744,8 @@ export function attachPreflightRuntimeContext(
     readonly sandboxMode: SandboxMode;
   },
 ): void {
-  if (readToolRuntimeContext(args) !== undefined) return;
+  const previous = readToolRuntimeContext(args);
+  invocation = invocationForArgs(previous?.invocation ?? invocation, args);
   const call = buildToolRuntimeCallContext({
     toolCall: { id: invocation.callId, name: nameDisplay(invocation.toolName) },
     payload: invocation.payload,
@@ -1776,11 +1755,16 @@ export function attachPreflightRuntimeContext(
   });
   attachToolRuntimeContext(
     args,
-    buildToolRuntimeAttemptContext(call, {
+    buildToolRuntimeAttemptContext({
+      ...call,
+      ...previous,
+      classification: call.classification,
+    }, {
       approvalPolicy: params.approvalPolicy,
       requestedSandboxMode: params.sandboxMode,
       sandboxMode: params.sandboxMode,
       approvalResolved: false,
+      ...previous,
       rawArgs: stringifyToolArgsWithBigInt(args),
       invocation,
     }),
@@ -1797,12 +1781,13 @@ function preflightToolCall(
     readonly sandboxMode?: SandboxMode;
   } = {},
 ): ToolDispatchResult | null {
-  attachPreflightRuntimeContext(tool, args, invocation, {
-    approvalPolicy:
-      options.approvalPolicy ?? directDispatchApprovalPolicy(invocation),
-    sandboxMode: options.sandboxMode ?? directDispatchSandboxMode(invocation),
+  const result = validateToolPreflight(tool, args, {
+    ...options, eventLog: invocation.session.eventLog, subId: invocation.callId,
+    onValidatedArgs: () => attachPreflightRuntimeContext(tool, args, invocationForArgs(invocation, args), {
+      approvalPolicy: options.approvalPolicy ?? directDispatchApprovalPolicy(invocation),
+      sandboxMode: options.sandboxMode ?? directDispatchSandboxMode(invocation),
+    }),
   });
-  const result = validateToolPreflight(tool, args, options);
   if (result !== null) {
     emitErrorEvent(invocation.session.eventLog, invocation.callId, {
       cause: "schema_validation_failed",
