@@ -18,6 +18,7 @@ import {
   buildStructuredOutputTextFormat,
   parseStructuredOutputText,
 } from "../structured-output.js";
+import { openAiAcceptsSamplingTemperature } from "../registry/openai-reasoning-models.js";
 import { DEFAULT_MAX_OUTPUT_TOKENS } from "../openai-compatible-token-limits.js";
 import {
   assistantTextFromContentBlocks,
@@ -27,6 +28,7 @@ import {
   messageTextContent,
   normalizeFinishReason,
   normalizeToolCallsStrict,
+  openAiServedSpeed,
   parseOpenAIToolChoice,
   prepareMessagesForWire,
   serializeProviderToolArguments,
@@ -684,7 +686,14 @@ export function buildChatCompletionsRequest(
   }
   if (
     input.options?.temperature !== undefined &&
-    input.providerCapabilityHints?.acceptsTemperature !== false
+    input.providerCapabilityHints?.acceptsTemperature !== false &&
+    !(
+      input.providerCapabilityHints?.gatesTemperatureOnOpenAiReasoning === true &&
+      !openAiAcceptsSamplingTemperature(
+        input.model,
+        input.options.reasoningEffort,
+      )
+    )
   ) {
     body.temperature = input.options.temperature;
   }
@@ -1008,6 +1017,18 @@ export function parseChatCompletionsResponse(
         promptDetails.cached_tokens ??
         (isKimiResponse ? usageRecord.cached_tokens : undefined),
       reasoningOutputTokens: completionDetails.reasoning_tokens,
+      // Unlike Responses' input_tokens_details.cache_write_tokens, Chat
+      // Completions has no field for prompt-cache writes: a real cache write
+      // is folded into prompt_tokens with no way to tell it apart from
+      // ordinary input. Flag it so budget reconciliation
+      // (admitted-model-call.ts) does not under-price it as ordinary input on
+      // models that bill cache writes above the input rate.
+      cacheWritesUnreported: true,
+      // Only providers documented to take service_tier report the tier that
+      // served the request; Fast mode bills at its own rates.
+      ...(request.providerCapabilityHints?.acceptsServiceTier === true
+        ? { speed: openAiServedSpeed(response.service_tier) }
+        : {}),
     }),
     model:
       typeof response.model === "string" ? response.model : model,
