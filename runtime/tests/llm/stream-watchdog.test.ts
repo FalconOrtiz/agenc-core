@@ -67,7 +67,7 @@ describe("stream-watchdog", () => {
     expect(handle.firedAt).toBe(100);
   });
 
-  test("a delta kick resets the quiet warning window without aborting", () => {
+  test("a delta kick resets the quiet warning and byte-idle abort windows", () => {
     const abortController = new AbortController();
     const warnings: Array<{ elapsedMs: number; reason: string }> = [];
     const fired: Array<{ elapsedMs: number; reason: string }> = [];
@@ -92,12 +92,48 @@ describe("stream-watchdog", () => {
     expect(warnings).toEqual([
       { elapsedMs: 50, reason: STREAM_IDLE_WARNING_REASON },
     ]);
+    expect(abortController.signal.aborted).toBe(false);
 
     nowMs = 140;
     vi.advanceTimersByTime(50);
+    expect(fired).toEqual([
+      { elapsedMs: 100, reason: STREAM_IDLE_ABORT_REASON },
+    ]);
+    expect(abortController.signal.reason).toBe(STREAM_IDLE_ABORT_REASON);
+    expect(handle.firedAt).toBe(140);
+  });
+
+  test("one chunk then a stall past timeout aborts from the last byte", () => {
+    const abortController = new AbortController();
+    const warnings: Array<{ elapsedMs: number; reason: string }> = [];
+    const fired: Array<{ elapsedMs: number; reason: string }> = [];
+    const handle = installStreamWatchdog({
+      abortController,
+      timeoutMs: 100,
+      onWarning: (info) => warnings.push(info),
+      onFired: (info) => fired.push(info),
+    });
+
+    nowMs = 10;
+    vi.advanceTimersByTime(10);
+    handle.kick("bytes");
+
+    nowMs = 60;
+    vi.advanceTimersByTime(50);
+    expect(warnings).toEqual([
+      { elapsedMs: 60, reason: STREAM_IDLE_WARNING_REASON },
+    ]);
     expect(fired).toEqual([]);
     expect(abortController.signal.aborted).toBe(false);
-    expect(handle.firedAt).toBeNull();
+
+    nowMs = 110;
+    vi.advanceTimersByTime(50);
+    expect(fired).toEqual([
+      { elapsedMs: 100, reason: STREAM_IDLE_ABORT_REASON },
+    ]);
+    expect(abortController.signal.aborted).toBe(true);
+    expect(abortController.signal.reason).toBe(STREAM_IDLE_ABORT_REASON);
+    expect(handle.firedAt).toBe(110);
   });
 
   test("stop cancels pending warning and timeout timers", () => {
@@ -158,20 +194,30 @@ describe("stream-watchdog", () => {
     ).toBe("dead");
     expect(
       classifyStreamLiveness({
-        nowMs: 100,
+        nowMs: 110,
         startedAtMs: 0,
         lastByteMs: 10,
         lastDeltaMs: 10,
         warningMs: 50,
         deadMs: 100,
       }),
-    ).toBe("quiet");
+    ).toBe("dead");
     expect(
       classifyStreamLiveness({
         nowMs: 80,
         startedAtMs: 0,
         lastByteMs: 40,
         lastDeltaMs: null,
+        warningMs: 50,
+        deadMs: 100,
+      }),
+    ).toBe("quiet");
+    expect(
+      classifyStreamLiveness({
+        nowMs: 70,
+        startedAtMs: 0,
+        lastByteMs: 40,
+        lastDeltaMs: 10,
         warningMs: 50,
         deadMs: 100,
       }),
@@ -219,8 +265,11 @@ describe("stream-watchdog", () => {
     nowMs = 110;
     vi.advanceTimersByTime(10);
     quiet.kick("bytes");
-    nowMs = 200;
-    vi.advanceTimersByTime(90);
+    nowMs = 160;
+    vi.advanceTimersByTime(50);
+    quiet.kick("bytes");
+    nowMs = 210;
+    vi.advanceTimersByTime(50);
     expect(quietWarnings).toEqual([STREAM_IDLE_WARNING_REASON]);
     expect(quietFired).toEqual([]);
     expect(quietAbort.signal.aborted).toBe(false);

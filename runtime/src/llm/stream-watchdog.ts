@@ -5,11 +5,11 @@
  * `streamWatchdogFiredAt`, `streamIdleAborted`) driven by
  * `stream_idle_timeout_ms` from provider info.
  *
- * Abort is opt-in (`timeoutMs` > 0) and fires only when the socket never
- * received bytes. Heartbeats (`kick("bytes")`) keep that abort from firing.
- * Model deltas (`kick("delta")`) reset the quiet-warning window. A zero abort
- * timeout still warns when `onWarning` is set, so long grok-4.6 xhigh quiet
- * phases stay alive with a ticker signal instead of a hard kill.
+ * Abort is opt-in (`timeoutMs` > 0) and measures idle time from the most
+ * recent byte (`kick("bytes")` or any kick). Model deltas (`kick("delta")`)
+ * reset the quiet-warning window separately. A zero abort timeout still
+ * warns when `onWarning` is set, so long grok-4.6 xhigh quiet phases stay
+ * alive with a ticker signal instead of a hard kill.
  *
  * Timers use monotonic clock (I-82) via `monotonicMs()`.
  *
@@ -84,12 +84,8 @@ export function classifyStreamLiveness(input: {
   readonly warningMs: number;
   readonly deadMs: number;
 }): StreamLiveness {
-  const sinceStart = input.nowMs - input.startedAtMs;
-  if (
-    input.deadMs > 0 &&
-    input.lastByteMs === null &&
-    sinceStart >= input.deadMs
-  ) {
+  const sinceByte = input.nowMs - (input.lastByteMs ?? input.startedAtMs);
+  if (input.deadMs > 0 && sinceByte >= input.deadMs) {
     return "dead";
   }
   const sinceDelta = input.nowMs - (input.lastDeltaMs ?? input.startedAtMs);
@@ -150,8 +146,8 @@ export const STREAM_IDLE_ABORT_REASON = "stream_idle";
 export const STREAM_IDLE_WARNING_REASON = "stream_idle_warning";
 
 export interface StreamWatchdogHandle {
-  /** Heartbeat (`bytes`) keeps a dead-socket abort from firing. A model
-   *  `delta` also resets the quiet-warning window. */
+  /** Any kick refreshes the byte-idle abort clock. A model `delta` also
+   *  resets the quiet-warning window. */
   kick(source?: StreamWatchdogKickSource): void;
   /** Stop the watchdog without firing (stream completed cleanly). */
   stop(): void;
@@ -187,7 +183,7 @@ export interface InstallStreamWatchdogOptions {
  * `stop()` / `kick()` after fire is a no-op.
  *
  * A zero abort timeout still warns when `onWarning` is set. Abort fires
- * only for a socket that never received bytes.
+ * when no bytes arrive for `timeoutMs` since the last byte (or start).
  */
 export function installStreamWatchdog(
   options: InstallStreamWatchdogOptions,
@@ -247,10 +243,10 @@ export function installStreamWatchdog(
   };
 
   const fire = () => {
-    if (stopped || firedAtValue !== null || lastByteMs !== null) return;
+    if (stopped || firedAtValue !== null) return;
     timeoutTimer = null;
     firedAtValue = monotonicMs();
-    const elapsedMs = firedAtValue - startedAtMs;
+    const elapsedMs = firedAtValue - (lastByteMs ?? startedAtMs);
     try {
       options.onFired?.({ elapsedMs, reason: STREAM_IDLE_ABORT_REASON });
     } finally {
@@ -269,8 +265,12 @@ export function installStreamWatchdog(
       warningTimer = setTimeout(warn, delay);
       withUnref(warningTimer);
     }
-    if (timeoutMs > 0 && lastByteMs === null) {
-      timeoutTimer = setTimeout(fire, Math.max(0, timeoutMs - (nowMs - startedAtMs)));
+    if (timeoutMs > 0) {
+      const delay = Math.max(
+        0,
+        timeoutMs - (nowMs - (lastByteMs ?? startedAtMs)),
+      );
+      timeoutTimer = setTimeout(fire, delay);
       withUnref(timeoutTimer);
     }
   };
