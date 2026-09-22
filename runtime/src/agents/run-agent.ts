@@ -25,6 +25,7 @@ import {
   SESSION_TOOL_CATALOG_SCOPE_ARG,
 } from "../tools/system/coding-common.js";
 import { filesystemRootsForDispatch } from "../tools/filesystem-dispatch-roots.js";
+import { unavailableToolResult } from "../tools/router.js";
 import {
   attachToolRuntimeContext,
   readToolRuntimeContext,
@@ -2229,8 +2230,13 @@ export function buildFilteredRegistry(
   const constrainedTools = opts.executionConstraint === undefined ? undefined : new Set(
     base.tools.filter(readOnlyDelegationToolAvailable).map((tool) => tool.name),
   );
+  // `base.tools` keeps unavailable tools for telemetry. A child must never
+  // wrap, offer or run one, including through the fallback catalog below.
+  const unavailable: ReadonlySet<string> =
+    base.getUnavailableToolNames?.() ?? new Set<string>();
   const isEligible = (name: string): boolean =>
     (constrainedTools === undefined || constrainedTools.has(name)) &&
+    !unavailable.has(name) &&
     !disabled.has(name) &&
     !mcpOriginToolNames.has(name) &&
     !isMcpWireToolName(name) &&
@@ -2269,7 +2275,13 @@ export function buildFilteredRegistry(
     toLLMTools() {
       return advertisedLLMTools();
     },
+    getUnavailableToolNames() {
+      return unavailable;
+    },
     async dispatch(toolCall): Promise<ToolDispatchResult> {
+      if (unavailable.has(toolCall.name)) {
+        return unavailableToolResult(toolCall.name);
+      }
       if (disabled.has(toolCall.name)) {
         return {
           content: safeStringify({
@@ -2591,12 +2603,11 @@ function stripModelSuppliedChildArgs(
     }
   }
   if (!needsStrip) return args;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (key.startsWith("__agenc")) continue;
-    out[key] = value;
-  }
-  return out;
+  // Own data properties only: assigning a model's JSON `__proto__` key onto
+  // `{}` would make it the copy's prototype instead of an argument.
+  return Object.fromEntries(
+    Object.entries(args).filter(([key]) => !key.startsWith("__agenc")),
+  );
 }
 
 export function injectChildToolArgs(

@@ -108,6 +108,7 @@ import {
   type PlanFileContext,
 } from "../planning/plan-files.js";
 import { markLoadedToolNamesDiscovered } from "./deferred-discovery.js";
+import { settledNoEffectToolResult } from "./effect-boundary.js";
 import {
   attachToolRuntimeContext,
   buildToolRuntimeAttemptContext,
@@ -136,8 +137,9 @@ export interface ConfiguredToolSpec {
   readonly tool: Tool;
   readonly supportsParallelToolCalls: boolean;
   readonly serverId?: string;
-  /** When true, the tool is unavailable for direct invocation but may
-   *  still appear in the spec catalog for telemetry/tracing. */
+  /** When true, the tool stays in `getSpecs()` for telemetry/tracing only:
+   *  it is never advertised or offered to tool search, and every dispatch
+   *  refuses it with `unavailableToolResult`. */
   readonly unavailable?: boolean;
   /** When true, the tool is loaded on demand through system.searchTools and
    *  should not be advertised in `modelVisibleSpecs()`. */
@@ -382,10 +384,11 @@ export class ToolRouter {
   }
 
   /** LLMTool array for provider requests. Deferred tools are hidden
-   *  (loaded on demand through system.searchTools). */
+   *  (loaded on demand through system.searchTools); unavailable ones are
+   *  never offered. */
   modelVisibleSpecs(): ReadonlyArray<LLMTool> {
     return this.specs
-      .filter((config) => config.deferred !== true)
+      .filter((config) => config.deferred !== true && config.unavailable !== true)
       .map((config) => ({
         type: "function",
         function: {
@@ -529,6 +532,7 @@ export class ToolRouter {
         isError: true,
       };
     }
+    if (spec.unavailable === true) return unavailableToolResult(spec.tool.name);
 
     try {
       // SECURITY: strip any `__agenc*` keys reaching this dispatch
@@ -823,6 +827,7 @@ export class ToolRouter {
         isError: true,
       };
     }
+    if (spec.unavailable === true) return unavailableToolResult(spec.tool.name);
 
     if (ledgerTurnBlocksTool(opts, spec.tool)) {
       const message =
@@ -1503,12 +1508,13 @@ function stripModelSuppliedAgenCInternalArgs(
     }
   }
   if (!needsStrip) return input;
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (key.startsWith(AGENC_INTERNAL_ARG_PREFIX)) continue;
-    out[key] = value;
-  }
-  return out;
+  // Own data properties only: assigning a model's JSON `__proto__` key onto
+  // `{}` would make it the copy's prototype instead of an argument.
+  return Object.fromEntries(
+    Object.entries(input).filter(
+      ([key]) => !key.startsWith(AGENC_INTERNAL_ARG_PREFIX),
+    ),
+  );
 }
 
 function planFileContextForApproval(
@@ -1868,6 +1874,9 @@ export function routerFromRegistry(
   registry: ToolRegistry,
   opts: ToolRouterOpts = {},
 ): ToolRouter {
+  // `registry.tools` drops spec flags; carry `unavailable` over so the
+  // session router refuses those tools like the registry's own router does.
+  const unavailable = registry.getUnavailableToolNames?.();
   const specs: ConfiguredToolSpec[] = registry.tools.map((tool) => ({
     tool,
     supportsParallelToolCalls:
@@ -1876,8 +1885,21 @@ export function routerFromRegistry(
     ...((tool as Tool & { serverId?: string }).serverId !== undefined
       ? { serverId: (tool as Tool & { serverId?: string }).serverId }
       : {}),
+    ...(unavailable?.has(tool.name) === true ? { unavailable: true } : {}),
   }));
   return new ToolRouter(specs, opts);
+}
+
+/**
+ * The refusal for a spec marked `unavailable`. The tool never ran, so the
+ * result settles as confirmed no effect instead of an unknown outcome.
+ */
+export function unavailableToolResult(toolName: string): ToolDispatchResult {
+  return settledNoEffectToolResult({
+    toolName,
+    message: `<tool_use_error>Error: ${toolName} is unavailable in this session and cannot be called.</tool_use_error>`,
+    evidence: "unavailable",
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────
