@@ -57,6 +57,15 @@ export const AGENC_DAEMON_PROTOCOL_PUBLISH_TARGET = {
   schemaId: AGENC_DAEMON_PROTOCOL_SCHEMA_ID,
 } as const;
 export const AGENC_DAEMON_METHOD_CAPABILITIES_KEY = "daemon.methods" as const;
+/**
+ * A client advertising this reconciles pending permission requests through
+ * `permission.list` (on attach, reconnect or a poll), so it can show a
+ * forwarded sub-agent approval it never received live. Without any such
+ * client, or a live recipient, the daemon denies the request instead of
+ * leaving it pending.
+ */
+export const AGENC_PENDING_APPROVALS_LIST_CAPABILITY =
+  "approvals.pending.list.v1" as const;
 /** Explicit opt-in for unsolicited, cross-session mobile agent-status notifications. */
 export const AGENC_PORTAL_MOBILE_STATUS_PUSH_CAPABILITY =
   "portal.mobile.status.push.v1" as const;
@@ -2196,6 +2205,11 @@ export interface EventToolRequestParams extends AgenCEventBaseParams {
 
 export interface EventPermissionRequestParams extends AgenCEventBaseParams {
   readonly requestId: string;
+  readonly callId?: string;
+  /** Set when a spawned sub-agent (or a nested one) asks through its owner. */
+  readonly sourceConversationId?: string;
+  readonly sourceAgentNickname?: string;
+  readonly sourceAgentPath?: string;
   readonly toolName?: string;
   readonly turnId?: string;
   readonly permissions: readonly string[];
@@ -3648,6 +3662,8 @@ export interface PendingToolApproval extends JsonObject {
   readonly requestId: string;
   readonly ownerRunId: string;
   readonly sessionId: string;
+  readonly sourceAgentNickname?: string;
+  readonly sourceAgentPath?: string;
   readonly toolName: string;
   readonly input?: JsonObject;
   readonly turnId?: string;
