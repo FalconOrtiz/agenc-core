@@ -864,8 +864,17 @@ export class RolloutStore {
       }
 
       this.store.open(meta);
+      const liveHistoryRefs =
+        existingEpoch === undefined
+          ? []
+          : this.compactionRetentionRepo
+              .listActiveForSourceBinding(
+                `rollout:${this.rolloutPath}#epoch:${existingEpoch.epoch}`,
+              )
+              .flatMap((pin) => pin.activeHistoryRefs);
       this.store.rewriteFailedCompactionPayloadChunksAtomically(
         COMPACTION_SOURCE_DIGEST_DOMAIN,
+        liveHistoryRefs,
       );
       this.promoteDurableCheckpointSchema(meta);
       this.rebuildLiveToolPairProjection();

@@ -265,6 +265,28 @@ function failedCompactionPayloadExclusions(
   );
 }
 
+/**
+ * Drop only failed-payload lines that sit strictly after every live pin ordinal.
+ * Earlier deletions shift physical source sequences and break retention pins.
+ */
+function exclusionsSafeForLiveOrdinals(
+  exclusions: readonly RolloutPhysicalLineExclusion[],
+  liveHistoryRefs: readonly {
+    readonly first_sequence: number;
+    readonly last_sequence: number;
+  }[],
+): readonly RolloutPhysicalLineExclusion[] {
+  if (exclusions.length === 0 || liveHistoryRefs.length === 0) {
+    return exclusions;
+  }
+  const maxLiveOrdinal = Math.max(
+    ...liveHistoryRefs.map((ref) => ref.last_sequence),
+  );
+  return exclusions.filter(
+    (exclusion) => exclusion.lineNumber > maxLiveOrdinal,
+  );
+}
+
 // OOM: bound the per-session monotonic indices (`toolResultBytesByTurn`,
 // `tokenEstimateByTurn`, `toolCallTurnIds`, `offsetsBySeq`). These are advisory
 // accumulators — the rollout JSONL is the source of truth (I-25), the live
@@ -3025,10 +3047,21 @@ export class SessionStore {
   /**
    * Drop payload chunks whose attempt already recorded compaction_failed.
    * Schema-invalid chunks still match by physical digest and type fields.
+   * Live retention pin ordinals are preserved: deletions at or before those
+   * sequences are rejected, matching physical source pruning.
    */
-  rewriteFailedCompactionPayloadChunksAtomically(digestDomain: string): void {
+  rewriteFailedCompactionPayloadChunksAtomically(
+    digestDomain: string,
+    liveHistoryRefs: readonly {
+      readonly first_sequence: number;
+      readonly last_sequence: number;
+    }[] = [],
+  ): void {
     const bytes = this.readCurrentRolloutBytes();
-    const exclusions = failedCompactionPayloadExclusions(bytes, digestDomain);
+    const exclusions = exclusionsSafeForLiveOrdinals(
+      failedCompactionPayloadExclusions(bytes, digestDomain),
+      liveHistoryRefs,
+    );
     if (exclusions.length === 0) return;
     this.rewriteRolloutExcludingPhysicalLinesAtomically(
       exclusions,

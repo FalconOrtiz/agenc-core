@@ -1054,6 +1054,116 @@ describe("RolloutStore transactional compaction", () => {
     }
   });
 
+  it("preserves failed-attempt payload ordinals under a later pinned compaction across restart and source release", () => {
+    let nowMs = Date.now();
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "failed-then-pinned-ordinals";
+    const failedAttemptId = "early-failed-attempt";
+    const store = openStore(
+      sessionId,
+      { nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    let pinnedAttemptId: string;
+    let pinnedCommittedAtMs: number;
+    let expectedSourceSha256: string;
+    let expectedActiveHistoryRefs: ReturnType<
+      RolloutStore["prepareSource"]
+    >["source"]["active_history_refs"];
+    try {
+      store.appendRollout(
+        {
+          type: "response_item",
+          payload: { role: "user", content: "pre-fail keep" },
+        },
+        { durable: true },
+      );
+      const prepared = store.prepareSource(failedAttemptId, []);
+      const intent: CompactionIntentV1 = {
+        format_version: COMPACTION_EVENT_FORMAT_VERSION,
+        minimum_reader_runtime: COMPACTION_MINIMUM_READER_RUNTIME,
+        attempt_id: failedAttemptId,
+        recorded_at_ms: nowMs,
+        source: prepared.source,
+        policy_digest: "ab".repeat(32),
+        configuration_digest: "cd".repeat(32),
+        accounting_ref: "ef".repeat(32),
+        automatic: false,
+        selected_history_indexes: [0],
+        admission_required: true,
+        planned_provider_calls: 1,
+      };
+      store.pinAndRecordIntent(intent, sourcePayloadBundles(prepared, intent));
+      store.recordFailure({
+        format_version: COMPACTION_EVENT_FORMAT_VERSION,
+        minimum_reader_runtime: COMPACTION_MINIMUM_READER_RUNTIME,
+        attempt_id: failedAttemptId,
+        recorded_at_ms: nowMs + 1,
+        source_sha256: prepared.source.source_sha256,
+        history_digest: prepared.source.history_digest,
+        reason: "commit_failed",
+        detail_digest: "5".repeat(64),
+      });
+
+      const pinned = commitSmallCompaction(store, "later-pinned-attempt");
+      pinnedAttemptId = pinned.intent.attempt_id;
+      pinnedCommittedAtMs = pinned.committedAtMs;
+      store.markProjectionComplete(pinnedAttemptId);
+      expect(
+        readTestRolloutRows(store.rolloutPath).some(
+          (row) =>
+            row.type === "compaction_payload_chunk" &&
+            (row.payload as CompactionPayloadChunkV1).attempt_id ===
+              failedAttemptId,
+        ),
+      ).toBe(true);
+      const expected = store.prepareSource("ordinal-verify-after-restart", []);
+      expectedSourceSha256 = expected.source.source_sha256;
+      expectedActiveHistoryRefs = expected.source.active_history_refs;
+    } finally {
+      store.close();
+    }
+
+    const reopened = openStore(
+      sessionId,
+      { resume: true, nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    try {
+      const rows = readTestRolloutRows(reopened.rolloutPath);
+      expect(
+        rows.some(
+          (row) =>
+            row.type === "compaction_payload_chunk" &&
+            (row.payload as CompactionPayloadChunkV1).attempt_id ===
+              failedAttemptId,
+        ),
+      ).toBe(true);
+      const verified = reopened.prepareSource("ordinal-verify-after-restart", []);
+      expect(verified.source.source_sha256).toBe(expectedSourceSha256);
+      expect(verified.source.active_history_refs).toEqual(
+        expectedActiveHistoryRefs,
+      );
+
+      nowMs = pinnedCommittedAtMs + COMPACTION_ROLLBACK_RETENTION_MS;
+      expect(() =>
+        reopened.beginCompactionSourceRelease({
+          attemptId: pinnedAttemptId,
+          nowMs,
+        }),
+      ).not.toThrow();
+      expect(
+        reopened.resumeCompactionSourceRelease({
+          attemptId: pinnedAttemptId,
+          nowMs: nowMs + 1,
+        }),
+      ).toBe(true);
+    } finally {
+      reopened.close();
+    }
+  });
+
   it("binds a persisted rollback to the hydrated canonical commit digest", () => {
     const cwd = createTestWorkspace();
     temporaryWorkspaces.push(cwd);
