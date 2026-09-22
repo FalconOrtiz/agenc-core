@@ -253,14 +253,17 @@ describe('AgentTool loadAgentsDir adapter', () => {
     vi.stubEnv('AGENC_HOME', agencHome)
     __setPluginAgentsLoaderForTesting(async () => [])
 
-    const catalog = await loadFreshAgentDefinitions(
-      workspace,
-      testPluginStorageRoot,
-    )
-
-    expect(
-      catalog.allAgents.map(definition => definition.agentType),
-    ).not.toContain('hardlinked-external')
+    for (const nativeSearch of ['1', '']) {
+      vi.stubEnv('AGENC_USE_NATIVE_FILE_SEARCH', nativeSearch)
+      clearAgentDefinitionsCache()
+      const catalog = await loadFreshAgentDefinitions(
+        workspace,
+        testPluginStorageRoot,
+      )
+      expect(
+        catalog.allAgents.map(definition => definition.agentType),
+      ).not.toContain('hardlinked-external')
+    }
   })
 
   test('applies source precedence when active agents collide by type', () => {
@@ -301,7 +304,7 @@ describe('AgentTool loadAgentsDir adapter', () => {
       tools: ['Read', 1, 'Grep'],
       disallowedTools: ['Write'],
       model: 'inherit',
-      effort: 'high',
+      effort: 'minimal',
       permissionMode: 'plan',
       mcpServers: ['github', { slack: { type: 'stdio', command: 'slack-mcp' } }],
       hooks: { PreToolUse: [] },
@@ -320,7 +323,7 @@ describe('AgentTool loadAgentsDir adapter', () => {
       tools: ['Read', 'Grep', 'Write', 'Edit', 'FileRead'],
       disallowedTools: ['Write'],
       model: 'inherit',
-      effort: 'high',
+      effort: 'minimal',
       permissionMode: 'plan',
       mcpServers: ['github', { slack: { type: 'stdio', command: 'slack-mcp' } }],
       hooks: { PreToolUse: [] },
@@ -396,37 +399,27 @@ describe('AgentTool loadAgentsDir adapter', () => {
     expect(parsed).not.toHaveProperty('memory')
   })
 
-  test('rejects remote isolation outside internal builds', () => {
-    const previousUserType = process.env.USER_TYPE
-    delete process.env.USER_TYPE
-    try {
-      expect(
-        parseAgentFromJson('remote-json', {
-          description: 'Remote JSON',
-          prompt: 'Run remotely.',
-          isolation: 'remote',
-        }),
-      ).not.toMatchObject({ isolation: 'remote' })
+  test('rejects remote isolation', () => {
+    expect(
+      parseAgentFromJson('remote-json', {
+        description: 'Remote JSON',
+        prompt: 'Run remotely.',
+        isolation: 'remote',
+      }),
+    ).not.toMatchObject({ isolation: 'remote' })
 
-      const parsed = parseAgentFromMarkdown(
-        '/repo/.agenc/agents/remote.md',
-        '/repo/.agenc/agents',
-        {
-          name: 'remote-markdown',
-          description: 'Remote markdown',
-          isolation: 'remote',
-        },
-        'Run remotely.',
-        'projectSettings',
-      )
-      expect(parsed).not.toMatchObject({ isolation: 'remote' })
-    } finally {
-      if (previousUserType === undefined) {
-        delete process.env.USER_TYPE
-      } else {
-        process.env.USER_TYPE = previousUserType
-      }
-    }
+    const parsed = parseAgentFromMarkdown(
+      '/repo/.agenc/agents/remote.md',
+      '/repo/.agenc/agents',
+      {
+        name: 'remote-markdown',
+        description: 'Remote markdown',
+        isolation: 'remote',
+      },
+      'Run remotely.',
+      'projectSettings',
+    )
+    expect(parsed).not.toMatchObject({ isolation: 'remote' })
   })
 
   test('omits invalid hook and MCP server settings', () => {

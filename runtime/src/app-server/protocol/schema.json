@@ -8,6 +8,32 @@
     "export": "./daemon-json-rpc.schema.json"
   },
   "x-agenc-methods": [
+    "remote.capabilities",
+    "remote.status",
+    "remote.start",
+    "remote.stop",
+    "remote.pair.begin",
+    "remote.pair.refresh",
+    "remote.pair.cancel",
+    "remote.devices",
+    "remote.pending",
+    "remote.approve",
+    "remote.revoke",
+    "telegram.capabilities",
+    "telegram.status",
+    "telegram.configure",
+    "telegram.start",
+    "telegram.stop",
+    "telegram.revoke",
+    "telegram.agents.list",
+    "telegram.agents.create",
+    "telegram.agents.update",
+    "telegram.agents.start",
+    "telegram.agents.stop",
+    "telegram.agents.remove",
+    "telegram.agents.pair.begin",
+    "telegram.agents.pair.confirm",
+    "telegram.agents.pair.cancel",
     "initialize",
     "request.cancel",
     "agent.create",
@@ -21,6 +47,15 @@
     "run.evidence",
     "run.cancel",
     "run.start",
+    "routine.capabilities",
+    "routine.list",
+    "routine.get",
+    "routine.create",
+    "routine.update",
+    "routine.delete",
+    "routine.run",
+    "routine.runs",
+    "routine.cancel",
     "csvJob.review.list",
     "csvJob.review.show",
     "csvJob.review.resolve",
@@ -64,6 +99,7 @@
     "auth.logout"
   ],
   "x-agenc-notifications": [
+    "routine.updated",
     "commandExec.outputDelta",
     "event.message_chunk",
     "event.tool_request",
@@ -83,6 +119,11 @@
     "thread/realtime/error",
     "thread/realtime/closed"
   ],
+  "x-agenc-whisper-internal-methods": [
+    "audio.whisper.status",
+    "audio.whisper.install",
+    "audio.whisper.transcribe"
+  ],
   "oneOf": [
     {
       "$ref": "#/definitions/AgenCDaemonRequest"
@@ -98,6 +139,1292 @@
     }
   ],
   "definitions": {
+    "WhisperModel": { "type": "string", "enum": ["base", "small"] },
+    "WhisperLanguage": { "type": "string", "enum": ["auto", "en", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk", "zh", "ja", "ko", "ar", "hi", "tr"] },
+    "WhisperStatusParams": { "type": "object", "additionalProperties": false },
+    "WhisperInstallParams": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "model": { "$ref": "#/definitions/WhisperModel" } },
+      "required": ["model"]
+    },
+    "WhisperTranscribeParams": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "model": { "$ref": "#/definitions/WhisperModel" },
+        "language": { "$ref": "#/definitions/WhisperLanguage" },
+        "task": { "type": "string", "enum": ["transcribe", "translate"], "default": "transcribe" },
+        "compute": { "type": "string", "enum": ["auto", "cpu"], "default": "auto" },
+        "prompt": { "type": "string", "maxLength": 500, "pattern": "^[^\\u0000-\\u001f\\u007f]*$", "description": "Vocabulary hints; runtime additionally bounds UTF-16 code units to 500." },
+        "audio": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "mimeType": { "const": "audio/wav" },
+            "data": { "type": "string", "minLength": 64, "maxLength": 1280060, "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$", "description": "Canonical PCM16 mono 16 kHz WAV, at most 30 seconds; runtime validates base64 padding bits and every header field." }
+          },
+          "required": ["mimeType", "data"]
+        }
+      },
+      "required": ["model", "language", "audio"]
+    },
+    "WhisperStatus": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "engine": { "const": "whisper.cpp" },
+        "optionsVersion": { "const": 1 },
+        "available": { "type": "boolean" },
+        "reason": { "type": "string", "maxLength": 500 },
+        "models": {
+          "type": "array", "maxItems": 2,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "properties": { "id": { "$ref": "#/definitions/WhisperModel" }, "installed": { "type": "boolean" }, "bytes": { "type": "integer", "enum": [147951465, 487601967] } },
+            "required": ["id", "installed", "bytes"]
+          }
+        }
+      },
+      "required": ["engine", "available", "models"]
+    },
+    "WhisperTranscription": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "text": { "type": "string", "maxLength": 16000 }, "model": { "$ref": "#/definitions/WhisperModel" }, "provider": { "const": "local" } },
+      "required": ["text", "model", "provider"]
+    },
+    "WhisperStatusRequest": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "jsonrpc": { "const": "2.0" }, "id": { "$ref": "#/definitions/RequestId" }, "method": { "const": "audio.whisper.status" }, "params": { "$ref": "#/definitions/WhisperStatusParams" } },
+      "required": ["jsonrpc", "id", "method", "params"]
+    },
+    "WhisperInstallRequest": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "jsonrpc": { "const": "2.0" }, "id": { "$ref": "#/definitions/RequestId" }, "method": { "const": "audio.whisper.install" }, "params": { "$ref": "#/definitions/WhisperInstallParams" } },
+      "required": ["jsonrpc", "id", "method", "params"]
+    },
+    "WhisperTranscribeRequest": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "jsonrpc": { "const": "2.0" }, "id": { "$ref": "#/definitions/RequestId" }, "method": { "const": "audio.whisper.transcribe" }, "params": { "$ref": "#/definitions/WhisperTranscribeParams" } },
+      "required": ["jsonrpc", "id", "method", "params"]
+    },
+    "WhisperInternalRequest": {
+      "description": "Opt-in local authenticated client extension; not part of the public request union or remote browser grant surface.",
+      "oneOf": [{ "$ref": "#/definitions/WhisperStatusRequest" }, { "$ref": "#/definitions/WhisperInstallRequest" }, { "$ref": "#/definitions/WhisperTranscribeRequest" }]
+    },
+    "RemoteCapabilitiesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.capabilities" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteStatusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.status" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteStartRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.start" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteStopRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.stop" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemotePairBeginRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.pair.begin" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemotePairRefreshRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.pair.refresh" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemotePairCancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.pair.cancel" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteDevicesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.devices" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemotePendingRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.pending" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteApproveRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.approve" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "RemoteRevokeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "remote.revoke" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramCapabilitiesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.capabilities" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramStatusRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.status" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramConfigureRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.configure" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramStartRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.start" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramStopRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.stop" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramRevokeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/definitions/RequestId" },
+        "method": { "const": "telegram.revoke" },
+        "params": { "$ref": "#/definitions/JsonObject" }
+      },
+      "required": ["jsonrpc", "id", "method"]
+    },
+    "TelegramAgentsListRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.list"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.create"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsUpdateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.update"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsStartRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.start"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsStopRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.stop"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsRemoveRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.remove"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsPairBeginRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.pair.begin"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsPairConfirmRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.pair.confirm"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "TelegramAgentsPairCancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "telegram.agents.pair.cancel"
+        },
+        "params": {
+          "$ref": "#/definitions/JsonObject"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "RoutineSchedule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "manual"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "cron"
+            },
+            "expression": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          },
+          "required": [
+            "kind",
+            "expression"
+          ]
+        }
+      ]
+    },
+    "RoutineWorkspaceExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "dev": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[0-9]{1,32}(?![\\s\\S])"
+        },
+        "ino": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[0-9]{1,32}(?![\\s\\S])"
+        }
+      },
+      "required": [
+        "cwd",
+        "dev",
+        "ino"
+      ]
+    },
+    "RoutineCreateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "schedule": {
+          "$ref": "#/definitions/RoutineSchedule"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "model": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "permissionMode": {
+          "enum": [
+            "default",
+            "plan"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "notifyOnCompletion": {
+          "type": "boolean"
+        },
+        "expectedWorkspace": {
+          "$ref": "#/definitions/RoutineWorkspaceExpectation"
+        }
+      },
+      "required": [
+        "name",
+        "instructions",
+        "cwd",
+        "schedule"
+      ]
+    },
+    "RoutineIdParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "RoutineUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "patch": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "description": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 2048
+            },
+            "instructions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384
+            },
+            "cwd": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "schedule": {
+              "$ref": "#/definitions/RoutineSchedule"
+            },
+            "provider": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 256
+            },
+            "model": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 256
+            },
+            "permissionMode": {
+              "enum": [
+                "default",
+                "plan"
+              ]
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "notifyOnCompletion": {
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "minProperties": 1
+        },
+        "expectedUpdatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "expectedWorkspace": {
+          "$ref": "#/definitions/RoutineWorkspaceExpectation"
+        }
+      },
+      "required": [
+        "id",
+        "patch"
+      ],
+      "dependencies": {
+        "expectedWorkspace": {
+          "properties": {
+            "patch": {
+              "required": [
+                "cwd"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "RoutineDeleteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedUpdatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "RoutineRunParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "expectedUpdatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "RoutineRunsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "RoutineCancelParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "runId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "RoutineRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "routineId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "enum": [
+            "starting",
+            "running",
+            "waiting_permission",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted"
+          ]
+        },
+        "trigger": {
+          "enum": [
+            "manual",
+            "schedule"
+          ]
+        },
+        "startedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "finishedAt": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agentId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coreRunId": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "routineId",
+        "status",
+        "trigger",
+        "startedAt",
+        "finishedAt",
+        "agentId",
+        "sessionId",
+        "coreRunId",
+        "error"
+      ]
+    },
+    "Routine": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2048
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "schedule": {
+          "$ref": "#/definitions/RoutineSchedule"
+        },
+        "provider": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "model": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "permissionMode": {
+          "enum": [
+            "default",
+            "plan"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "notifyOnCompletion": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "nextRunAt": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastRun": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RoutineRun"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "instructions",
+        "cwd",
+        "schedule",
+        "permissionMode",
+        "enabled",
+        "notifyOnCompletion",
+        "id",
+        "createdAt",
+        "updatedAt",
+        "nextRunAt",
+        "lastRun"
+      ]
+    },
+    "RoutineCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "available": {
+          "const": true
+        },
+        "scheduleKinds": {
+          "const": [
+            "manual",
+            "cron"
+          ]
+        },
+        "permissionModes": {
+          "const": [
+            "default",
+            "plan"
+          ]
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "executionMode": {
+          "const": "local"
+        },
+        "maxRoutines": {
+          "const": 100
+        },
+        "maxRunsPerRoutine": {
+          "const": 50
+        }
+      },
+      "required": [
+        "version",
+        "available",
+        "scheduleKinds",
+        "permissionModes",
+        "timezone",
+        "executionMode",
+        "maxRoutines",
+        "maxRunsPerRoutine"
+      ]
+    },
+    "RoutineUpdatedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason": {
+          "enum": [
+            "created",
+            "updated",
+            "deleted",
+            "run"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "reason"
+      ]
+    },
+    "RoutineUpdatedNotification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "method": {
+          "const": "routine.updated"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineUpdatedEvent"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineCapabilitiesRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.capabilities"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "RoutineListRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.list"
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {},
+          "required": []
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method"
+      ]
+    },
+    "RoutineGetRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.get"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineIdParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineCreateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.create"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineCreateParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineUpdateRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.update"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineUpdateParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineDeleteRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.delete"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineDeleteParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineRunRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.run"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineRunParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineRunsRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.runs"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineRunsParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
+    "RoutineCancelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "jsonrpc": {
+          "const": "2.0"
+        },
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "const": "routine.cancel"
+        },
+        "params": {
+          "$ref": "#/definitions/RoutineCancelParams"
+        }
+      },
+      "required": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ]
+    },
     "RequestId": {
       "oneOf": [
         {
@@ -249,6 +1576,14 @@
         },
         "instructions": {
           "type": "string"
+        },
+        "addDirs": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         },
         "unattendedAllow": {
           "type": "array",
@@ -1029,6 +2364,31 @@
         },
         "required": {
           "type": "boolean"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "localOnly": {
+          "type": "boolean"
+        },
+        "desktopAuthority": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "signature"
+          ]
         }
       },
       "required": [
@@ -1045,6 +2405,9 @@
         },
         "config": {
           "$ref": "#/definitions/SessionMcpServerConfig"
+        },
+        "replace": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -2358,6 +3721,41 @@
     },
     "AgenCDaemonRequest": {
       "oneOf": [
+        { "$ref": "#/definitions/RemoteCapabilitiesRequest" },
+        { "$ref": "#/definitions/RemoteStatusRequest" },
+        { "$ref": "#/definitions/RemoteStartRequest" },
+        { "$ref": "#/definitions/RemoteStopRequest" },
+        { "$ref": "#/definitions/RemotePairBeginRequest" },
+        { "$ref": "#/definitions/RemotePairRefreshRequest" },
+        { "$ref": "#/definitions/RemotePairCancelRequest" },
+        { "$ref": "#/definitions/RemoteDevicesRequest" },
+        { "$ref": "#/definitions/RemotePendingRequest" },
+        { "$ref": "#/definitions/RemoteApproveRequest" },
+        { "$ref": "#/definitions/RemoteRevokeRequest" },
+        { "$ref": "#/definitions/TelegramCapabilitiesRequest" },
+        { "$ref": "#/definitions/TelegramStatusRequest" },
+        { "$ref": "#/definitions/TelegramConfigureRequest" },
+        { "$ref": "#/definitions/TelegramStartRequest" },
+        { "$ref": "#/definitions/TelegramStopRequest" },
+        { "$ref": "#/definitions/TelegramRevokeRequest" },
+        { "$ref": "#/definitions/TelegramAgentsListRequest" },
+        { "$ref": "#/definitions/TelegramAgentsCreateRequest" },
+        { "$ref": "#/definitions/TelegramAgentsUpdateRequest" },
+        { "$ref": "#/definitions/TelegramAgentsStartRequest" },
+        { "$ref": "#/definitions/TelegramAgentsStopRequest" },
+        { "$ref": "#/definitions/TelegramAgentsRemoveRequest" },
+        { "$ref": "#/definitions/TelegramAgentsPairBeginRequest" },
+        { "$ref": "#/definitions/TelegramAgentsPairConfirmRequest" },
+        { "$ref": "#/definitions/TelegramAgentsPairCancelRequest" },
+        { "$ref": "#/definitions/RoutineCapabilitiesRequest" },
+        { "$ref": "#/definitions/RoutineListRequest" },
+        { "$ref": "#/definitions/RoutineGetRequest" },
+        { "$ref": "#/definitions/RoutineCreateRequest" },
+        { "$ref": "#/definitions/RoutineUpdateRequest" },
+        { "$ref": "#/definitions/RoutineDeleteRequest" },
+        { "$ref": "#/definitions/RoutineRunRequest" },
+        { "$ref": "#/definitions/RoutineRunsRequest" },
+        { "$ref": "#/definitions/RoutineCancelRequest" },
         {
           "$ref": "#/definitions/InitializeRequest"
         },
@@ -2524,6 +3922,7 @@
     },
     "AgenCDaemonNotification": {
       "oneOf": [
+        { "$ref": "#/definitions/RoutineUpdatedNotification" },
         {
           "$ref": "#/definitions/CommandExecOutputDeltaNotification"
         },

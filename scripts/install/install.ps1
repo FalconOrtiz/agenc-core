@@ -1414,6 +1414,7 @@ try {
   # --- download + verify + extract (idempotent via the marker contract) -----
 
   $RuntimeInstaller = @'
+// BEGIN GENERATED AGENC RUNTIME INSTALLER PROGRAM
 const { spawnSync } = require("node:child_process");
 const { createHash, randomUUID } = require("node:crypto");
 const {
@@ -1895,9 +1896,15 @@ function strictMarkerMatches(path) {
   } catch { return false; }
 }
 const PROVENANCE_RECEIPT_NAME = ".agenc-runtime-provenance-v1.json";
+function compareAsciiKeys(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
 function exactKeys(value, expected) {
   return value !== null && typeof value === "object" && !Array.isArray(value) &&
-    Object.keys(value).sort().join("\0") === [...expected].sort().join("\0");
+    Object.keys(value).sort(compareAsciiKeys).join("\0") ===
+      [...expected].sort(compareAsciiKeys).join("\0");
 }
 function decodeProvenanceJson(encoded, label) {
   if (encoded === "" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
@@ -2562,6 +2569,7 @@ main().catch((error) => {
   console.error(installerErrorMessages(error).join("\n"));
   process.exitCode = 1;
 });
+// END GENERATED AGENC RUNTIME INSTALLER PROGRAM
 '@
   $runtimeInstallerPath = Join-Path $work "runtime-installer.cjs"
   Set-Content -LiteralPath $runtimeInstallerPath -Value $RuntimeInstaller -Encoding UTF8

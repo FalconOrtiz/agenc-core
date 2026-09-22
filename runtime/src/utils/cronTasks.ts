@@ -10,8 +10,7 @@
 //   { "tasks": [{ id, cron, prompt, createdAt, recurring?, permanent? }] }
 
 import { randomUUID } from "crypto";
-import { readFileSync } from "fs";
-import { mkdir, readFile, writeFile } from "fs/promises";
+import { lstat } from "node:fs/promises";
 import { join } from "path";
 import {
   addSessionCronTask,
@@ -21,7 +20,12 @@ import {
 } from "../bootstrap/state.js";
 import { computeNextCronRun, parseCronExpression } from "./cron.js";
 import { logForDebugging } from "./debug.js";
-import { isFsInaccessible } from "./errors.js";
+import { acquireCronStorageLock, withCronStorage } from "./cron-storage.js";
+import {
+  MAX_CRON_FILE_BYTES,
+  parseCronDeliveryOutbox,
+  type CronDeliveryOutbox,
+} from "./cron-delivery-state.js";
 
 /**
  * Delivery routing for gateway-executed cron tasks (TODO task 16). A task
@@ -98,7 +102,10 @@ export type CronSessionQueueOwner = {
   readonly conversationId: string;
 };
 
-type CronFile = { tasks: CronTask[] };
+export type CronFile = {
+  tasks: CronTask[];
+  deliveryOutbox?: CronDeliveryOutbox;
+};
 
 const CRON_FILE_REL = join(".agenc", "scheduled_tasks.json");
 
@@ -121,20 +128,41 @@ export function getCronFilePath(dir?: string): string {
 
 /**
  * Read and parse .agenc/scheduled_tasks.json. Returns an empty task list if the file
- * is missing, empty, or malformed. Tasks with invalid cron strings are
+ * is missing, empty, or malformed. Unsafe storage and unavailable confinement
+ * are errors, so callers can show a diagnostic instead of an empty schedule.
+ * Tasks with invalid cron strings are
  * silently dropped (logged at debug level) so a single bad entry never
  * blocks the whole file.
  */
 export async function readCronTasks(dir?: string): Promise<CronTask[]> {
-  let raw: string;
   try {
-    raw = await readFile(getCronFilePath(dir), { encoding: "utf-8" });
-  } catch (e: unknown) {
-    if (isFsInaccessible(e)) return [];
-    return [];
+    const raw = await withCronStorage(dir ?? getProjectRoot(), false, (storage) => storage.read());
+    return raw === undefined ? [] : parseCronTaskRecords(parseCronJson(raw));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
   }
+}
 
-  const parsed = parseCronJson(raw);
+/**
+ * Whether a failed startup restore of durable tasks deserves a warning. A
+ * platform without descriptor-confined I/O (macOS, Windows) cannot restore
+ * durable tasks at all, but a workspace that never had a durable record has
+ * nothing to restore, and a warning in every session there buries real
+ * failures. Every other failure, and a record that exists but cannot be
+ * restored, is reported.
+ */
+export async function cronRestoreFailureNeedsWarning(error: unknown, dir?: string): Promise<boolean> {
+  if ((error as { code?: unknown } | null)?.code !== "DESCRIPTOR_UNSUPPORTED") return true;
+  try {
+    await lstat(getCronFilePath(dir));
+    return true;
+  } catch (statError) {
+    return (statError as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
+function parseCronTaskRecords(parsed: unknown): CronTask[] {
   if (!parsed || typeof parsed !== "object") return [];
   const file = parsed as Partial<CronFile>;
   if (!Array.isArray(file.tasks)) return [];
@@ -177,24 +205,6 @@ export async function readCronTasks(dir?: string): Promise<CronTask[]> {
 }
 
 /**
- * Sync check for whether the cron file has any valid tasks. Used by
- * cronScheduler.start() to decide whether to auto-enable. One file read.
- */
-export function hasCronTasksSync(dir?: string): boolean {
-  let raw: string;
-  try {
-    // eslint-disable-next-line custom-rules/no-sync-fs -- called once from cronScheduler.start()
-    raw = readFileSync(getCronFilePath(dir), "utf-8");
-  } catch {
-    return false;
-  }
-  const parsed = parseCronJson(raw);
-  if (!parsed || typeof parsed !== "object") return false;
-  const tasks = (parsed as Partial<CronFile>).tasks;
-  return Array.isArray(tasks) && tasks.length > 0;
-}
-
-/**
  * Overwrite .agenc/scheduled_tasks.json with the given tasks. Creates .agenc/ if
  * missing. Empty task list writes an empty file (rather than deleting) so
  * the file watcher sees a change event on last-task-removed.
@@ -203,26 +213,87 @@ export async function writeCronTasks(
   tasks: CronTask[],
   dir?: string,
 ): Promise<void> {
-  const root = dir ?? getProjectRoot();
-  await mkdir(join(root, ".agenc"), { recursive: true });
-  // Strip runtime-only routing fields. Everything on disk is durable by
-  // definition and binds to the scheduler activation that loads it. Persisting
-  // a conversation owner here would route a restarted task to a stale session.
-  const body: CronFile = {
-    tasks: tasks.map(
-      ({
-        durable: _durable,
-        queueOwner: _queueOwner,
-        agentId: _agentId,
-        ...rest
-      }) => rest,
-    ),
+  await mutateCronFile(dir, (state) => {
+    state.tasks = tasks;
+    if (state.deliveryOutbox !== undefined) {
+      const taskIds = new Set(tasks.map((task) => task.id));
+      state.deliveryOutbox.occurrences = state.deliveryOutbox.occurrences.filter(
+        (entry) => entry.completedAt !== undefined || taskIds.has(entry.taskId),
+      );
+    }
+  });
+}
+
+export async function readCronFile(dir?: string): Promise<CronFile> {
+  try {
+    return await withCronStorage(dir ?? getProjectRoot(), false, async (storage) =>
+      parseCronFile(await storage.read())) ?? { tasks: [] };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { tasks: [] };
+    throw error;
+  }
+}
+
+function parseCronFile(raw: string | undefined): CronFile {
+  if (raw === undefined) return { tasks: [] };
+  const parsed = parseCronJson(raw);
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    !Array.isArray((parsed as CronFile).tasks)
+  ) {
+    throw new Error("Invalid cron task file; preserve it for recovery");
+  }
+  const outbox = (parsed as { deliveryOutbox?: unknown }).deliveryOutbox;
+  return {
+    tasks: parseCronTaskRecords(parsed),
+    ...(outbox !== undefined
+      ? { deliveryOutbox: parseCronDeliveryOutbox(outbox) }
+      : {}),
   };
-  await writeFile(
-    getCronFilePath(root),
-    JSON.stringify(body, null, 2) + "\n",
-    "utf-8",
-  );
+}
+
+export async function mutateCronFile<Result>(
+  dir: string | undefined,
+  mutate: (state: CronFile) => Result,
+  expectedWorkspaceIdentity?: string,
+): Promise<Result> {
+  return (await withCronStorage(dir ?? getProjectRoot(), true, async (storage) => {
+    const release = await acquireCronStorageLock(storage, "tasks", {
+      timeoutMs: 5_000, label: "cron task transaction",
+    });
+    try {
+      const state = parseCronFile(await storage.read());
+      const result = mutate(state);
+      const body: CronFile = {
+        tasks: state.tasks.map(
+          ({
+            durable: _durable,
+            queueOwner: _queueOwner,
+            agentId: _agentId,
+            ...task
+          }) => task,
+        ),
+        ...(state.deliveryOutbox !== undefined
+          ? { deliveryOutbox: parseCronDeliveryOutbox(state.deliveryOutbox) }
+          : {}),
+      };
+      const serialized = `${JSON.stringify(body, null, 2)}\n`;
+      if (Buffer.byteLength(serialized, "utf8") > MAX_CRON_FILE_BYTES) {
+        throw new Error("Cron task file exceeds its storage limit");
+      }
+      await storage.write(serialized);
+      return result;
+    } finally {
+      release();
+    }
+  }, expectedWorkspaceIdentity)) as Result;
+}
+
+export async function appendCronTask(task: CronTask, dir?: string): Promise<void> {
+  await mutateCronFile(dir, (state) => {
+    state.tasks.push(task);
+  });
 }
 
 /**
@@ -275,9 +346,7 @@ export async function addCronTask(
     });
     return id;
   }
-  const tasks = await readCronTasks(dir);
-  tasks.push(task);
-  await writeCronTasks(tasks, dir);
+  await appendCronTask(task, dir);
   return id;
 }
 
@@ -338,10 +407,14 @@ export async function removeCronTasks(
     return;
   }
   const idSet = new Set(ids);
-  const tasks = await readCronTasks(dir);
-  const remaining = tasks.filter((t) => !idSet.has(t.id));
-  if (remaining.length === tasks.length) return;
-  await writeCronTasks(remaining, dir);
+  await mutateCronFile(dir, (state) => {
+    state.tasks = state.tasks.filter((task) => !idSet.has(task.id));
+    if (state.deliveryOutbox !== undefined) {
+      state.deliveryOutbox.occurrences = state.deliveryOutbox.occurrences.filter(
+        (entry) => !idSet.has(entry.taskId),
+      );
+    }
+  });
 }
 
 /**
@@ -362,16 +435,11 @@ export async function markCronTasksFired(
 ): Promise<void> {
   if (ids.length === 0) return;
   const idSet = new Set(ids);
-  const tasks = await readCronTasks(dir);
-  let changed = false;
-  for (const t of tasks) {
-    if (idSet.has(t.id)) {
-      t.lastFiredAt = firedAt;
-      changed = true;
+  await mutateCronFile(dir, (state) => {
+    for (const task of state.tasks) {
+      if (idSet.has(task.id)) task.lastFiredAt = firedAt;
     }
-  }
-  if (!changed) return;
-  await writeCronTasks(tasks, dir);
+  });
 }
 
 /**
@@ -388,6 +456,11 @@ export async function listAllCronTasks(
 ): Promise<CronTask[]> {
   const fileTasks = await readCronTasks(dir);
   if (conversationId === undefined) return fileTasks;
+  return [...fileTasks, ...listSessionCronTasks(conversationId)];
+}
+
+/** In-memory ownership lookup; must never fall through to the durable file. */
+export function listSessionCronTasks(conversationId: string): CronTask[] {
   const sessionTasks = getSessionCronTasks()
     .filter((t) => t.queueOwner.conversationId === conversationId)
     .map((t) => ({
@@ -395,7 +468,7 @@ export async function listAllCronTasks(
       queueOwner: { ...t.queueOwner },
       durable: false as const,
     }));
-  return [...fileTasks, ...sessionTasks];
+  return sessionTasks;
 }
 
 /**
@@ -410,10 +483,8 @@ export function nextCronRunMs(cron: string, fromMs: number): number | null {
 }
 
 /**
- * Cron scheduler tuning knobs. Sourced at runtime from the
- * `tengu_kairos_cron_config` GrowthBook JSON config (see cronJitterConfig.ts)
- * so ops can adjust behavior fleet-wide without shipping a client build.
- * Defaults here preserve the pre-config behavior exactly.
+ * Cron scheduler tuning knobs (see cronJitterConfig.ts for the config
+ * shape). Defaults here are the shipped behavior.
  */
 export type CronJitterConfig = {
   /** Recurring-task forward delay as a fraction of the interval between fires. */
@@ -511,7 +582,7 @@ export function jitteredNextCronRunMs(
  * At defaults (mod 30, max 90 s, floor 0) only :00 and :30 get jitter,
  * because humans round to the half-hour.
  *
- * During an incident, ops can push `tengu_kairos_cron_config` with e.g.
+ * A cron config such as
  * `{oneShotMinuteMod: 15, oneShotMaxMs: 300000, oneShotFloorMs: 30000}` to
  * spread :00/:15/:30/:45 fires across a [t-5min, t-30s] window — every task
  * gets at least 30 s of lead, so nobody lands on the exact mark.

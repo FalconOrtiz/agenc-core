@@ -1149,31 +1149,6 @@ function migrateRetiredServiceTierAlias(
   }
 }
 
-function migrateRetiredReasoningEffortAlias(
-  config: JsonRecord,
-  scope: ConfigMigrationScope,
-  sourcePath: string,
-  notices: ConfigMigrationNotice[],
-): void {
-  const migrate = (record: JsonRecord, field: string): void => {
-    if (record.reasoning_effort !== "minimal") return;
-    record.reasoning_effort = "low";
-    notices.push(Object.freeze({
-      scope,
-      sourcePath,
-      field,
-      action: "migrate",
-      target: `${field}=low`,
-    }));
-  };
-  migrate(config, "reasoning_effort");
-  if (!isPlainRecord(config.profiles)) return;
-  for (const [profileName, profile] of Object.entries(config.profiles)) {
-    if (!isPlainRecord(profile)) continue;
-    migrate(profile, `profiles.${profileName}.reasoning_effort`);
-  }
-}
-
 function migrateRetiredProviderFallbackModels(
   config: JsonRecord,
   scope: ConfigMigrationScope,
@@ -1667,23 +1642,8 @@ function convertV1Config(
     }
   }
   if (Object.hasOwn(converted, "editorMode")) {
-    const editorMode = converted.editorMode;
     delete converted.editorMode;
-    if (mergeLegacyEditorMode(
-      converted,
-      editorMode,
-      scope,
-      sourcePath,
-      conflicts,
-    )) {
-      notices.push(Object.freeze({
-        scope,
-        sourcePath,
-        field: "editorMode",
-        action: "migrate",
-        target: "tui.vimMode",
-      }));
-    }
+    notices.push(Object.freeze({ scope, sourcePath, field: "editorMode", action: "drop" }));
   }
   if (Object.hasOwn(converted, "enabledPlugins")) {
     const enabledPlugins = converted.enabledPlugins;
@@ -1851,7 +1811,6 @@ function convertV1Config(
     notices,
   );
   migrateRetiredServiceTierAlias(migrated, scope, sourcePath, notices);
-  migrateRetiredReasoningEffortAlias(migrated, scope, sourcePath, notices);
   dropRetiredInactiveConfigFields(migrated, scope, sourcePath, notices);
   return migrated;
 }
@@ -2207,54 +2166,6 @@ function mergeRecord(
   for (const [key, value] of Object.entries(incoming)) {
     mergeValue(target, key, value, { scope, sourcePath, conflicts });
   }
-}
-
-function legacyEditorModeValue(value: unknown): boolean | null {
-  if (value === "vim") return true;
-  if (value === "default" || value === "normal" || value === "emacs") {
-    return false;
-  }
-  return null;
-}
-
-function mergeLegacyEditorMode(
-  config: JsonRecord,
-  value: unknown,
-  scope: ConfigMigrationScope,
-  sourcePath: string,
-  conflicts: ConfigMigrationConflict[],
-): boolean {
-  const vimMode = legacyEditorModeValue(value);
-  if (vimMode === null) {
-    pushConflict(
-      conflicts,
-      scope,
-      sourcePath,
-      'legacy editorMode must be "vim", "default", "normal", or "emacs"',
-      "editorMode",
-    );
-    return false;
-  }
-  if (config.tui !== undefined && !isPlainRecord(config.tui)) {
-    pushConflict(
-      conflicts,
-      scope,
-      sourcePath,
-      "editorMode cannot merge with a non-object tui value",
-      "tui",
-    );
-    return false;
-  }
-  const tui = isPlainRecord(config.tui)
-    ? config.tui
-    : (config.tui = {} as JsonRecord);
-  mergeValue(tui, "vimMode", vimMode, {
-    scope,
-    sourcePath,
-    conflicts,
-    prefix: "tui",
-  });
-  return true;
 }
 
 function mergeLegacyEnabledPlugins(
@@ -3551,15 +3462,7 @@ function consumeGlobalState(
   for (const [field, value] of Object.entries(raw)) {
     const classification = classifyRetiredField("global-state", field);
     if (classification.authority === "config" && classification.target) {
-      if (field === "editorMode") {
-        if (!mergeLegacyEditorMode(
-          userConfig,
-          value,
-          "user",
-          sourcePath,
-          conflicts,
-        )) continue;
-      } else if (field === "env") {
+      if (field === "env") {
         const mapped = mapSettingsConfigValue(field, value);
         if (!mapped) {
           pushConflict(
@@ -3707,7 +3610,6 @@ async function loadTarget(
   migrateRetiredProtocolNoOps(raw, scope, targetPath, notices);
   migrateRetiredApprovalsReviewerAlias(raw, scope, targetPath, notices);
   migrateRetiredServiceTierAlias(raw, scope, targetPath, notices);
-  migrateRetiredReasoningEffortAlias(raw, scope, targetPath, notices);
   dropRetiredInactiveConfigFields(raw, scope, targetPath, notices);
   return {
     scope,
@@ -4771,12 +4673,6 @@ export async function checkConfigV2Migration(
       notices,
     );
     migrateRetiredServiceTierAlias(
-      accumulator.raw,
-      accumulator.scope,
-      accumulator.targetPath,
-      notices,
-    );
-    migrateRetiredReasoningEffortAlias(
       accumulator.raw,
       accumulator.scope,
       accumulator.targetPath,

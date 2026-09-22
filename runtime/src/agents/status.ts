@@ -1,8 +1,7 @@
 /**
  * AgentStatus — subagent lifecycle FSM.
  *
- * Hand-port of reference runtime `core/src/agent/status.rs` (27 LOC). Tracks the
- * state transitions of a spawned subagent from creation through
+ * Tracks the state transitions of a spawned subagent from creation through
  * terminal states.
  *
  * Final states for wait/list semantics: `completed`, `errored`, `shutdown`,
@@ -15,16 +14,16 @@
  *
  * Shutdown, errored, and not_found remain irreversible.
  *
- * `interrupted` is intentionally non-final (matches reference runtime
- * `status.rs` — `is_final` returns false for `Running | PendingInit |
- * Interrupted`). Completion watchers must loop past an interrupt
- * until a truly terminal state arrives.
+ * `interrupted` is intentionally non-final: `isFinal` returns false for
+ * `running`, `pending_init`, and `interrupted`. Completion watchers must
+ * loop past an interrupt until a truly terminal state arrives.
  *
  * @module
  */
 
 import { BehaviorSubject } from "./_deps/behavior-subject.js";
 import { monotonicMs } from "./_deps/monotonic.js";
+import { classifyTurnTerminal } from "../contracts/turn-terminal.js";
 
 export type AgentStatus =
   | { readonly status: "pending_init" }
@@ -91,98 +90,64 @@ export function isFinal(status: AgentStatus): boolean {
 }
 
 /**
- * Hand-port of reference `agent_status_from_event` (status.rs:6-21).
  * Maps an `EventMsg` to the AgentStatus the FSM should transition to,
  * or `undefined` if the event doesn't drive a status change.
  *
- * Reference mapping:
+ * Mapping:
  *   - TurnStarted               -> Running
  *   - TurnComplete              -> Completed(last_agent_message)
  *   - TurnAborted(Interrupted   -> Interrupted
  *                |BudgetLimited)
  *   - TurnAborted(other)        -> Errored(reason)
- *   - Error                     -> Errored(message)
+ *   - TurnFailed                -> Errored(message)
  *   - ShutdownComplete          -> Shutdown
  *   - else                      -> None
  *
  * AgenC's TurnAbortedEvent.reason is a free-text string; the mapper
- * recognizes the two reference interrupt-class reasons and treats anything
+ * recognizes the two interrupt-class reasons and treats anything
  * else as an errored transition.
  */
 export function agentStatusFromEvent(event: {
   readonly type: string;
   readonly payload?: unknown;
 }): AgentStatus | undefined {
-  switch (event.type) {
-    case "turn_started": {
-      const payload =
-        (event.payload as {
-          turnId?: string;
-          startedAt?: number;
-        }) ?? {};
-      return {
-        status: "running",
-        turnId: payload.turnId ?? "",
-        startedAtMs: payload.startedAt ?? Date.now(),
-      };
-    }
-    case "turn_complete": {
-      const payload =
-        (event.payload as {
-          turnId?: string;
-          lastAgentMessage?: string;
-          completedAt?: number;
-        }) ?? {};
-      return {
-        status: "completed",
-        turnId: payload.turnId ?? "",
-        endedAtMs: payload.completedAt ?? Date.now(),
-        ...(payload.lastAgentMessage !== undefined
-          ? { lastMessage: payload.lastAgentMessage }
-          : {}),
-      };
-    }
-    case "turn_aborted": {
-      const payload =
-        (event.payload as {
-          turnId?: string;
-          reason?: string;
-        }) ?? {};
-      const reason = (payload.reason ?? "").toLowerCase();
-      const isInterruptClass =
-        reason.includes("interrupt") || reason.includes("budget");
-      const endedAtMs = Date.now();
-      if (isInterruptClass) {
-        return {
-          status: "interrupted",
-          turnId: payload.turnId ?? "",
-          endedAtMs,
-          reason: payload.reason ?? "interrupted",
-        };
-      }
-      return {
-        status: "errored",
-        turnId: payload.turnId ?? "",
-        endedAtMs,
-        error: payload.reason ?? "errored",
-      };
-    }
-    case "error": {
-      const payload =
-        (event.payload as {
-          turnId?: string;
-          message?: string;
-        }) ?? {};
-      return {
-        status: "errored",
-        turnId: payload.turnId ?? "",
-        endedAtMs: Date.now(),
-        error: payload.message ?? "error",
-      };
-    }
-    default:
-      return undefined;
+  if (event.type === "turn_started") {
+    const payload = (event.payload as { turnId?: string; startedAt?: number }) ?? {};
+    return {
+      status: "running",
+      turnId: payload.turnId ?? "",
+      startedAtMs: payload.startedAt ?? Date.now(),
+    };
   }
+  const terminal = classifyTurnTerminal(event);
+  if (terminal === undefined) return undefined;
+  const turnId = terminal.turnId ?? "";
+  const endedAtMs = terminal.completedAt ?? Date.now();
+  if (terminal.outcome === "completed") {
+    return {
+      status: "completed",
+      turnId,
+      endedAtMs,
+      ...(terminal.message !== undefined ? { lastMessage: terminal.message } : {}),
+    };
+  }
+  if (terminal.outcome === "aborted") {
+    const reason = (terminal.message ?? "").toLowerCase();
+    if (reason.includes("interrupt") || reason.includes("budget")) {
+      return {
+        status: "interrupted",
+        turnId,
+        endedAtMs,
+        reason: terminal.message ?? "interrupted",
+      };
+    }
+  }
+  return {
+    status: "errored",
+    turnId,
+    endedAtMs,
+    error: terminal.message ?? "errored",
+  };
 }
 
 export function toAgentStatusJson(status: AgentStatus): AgentStatusJson {
@@ -264,8 +229,16 @@ export function formatSubagentNotification(params: {
  * Per-agent status tracker. Subscribers receive a replay of the
  * current state + every subsequent mutation.
  */
+export type NativeWorkerTiming = {
+  readonly turnId: string;
+  /** Unix milliseconds recorded when this assignment starts executing. */
+  readonly startedAt: number;
+  readonly endedAt?: number;
+};
+
 export class AgentStatusTracker {
   readonly subject: BehaviorSubject<AgentStatus>;
+  private runTiming: NativeWorkerTiming | undefined;
 
   constructor(initial: AgentStatus = { status: "pending_init" }) {
     this.subject = new BehaviorSubject<AgentStatus>(initial);
@@ -273,6 +246,10 @@ export class AgentStatusTracker {
 
   get value(): AgentStatus {
     return this.subject.value;
+  }
+
+  get timing(): NativeWorkerTiming | undefined {
+    return this.runTiming;
   }
 
   markRunning(turnId: string): void {
@@ -307,7 +284,7 @@ export class AgentStatusTracker {
    * than reopening normal completed agents for reuse.
    */
   markDurabilityErrored(turnId: string, error: string): void {
-    this.subject.next({
+    this.publish({
       status: "errored",
       turnId,
       endedAtMs: monotonicMs(),
@@ -344,6 +321,26 @@ export class AgentStatusTracker {
     // Only irreversible states are sticky. Control-plane admission separately
     // enforces idle-only reuse, so a completed live handle cannot accept work.
     if (IRREVERSIBLE_STATES.has(this.subject.value.status)) return;
+    this.publish(status);
+  }
+
+  private publish(status: AgentStatus): void {
+    const timing = this.runTiming;
+    if (status.status === "running") {
+      this.runTiming = {
+        turnId: status.turnId,
+        // run-agent marks one turn running both before and inside its loop.
+        startedAt: timing?.turnId === status.turnId ? timing.startedAt : Date.now(),
+      };
+    } else if (timing !== undefined) {
+      if ("turnId" in status && status.turnId !== timing.turnId) {
+        this.runTiming = undefined;
+      } else {
+        // Idle, repeated terminal notifications and later shutdown all retain
+        // the first settled endpoint of the actual execution interval.
+        this.runTiming = { ...timing, endedAt: timing.endedAt ?? Date.now() };
+      }
+    }
     this.subject.next(status);
   }
 }

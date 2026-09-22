@@ -1,0 +1,386 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  classifyShellWorkspaceWritePolicy,
+  collectShellWorkspaceDeletionTargets,
+} from "../../src/llm/shell-write-policy.js";
+
+const WORKSPACE_ROOT = "/repo";
+
+function classify(command: string, allowWorkspaceDeletions?: boolean) {
+  return classifyShellWorkspaceWritePolicy({
+    toolName: "exec_command",
+    args: { command },
+    workspaceRoot: WORKSPACE_ROOT,
+    ...(allowWorkspaceDeletions === undefined ? {} : { allowWorkspaceDeletions }),
+  });
+}
+
+/** The command the live session repeated 14 times against the old policy. */
+const REFACTOR_CLEANUP =
+  "rm arcade15/game.js && ls -la arcade15 && node --check arcade15/main.js";
+
+describe("classifyShellWorkspaceWritePolicy", () => {
+  it.each([">", ">>", ">|", "&>", "&>>", "<>", "2>", "3<>"])(
+    "blocks workspace writes through %s",
+    (operator) => {
+      const decision = classify(`cat ${operator} src/output.txt`);
+      expect(decision.blockedTargets).toContain("/repo/src/output.txt");
+      expect(decision.blocked).toBe(true);
+    },
+  );
+
+  it.each(["&&", "||", ";", "&", "|", "|&"])(
+    "checks writes after chained operator %s",
+    (operator) => expect(classify(`echo safe ${operator} touch src/file`).blocked).toBe(true),
+  );
+
+  it.each(["echo '>' src/file", "echo \\> src/file", "echo '|' touch src/file"])(
+    "does not treat literal metacharacters as shell syntax: %s",
+    (command) => {
+      expect(classify(command).observedTargets).toEqual([]);
+      expect(classify(command).blocked).toBe(false);
+    },
+  );
+
+  it.each([
+    "echo $(touch src/file)", 'echo "$(touch src/file)"', "echo `touch src/file`",
+    "cat <(touch src/file)", "echo $\\\n(touch src/file)",
+    "cat <<EOF\n$(touch src/file)\nEOF", "echo 'open", 'echo "open', "cat <<EOF\nbody",
+  ])("fails closed for active substitution or malformed input: %s", (command) => {
+    const decision = classify(command);
+    expect(decision.indeterminate).toBe(true);
+    expect(decision.blocked).toBe(true);
+  });
+
+  it("checks writes after a continued heredoc delimiter", () => {
+    expect(classify("cat <<EOF\nEO\\\nF\ntouch src/file").blockedTargets).toContain("/repo/src/file");
+  });
+
+  it("treats descriptor moves and closes as non-file redirects", () => {
+    expect(classify("cat 2>&1- 3>&-").observedTargets).toEqual([]);
+  });
+
+  it("does not interpret here-string data as a path or a command", () => {
+    expect(classify('cat <<< "touch src/file > src/output"').blocked).toBe(false);
+  });
+
+  it("does not read the fd prefix of 2>/dev/null as an rmdir operand", () => {
+    const decision = classify("rmdir tmp 2>/dev/null");
+
+    expect(decision.blocked).toBe(false);
+    expect(decision.indeterminate).toBe(false);
+    expect(decision.blockedTargets).toEqual([]);
+  });
+
+  it("allows the cleanup chain that was rejected five times in a row", () => {
+    const decision = classify(
+      "rm -f tmp/snake-sim.js && rmdir tmp 2>/dev/null; ls -la game5 game4b; node --check game5/game.js",
+    );
+
+    expect(decision.blocked).toBe(false);
+    expect(decision.indeterminate).toBe(false);
+  });
+
+  it("ignores program text inside a stdin heredoc", () => {
+    const decision = classify(
+      [
+        "node --check game5/game.js && node <<'JS'",
+        "const s = { x: 0 };",
+        "const r = { pass: false };",
+        "if (s.x === 0 && !r.pass) { console.log(1 > 0); }",
+        "JS",
+      ].join("\n"),
+    );
+
+    expect(decision.blocked).toBe(false);
+    expect(decision.indeterminate).toBe(false);
+    expect(decision.observedTargets).toEqual([]);
+  });
+
+  it("allows a heredoc redirected outside the workspace", () => {
+    const decision = classify(
+      ["cat > /tmp/game4b_sim.js << 'EOF'", "if (b.x > 40) { x = 1; }", "EOF"].join(
+        "\n",
+      ),
+    );
+
+    expect(decision.blocked).toBe(false);
+    expect(decision.indeterminate).toBe(false);
+    expect(decision.observedTargets).toEqual(["/tmp/game4b_sim.js"]);
+  });
+
+  it("still blocks a heredoc redirected into a workspace source file", () => {
+    const decision = classify(
+      ["cat > src/x.js <<EOF", "export const x = 1 > 0;", "EOF"].join("\n"),
+    );
+
+    expect(decision.blocked).toBe(true);
+    expect(decision.blockedTargets).toEqual(["/repo/src/x.js"]);
+  });
+
+  it("still blocks an fd-prefixed redirect into a workspace file", () => {
+    const decision = classify("make 2> build/make.log 2>> src/errors.log");
+
+    expect(decision.blocked).toBe(true);
+    expect(decision.blockedTargets).toEqual(["/repo/src/errors.log"]);
+  });
+
+  it("treats 2>&1 as a descriptor duplication, not a file", () => {
+    const decision = classify("npm test 2>&1 | tail -20");
+
+    expect(decision.blocked).toBe(false);
+    expect(decision.observedTargets).toEqual([]);
+  });
+
+  it("denies with one sentence plus the blocked targets", () => {
+    const decision = classify("echo hi > notes.txt");
+
+    expect(decision.blocked).toBe(true);
+    expect(decision.message).toBe(
+      "shell_workspace_file_write_disallowed: shell commands may not write " +
+        "workspace files except under build, dist, logs, .cache, tmp, or coverage; " +
+        "use Edit or Write instead. Blocked target(s): /repo/notes.txt",
+    );
+  });
+
+  describe("workspace deletions", () => {
+    it("lets a session that edits without prompting rm a workspace file", () => {
+      const decision = classify(REFACTOR_CLEANUP, true);
+
+      expect(decision.blocked).toBe(false);
+      expect(decision.indeterminate).toBe(false);
+      expect(decision.deletionTargets).toEqual(["/repo/arcade15/game.js"]);
+      expect(decision.blockedDeletions).toEqual([]);
+      expect(decision.blockedTargets).toEqual([]);
+      expect(decision.observedTargets).toEqual(["/repo/arcade15/game.js"]);
+    });
+
+    it("sends a deletion through the approval path when the mode prompts", () => {
+      const decision = classify(REFACTOR_CLEANUP, false);
+
+      expect(decision.blocked).toBe(true);
+      expect(decision.blockedDeletions).toEqual(["/repo/arcade15/game.js"]);
+      expect(decision.deletionTargets).toEqual([]);
+      expect(decision.message).toBe(
+        "shell_workspace_file_delete_requires_approval: deleting or moving " +
+          "workspace files with a shell command needs the user's approval in this " +
+          "permission mode; ask the user to approve this exact command, or to " +
+          "switch to acceptEdits or bypassPermissions, then run it again. Edit and " +
+          "Write cannot delete files. Blocked target(s): /repo/arcade15/game.js",
+      );
+    });
+
+    it("treats rmdir and unlink like rm", () => {
+      const decision = classify("unlink src/a.js; rmdir src/empty", true);
+
+      expect(decision.blocked).toBe(false);
+      expect(decision.deletionTargets).toEqual(["/repo/src/a.js", "/repo/src/empty"]);
+    });
+
+    it("blocks rm outside the workspace even when deletions are allowed", () => {
+      const decision = classify("rm ../outside.txt", true);
+
+      expect(decision.blocked).toBe(true);
+      expect(decision.blockedDeletions).toEqual(["/outside.txt"]);
+      expect(decision.message).toContain(
+        "shell_workspace_file_delete_disallowed: shell commands may delete or " +
+          "move files only inside the workspace or the system temp directory; ask " +
+          "the user to remove anything else themselves. Blocked target(s): /outside.txt",
+      );
+    });
+
+    it("still lets the shell clean up its own temp files", () => {
+      const decision = classify("rm -f /tmp/game4b_sim.js", true);
+
+      expect(decision.blocked).toBe(false);
+      expect(decision.deletionTargets).toEqual([]);
+      expect(decision.observedTargets).toEqual(["/tmp/game4b_sim.js"]);
+    });
+
+    it("blocks rm of protected paths even when deletions are allowed", () => {
+      const decision = classify("rm .git/config", true);
+
+      expect(decision.blocked).toBe(true);
+      expect(decision.blockedDeletions).toEqual(["/repo/.git/config"]);
+      expect(decision.message).toContain(
+        "shell_workspace_file_delete_disallowed: shell commands may not delete or " +
+          "move protected paths (the workspace root, .git, .agenc, .agents, the " +
+          "AgenC home, shell and git config files); ask the user to remove them " +
+          "themselves. Blocked target(s): /repo/.git/config",
+      );
+    });
+
+    it("blocks removing the workspace root, the AgenC home, and the home directory", () => {
+      const withHome = classifyShellWorkspaceWritePolicy({
+        toolName: "exec_command",
+        args: { command: "rm -rf . /Users/dev/agenc-home/state ~/" },
+        workspaceRoot: WORKSPACE_ROOT,
+        allowWorkspaceDeletions: true,
+        protectedRoots: ["/Users/dev/agenc-home"],
+      });
+
+      expect(withHome.blocked).toBe(true);
+      // `~/` expands dynamically, so it also makes the command indeterminate.
+      expect(withHome.indeterminate).toBe(true);
+      expect(withHome.blockedDeletions).toEqual([
+        "/repo",
+        "/Users/dev/agenc-home/state",
+      ]);
+    });
+
+    it("keeps blocking redirect writes when deletions are allowed", () => {
+      const decision = classify("cat > src/x.js <<EOF\nexport const x = 1;\nEOF", true);
+
+      expect(decision.blocked).toBe(true);
+      expect(decision.blockedTargets).toEqual(["/repo/src/x.js"]);
+      expect(decision.blockedDeletions).toEqual([]);
+      expect(decision.message).toContain("shell_workspace_file_write_disallowed");
+      expect(decision.message).toContain("use Edit or Write instead");
+    });
+
+    it("keeps blocking tee, touch and truncate as content writes", () => {
+      expect(classify("echo x | tee src/x.js", true).blocked).toBe(true);
+      expect(classify("touch src/new.js", true).blocked).toBe(true);
+      expect(classify("truncate -s 0 src/x.js", true).blocked).toBe(true);
+    });
+
+    it("treats a rename inside the workspace as a deletion-class mutation", () => {
+      const allowed = classify("mv src/old.js src/new.js", true);
+      expect(allowed.blocked).toBe(false);
+      expect(allowed.deletionTargets).toEqual(["/repo/src/old.js", "/repo/src/new.js"]);
+      expect(allowed.blockedTargets).toEqual([]);
+
+      const prompting = classify("mv src/old.js src/new.js", false);
+      expect(prompting.blocked).toBe(true);
+      expect(prompting.blockedDeletions).toEqual(["/repo/src/old.js", "/repo/src/new.js"]);
+      expect(prompting.message).toContain("shell_workspace_file_delete_requires_approval");
+    });
+
+    it("keeps a move from outside the workspace as a content write", () => {
+      const decision = classify("mv /tmp/generated.js src/x.js", true);
+
+      expect(decision.blocked).toBe(true);
+      expect(decision.blockedTargets).toEqual(["/repo/src/x.js"]);
+      expect(decision.blockedDeletions).toEqual([]);
+      expect(decision.message).toContain("use Edit or Write instead");
+    });
+
+    it("still allows deletions under generated output roots without approval", () => {
+      const decision = classify("rm -rf dist build/out.js", false);
+
+      expect(decision.blocked).toBe(false);
+      expect(decision.deletionTargets).toEqual(["/repo/dist", "/repo/build/out.js"]);
+    });
+
+    it("lists the workspace files a command is about to remove for file history", () => {
+      expect(
+        collectShellWorkspaceDeletionTargets({
+          toolName: "exec_command",
+          args: { command: REFACTOR_CLEANUP, cwd: "/repo" },
+          workspaceRoot: WORKSPACE_ROOT,
+        }),
+      ).toEqual(["/repo/arcade15/game.js"]);
+      // A command the policy refuses will not run, so there is nothing to back up.
+      expect(
+        collectShellWorkspaceDeletionTargets({
+          toolName: "exec_command",
+          args: { command: "rm src/a.js ../outside.txt" },
+          workspaceRoot: WORKSPACE_ROOT,
+        }),
+      ).toEqual([]);
+      expect(
+        collectShellWorkspaceDeletionTargets({
+          toolName: "exec_command",
+          args: { command: "ls -la" },
+          workspaceRoot: WORKSPACE_ROOT,
+        }),
+      ).toEqual([]);
+    });
+  });
+});
+
+describe("classifyShellWorkspaceWritePolicy under the full bypass", () => {
+  /** Approvals bypassed and no sandbox: `--dangerously-bypass-approvals-and-sandbox`. */
+  function classifyBypassed(command: string) {
+    return classifyShellWorkspaceWritePolicy({
+      toolName: "exec_command",
+      args: { command },
+      workspaceRoot: WORKSPACE_ROOT,
+      allowWorkspaceDeletions: true,
+      bypassesApprovalsAndSandbox: true,
+    });
+  }
+
+  it("lets a command with an unresolvable target run and still reports it indeterminate", () => {
+    // The Terminal-Bench git-multibranch run lost 51 of 459 shell calls to
+    // this refusal, most of them an `echo "$(...)"` next to a harmless write.
+    const decision = classifyBypassed(
+      'for f in refs/heads/*; do echo "$f: $(cat $f)"; done > /tmp/agenc-bypass/refs.txt',
+    );
+    expect(decision.indeterminate).toBe(true);
+    expect(decision.blocked).toBe(false);
+    expect(decision.message).toBeUndefined();
+  });
+
+  it("allows removals outside the workspace", () => {
+    const decision = classifyBypassed("rm -f /etc/nginx/sites-enabled/default");
+    expect(decision.blocked).toBe(false);
+    expect(decision.blockedDeletions).toEqual([]);
+    // Outside the workspace, so nothing for the file-history sidecar to back up.
+    expect(decision.deletionTargets).toEqual([]);
+  });
+
+  it.each(["rm -rf /", "rm .git/config", `rm -rf ${WORKSPACE_ROOT}`])(
+    "keeps refusing the protected roots: %s",
+    (command) => {
+      const decision = classifyBypassed(command);
+      expect(decision.blocked).toBe(true);
+      expect(decision.message).toContain("protected paths");
+    },
+  );
+
+  it("still routes workspace content writes to Edit and Write", () => {
+    const decision = classifyBypassed("cat > src/output.txt");
+    expect(decision.blocked).toBe(true);
+    expect(decision.blockedTargets).toContain("/repo/src/output.txt");
+  });
+
+  it("changes nothing while a prompt or a sandbox still gates the command", () => {
+    const decision = classify('echo "$(id)" > /tmp/agenc-bypass/out.txt', true);
+    expect(decision.blocked).toBe(true);
+    expect(decision.message).toContain("Unable to confirm workspace write targets");
+  });
+});
+
+describe("classifyShellWorkspaceWritePolicy with added directories", () => {
+  const ADDED_ROOT = "/srv/agenc-added-root";
+
+  function classifyWithAdded(command: string, allowWorkspaceDeletions: boolean) {
+    return classifyShellWorkspaceWritePolicy({
+      toolName: "exec_command",
+      args: { command },
+      workspaceRoot: WORKSPACE_ROOT,
+      allowWorkspaceDeletions,
+      additionalRoots: [ADDED_ROOT],
+    });
+  }
+
+  it("treats a removal under an added directory like a workspace removal", () => {
+    const promptFree = classifyWithAdded(`rm ${ADDED_ROOT}/stale.log`, true);
+    expect(promptFree.blocked).toBe(false);
+    // Granted by the user, but not a workspace path: no sidecar backup.
+    expect(promptFree.deletionTargets).toEqual([]);
+
+    const prompting = classifyWithAdded(`rm ${ADDED_ROOT}/stale.log`, false);
+    expect(prompting.blocked).toBe(true);
+    expect(prompting.message).toContain("shell_workspace_file_delete_requires_approval");
+    expect(prompting.message).not.toContain("only inside the workspace");
+  });
+
+  it("still refuses a removal outside every root", () => {
+    const decision = classifyWithAdded("rm /srv/agenc-elsewhere/file.txt", true);
+    expect(decision.blocked).toBe(true);
+    expect(decision.message).toContain("only inside the workspace");
+  });
+});

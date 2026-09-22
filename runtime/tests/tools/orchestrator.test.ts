@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 import {
   ApprovalRejectedError,
+  approvalDenialEndsTurn,
   SandboxDeniedError,
   attemptWithRetry,
   classifyToolApproval,
@@ -174,7 +175,7 @@ describe("defaultRetryPolicy + attemptWithRetry", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// donor runtime-parity port coverage (T7 orchestrator gap fill)
+// Approval and sandbox decision coverage
 // ─────────────────────────────────────────────────────────────────────
 
 describe("defaultExecApprovalRequirement (sandboxing behavior)", () => {
@@ -735,8 +736,8 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
   });
 
   test("sandbox escalation: first attempt sandbox-denied → approval → second attempt succeeds with sandbox=off (under on_failure which wants escalation)", async () => {
-    // AgenC behavior (sandboxing.rs:290-298): `AskForApproval::OnFailure`
-    // has `wants_no_sandbox_approval == true`. Under `never` /
+    // AgenC behavior: the `on_failure` policy
+    // wants sandbox-escalation approval. Under `never` /
     // `on_request`, the orchestrator bails with the original denial
     // (covered in separate tests below). This test exercises the
     // approval → retry-with-sandbox-off pathway via the policy that
@@ -847,6 +848,43 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     expect(ran).toBe(1);
   });
 
+  test("preserves the permission evaluator reason for a forced approval", async () => {
+    const request = vi.fn(async () => ({ kind: "denied" as const }));
+    const dispatch = vi.fn(async () => "unexpected");
+    await expect(orchestrateToolCall({
+      tool: mkTool({ name: "spawn_agent", requiresApproval: true }),
+      approvalCtx: {
+        ...mkCtx(),
+        toolName: "spawn_agent",
+        retryReason: "Permission to use spawn_agent is required",
+      },
+      approvalPolicy: "untrusted",
+      sandboxMode: "workspace_write",
+      dispatch,
+      approvalResolver: { request },
+    })).rejects.toBeInstanceOf(ApprovalRejectedError);
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      retryReason: "Permission to use spawn_agent is required",
+    }));
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  test("keeps sandbox escalation reasons ahead of a permission evaluator reason", async () => {
+    const request = vi.fn(async () => ({ kind: "denied" as const }));
+    await expect(orchestrateToolCall({
+      tool: mkTool(),
+      approvalCtx: { ...mkCtx(), retryReason: "Tool requires approval" },
+      approvalPolicy: "untrusted",
+      sandboxMode: "workspace_write",
+      approvalArgs: { sandbox_permissions: "require_escalated" },
+      dispatch: async () => "unexpected",
+      approvalResolver: { request },
+    })).rejects.toBeInstanceOf(ApprovalRejectedError);
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({
+      retryReason: expect.stringContaining("sandbox"),
+    }));
+  });
+
   test("sandbox_permissions=require_escalated: approval drives first attempt with sandbox off", async () => {
     const dispatches: string[] = [];
     const result = await orchestrateToolCall<string>({
@@ -923,6 +961,59 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     });
 
     expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A call under the bypassPermissions mode: approval policy never, a
+   * workspace-write sandbox, and a resolver that must never be asked.
+   */
+  async function bypassModeCall(approvalArgs: Record<string, unknown>) {
+    const resolver: ApprovalResolver = {
+      request: vi.fn(async () => ({ kind: "approved" })),
+    };
+    const dispatched = vi.fn(async () => "ok");
+    const result = await orchestrateToolCall<string>({
+      tool: mkTool(),
+      approvalCtx: {
+        ...mkCtx(),
+        invocation: {
+          session: approvalSession({
+            permissionModeRegistry: {
+              current: () => ({ mode: "bypassPermissions" }),
+            },
+          }),
+        } as never,
+      },
+      approvalPolicy: "never",
+      sandboxMode: "workspace_write",
+      approvalArgs,
+      dispatch: dispatched,
+      approvalResolver: resolver,
+    });
+    expect(result).toBe("ok");
+    expect(resolver.request).not.toHaveBeenCalled();
+    expect(dispatched).toHaveBeenCalledOnce();
+    return dispatched.mock.calls[0] as unknown as [string, Record<string, unknown>];
+  }
+
+  test("sandbox_permissions=require_escalated: bypassPermissions grants the escalation without a prompt", async () => {
+    const [sandbox] = await bypassModeCall({
+      sandbox_permissions: "require_escalated",
+    });
+    // The grant runs the call the way an approval would: outside the sandbox.
+    expect(sandbox).toBe("danger_full_access");
+  });
+
+  test("sandbox_permissions=with_additional_permissions: bypassPermissions grants the permissions without a prompt", async () => {
+    const [sandbox, context] = await bypassModeCall({
+      sandbox_permissions: "with_additional_permissions",
+      additional_permissions: { network: { enabled: true } },
+    });
+    // Still sandboxed, with the requested permissions passed through.
+    expect(sandbox).toBe("workspace_write");
+    expect(context).toMatchObject({
+      additionalPermissions: { network: { enabled: true } },
+    });
   });
 
   test("sandbox_permissions=with_additional_permissions stays sandboxed after approval", async () => {
@@ -1218,6 +1309,55 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     expect(guardian.reviewApprovalRequest).toHaveBeenCalledOnce();
   });
 
+  /** Run the call, expect an ApprovalRejectedError with a denied decision. */
+  async function deniedCall(
+    opts: Partial<Parameters<typeof orchestrateToolCall<string>>[0]>,
+  ): Promise<ApprovalRejectedError> {
+    const rejection = await orchestrateToolCall<string>({
+      tool: mkTool(),
+      approvalCtx: mkCtx(),
+      approvalPolicy: "on_request",
+      sandboxMode: "workspace_write",
+      dispatch: async () => "ok",
+      ...opts,
+    }).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(rejection).toBeInstanceOf(ApprovalRejectedError);
+    const error = rejection as ApprovalRejectedError;
+    expect(error.decision).toEqual({ kind: "denied" });
+    return error;
+  }
+
+  test("resolver denial names the tool, forbids a retry, and records its source", async () => {
+    const dispatched = vi.fn(async () => "ok");
+    const error = await deniedCall({
+      tool: mkTool({ requiresApproval: true }),
+      dispatch: dispatched,
+      approvalResolver: { request: async () => ({ kind: "denied" }) },
+    });
+
+    expect(error.source).toBe("resolver");
+    expect(error.message).toBe(
+      "Permission denied: test.cmd was denied by this session's approval resolver. Do not retry the same call; choose a different approach or ask the user how to proceed.",
+    );
+    expect(approvalDenialEndsTurn(error)).toBe(true);
+    expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  test("default denial says the tool is not permitted in this session", async () => {
+    const error = await deniedCall({ approvalPolicy: "untrusted" });
+
+    expect(error.source).toBe("default_deny");
+    expect(error.message).toBe(
+      "Not permitted: test.cmd cannot run in this session because no approval resolver is available to allow it. Do not retry this call; use a different tool or ask the user.",
+    );
+    // No resolver means nobody could ever approve: the model keeps the turn
+    // so it can report the denial instead of being cut off.
+    expect(approvalDenialEndsTurn(error)).toBe(false);
+  });
+
   test("needs_approval path: no resolver + no hook → default-deny (ApprovalRejectedError)", async () => {
     await expect(
       orchestrateToolCall<string>({
@@ -1290,7 +1430,7 @@ describe("orchestrateToolCall lifecycle (orchestrator behavior)", () => {
     );
   });
 
-  test("sandbox-denied under on_request policy: bails with original error, no approval (orchestrator behavior + sandboxing.rs:290-298)", async () => {
+  test("sandbox-denied under on_request policy: bails with original error, no approval", async () => {
     // AgenC behavior: `AskForApproval::OnRequest` has
     // `wants_no_sandbox_approval == false` (without network-approval
     // context). A SandboxDeniedError must propagate unchanged — the

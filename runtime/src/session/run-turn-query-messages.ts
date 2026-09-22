@@ -1,0 +1,492 @@
+/**
+ * Query projection for one sampling request: slicing after the compaction
+ * boundary, tool-result budgeting, microcompaction and truncate-to-fit,
+ * the Editor fit projection, and the in-memory tool-result retention
+ * bound that mirrors microcompact. Pure move out of run-turn.ts; the
+ * declarations are the originals byte for byte.
+ *
+ * @module
+ */
+
+import type { LLMMessage } from "../llm/types.js";
+import { isAuthenticatedCompactionBoundary } from "./compaction-history-marker.js";
+import {
+  fromAgenCRuntimeMessages,
+  toAgenCRuntimeMessages,
+  type AgenCRuntimeMessage,
+} from "./runtime-message-conversion.js";
+import {
+  applyToolResultBudget,
+  resolveToolResultBudgetChars,
+  shrinkOversizedToolResults,
+  type ContentReplacementState,
+} from "./_deps/tool-result-storage.js";
+import { roughTokenCountEstimationForMessages } from "../llm/token-estimation.js";
+import type { Session } from "./session.js";
+import type { TurnContext } from "./turn-context.js";
+import { FILE_READ_TOOL_NAME } from "../tools/system/file-read.js";
+import type { AssistantMessage, Terminal, TurnState } from "./turn-state.js";
+import {
+  buildAgenCToolUseContext,
+  toAgenCModelContext,
+  type AgenCToolUseContext,
+} from "./agenc-tool-use-context.js";
+import { cloneLLMMessage, finitePositive } from "./run-turn-messages.js";
+
+const PREPARED_TERMINAL = Symbol("agenc_prepared_terminal");
+
+interface AgenCPreparedTerminal {
+  readonly terminal: Terminal;
+  readonly assistantMessage: AssistantMessage;
+}
+
+type PreparedState = TurnState & {
+  [PREPARED_TERMINAL]?: AgenCPreparedTerminal;
+};
+
+async function prepareAgenCTurnContext(
+  state: TurnState,
+  ctx: TurnContext,
+  session: Session,
+  querySource: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  delete (state as PreparedState)[PREPARED_TERMINAL];
+  if (signal?.aborted) return;
+  toAgenCModelContext(ctx);
+  const messages = messagesAfterAgenCBoundary(state.messages);
+  const toolUseContext = buildAgenCToolUseContext(session, ctx, {
+    querySource,
+  });
+  try {
+    const prepared = await prepareAgenCQueryMessages({
+      messages,
+      toolUseContext,
+      querySource,
+      contentReplacementState: state.contentReplacementState,
+    });
+    state.messagesForQuery = prepared.messages;
+    state.snipTokensFreed = prepared.snipTokensFreed;
+    if (prepared.committed) {
+      state.messages = [...state.messagesForQuery];
+    }
+  } catch {
+    state.messagesForQuery = messages.map(cloneLLMMessage);
+    state.snipTokensFreed = 0;
+  }
+  // Everything below this index is the sampled batch; a retry that must drop
+  // it truncates here (see removeTruncatedAssistantForRetry).
+  state.messagesAtSampleStart = state.messages.length;
+}
+
+function getAgenCPreparedTerminal(
+  state: TurnState,
+): AgenCPreparedTerminal | undefined {
+  return (state as PreparedState)[PREPARED_TERMINAL];
+}
+
+function messagesAfterAgenCBoundary(
+  messages: readonly LLMMessage[],
+): LLMMessage[] {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isAuthenticatedCompactionBoundary(message)) {
+      return messages.slice(index + 1).map((item) => ({ ...item }));
+    }
+  }
+  return messages.map((item) => ({ ...item }));
+}
+
+async function prepareAgenCQueryMessages(params: {
+  readonly messages: readonly LLMMessage[];
+  readonly toolUseContext: AgenCToolUseContext;
+  readonly querySource: string;
+  readonly contentReplacementState?: ContentReplacementState;
+}): Promise<{
+  readonly messages: LLMMessage[];
+  readonly snipTokensFreed: number;
+  readonly committed: boolean;
+}> {
+  try {
+    let messages = toAgenCRuntimeMessages(params.messages);
+    const budgeted = await applyToolResultBudget(
+      messages,
+      params.contentReplacementState,
+      {
+        limitChars: resolveToolResultBudgetChars(
+          params.toolUseContext.options.contextWindowTokens,
+        ),
+        persist: persistOversizedToolResult,
+      },
+    );
+    messages = budgeted.messages as AgenCRuntimeMessage[];
+    const { microcompactMessages } =
+      await import("../services/compact/microCompact.js");
+    const microcompactResult = await microcompactMessages(
+      messages,
+      params.toolUseContext,
+      params.querySource,
+    );
+    messages = microcompactResult.messages as AgenCRuntimeMessage[];
+    const result = {
+      messages: truncateToolResultsToFit(
+        fromAgenCRuntimeMessages(messages),
+        params.toolUseContext.options.contextWindowTokens,
+      ),
+      snipTokensFreed: 0,
+      committed: false,
+    };
+    return {
+      messages: result.messages,
+      snipTokensFreed: result.snipTokensFreed,
+      committed: result.committed,
+    };
+  } catch (error) {
+    throw error;
+  }
+}
+
+
+/**
+ * Pre-send truncate-to-fit backstop. The mid-turn compact gate anchors
+ * on the PREVIOUS sample's `promptTokens`, which cannot see tool
+ * results added since — a burst of large results can push the next
+ * request past the window and waste a full 413 round-trip before the
+ * reactive collapse fires. When the assembled request's rough estimate
+ * exceeds the window minus an output reserve, shrink oversized tool
+ * results (head+tail slices, pairing preserved) at progressively
+ * tighter caps until it fits or nothing shrinkable remains.
+ */
+function truncateToolResultsToFit(
+  messages: LLMMessage[],
+  contextWindowTokens: number | undefined,
+): LLMMessage[] {
+  const window = finitePositive(contextWindowTokens);
+  if (window === undefined) return messages;
+  const fitTokens = Math.max(8_000, window - 16_000);
+  let estimate = roughTokenCountEstimationForMessages(messages);
+  if (estimate <= fitTokens) return messages;
+  let out = messages;
+  for (const cap of [100_000, 50_000, 20_000, 8_000]) {
+    const shrunk = shrinkOversizedToolResults(out, cap);
+    if (shrunk.shrunkCount === 0) continue;
+    out = shrunk.messages;
+    estimate = roughTokenCountEstimationForMessages(out);
+    if (estimate <= fitTokens) break;
+  }
+  return out;
+}
+
+/**
+ * Persist an over-budget tool result via the shared tool-results store
+ * (same disk layout as the single-result offload path in
+ * `tools/execution.ts`, so the model's FileRead pointer works for both)
+ * and return the preview replacement string, or null on failure.
+ */
+async function persistOversizedToolResult(
+  content: string,
+  toolUseId: string,
+): Promise<string | null> {
+  const { persistToolResult, buildLargeToolResultMessage } =
+    await import("../utils/toolResultStorage.js");
+  const persisted = await persistToolResult(content, toolUseId);
+  if ("error" in persisted) return null;
+  return buildLargeToolResultMessage(persisted);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// In-memory tool-result retention bound (session-history-memory fix).
+//
+// Full tool-output content (build logs, large file reads, ctest output)
+// otherwise accumulates UNBOUNDED in the live in-memory session for the
+// whole session, in BOTH `state.messages` and the deep-cloned
+// `sessionState.history`, causing GB-scale heap growth / OOM.
+//
+// The outbound request the model sees is already microcompacted
+// (`state.messagesForQuery` via `microcompactMessages`), which keeps the
+// most-recent-N tool results full and replaces OLDER large tool-result
+// content with a compact marker. The durable in-memory copy is aligned
+// to that same decision here: older large tool-result content is replaced
+// with the same marker, while the most-recent-N tool results keep full
+// content (so recent context the model relies on is unchanged).
+//
+// IMPORTANT: this only mutates the LIVE in-memory structures. The disk
+// rollout (persisted response items via `rolloutStore.appendRollout`)
+// must keep FULL content for resume, so this bound is only ever applied
+// AFTER `persistNewResponseItems()` has persisted the full content, and
+// only to messages that have already been persisted.
+//
+// The constants/heuristics below are kept in lockstep with `microCompact.ts`
+// (`MICROCOMPACT_KEEP_RECENT`, `MICROCOMPACT_MIN_CHARS`,
+// `TOOL_RESULT_CLEARED_MESSAGE`, `COMPACTABLE_TOOLS`) so the durable in-memory
+// copy clears exactly the tool results microcompact already clears in the
+// OUTBOUND view — older, large, compactable-tool results outside the
+// most-recent-N window — and the model's view on the next turn never loses
+// content the in-memory copy still owed it.
+const IN_MEMORY_KEEP_RECENT_TOOL_RESULTS = 5;
+const IN_MEMORY_TOOL_RESULT_MAX_CHARS = 6_000;
+const IN_MEMORY_TOOL_RESULT_CLEARED_MARKER =
+  "[Old tool result content cleared]";
+const IN_MEMORY_MCP_TOOL_PREFIX = "mcp__";
+// Shell tools register as "exec_command" / "system.bash" in the LIVE tool
+// registry. Removed names in the compactable set exist only for persisted
+// historical transcripts.
+const IN_MEMORY_EXEC_COMMAND_TOOL_NAME = "exec_command";
+// Tool names MUST match the LIVE tool registry. The whole-file reader is
+// `FILE_READ_TOOL_NAME` ("FileRead") and the shell tool is "exec_command" —
+// these (the largest tool outputs: whole-file reads, build/test logs) were
+// previously absent, so their results were NEVER bounded in memory and the
+// OOM bound missed its biggest targets. Grep/Glob/Edit/Write already match.
+// Kept in lockstep with `microCompact.ts` `COMPACTABLE_TOOLS`.
+const IN_MEMORY_COMPACTABLE_TOOLS = new Set([
+  FILE_READ_TOOL_NAME,
+  "Read",
+  IN_MEMORY_EXEC_COMMAND_TOOL_NAME,
+  "system.bash",
+  "Bash",
+  "PowerShell",
+  "Grep",
+  "Glob",
+  "WebSearch",
+  "web_fetch",
+  "WebFetch",
+  "Edit",
+  "Write",
+]);
+
+// Path-bearing readers whose tool call carries a `file_path` argument. The
+// LATEST result per active path is retained full (model context preserved)
+// even when it falls outside the most-recent-N window — mirroring
+// microcompact's `PATH_BEARING_READ_TOOLS` path-aware retention.
+const IN_MEMORY_PATH_BEARING_READ_TOOLS = new Set([
+  FILE_READ_TOOL_NAME,
+  "Read",
+]);
+
+function inMemoryReadFilePathFromArguments(
+  argumentsJson: string | undefined,
+): string | undefined {
+  if (typeof argumentsJson !== "string" || argumentsJson.length === 0) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(argumentsJson);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const filePath = (parsed as Record<string, unknown>).file_path;
+  return typeof filePath === "string" && filePath.length > 0
+    ? filePath
+    : undefined;
+}
+
+function isToolResultMessage(message: LLMMessage): boolean {
+  return message.role === "tool" || message.toolCallId !== undefined;
+}
+
+function isInMemoryCompactableTool(name: string | undefined): boolean {
+  if (name === undefined) return false;
+  return (
+    IN_MEMORY_COMPACTABLE_TOOLS.has(name) ||
+    name.startsWith(IN_MEMORY_MCP_TOOL_PREFIX)
+  );
+}
+
+function toolResultContentLength(content: LLMMessage["content"]): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let total = 0;
+  for (const part of content) {
+    if (part && typeof part === "object" && "text" in part) {
+      const text = (part as { readonly text?: unknown }).text;
+      if (typeof text === "string") total += text.length;
+    }
+  }
+  return total;
+}
+
+/**
+ * Replace OLDER large tool-result content in `messages` (mutating in place)
+ * with a compact marker, keeping the most-recent-N tool results full so the
+ * model's recent context is unchanged.
+ *
+ * `boundUpToIndex` caps how far into `messages` clearing may reach so that
+ * in-flight / not-yet-persisted tail messages are never altered before their
+ * full content has been persisted to the durable rollout. Only messages with
+ * index < `boundUpToIndex` are eligible for clearing.
+ *
+ * Returns the number of tool-result messages whose content was cleared.
+ */
+function boundInMemoryToolResultContent(
+  messages: LLMMessage[],
+  boundUpToIndex: number,
+  outboundMessages: readonly LLMMessage[] | undefined,
+): number {
+  // Soak F74 / #2244: this bound used to decide on its own which results to
+  // clear, using constants "kept in lockstep" with microcompact by hand. The
+  // two policies drifted, and worse, this one has no pressure gate: a result
+  // still being sent in FULL on the wire was cleared here the moment it fell
+  // out of a flat recent-N window, so the NEXT request sent a marker where the
+  // last one sent the body. That rewrites an already-cached prefix, and the
+  // provider re-reads every token after it (438,986 re-billed input tokens in
+  // one traced six-goal run, up to 51,725 per event).
+  //
+  // The decision now belongs to the OUTBOUND projection alone. This function
+  // may only:
+  //   - adopt, byte for byte, content the request that just went out already
+  //     carried in shrunken form (zero delta by construction), or
+  //   - clear results before the newest authenticated compaction boundary,
+  //     which no future request will ever carry again (free).
+  // Anything the wire still carries in full stays full here.
+  const outboundContentByCallId = new Map<string, LLMMessage["content"]>();
+  for (const message of outboundMessages ?? []) {
+    if (!isToolResultMessage(message)) continue;
+    const callId = message.toolCallId;
+    if (callId === undefined) continue;
+    outboundContentByCallId.set(callId, message.content);
+  }
+  // Messages at or after this index are still reachable by future requests.
+  let boundaryIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message !== undefined && isAuthenticatedCompactionBoundary(message)) {
+      boundaryIndex = index;
+      break;
+    }
+  }
+  let clearedBeforeBoundary = 0;
+  // Everything before the newest boundary is sliced away by
+  // `messagesAfterAgenCBoundary` on every future projection, so no request
+  // will ever carry it again. Clearing there is free, which is why it needs
+  // none of the eligibility rules below: no keep-recent window, no
+  // compactable-tool list, no path retention. The durable rollout still holds
+  // the full bytes for resume.
+  const preBoundaryLimit = Math.min(boundaryIndex, boundUpToIndex);
+  for (let index = 0; index < preBoundaryLimit; index += 1) {
+    const message = messages[index];
+    if (message === undefined || !isToolResultMessage(message)) continue;
+    if (message.content === IN_MEMORY_TOOL_RESULT_CLEARED_MARKER) continue;
+    if (
+      toolResultContentLength(message.content) < IN_MEMORY_TOOL_RESULT_MAX_CHARS
+    ) {
+      continue;
+    }
+    messages[index] = {
+      ...message,
+      content: IN_MEMORY_TOOL_RESULT_CLEARED_MARKER,
+    };
+    clearedBeforeBoundary += 1;
+  }
+  // Compactability is keyed off the assistant `toolCalls` that requested each
+  // tool, exactly like microcompact's `collectCompactableToolUseIds` — the
+  // tool-result message itself does not reliably carry `toolName`. A result is
+  // compactable when its `toolCallId` was requested by a compactable tool, or
+  // (fallback, mirroring microcompact) its own `toolName` is compactable.
+  const compactableCallIds = new Set<string>();
+  // Map every path-bearing read tool_use id → the `file_path` it read, so the
+  // LATEST read per path can be retained full even outside the recent-N window.
+  const readPathByCallId = new Map<string, string>();
+  for (const message of messages) {
+    for (const call of message.toolCalls ?? []) {
+      if (isInMemoryCompactableTool(call.name)) compactableCallIds.add(call.id);
+      if (IN_MEMORY_PATH_BEARING_READ_TOOLS.has(call.name)) {
+        const filePath = inMemoryReadFilePathFromArguments(call.arguments);
+        if (filePath !== undefined) readPathByCallId.set(call.id, filePath);
+      }
+    }
+  }
+  const isCompactableResult = (message: LLMMessage): boolean => {
+    if (
+      message.toolCallId !== undefined &&
+      compactableCallIds.has(message.toolCallId)
+    ) {
+      return true;
+    }
+    return isInMemoryCompactableTool(message.toolName);
+  };
+  // Identify indices of compactable tool-result messages so we can preserve
+  // the most-recent-N (matching microcompact's keep-recent window) full. Only
+  // compactable-tool results are eligible — mirroring microcompact — so the
+  // in-memory copy never clears a result the outbound view still keeps full.
+  const compactableResultIndices: number[] = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const message = messages[i];
+    if (
+      message !== undefined &&
+      isToolResultMessage(message) &&
+      isCompactableResult(message)
+    ) {
+      compactableResultIndices.push(i);
+    }
+  }
+  const keepFromIndex =
+    compactableResultIndices.length > IN_MEMORY_KEEP_RECENT_TOOL_RESULTS
+      ? compactableResultIndices[
+          compactableResultIndices.length - IN_MEMORY_KEEP_RECENT_TOOL_RESULTS
+        ]
+      : -1;
+  // Path-aware retention: for each distinct file path, keep the LATEST read
+  // result full so the active working file is never evicted by the flat
+  // recent-N window (otherwise the model re-reads it every turn — context
+  // thrash). `compactableResultIndices` is in document order, so the last
+  // index seen per path is the most-recent read of that path. Mirrors
+  // microcompact's `latestReadResultPerPath`.
+  const keepIndexByPath = new Map<string, number>();
+  for (const index of compactableResultIndices) {
+    const message = messages[index];
+    const callId = message?.toolCallId;
+    if (callId === undefined) continue;
+    const filePath = readPathByCallId.get(callId);
+    if (filePath === undefined) continue;
+    keepIndexByPath.set(filePath, index);
+  }
+  const keepIndices = new Set<number>(keepIndexByPath.values());
+  let cleared = 0;
+  for (const index of compactableResultIndices) {
+    // Never clear within the most-recent-N kept window.
+    if (keepFromIndex >= 0 && index >= keepFromIndex) continue;
+    // Never clear the most-recent read of an active file path.
+    if (keepIndices.has(index)) continue;
+    // Never clear content that has not yet been persisted to the rollout.
+    if (index >= boundUpToIndex) continue;
+    const message = messages[index];
+    if (message === undefined) continue;
+    if (
+      toolResultContentLength(message.content) < IN_MEMORY_TOOL_RESULT_MAX_CHARS
+    ) {
+      continue;
+    }
+    if (message.content === IN_MEMORY_TOOL_RESULT_CLEARED_MARKER) continue;
+    const callId = message.toolCallId;
+    const outboundContent =
+      callId !== undefined ? outboundContentByCallId.get(callId) : undefined;
+    if (outboundContent !== undefined) {
+      // The wire still carries this result in full: clearing it here would
+      // change the next request's bytes and cost the whole cached suffix.
+      if (
+        toolResultContentLength(outboundContent) >=
+        toolResultContentLength(message.content)
+      ) {
+        continue;
+      }
+      // Adopt the outbound bytes verbatim, so the next request's projection
+      // reproduces exactly what the last one sent.
+      messages[index] = { ...message, content: outboundContent };
+      cleared += 1;
+      continue;
+    }
+    // Not carried by the request that just went out, and after the boundary:
+    // a future projection may still carry it, so it stays whole. (Anything
+    // before the boundary was already handled by the free pass above.)
+  }
+  return cleared + clearedBeforeBoundary;
+}
+
+// Shared with run-turn.ts and its sibling modules.
+export {
+  prepareAgenCTurnContext,
+  getAgenCPreparedTerminal,
+  boundInMemoryToolResultContent,
+};

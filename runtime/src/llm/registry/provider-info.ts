@@ -6,6 +6,7 @@
  * defaults, ordered environment ingress names, and onboarding classification.
  */
 
+import { OLLAMA_CLOUD_BASE_URL, OLLAMA_CLOUD_API_KEY_ENV, OLLAMA_CLOUD_DEFAULT_MODEL } from "./ollama-cloud-models.js";
 import { deriveFlatCatalog } from "./model-catalog.js";
 import { OPENROUTER_FREE_MODEL_IDS } from "./openrouter-free-models.js";
 import { normalizeProviderIdentity } from "../../provider-identity.js";
@@ -17,7 +18,7 @@ export const GITHUB_COPILOT_MODEL_PREFIX = "github:copilot:";
 
 const GITHUB_COPILOT_MODEL_IDS = Object.freeze([
   "gpt-5-mini",
-  "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+  "gpt-5.3-codex",
   "gpt-5.4",
   "gpt-5.4-mini",
   "gpt-5.4-nano",
@@ -55,6 +56,7 @@ const GITHUB_COPILOT_CATALOG_MODELS = Object.freeze(
 );
 
 const NVIDIA_PROVIDER_MODEL_IDS = Object.freeze([
+  "openai/gpt-oss-120b",
   "nvidia/cosmos-reason2-8b",
   "microsoft/phi-4-mini-flash-reasoning",
   "qwen/qwen3-next-80b-a3b-thinking",
@@ -165,18 +167,6 @@ const NVIDIA_PROVIDER_MODEL_IDS = Object.freeze([
   "moonshotai/kimi-k2-thinking",
   "moonshotai/kimi-k2.5-thinking",
   "moonshotai/kimi-k2-instruct-0905",
-] as const);
-
-const MINIMAX_MODEL_IDS = Object.freeze([
-  "MiniMax-M3",
-  "MiniMax-M2.7",
-  "MiniMax-M2",
-  "MiniMax-M2.1",
-  "MiniMax-M2.5",
-  "MiniMax-Text-01",
-  "MiniMax-Text-01-Preview",
-  "MiniMax-Vision-01",
-  "MiniMax-Vision-01-Fast",
 ] as const);
 
 // Single source of truth: model lists for providers that have entries in
@@ -361,7 +351,7 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
     onboarding: onboardingInfo(10, "api-key"),
   }),
   openai: providerDefinition({
-    name: "OpenAI", // branding-scan: allow real provider display name
+    name: "OpenAI",
     defaultModel: "gpt-5",
     baseURL: "https://api.openai.com/v1",
     credentials: apiKeyCredentials(["OPENAI_API_KEY"]),
@@ -370,8 +360,8 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
     onboarding: onboardingInfo(20, "api-key"),
   }),
   anthropic: providerDefinition({
-    name: "Anthropic", // branding-scan: allow real provider display name
-    defaultModel: "claude-opus-4-7",
+    name: "Anthropic",
+    defaultModel: "claude-opus-5",
     baseURL: "https://api.anthropic.com/v1",
     credentials: apiKeyCredentials(["ANTHROPIC_API_KEY"]),
     baseURLEnvVars: ["ANTHROPIC_BASE_URL"],
@@ -394,7 +384,7 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
     onboarding: onboardingInfo(50, "local"),
   }),
   "openai-compatible": providerDefinition({
-    name: "OpenAI-compatible", // branding-scan: allow provider category display name
+    name: "OpenAI-compatible",
     defaultModel: "local-model",
     baseURL: "http://localhost:8000/v1",
     credentials: apiKeyCredentials(
@@ -426,22 +416,96 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
   }),
   deepseek: providerDefinition({
     name: "DeepSeek",
-    defaultModel: "deepseek-v4-flash",
+    defaultModel: "deepseek-flash",
     baseURL: "https://api.deepseek.com/v1",
     credentials: apiKeyCredentials(["DEEPSEEK_API_KEY"]),
     baseURLEnvVars: ["DEEPSEEK_BASE_URL"],
     onboarding: onboardingInfo(90, "api-key"),
   }),
+  meta: providerDefinition({
+    name: "Meta",
+    defaultModel: "muse-spark-1.3",
+    baseURL: "https://api.meta.ai/v1",
+    credentials: apiKeyCredentials(["MODEL_API_KEY"]),
+    baseURLEnvVars: ["META_BASE_URL"],
+    onboarding: onboardingInfo(95, "api-key"),
+  }),
+  qwen: providerDefinition({
+    name: "QwenCloud Pay-As-You-Go",
+    defaultModel: "qwen3.8-max",
+    // The workspace-specific Singapore endpoint is preferred when available,
+    // but requires a workspace id. Alibaba keeps this shared international
+    // endpoint fully functional, making it the only safe built-in default.
+    baseURL: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    credentials: apiKeyCredentials(["DASHSCOPE_API_KEY", "QWEN_API_KEY"]),
+    baseURLEnvVars: ["DASHSCOPE_BASE_URL", "QWEN_BASE_URL"],
+    onboarding: onboardingInfo(97, "api-key"),
+  }),
+  "qwen-token-plan": providerDefinition({
+    name: "QwenCloud Token Plan",
+    defaultModel: "qwen3.8-max",
+    baseURL:
+      "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    credentials: apiKeyCredentials([
+      "QWEN_TOKEN_PLAN_API_KEY",
+      "DASHSCOPE_TOKEN_PLAN_API_KEY",
+    ]),
+    baseURLEnvVars: [
+      "QWEN_TOKEN_PLAN_BASE_URL",
+      "DASHSCOPE_TOKEN_PLAN_BASE_URL",
+    ],
+    onboarding: onboardingInfo(98, "api-key"),
+  }),
+  "ollama-cloud": providerDefinition({
+    name: "Ollama Cloud",
+    defaultModel: OLLAMA_CLOUD_DEFAULT_MODEL,
+    baseURL: OLLAMA_CLOUD_BASE_URL,
+    credentials: apiKeyCredentials([OLLAMA_CLOUD_API_KEY_ENV]),
+    baseURLEnvVars: [],
+    onboarding: onboardingInfo(99, "api-key"),
+  }),
+  cerebras: providerDefinition({
+    name: "Cerebras",
+    defaultModel: "gpt-oss-120b",
+    baseURL: "https://api.cerebras.ai/v1",
+    credentials: apiKeyCredentials(["CEREBRAS_API_KEY"]),
+    baseURLEnvVars: ["CEREBRAS_BASE_URL"],
+    onboarding: onboardingInfo(99, "api-key"),
+  }),
+  zai: providerDefinition({
+    name: "Z.AI",
+    defaultModel: "glm-5.3",
+    baseURL: "https://api.z.ai/api/paas/v4",
+    credentials: apiKeyCredentials(["ZAI_API_KEY"]),
+    baseURLEnvVars: ["ZAI_BASE_URL"],
+    onboarding: onboardingInfo(99, "api-key"),
+  }),
+  "zai-coding-plan": providerDefinition({
+    name: "Z.AI Coding Plan",
+    defaultModel: "glm-5.3",
+    baseURL: "https://api.z.ai/api/coding/paas/v4",
+    credentials: apiKeyCredentials(["ZAI_CODING_PLAN_API_KEY"]),
+    baseURLEnvVars: ["ZAI_CODING_PLAN_BASE_URL"],
+    onboarding: onboardingInfo(100, "api-key"),
+  }),
   gemini: providerDefinition({
     name: "Gemini",
-    // gemini-2.5-pro is retired for new keys (404 pointing at the 3.x
-    // line), so the default must live on the current family.
     defaultModel: "gemini-3.1-pro-preview",
     baseURL: GEMINI_DEVELOPER_NATIVE_BASE_URL,
     credentials: apiKeyCredentials(["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
     baseURLEnvVars: ["GEMINI_BASE_URL"],
     supportsApiKeylessAuth: true,
     onboarding: onboardingInfo(100, "api-key"),
+  }),
+  kimi: providerDefinition({
+    name: "Kimi (Moonshot)",
+    defaultModel: "kimi-k3",
+    baseURL: "https://api.moonshot.ai/v1",
+    credentials: apiKeyCredentials(["MOONSHOT_API_KEY"]),
+    // The native provider is intentionally bound to Moonshot's global API.
+    // The existing openai-compatible slot remains available for custom URLs.
+    baseURLEnvVars: [],
+    onboarding: onboardingInfo(101, "api-key"),
   }),
   mistral: providerDefinition({
     name: "Mistral",
@@ -461,7 +525,7 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
   }),
   minimax: providerDefinition({
     name: "MiniMax",
-    defaultModel: "MiniMax-M2.5",
+    defaultModel: "MiniMax-M3",
     baseURL: "https://api.minimax.io/v1",
     credentials: apiKeyCredentials(["MINIMAX_API_KEY"]),
     baseURLEnvVars: ["MINIMAX_BASE_URL"],
@@ -469,7 +533,7 @@ export const BUILT_IN_PROVIDER_DEFINITIONS = Object.freeze({
   }),
   github: providerDefinition({
     name: "GitHub Copilot",
-    defaultModel: "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+    defaultModel: "gpt-5.3-codex",
     baseURL: "https://api.githubcopilot.com",
     credentials: apiKeyCredentials(["GITHUB_TOKEN", "GH_TOKEN"]),
     baseURLEnvVars: ["GITHUB_BASE_URL"],
@@ -586,7 +650,13 @@ export const BUILT_IN_PROVIDER_MODEL_CATALOG: Readonly<
   openai: mergeDerivedProviderModels("openai", {
     trailingExtras: ["o3"],
   }),
+  // The current lineup platform.claude.com lists (2026-09-11), then the
+  // legacy models it still serves. Haiku 4.5 is not offered: it takes no
+  // effort parameter, and the picker's dial would be a lie there.
   anthropic: Object.freeze([
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
@@ -624,16 +694,32 @@ export const BUILT_IN_PROVIDER_MODEL_CATALOG: Readonly<
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
   ]),
-  deepseek: Object.freeze(["deepseek-v4-flash", "deepseek-v4-pro"]),
+  deepseek: Object.freeze(["deepseek-flash", "deepseek-v4-pro"]),
+  // `/models` also advertises image generation and voice transcription.
+  // Those are not chat-completion LLMs and deliberately stay out of this list.
+  meta: mergeDerivedProviderModels("meta"),
+  qwen: mergeDerivedProviderModels("qwen"),
+  "qwen-token-plan": mergeDerivedProviderModels("qwen-token-plan"),
+  "ollama-cloud": mergeDerivedProviderModels("ollama-cloud"),
+  cerebras: mergeDerivedProviderModels("cerebras"),
+  zai: mergeDerivedProviderModels("zai"),
+  "zai-coding-plan": mergeDerivedProviderModels("zai-coding-plan"),
+  kimi: mergeDerivedProviderModels("kimi"),
+  // Mirrors the curated rows of GEMINI_THINKING_MODELS: every id here has a
+  // verified thinking contract, so an effort never dies at request build.
   gemini: Object.freeze([
     "gemini-3.1-pro-preview",
+    "gemini-3.8-flash",
     "gemini-3.7-flash",
+    "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
   ]),
   mistral: Object.freeze(["mistral-medium-latest"]),
   "nvidia-nim": NVIDIA_PROVIDER_MODEL_IDS,
-  minimax: MINIMAX_MODEL_IDS,
+  minimax: mergeDerivedProviderModels("minimax"),
   // Copilot proxies models owned by several providers. Keep those entries
   // qualified here so bare slugs such as gpt-5.4 retain one global owner.
   github: GITHUB_COPILOT_CATALOG_MODELS,

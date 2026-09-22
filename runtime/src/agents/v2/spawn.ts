@@ -4,9 +4,15 @@ import {
   type ToolResult,
 } from "../../tools/types.js";
 import { validationErrorToolResult } from "../../tools/results.js";
+import {
+  DEADLINE_RESERVE_SPAWN_REFUSAL,
+  inDeadlineReserve,
+} from "../../session/run-deadline.js";
 import type { Session } from "../../session/session.js";
 import type { ModelInfo, ReasoningEffort } from "../../session/turn-context.js";
 import { delegate } from "../delegate.js";
+import { liveAgentSession } from "../live-session.js";
+import { READ_ONLY_DELEGATION_PROMPT, sessionIsPlanning, sessionReadOnlyDelegation } from "../readonly-delegation.js";
 import type { ForkMode } from "../fork-context.js";
 import type { AgentThread } from "../thread.js";
 import {
@@ -30,6 +36,7 @@ import {
   backgroundTaskLifecycle,
   observeAgentThreadTask,
   registerAgentThreadTask,
+  isTerminalTaskStatus,
   type BackgroundTaskSnapshot,
 } from "../../tasks/index.js";
 import { syncBackgroundTaskSnapshotToAppState } from "../../tasks/app-state-bridge.js";
@@ -46,44 +53,53 @@ import {
   stringValue,
   toolMetadata,
   type MultiAgentV2Options,
+  agentValidationError,
 } from "./common.js";
 
 const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE =
   "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
 
-const SPAWN_AGENT_DELEGATION_DISCIPLINE = `
-### When to delegate vs. do the subtask yourself
-- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
-- Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
-- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
-- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
-- For reviewer, tester, or verifier agents, first create the artifact they are supposed to inspect and do the smallest local check that it exists. Agents asked to review missing files waste the user's time and produce confusing output.
-
-### Designing delegated subtasks
-- Subtasks must be concrete, well-defined, and self-contained.
-- Delegated subtasks must materially advance the main task.
-- Do not duplicate work between the main rollout and delegated subtasks.
-- Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
-- Narrow the delegated ask to the concrete output you need next.
-- For coding tasks, prefer delegating concrete code-change runner subtasks over read-only scanner analysis when the subagent can make a bounded patch in a clear write scope.
-- When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
-- For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
-- For parallel code-edit subtasks, use \`isolation: "worktree"\`. Require the worker to commit its changes and report the commit, changed files, and verification it ran. Review and integrate one exact verified \`base_commit..integration_ref\` range at a time; never infer an integration target from a mutable worker branch or treat completion as merge approval. An intended deliverable under an ignored path must be explicitly unignored or force-added and committed.
-- The spawned agent inherits its working directory from the parent session and receives the same Environment section. Do NOT embed absolute filesystem paths from memory in the \`message\` body and do NOT invent project root paths. Refer to files relative to the cwd the spawned agent will already know.
-- Omit \`fork_turns\` for a clean fork: the spawned agent starts fresh with ONLY your task as its context, so make the \`message\` fully self-contained (background, goal, constraints, relevant file paths/snippets) — it has NOT seen this conversation. This is the default and the cheap path for an N-agent fan-out. Use \`fork_turns: "all"\` only when the subtask genuinely needs the full parent conversation, or a positive integer string such as \`"3"\` for just the most recent turns. Full-history forks inherit the parent role/model/effort and cannot be combined with \`agent_type\`, \`model\`, or \`reasoning_effort\` overrides.
-
-### After you delegate
-- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
-- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
-- While the subagent is running in the background, do meaningful non-overlapping work immediately.
-- Do not repeatedly wait by reflex.
-- When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
-
-### Parallel delegation patterns
-- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
-- Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
-- Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
-- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task.`;
+/** Status projection belongs to the spawning Session, not the worker lifetime. */
+function ownTaskStatusProjection(session: Session): {
+  readonly active: () => boolean;
+  readonly own: (unsubscribe: () => void) => void;
+  readonly close: () => void;
+} {
+  let closed = session.isShuttingDown;
+  const subscriptions = new Set<() => void>();
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    for (const unsubscribe of subscriptions) unsubscribe();
+    subscriptions.clear();
+  };
+  const own = (unsubscribe: () => void): void => {
+    // Both Session status and task observation can replay synchronously.
+    if (closed) unsubscribe();
+    else subscriptions.add(unsubscribe);
+  };
+  if (!closed) {
+    try {
+      own(session.onBeforeDurableClose(close));
+      // A failed durable finalizer intentionally skips later finalizers.
+      // The owner shutdown status still releases projection subscriptions.
+      own(session.agentStatus.subscribe(() => {
+        if (session.isShuttingDown) close();
+      }));
+    } catch (error) {
+      close();
+      throw error;
+    }
+  }
+  return {
+    active: () => {
+      if (session.isShuttingDown) close();
+      return !closed;
+    },
+    own,
+    close,
+  };
+}
 
 function buildSpawnAgentDescription(session: Session | null): string {
   const base = `Spawns an agent to work on the specified task.
@@ -99,7 +115,15 @@ ${SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.`;
   const cfg = session?.config?.multiAgentV2;
-  let result = `${base}${SPAWN_AGENT_DELEGATION_DISCIPLINE}`;
+  if (sessionIsPlanning(session) || sessionReadOnlyDelegation(session) !== undefined) {
+    return `${base}\n\n${READ_ONLY_DELEGATION_PROMPT}\nDelegate bounded independent inspection tasks in parallel. Use isolation none, list_agents, wait_agent, and close_agent for your constrained workers.`;
+  }
+  // The delegation rules (when to delegate, how to design subtasks, what to
+  // do after delegating, parallel patterns) live in the static `# Subagents`
+  // system prompt section (prompts/system-prompt.ts getAgentToolSection),
+  // emitted whenever this tool is in the catalog. Keeping them out of the
+  // description takes about 4.8 KB out of the tool catalog of every request.
+  let result = `${base}\nThe delegation rules are in the Subagents section of your instructions.`;
   if (cfg?.usageHintEnabled && cfg.usageHintText) {
     result = `${result}\n${cfg.usageHintText}`;
   }
@@ -108,6 +132,7 @@ The new agent's canonical task name will be provided to it along with the messag
 
 function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
   if (
+    value === "minimal" ||
     value === "low" ||
     value === "medium" ||
     value === "high" ||
@@ -227,11 +252,8 @@ async function validateSpawnModelOverrides(opts: {
       modelsManager.tryListModels() ?? (await modelsManager.listModels());
     if (!listed.some((candidate) => candidate.slug === opts.model)) {
       const available = listed.map((candidate) => candidate.slug).join(", ");
-      return json(
-        {
-          error: `Unknown model \`${opts.model}\` for spawn_agent. Available models: ${available}`,
-        },
-        true,
+      return agentValidationError(
+        `Unknown model \`${opts.model}\` for spawn_agent. Available models: ${available}`,
       );
     }
   }
@@ -245,11 +267,8 @@ async function validateSpawnModelOverrides(opts: {
         : await modelsManager.getModelInfo(model);
     if (!modelInfo.supportedReasoningLevels.includes(opts.reasoningEffort)) {
       const supported = modelInfo.supportedReasoningLevels.join(", ");
-      return json(
-        {
-          error: `Reasoning effort \`${opts.reasoningEffort}\` is not supported for model \`${model}\`. Supported reasoning efforts: ${supported}`,
-        },
-        true,
+      return agentValidationError(
+        `Reasoning effort \`${opts.reasoningEffort}\` is not supported for model \`${model}\`. Supported reasoning efforts: ${supported}`,
       );
     }
   }
@@ -275,12 +294,8 @@ async function resolveSpawnServiceTier(opts: {
     opts.session.sessionConfiguration.collaborationMode.model ??
     opts.session.modelInfo.slug;
   if (!model) {
-    return json(
-      {
-        error:
-          "spawn_agent could not resolve the child model for service tier validation",
-      },
-      true,
+    return agentValidationError(
+      "spawn_agent could not resolve the child model for service tier validation",
     );
   }
   const modelInfo =
@@ -291,11 +306,8 @@ async function resolveSpawnServiceTier(opts: {
     opts.requestedServiceTier !== undefined &&
     !modelSupportsServiceTier(modelInfo, opts.requestedServiceTier)
   ) {
-    return json(
-      {
-        error: `Service tier \`${opts.requestedServiceTier}\` is not supported for model \`${model}\`. Supported service tiers: ${formatSupportedServiceTiers(modelInfo)}`,
-      },
-      true,
+    return agentValidationError(
+      `Service tier \`${opts.requestedServiceTier}\` is not supported for model \`${model}\`. Supported service tiers: ${formatSupportedServiceTiers(modelInfo)}`,
     );
   }
   for (const candidate of [
@@ -414,14 +426,28 @@ function buildSpawnAgentSchema(opts: MultiAgentV2Options): Record<string, unknow
 }
 
 export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
+  const preflight: NonNullable<Tool["preflight"]> = (args) => {
+    for (const key of ["message", "task_name"]) {
+      if (typeof args[key] !== "string" || args[key].trim().length === 0) {
+        return { code: `missing-${key}`, message: `${key} is required` };
+      }
+    }
+    return null;
+  };
   const execute = async (
     args: Record<string, unknown>,
   ): Promise<ToolResult> => {
+    const preflightFailure = preflight(args);
+    if (preflightFailure !== null) return spawnValidationError(preflightFailure.message);
     const sessionOrError = getSessionOrError(opts);
     if (!("conversationId" in sessionOrError)) {
       return confirmedNoSpawn(sessionOrError);
     }
-    const session = sessionOrError;
+    const rootSession = sessionOrError;
+    // A run in its deadline reserve (#2503) finishes with what it has.
+    if (inDeadlineReserve(rootSession)) {
+      return spawnValidationError(DEADLINE_RESERVE_SPAWN_REFUSAL);
+    }
     const strict = strictArgs(args, {
       allowed: new Set([
         "message",
@@ -468,7 +494,7 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
     }
     try {
       assertAgentRoleWorkspaceMatches(
-        session.roleWorkspace,
+        rootSession.roleWorkspace,
         opts.workspace.id,
       );
     } catch (error) {
@@ -476,7 +502,7 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
         error instanceof Error ? error.message : String(error),
       );
     }
-    const { control, registry } = opts.ensureAgentControl(session);
+    const { control, registry } = opts.ensureAgentControl(rootSession);
     try {
       control.assertRoleWorkspace(opts.workspace);
     } catch (error) {
@@ -484,8 +510,26 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
         error instanceof Error ? error.message : String(error),
       );
     }
-    const current = currentAgentContext(session, args, opts);
+    const current = currentAgentContext(rootSession, args, opts);
     if (isCurrentAgentContextError(current)) return confirmedNoSpawn(current);
+    const caller = current.threadId === rootSession.conversationId
+      ? undefined : control.getLive(current.threadId);
+    const session = current.threadId === rootSession.conversationId
+      ? rootSession : caller === undefined ? undefined : liveAgentSession(caller);
+    const callerIsCurrent = (): boolean => session !== undefined &&
+      (caller === undefined
+        ? session === rootSession
+        : control.getLive(current.threadId) === caller &&
+          caller.agentId === current.threadId && caller.agentPath === current.agentPath &&
+          liveAgentSession(caller) === session);
+    if (session === undefined || !callerIsCurrent()) {
+      return spawnValidationError("invalid-runtime-identity: calling agent session is not live");
+    }
+    try {
+      assertAgentRoleWorkspaceMatches(session.roleWorkspace, opts.workspace.id);
+    } catch (error) {
+      return spawnValidationError(error instanceof Error ? error.message : String(error));
+    }
     const rawRole = stringValue(args.agent_type);
     // The session catalog performs exact-name lookup before public alias
     // fallback. Canonicalizing here would make an executable plugin/workspace
@@ -692,7 +736,13 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
     } catch (error) {
       return failSpawn(error instanceof Error ? error.message : String(error));
     }
+    // Model/tier validation can await. Never delegate using a child Session
+    // that closed or was replaced while those checks were pending.
+    if (!callerIsCurrent()) {
+      return failSpawn("invalid-runtime-identity: calling agent session is no longer live");
+    }
     let thread: AgentThread | undefined;
+    let rejectedEffectDisposition: ToolResult["effectDisposition"];
     try {
       const childAgentPath = joinAgentPath(current.agentPath, taskName);
       const worktreeSlug =
@@ -706,6 +756,11 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
       const outcome = await delegate({
         parent: session,
         parentPath: current.agentPath,
+        ...(caller !== undefined ? {
+          assertParentSessionActive: () => {
+            if (!callerIsCurrent()) throw new Error("invalid-runtime-identity: calling agent session is no longer live");
+          },
+        } : {}),
         control,
         registry,
         taskPrompt: prompt,
@@ -730,6 +785,7 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
           : {}),
       });
       if (outcome.kind === "rejected") {
+        rejectedEffectDisposition = outcome.effectDisposition;
         throw new Error(outcome.reason);
       }
       thread = outcome.thread;
@@ -755,43 +811,54 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
           },
         },
       });
-      return json({ error: reason }, true);
+      return {
+        ...json({ error: reason }, true),
+        ...(rejectedEffectDisposition !== undefined
+          ? { effectDisposition: rejectedEffectDisposition }
+          : {}),
+      };
     }
     if (thread === undefined) {
       return json({ error: "spawn_agent did not return an agent thread" }, true);
     }
     const live = thread.live;
+    const projection = ownTaskStatusProjection(session);
     const emitTaskStatus = (snapshot: BackgroundTaskSnapshot): void => {
-      if (snapshot.status === "pending") return;
-      emit(session, {
-        type: "collab_agent_status",
-        payload: {
-          callId,
-          senderThreadId: current.threadId,
-          threadId: live.agentId,
-          agentPath: live.agentPath,
-          agentNickname: live.nickname,
-          agentRole: live.role.name,
-          agentRoleDisplayName: formatAgentRoleLabel(live.role.name),
-          prompt,
-          model: model ?? session.sessionConfiguration.collaborationMode.model,
-          reasoningEffort:
-            reasoningEffort ??
-            session.sessionConfiguration.collaborationMode.reasoningEffort,
-          status: snapshot.status,
-          // Forward the live per-agent tool-use + token counts so the fan-out
-          // rail / fleet panel show real activity for collab-spawned agents
-          // instead of a frozen `tools 0 tokens 0`. The snapshot's progress is
-          // refreshed from the live handle by registerAgentThreadTask.
-          ...(snapshot.progress?.toolUseCount !== undefined
-            ? { toolUseCount: snapshot.progress.toolUseCount }
-            : {}),
-          ...(snapshot.progress?.tokenCount !== undefined
-            ? { tokenCount: snapshot.progress.tokenCount }
-            : {}),
-          ...(snapshot.error !== undefined ? { error: snapshot.error } : {}),
-        },
-      });
+      if (snapshot.status === "pending" || !projection.active()) return;
+      try {
+        emit(session, {
+          type: "collab_agent_status",
+          payload: {
+            callId,
+            senderThreadId: current.threadId,
+            threadId: live.agentId,
+            ...(live.status.timing !== undefined ? { timing: live.status.timing } : {}),
+            agentPath: live.agentPath,
+            agentNickname: live.nickname,
+            agentRole: live.role.name,
+            agentRoleDisplayName: formatAgentRoleLabel(live.role.name),
+            prompt,
+            model: model ?? session.sessionConfiguration.collaborationMode.model,
+            reasoningEffort:
+              reasoningEffort ??
+              session.sessionConfiguration.collaborationMode.reasoningEffort,
+            status: snapshot.status,
+            // Forward the live per-agent tool-use + token counts so the fan-out
+            // rail / fleet panel show real activity for collab-spawned agents
+            // instead of a frozen `tools 0 tokens 0`. The snapshot's progress is
+            // refreshed from the live handle by registerAgentThreadTask.
+            ...(snapshot.progress?.toolUseCount !== undefined
+              ? { toolUseCount: snapshot.progress.toolUseCount }
+              : {}),
+            ...(snapshot.progress?.tokenCount !== undefined
+              ? { tokenCount: snapshot.progress.tokenCount }
+              : {}),
+            ...(snapshot.error !== undefined ? { error: snapshot.error } : {}),
+          },
+        });
+      } finally {
+        if (isTerminalTaskStatus(snapshot.status)) projection.close();
+      }
     };
     try {
       registerAgentThreadTask(backgroundTaskLifecycle, thread, {
@@ -802,7 +869,24 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
         // is preserved separately on the task's `prompt` field.
         description: shortAgentTaskTitle(taskName, prompt),
         prompt,
-        onSnapshot: (snapshot) => {
+      });
+    } catch (error) {
+      if (
+        !(error instanceof BackgroundTaskError) ||
+        error.code !== "already_exists"
+      ) {
+        projection.close();
+        throw error;
+      }
+    }
+    try {
+      // The daemon may already own registration. In either case, status
+      // projection has a separate subscription scoped to this Session.
+      projection.own(observeAgentThreadTask(
+        backgroundTaskLifecycle,
+        thread,
+        (snapshot) => {
+          if (!projection.active()) return;
           syncBackgroundTaskSnapshotToAppState(
             (
               session as unknown as {
@@ -815,45 +899,30 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
           );
           emitTaskStatus(snapshot);
         },
+      ));
+      emit(session, {
+        type: "collab_agent_spawn_end",
+        payload: {
+          callId,
+          senderThreadId: current.threadId,
+          newThreadId: live.agentId,
+          ...(live.status.timing !== undefined ? { timing: live.status.timing } : {}),
+          newAgentPath: live.agentPath,
+          newAgentNickname: live.nickname,
+          newAgentRole: live.role.name,
+          newAgentRoleDisplayName: formatAgentRoleLabel(live.role.name),
+          prompt,
+          model: model ?? session.sessionConfiguration.collaborationMode.model,
+          reasoningEffort:
+            reasoningEffort ??
+            session.sessionConfiguration.collaborationMode.reasoningEffort,
+          status: live.status.value,
+        },
       });
     } catch (error) {
-      if (
-        !(error instanceof BackgroundTaskError) ||
-        error.code !== "already_exists"
-      ) {
-        throw error;
-      }
-      /*
-       * The daemon pre-registers agent threads, so this registration — and
-       * with it the onSnapshot hook that carries `collab_agent_status` to
-       * attached UIs — was silently skipped: clients saw the spawn begin
-       * and end, then nothing. No status, no live tool/token counts. Wire
-       * the same telemetry straight to the live handle instead.
-       */
-      observeAgentThreadTask(
-        backgroundTaskLifecycle,
-        thread,
-        emitTaskStatus,
-      );
+      projection.close();
+      throw error;
     }
-    emit(session, {
-      type: "collab_agent_spawn_end",
-      payload: {
-        callId,
-        senderThreadId: current.threadId,
-        newThreadId: live.agentId,
-        newAgentPath: live.agentPath,
-        newAgentNickname: live.nickname,
-        newAgentRole: live.role.name,
-        newAgentRoleDisplayName: formatAgentRoleLabel(live.role.name),
-        prompt,
-        model: model ?? session.sessionConfiguration.collaborationMode.model,
-        reasoningEffort:
-          reasoningEffort ??
-          session.sessionConfiguration.collaborationMode.reasoningEffort,
-        status: live.status.value,
-      },
-    });
     return json({
       task_name: live.agentPath,
       ...(!hideSpawnAgentMetadata(session)
@@ -882,6 +951,7 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
     }),
     requiresApproval: true,
     recoveryCategory: "side-effecting",
+    preflight,
     admissionEstimate: localZeroAdmissionEstimate,
     get inputSchema(): Record<string, unknown> {
       return buildSpawnAgentSchema(opts);

@@ -32,6 +32,11 @@ describe("expandIPv6Groups", () => {
     expect(expandIPv6Groups("::ffff:01.2.3.4")).toBeNull();
     expect(expandIPv6Groups("::ffff:999.2.3.4")).toBeNull();
   });
+
+  it("rejects malformed zone IDs on mapped private addresses", () => {
+    expect(expandIPv6Groups("::ffff:169.254.169.254%")).toBeNull();
+    expect(expandIPv6Groups("::ffff:10.0.0.1%eth0%extra")).toBeNull();
+  });
 });
 
 describe("isBlockedAddress", () => {
@@ -51,8 +56,21 @@ describe("isBlockedAddress", () => {
     }
   });
 
+  it("blocks scoped mapped private and link-local addresses", () => {
+    for (const address of [
+      "::ffff:169.254.169.254%eth0",
+      "::ffff:10.0.0.1%eth0",
+      "::ffff:172.16.0.1%7",
+      "::ffff:192.168.0.1%en0",
+    ]) {
+      expect(isBlockedAddress(address), address).toBe(true);
+    }
+  });
+
   it("keeps public mapped addresses and scoped loopback allowed", () => {
     expect(isBlockedAddress("::ffff:8.8.8.8")).toBe(false);
     expect(isBlockedAddress("::1%lo0")).toBe(false);
+    expect(isBlockedAddress("0:0:0:0:0:0:0:1%lo0")).toBe(false);
+    expect(isBlockedAddress("::ffff:127.0.0.1%lo0")).toBe(false);
   });
 });

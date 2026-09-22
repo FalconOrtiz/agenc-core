@@ -40,27 +40,10 @@ import {
   GLOB_TOOL_NAME,
 } from "./glob.js";
 import { bindExplicitDangerBoundary } from "../../helpers/explicit-danger-boundary.js";
-import { workspaceMutationCoordinators } from "../../../src/workspace/mutation-coordinator.js";
 import { attachToolRuntimeContext } from "../../../src/tools/runtimes/context.js";
 
 const createGlobTool = (...args: Parameters<typeof createUnboundGlobTool>) =>
   bindExplicitDangerBoundary(createUnboundGlobTool(...args));
-
-function attachTrustedEditorContext(args: Record<string, unknown>): void {
-  attachToolRuntimeContext(args, {
-    callId: "trusted-editor-glob",
-    toolName: GLOB_TOOL_NAME,
-    sandboxMode: "danger_full_access",
-    invocation: {
-      turn: {
-        editorInteraction: {
-          interactionId: "trusted-editor-glob",
-          policy: "read_only",
-        },
-      },
-    },
-  } as never);
-}
 
 function isWindowsExchangeDenial(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException)?.code;
@@ -102,6 +85,17 @@ function expectCompletedExchangeAttempt(
   if (outcome === "kernel_denied") expect(process.platform).toBe("win32");
 }
 
+/** Run one scoped Glob query against `root` and assert it succeeded. */
+async function runScopedGlob(
+  root: string,
+  args: { readonly pattern: string; readonly path: string },
+) {
+  const tool = createGlobTool({ allowedPaths: [root] });
+  const result = await tool.execute(args);
+  expect(result.isError).toBeUndefined();
+  return result;
+}
+
 describe("Glob tool", () => {
   let root = "";
   let previousAgencHome: string | undefined;
@@ -110,11 +104,9 @@ describe("Glob tool", () => {
     root = await mkdtemp(join(tmpdir(), "agenc-glob-"));
     previousAgencHome = process.env.AGENC_HOME;
     process.env.AGENC_HOME = join(root, ".agenc-test-home");
-    workspaceMutationCoordinators.clearForTests();
   });
 
   afterEach(async () => {
-    workspaceMutationCoordinators.clearForTests();
     if (root) await rm(root, { recursive: true, force: true });
     root = "";
     if (previousAgencHome === undefined) {
@@ -214,7 +206,7 @@ describe("Glob tool", () => {
     expect(result.content).not.toContain("skip.md");
   });
 
-  test("scoped searches honor root ignore rules in clean and protected workspaces", async () => {
+  test("scoped searches honor root ignore rules", async () => {
     const scoped = join(root, "sub");
     await mkdir(scoped);
     await writeFile(join(root, ".gitignore"), "sub/ignored.ts\n", "utf8");
@@ -227,17 +219,39 @@ describe("Glob tool", () => {
     expect(clean.content).toContain("sub/visible.ts");
     expect(clean.content).not.toContain("ignored.ts");
 
-    workspaceMutationCoordinators.getOrCreate(root).acquire({
-      workspaceRoot: root,
-      editorInstanceId: "glob-ignore-editor",
-    });
-    const protectedResult = await tool.execute({
+    const protectedResult = await runScopedGlob(root, {
       pattern: "*.ts",
       path: scoped,
     });
-    expect(protectedResult.isError).toBeUndefined();
     expect(protectedResult.content).toContain("sub/visible.ts");
     expect(protectedResult.content).not.toContain("ignored.ts");
+  });
+
+  test("batched validation keeps every match and the mtime order", async () => {
+    // Matches are validated 16 at a time through the directory helper; the
+    // result must still list every file, newest first, exactly as the
+    // sequential path did.
+    const scoped = join(root, "many");
+    await mkdir(scoped);
+    const names: string[] = [];
+    const base = Date.now() - 60 * 60 * 1000;
+    for (let i = 0; i < 40; i += 1) {
+      const name = `file-${String(i).padStart(2, "0")}.ts`;
+      const file = join(scoped, name);
+      await writeFile(file, `export const v${i} = ${i};\n`, "utf8");
+      const stamp = new Date(base + i * 1000);
+      await utimes(file, stamp, stamp);
+      names.push(name);
+    }
+    const result = await runScopedGlob(root, { pattern: "*.ts", path: scoped },
+    );
+
+    const listed = result.content
+      .split("\n")
+      .filter((line) => line.includes("file-"))
+      .map((line) => line.trim().replace(/^.*\//, ""));
+    expect(listed).toEqual([...names].reverse());
+    expect(result.metadata).toMatchObject({ numFiles: 40, truncated: false });
   });
 
   test.runIf(process.platform !== "win32")(
@@ -255,10 +269,6 @@ describe("Glob tool", () => {
 
       const run = async (editorProtected: boolean) => {
         if (editorProtected) {
-          workspaceMutationCoordinators.getOrCreate(root).acquire({
-            workspaceRoot: root,
-            editorInstanceId: "glob-ignore-snapshot-editor",
-          });
         }
         let exchanged = false;
         const tool = createGlobTool({
@@ -294,10 +304,6 @@ describe("Glob tool", () => {
     await mkdir(outside);
     await writeFile(join(scoped, "inside.ts"), "inside\n", "utf8");
     await writeFile(join(outside, "outside-secret.ts"), "outside\n", "utf8");
-    workspaceMutationCoordinators.getOrCreate(workspace).acquire({
-      workspaceRoot: workspace,
-      editorInstanceId: "glob-prebind-editor",
-    });
     let exchangeOutcome: "pending" | "exchanged" | "kernel_denied" = "pending";
     const tool = createGlobTool({
       allowedPaths: [workspace],
@@ -362,10 +368,6 @@ describe("Glob tool", () => {
     await mkdir(outside);
     await writeFile(join(workspace, "inside-only.ts"), "inside\n", "utf8");
     await writeFile(join(outside, "outside-secret.ts"), "outside\n", "utf8");
-    workspaceMutationCoordinators.getOrCreate(workspace).acquire({
-      workspaceRoot: workspace,
-      editorInstanceId: "glob-confinement-editor",
-    });
     let exchangeOutcome: "pending" | "exchanged" | "kernel_denied" = "pending";
     const tool = createGlobTool({
       allowedPaths: [workspace],
@@ -387,113 +389,6 @@ describe("Glob tool", () => {
     expect(result.isError).toBeUndefined();
     expect(result.content).toContain("inside-only.ts");
     expect(result.content).not.toContain("outside-secret.ts");
-  });
-
-  test.runIf(process.platform !== "win32")(
-    "holds an Editor-acquisition fence across final read seams",
-    async () => {
-      for (const seam of ["final-path", "root-ignore"] as const) {
-        const workspace = join(root, `late-authority-${seam}`);
-        const displaced = join(root, `late-authority-${seam}-displaced`);
-        const outside = join(root, `late-authority-${seam}-outside`);
-        await mkdir(workspace);
-        await mkdir(outside);
-        await writeFile(join(workspace, "inside.ts"), "inside\n", "utf8");
-        await writeFile(
-          join(outside, "outside-secret.ts"),
-          "outside-glob-secret\n",
-          "utf8",
-        );
-        let lateAcquireError: unknown;
-        let exchangeOutcome: "pending" | "exchanged" | "kernel_denied" =
-          "pending";
-        const attemptLateAuthority = async (): Promise<void> => {
-          exchangeOutcome = await exchangeDirectory(
-            workspace,
-            displaced,
-            outside,
-          );
-          try {
-            workspaceMutationCoordinators.acquireEditor(workspace, {
-              workspaceRoot: workspace,
-              editorInstanceId: `glob-late-${seam}`,
-            });
-          } catch (error) {
-            lateAcquireError = error;
-          }
-        };
-        const tool = createGlobTool({
-          allowedPaths: [workspace],
-          ...(seam === "final-path"
-            ? { __testAfterFinalPathCheck: attemptLateAuthority }
-            : { __testAfterRootIgnoreSnapshot: attemptLateAuthority }),
-        });
-
-        const result = await tool.execute({
-          pattern: "**/*.ts",
-          path: workspace,
-        });
-
-        expect((lateAcquireError as { code?: unknown })?.code).toBe(
-          "EDITOR_LEASE_CONFLICT",
-        );
-        expectCompletedExchangeAttempt(exchangeOutcome);
-        expect(result.isError).toBeUndefined();
-        expect(result.content).toContain("inside.ts");
-        expect(result.content).not.toContain("outside-secret.ts");
-        expect(result.content).not.toContain("outside-glob-secret");
-        const postToolLease = workspaceMutationCoordinators.acquireEditor(
-          workspace,
-          {
-            workspaceRoot: workspace,
-            editorInstanceId: `glob-post-${seam}`,
-          },
-        );
-        expect(postToolLease.editorInstanceId).toBe(`glob-post-${seam}`);
-      }
-    },
-  );
-
-  test("keeps trusted Editor listings bound after the live lease disappears", async () => {
-    const workspace = join(root, "workspace");
-    const displaced = join(root, "workspace-displaced");
-    const outside = join(root, "outside");
-    await mkdir(workspace);
-    await mkdir(outside);
-    await writeFile(join(workspace, "inside-trusted.ts"), "inside\n", "utf8");
-    await writeFile(
-      join(outside, "outside-trusted-secret.ts"),
-      "outside\n",
-      "utf8",
-    );
-    workspaceMutationCoordinators.getOrCreate(workspace).acquire({
-      workspaceRoot: workspace,
-      editorInstanceId: "expired-glob-editor",
-    });
-    workspaceMutationCoordinators.clearForTests();
-    let exchangeOutcome: "pending" | "exchanged" | "kernel_denied" = "pending";
-    const tool = createGlobTool({
-      allowedPaths: [workspace],
-      __testAfterFinalPathCheck: async () => {
-        exchangeOutcome = await exchangeDirectory(
-          workspace,
-          displaced,
-          outside,
-        );
-      },
-    });
-    const args: Record<string, unknown> = {
-      pattern: "*.ts",
-      path: workspace,
-    };
-    attachTrustedEditorContext(args);
-
-    const result = await tool.execute(args);
-
-    expectCompletedExchangeAttempt(exchangeOutcome);
-    expect(result.isError).toBeUndefined();
-    expect(result.content).toContain("inside-trusted.ts");
-    expect(result.content).not.toContain("outside-trusted-secret.ts");
   });
 
   test("drops an intermediate-swap candidate restored before validation", async () => {
@@ -543,10 +438,6 @@ await rename(displaced, nested);
       );
     }
     await chmod(fakeRipgrep, 0o755);
-    workspaceMutationCoordinators.getOrCreate(workspace).acquire({
-      workspaceRoot: workspace,
-      editorInstanceId: "glob-intermediate-editor",
-    });
     const tool = createGlobTool({
       allowedPaths: [workspace],
       ripgrepCommand: fakeRipgrep,
@@ -670,7 +561,7 @@ await rename(displaced, nested);
     expect(result.metadata?.numFiles).toBe(3);
   });
 
-  test("truncates a protected one-chunk result without exhausting work", async () => {
+  test("truncates a one-chunk result without exhausting work", async () => {
     const fakeRipgrepScript = join(root, "one-chunk-rg.mjs");
     const fakeRipgrep =
       process.platform === "win32"
@@ -695,10 +586,6 @@ await rename(displaced, nested);
       );
     }
     await chmod(fakeRipgrep, 0o755);
-    workspaceMutationCoordinators.getOrCreate(root).acquire({
-      workspaceRoot: root,
-      editorInstanceId: "glob-one-chunk-editor",
-    });
     const tool = createGlobTool({
       allowedPaths: [root],
       maxResults: 3,

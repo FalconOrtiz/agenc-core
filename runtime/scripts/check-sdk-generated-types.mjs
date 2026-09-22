@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { renderSdkWireTypes } from "./sdk-wire-types.mjs";
+import { checkSdkWireParity } from "./check-sdk-wire-parity.mjs";
+import { readWorkflowHandoffGenerated } from "./sdk-workflow-handoff.mjs";
 import {
   createSourceFile,
   isInterfaceDeclaration,
@@ -19,9 +23,15 @@ const paths = {
   coreTypes: "src/entrypoints/sdk/coreTypes.ts",
   generated: "src/entrypoints/sdk/coreTypes.generated.ts",
   runtimeProtocol: "src/app-server/protocol/index.ts",
+  turnTerminal: "src/contracts/turn-terminal.ts",
+  packageTurnTerminal: "../packages/agenc-sdk/src/turn-terminal.generated.ts",
   packageTranscriptV2: "../packages/agenc-sdk/src/transcript-v2.generated.ts",
+  packageWire: "../packages/agenc-sdk/src/protocol-wire.generated.ts",
   packageWorkflowResult:
     "../packages/agenc-sdk/src/workflow-result.generated.ts",
+  handoffSchema: "src/agents/workflow-handoff-artifact.v1.schema.json",
+  handoffSource: "src/agents/workflow-handoff-schema.ts",
+  packageWorkflowHandoff: "../packages/agenc-sdk/src/workflow-handoff.generated.ts",
 };
 const checkCommand =
   "npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types";
@@ -44,10 +54,19 @@ function normalizeLineEndings(source) {
   return source.replace(/\r\n?/g, "\n");
 }
 
+export function parseSdkGeneratedTypesMode(args) {
+  if (args.length === 0 || (args.length === 1 && args[0] === "--check")) return "check";
+  if (args.length === 1 && args[0] === "--write") return "write";
+  throw new Error(
+    "usage: check-sdk-generated-types.mjs [--check | --write]",
+  );
+}
+
 const transcriptV2InterfaceNames = [
   "SessionTranscriptV2Message",
   "SessionTranscriptV2ActiveTurn",
   "SessionTranscriptV2TurnResult",
+  "SessionTranscriptV2Event",
   "SessionTranscriptV2Result",
 ];
 
@@ -105,22 +124,180 @@ function renderTranscriptV2Generated(runtimeProtocol) {
   ].join("\n")}`;
 }
 
+async function existingFileMode(filePath) {
+  try {
+    const metadata = await lstat(filePath);
+    return metadata.isFile() ? metadata.mode & 0o777 : undefined;
+  } catch (error) {
+    if (error?.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function writeFileAtomically(filePath, contents) {
+  const existingMode = await existingFileMode(filePath);
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporaryPath, "wx", existingMode ?? 0o666);
+    await handle.writeFile(contents, { encoding: "utf8" });
+    if (existingMode !== undefined) {
+      await handle.chmod(existingMode);
+    }
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, filePath);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
+}
+
+export async function synchronizeTranscriptV2Generated({
+  runtimeProtocolPath,
+  generatedPath,
+  write = false,
+}) {
+  const runtimeProtocol = await readFile(runtimeProtocolPath, "utf8");
+  const expected = renderTranscriptV2Generated(runtimeProtocol);
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+export async function synchronizeSdkWireGenerated({
+  runtimeProtocolPath,
+  generatedPath,
+  write = false,
+}) {
+  const expected = await renderSdkWireTypes(runtimeProtocolPath);
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+export async function synchronizeTurnTerminalGenerated({
+  canonicalPath,
+  generatedPath,
+  write = false,
+}) {
+  const expected = normalizeLineEndings(await readFile(canonicalPath, "utf8"));
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+export async function synchronizeWorkflowHandoffGenerated({ schemaPath, runtimeSourcePath, generatedPath, write = false }) {
+  const expected = await readWorkflowHandoffGenerated({ schemaPath, runtimeSourcePath });
+  return synchronizeGeneratedFile({ generatedPath, expected, write });
+}
+
+async function synchronizeGeneratedFile({ generatedPath, expected, write }) {
+  let current;
+  try {
+    current = await readFile(generatedPath, "utf8");
+  } catch (error) {
+    if (!write || error?.code !== "ENOENT") throw error;
+  }
+
+  if (!write) {
+    return {
+      changed: false,
+      matches: normalizeLineEndings(current) === expected,
+      expected,
+    };
+  }
+
+  if (current === expected) {
+    return { changed: false, matches: true, expected };
+  }
+
+  await writeFileAtomically(generatedPath, expected);
+  return { changed: true, matches: true, expected };
+}
+
+function appendWireParityFailures(failures, parity) {
+  for (const [surface, methods] of Object.entries(parity.mismatches)) {
+    expectCondition(
+      failures,
+      methods.length === 0,
+      `${surface}: ${methods.join(", ")}`,
+    );
+  }
+  for (const diagnostic of parity.diagnostics) {
+    failures.push(`${diagnostic.file ?? "compiler"}: ${diagnostic.message}`);
+  }
+}
+
+function reportSdkGeneratedTypesSuccess(mode) {
+  const message = mode === "write"
+    ? `regenerated SDK artifacts; run ${checkCommand} to verify wire parity`
+    : "verified committed SDK types";
+  process.stdout.write(`[sdk generated types] ${message}\n`);
+}
+
+function reportWrittenSdkArtifacts(transcriptV2Path, transcriptV2, wire, turnTerminal, workflowHandoff) {
+  const displayPath = path
+    .relative(path.dirname(runtimeRoot), transcriptV2Path)
+    .split(path.sep)
+    .join("/");
+  process.stdout.write(
+    transcriptV2.changed
+      ? `[sdk generated types] wrote ${displayPath}\n`
+      : `[sdk generated types] ${displayPath} is already current\n`,
+  );
+  process.stdout.write(
+    `[sdk generated types] ${wire.changed ? "wrote" : "current"} ${paths.packageWire}\n`,
+  );
+  process.stdout.write(
+    `[sdk generated types] ${turnTerminal.changed ? "wrote" : "current"} ${paths.packageTurnTerminal}\n`,
+  );
+  process.stdout.write(
+    `[sdk generated types] ${workflowHandoff.changed ? "wrote" : "current"} ${paths.packageWorkflowHandoff}\n`,
+  );
+}
+
 async function main() {
+  const mode = parseSdkGeneratedTypesMode(process.argv.slice(2));
+  const transcriptV2Path = path.join(
+    runtimeRoot,
+    paths.packageTranscriptV2,
+  );
   const [
     schemas,
     coreTypes,
     generated,
-    runtimeProtocol,
-    packageTranscriptV2,
     packageWorkflowResult,
+    transcriptV2,
+    wire,
+    turnTerminal,
+    workflowHandoff,
   ] = await Promise.all([
     readRuntimeFile(paths.schemas),
     readRuntimeFile(paths.coreTypes),
     readRuntimeFile(paths.generated),
-    readRuntimeFile(paths.runtimeProtocol),
-    readRuntimeFile(paths.packageTranscriptV2),
     readRuntimeFile(paths.packageWorkflowResult),
+    synchronizeTranscriptV2Generated({
+      runtimeProtocolPath: path.join(runtimeRoot, paths.runtimeProtocol),
+      generatedPath: transcriptV2Path,
+      write: mode === "write",
+    }),
+    synchronizeSdkWireGenerated({
+      runtimeProtocolPath: path.join(runtimeRoot, paths.runtimeProtocol),
+      generatedPath: path.join(runtimeRoot, paths.packageWire),
+      write: mode === "write",
+    }),
+    synchronizeTurnTerminalGenerated({
+      canonicalPath: path.join(runtimeRoot, paths.turnTerminal),
+      generatedPath: path.join(runtimeRoot, paths.packageTurnTerminal),
+      write: mode === "write",
+    }),
+    synchronizeWorkflowHandoffGenerated({
+      schemaPath: path.join(runtimeRoot, paths.handoffSchema),
+      runtimeSourcePath: path.join(runtimeRoot, paths.handoffSource),
+      generatedPath: path.join(runtimeRoot, paths.packageWorkflowHandoff),
+      write: mode === "write",
+    }),
   ]);
+  if (mode === "write") {
+    reportWrittenSdkArtifacts(transcriptV2Path, transcriptV2, wire, turnTerminal, workflowHandoff);
+  }
   const failures = [];
   const sources = [
     [paths.schemas, schemas],
@@ -252,12 +429,30 @@ async function main() {
     "committed SDK types reintroduced removed MCP surface McpSdkServerConfig",
   );
 
-  const expectedTranscriptV2 = renderTranscriptV2Generated(runtimeProtocol);
   expectCondition(
     failures,
-    normalizeLineEndings(packageTranscriptV2) === expectedTranscriptV2,
+    transcriptV2.matches,
     `${paths.packageTranscriptV2} is not the exact generated transcript.v2 mirror; regenerate it from ${paths.runtimeProtocol}`,
   );
+  expectCondition(
+    failures,
+    wire.matches,
+    `${paths.packageWire} is stale; run ${checkCommand} -- --write`,
+  );
+  expectCondition(
+    failures,
+    turnTerminal.matches,
+    `${paths.packageTurnTerminal} is stale; run ${checkCommand} -- --write`,
+  );
+  expectCondition(
+    failures,
+    workflowHandoff.matches,
+    `${paths.packageWorkflowHandoff} is stale; run ${checkCommand} -- --write`,
+  );
+
+  if (mode === "check") {
+    appendWireParityFailures(failures, checkSdkWireParity());
+  }
 
   if (failures.length > 0) {
     process.stderr.write(
@@ -267,7 +462,12 @@ async function main() {
     return;
   }
 
-  process.stdout.write("[sdk generated types] verified committed SDK types\n");
+  reportSdkGeneratedTypesSuccess(mode);
 }
 
-await main();
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  await main();
+}

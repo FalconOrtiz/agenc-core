@@ -43,11 +43,14 @@ import { createReadStream } from "node:fs";
 import { open, readFile, stat } from "node:fs/promises";
 import { dirname, extname, isAbsolute, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import {
+  hasReadOnlyDelegationReadGuard,
+  readOnlyDelegationReadPathAllowed,
+} from "../../permissions/readonly-read-guard.js";
 
 import type { Tool, ToolExecutionInjectedArgs, ToolResult } from "../types.js";
 import { plainTextErrorToolResult as errorResult } from "../results.js";
 import type { FunctionCallOutputContentItem } from "../context.js";
-import { readToolRuntimeContext } from "../runtimes/context.js";
 import { addLineNumbers } from "./_deps/line-numbers.js";
 import {
   recordSessionRead,
@@ -56,11 +59,11 @@ import {
   withSignedAllowedRoots,
 } from "./filesystem.js";
 import {
-  agentNamespacePathHint,
-  denyAgentNamespacePath,
-  isAgentNamespacePath,
+  FILE_TOOL_PATH_SCHEMA,
+  FILE_TOOL_PATH_USAGE,
 } from "./agent-path-hints.js";
 import { checkToolPathPermission } from "../../permissions/path-validation.js";
+import { sessionPlanFileAuthority } from "../../planning/session-plan-authority.js";
 import { roughTokenCountEstimationForFileType } from "../../llm/token-estimation.js";
 import {
   parsePDFPageRange as parseSharedPDFPageRange,
@@ -73,11 +76,6 @@ import { scrubEnvForChildProcess } from "../../unified-exec/scrub-env.js";
 import { getSelectedProviderEnvironment } from "../../utils/model/providers.js";
 import { applyRuntimeSandboxToSpawn } from "./apply-runtime-sandbox.js";
 import { runSupervisedProcess } from "../../utils/supervisedProcess.js";
-import {
-  workspaceAuthoritativeRead,
-  workspaceHasProtectedEditorPaths,
-  type WorkspaceAuthoritativeRead,
-} from "../../workspace/mutation-coordinator.js";
 import {
   bindWorkspaceFileReadCapability,
   WorkspaceBoundReadFileTooLargeError,
@@ -291,8 +289,9 @@ const FILE_READ_DESCRIPTION = `Reads a file from the local filesystem. You can a
 Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.
 
 Usage:
-- Use workspace-relative paths like 'game.py' unless the user provided a real absolute path. Do not use '/root/...'; '/root' is the agent namespace, not the filesystem.
+- ${FILE_TOOL_PATH_USAGE}
 - By default, it reads up to ${DEFAULT_LINE_LIMIT} lines starting from the beginning of the file
+- Output is capped at ${DEFAULT_MAX_OUTPUT_TOKENS} tokens; a read that would exceed the cap returns an error instead of content, so for large files pass offset and limit.
 - When you already know which part of the file you need, only read that part. This can be important for larger files.
 - Results are returned using cat -n format, with line numbers starting at 1
 - This tool allows AgenC to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually because AgenC can inspect multimodal inputs.
@@ -599,9 +598,6 @@ async function resolveAndCheck(
     typeof args.cwd === "string" && args.cwd.trim().length > 0
       ? args.cwd
       : (config.allowedPaths[0] ?? process.cwd());
-  if (isAgentNamespacePath(rawPath)) {
-    return { err: errorResult(agentNamespacePathHint(rawPath, cwdArg)) };
-  }
   const absolute = isAbsolute(rawPath) ? rawPath : resolve(cwdArg, rawPath);
   const safe = await safePathAllowingSessionPlanFile(
     absolute,
@@ -619,6 +615,7 @@ async function resolveAndCheck(
 // ─────────────────────────────────────────────────────────────────────
 
 interface TextReadOpts {
+  readonly readGuard?: () => void;
   readonly maxTextBytes: number;
   readonly maxTokens: number;
   readonly offset: number;
@@ -630,14 +627,11 @@ async function readTextFile(
   resolvedPath: ResolvedPath,
   opts: TextReadOpts,
   sessionId: string | undefined,
-  editorRead: WorkspaceAuthoritativeRead | null,
   boundRead?: WorkspaceBoundFileReadCapability,
   notifyListeners = true,
 ): Promise<ToolResult> {
   const rawFileStats =
-    editorRead === null && boundRead === undefined
-      ? await stat(resolvedPath.canonical)
-      : null;
+    boundRead === undefined ? await stat(resolvedPath.canonical) : null;
   if (rawFileStats !== null && !rawFileStats.isFile()) {
     return errorResult("Path is not a regular file");
   }
@@ -650,7 +644,7 @@ async function readTextFile(
   let boundWindow:
     | Awaited<ReturnType<WorkspaceBoundFileReadCapability["readTextWindow"]>>
     | undefined;
-  if (editorRead === null && boundRead !== undefined) {
+  if (boundRead !== undefined) {
     if (explicitWindow) {
       try {
         boundWindow = await boundRead.readTextWindow(
@@ -686,12 +680,8 @@ async function readTextFile(
     }
   }
   const authoritativeBytes =
-    editorRead !== null
-      ? Buffer.byteLength(editorRead.content, "utf8")
-      : (boundWindow?.stats.size ??
-        boundFile?.stats.size ??
-        fileStats?.size ??
-        0);
+    boundWindow?.stats.size ?? boundFile?.stats.size ?? fileStats?.size ?? 0;
+  opts.readGuard?.();
   if (!explicitWindow && authoritativeBytes > opts.maxTextBytes) {
     return errorResult(
       `File size ${formatBytes(authoritativeBytes)} exceeds the text-read limit of ${formatBytes(
@@ -700,7 +690,6 @@ async function readTextFile(
     );
   }
   const shouldStreamWindow =
-    editorRead === null &&
     boundRead === undefined &&
     explicitWindow &&
     authoritativeBytes > opts.maxTextBytes;
@@ -709,9 +698,7 @@ async function readTextFile(
     boundFile?.content ??
     (shouldStreamWindow
       ? await readInitialBytes(resolvedPath.canonical, 8192)
-      : editorRead === null
-        ? await readFile(resolvedPath.canonical)
-        : Buffer.from(editorRead.content, "utf8"));
+      : await readFile(resolvedPath.canonical));
   if (isBinaryContent(binarySample)) {
     return errorResult(
       "This tool cannot read binary files. The file contains non-text bytes. Use a different tool (e.g. a hex viewer or shell tooling) for binary file analysis.",
@@ -754,6 +741,7 @@ async function readTextFile(
   // still satisfy the read-before-write gate. AgenC only blocks
   // auto-injected processed partial views; AgenC does not populate that
   // path here.
+  opts.readGuard?.();
   recordSessionRead(sessionId, resolvedPath.canonical, {
     content: sliced.content,
     timestamp:
@@ -1023,18 +1011,15 @@ async function readNotebookFile(
   resolvedPath: ResolvedPath,
   opts: NotebookReadOpts,
   sessionId: string | undefined,
-  editorRead: WorkspaceAuthoritativeRead | null,
   boundRead?: WorkspaceBoundFileReadCapability,
 ): Promise<ToolResult> {
   const rawFileStats =
-    editorRead === null && boundRead === undefined
-      ? await stat(resolvedPath.canonical)
-      : null;
+    boundRead === undefined ? await stat(resolvedPath.canonical) : null;
   if (rawFileStats !== null && !rawFileStats.isFile()) {
     return errorResult("Path is not a regular file");
   }
   let boundFile: WorkspaceBoundReadFile | undefined;
-  if (editorRead === null && boundRead !== undefined) {
+  if (boundRead !== undefined) {
     try {
       boundFile = await boundRead.readFile(opts.maxNotebookBytes);
     } catch (error) {
@@ -1049,8 +1034,8 @@ async function readNotebookFile(
     }
   }
   const fileStats = boundFile?.stats ?? rawFileStats;
+  opts.readGuard?.();
   const rawText =
-    editorRead?.content ??
     boundFile?.content.toString("utf8") ??
     (await readFile(resolvedPath.canonical, "utf8"));
   const rawBytes = Buffer.byteLength(rawText, "utf8");
@@ -1086,6 +1071,7 @@ async function readNotebookFile(
     );
   }
 
+  opts.readGuard?.();
   recordSessionRead(sessionId, resolvedPath.canonical, {
     content: sliced.content,
     timestamp:
@@ -1152,6 +1138,7 @@ async function readNotebookFile(
 }
 
 interface ImageReadOpts {
+  readonly readGuard?: () => void;
   readonly displayPath: string;
   readonly ext: string;
   readonly maxImageBytes: number;
@@ -1366,6 +1353,7 @@ async function readImageFile(
     return errorResult("Path is not a regular file");
   }
   const fileStats = boundFile?.stats ?? rawFileStats!;
+  opts.readGuard?.();
   if (fileStats.size === 0) {
     return errorResult(`Image file is empty: ${opts.displayPath}`);
   }
@@ -1402,6 +1390,7 @@ async function readImageFile(
   // of the same image to dedup if the session needs the gate. The
   // changed-files producer uses `rawContent` (base64 here) as the diff
   // anchor for image edits.
+  opts.readGuard?.();
   recordSessionRead(sessionId, resolvedPath.canonical, {
     content: null,
     timestamp:
@@ -1413,9 +1402,7 @@ async function readImageFile(
     rawContent: base64,
   });
 
-  // The `FunctionCallOutputContentItem` shape (port of the runtime
-  // `FunctionCallOutputContentItem`) accepts `input_image` carrying a
-  // branding-scan: allow real provider API name in data URL compatibility note
+  // The `FunctionCallOutputContentItem` shape accepts `input_image` carrying a
   // URL — providers that support the OpenAI Responses API consume data
   // URLs verbatim. The text body remains a brief summary so the runtime
   // envelope is never empty.
@@ -1480,8 +1467,7 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
       properties: {
         file_path: {
           type: "string",
-          description:
-            "Workspace-relative path, or a real absolute filesystem path. Do not use /root; that is the agent namespace.",
+          description: FILE_TOOL_PATH_SCHEMA,
         },
         offset: {
           anyOf: [
@@ -1520,9 +1506,6 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
         typeof args.cwd === "string" && args.cwd.length > 0
           ? args.cwd
           : (config.allowedPaths[0] ?? process.cwd());
-      if (isAgentNamespacePath(filePath)) {
-        return denyAgentNamespacePath(filePath, cwd);
-      }
       const decision = checkToolPathPermission({
         toolName: FILE_READ_TOOL_NAME,
         input: input as Record<string, unknown>,
@@ -1531,6 +1514,12 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
         context: context.getAppState().toolPermissionContext,
         operationType: "read",
         extraWorkingDirectories: config.allowedPaths,
+        // `execute` already reads the owning session's plan file through
+        // `safePathAllowingSessionPlanFile`. Without the same authority here
+        // the permission layer asked to approve a read the tool would then
+        // perform anyway, and a print-mode run (which auto-denies requests)
+        // could not read the plan file it was told to keep (#2131).
+        planFileAuthority: sessionPlanFileAuthority(context.session),
       });
       if (decision.behavior !== "allow") return decision;
 
@@ -1580,38 +1569,52 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
       const resolveResult = await resolveAndCheck(filePath, config, rawArgs);
       if ("err" in resolveResult) return resolveResult.err;
       const resolved = resolveResult.ok;
+      const guardedRead = hasReadOnlyDelegationReadGuard(rawArgs);
+      const readGuard = (): void => {
+        if (
+          !readOnlyDelegationReadPathAllowed(rawArgs, resolved.absolute) ||
+          !readOnlyDelegationReadPathAllowed(rawArgs, resolved.canonical)
+        ) {
+          throw new Error(
+            "Access denied: file is outside delegated read authority",
+          );
+        }
+      };
+      const finalizeRead = async (
+        pending: Promise<ToolResult>,
+      ): Promise<ToolResult> => {
+        const result = await pending;
+        readGuard();
+        return result;
+      };
 
       const sessionId = resolveSessionId(rawArgs);
       let boundRead: WorkspaceBoundFileReadCapability | undefined;
 
       try {
-        const trustedEditorInteraction =
-          readToolRuntimeContext(rawArgs)?.invocation.turn.editorInteraction !==
-          undefined;
-        const editorRead = workspaceAuthoritativeRead(resolved.canonical);
-        const protectedByEditor =
-          trustedEditorInteraction ||
-          workspaceHasProtectedEditorPaths(resolved.canonical);
-        const needsDiskCapability = isImage || isPdf || editorRead === null;
-        if (protectedByEditor && needsDiskCapability) {
+        readGuard();
+        if (guardedRead && isPdf) {
+          return errorResult(
+            "PDF extraction is unavailable under delegated read authority because the external PDF helper cannot use a held file descriptor portably.",
+          );
+        }
+        if (guardedRead) {
           boundRead = await bindWorkspaceFileReadCapability(resolved.canonical);
         }
         await config.__testAfterFinalPathCheck?.();
+        readGuard();
 
         if (isImage) {
-          return await readImageFile(
-            resolved,
-            { displayPath: filePath, ext, maxImageBytes },
-            sessionId,
-            boundRead,
+          return await finalizeRead(
+            readImageFile(
+              resolved,
+              { displayPath: filePath, ext, maxImageBytes, readGuard },
+              sessionId,
+              boundRead,
+            ),
           );
         }
         if (isPdf) {
-          if (boundRead !== undefined) {
-            return errorResult(
-              "PDF extraction is unavailable while Editor owns this workspace because the external Poppler process cannot consume AgenC's held file descriptor portably. Close Editor or copy the PDF outside the protected workspace before reading it.",
-            );
-          }
           return await readPDFFile(
             resolved,
             {
@@ -1627,7 +1630,26 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
           );
         }
         if (isNotebook) {
-          return await readNotebookFile(
+          return await finalizeRead(
+            readNotebookFile(
+              resolved,
+              {
+                maxTextBytes,
+                maxTokens,
+                offset,
+                limit,
+                displayPath: filePath,
+                maxImageBytes,
+                maxNotebookBytes,
+                readGuard,
+              },
+              sessionId,
+              boundRead,
+            ),
+          );
+        }
+        return await finalizeRead(
+          readTextFile(
             resolved,
             {
               maxTextBytes,
@@ -1635,27 +1657,12 @@ export function createFileReadTool(config: FileReadToolConfig): Tool {
               offset,
               limit,
               displayPath: filePath,
-              maxImageBytes,
-              maxNotebookBytes,
+              readGuard,
             },
             sessionId,
-            editorRead,
             boundRead,
-          );
-        }
-        return await readTextFile(
-          resolved,
-          {
-            maxTextBytes,
-            maxTokens,
-            offset,
-            limit,
-            displayPath: filePath,
-          },
-          sessionId,
-          editorRead,
-          boundRead,
-          !trustedEditorInteraction,
+            true,
+          ),
         );
       } catch (err) {
         const code = (err as NodeJS.ErrnoException)?.code;

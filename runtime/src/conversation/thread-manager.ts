@@ -1,21 +1,12 @@
 /**
- * Ports donor runtime thread/conversation orchestration onto AgenC's
- * TypeScript session, agent, and rollout primitives.
+ * Thread/conversation orchestration over AgenC's session, agent, and
+ * rollout primitives.
  *
- * Source anchors:
- *   - `core/src/thread_manager.rs`
- *   - `core/src/codex_thread.rs` // branding-scan: allow upstream source filename
- *   - `core/src/thread_rollout_truncation.rs`
- *   - `core/src/session_startup_prewarm.rs`
- *   - `core/src/session/rollout_reconstruction.rs`
- *
- * Shape difference from upstream:
+ * Design notes:
  *   - The lower-level thread handle, rollout truncation, replay, and
  *     bootstrap prewarm pieces already live in `runtime/src/agents/` and
  *     `runtime/src/session/`. This module is the checklist-owned
  *     conversation surface that composes those pieces for the live CLI path.
- *
- * Cross-cuts deliberately NOT carried:
  *   - Provider websocket prewarm is exposed through an optional provider
  *     startup hook; current adapters that do not implement it are skipped.
  */
@@ -39,7 +30,11 @@ import type { IndexSnapshot } from "../session/session-store.js";
 import { SessionLock } from "../session/session-store.js";
 import type { ResponseItem, RolloutItem } from "../session/rollout-item.js";
 import type { LLMContentPart } from "../llm/types.js";
-import { responseItemToLlmMessage } from "../session/message-history-conversion.js";
+import {
+  llmMessageToDurableResponseItem,
+  responseItemToLlmMessage,
+} from "../session/message-history-conversion.js";
+import { createToolResultIntegrity } from "../session/tool-result-integrity.js";
 import { AsyncLock } from "../utils/async-lock.js";
 import {
   reconstructFromRollout,
@@ -64,6 +59,14 @@ export type ConversationPrewarmState =
 export interface ConversationStartupPrewarmParams {
   readonly session: Session;
   readonly threadId: ThreadId;
+  /**
+   * When true the prewarm must NOT attempt the durable-turn resume; the
+   * embedder drives it later through
+   * {@link ConversationThreadManager.runDeferredDurableTurnResume}. Every
+   * other prewarm step (fresh default turn, provider warm-up, agent-task
+   * registration) still runs inline. See #2239.
+   */
+  readonly deferDurableTurnResume?: boolean;
 }
 
 export type ConversationStartupPrewarm = (
@@ -74,6 +77,14 @@ export interface ConversationThreadManagerOptions {
   readonly threadManager?: ThreadManager;
   readonly prewarm?: ConversationStartupPrewarm;
   readonly now?: () => number;
+  /**
+   * Hand the durable-turn resume to the embedder instead of driving it from
+   * the startup prewarm. Daemon-owned sessions set this so the resumed turn
+   * runs only after the daemon has installed its approval bridge and
+   * registered the agent; without it the resumed turn has no approval
+   * resolver and every tool that needs approval is refused (#2239).
+   */
+  readonly deferDurableTurnResume?: boolean;
 }
 
 export interface ConversationReplayOptions {
@@ -127,6 +138,14 @@ export class ConversationThreadManager extends ThreadManager {
   readonly threadManager: ThreadManager;
   private readonly prewarm: ConversationStartupPrewarm;
   private readonly now: () => number;
+  private readonly deferDurableTurnResume: boolean;
+  /**
+   * Sessions whose startup prewarm skipped the durable resume because the
+   * embedder owns it. Membership is consumed by the first
+   * `runDeferredDurableTurnResume` so the orphaned turn is driven at most
+   * once per session.
+   */
+  private readonly pendingDurableTurnResumes = new WeakSet<Session>();
   private readonly sessionTurnLocks = new WeakMap<Session, AsyncLock<void>>();
   private forkSequence = 0;
   private readonly records = new Map<
@@ -143,6 +162,7 @@ export class ConversationThreadManager extends ThreadManager {
     });
     this.prewarm = opts.prewarm ?? defaultStartupPrewarm;
     this.now = opts.now ?? (() => Date.now());
+    this.deferDurableTurnResume = opts.deferDurableTurnResume === true;
     this.threadManager.subscribeThreadCreated((threadId) => {
       this.refreshRecordFromThreadId(threadId);
     });
@@ -332,6 +352,7 @@ export class ConversationThreadManager extends ThreadManager {
     rolloutItems: ReadonlyArray<RolloutItem>,
     opts: ConversationReplayOptions = {},
   ): Promise<ConversationReplayResult> {
+    session.restoreUserStopFromRollout(rolloutItems);
     const checkpointProjection = checkpointProjectionFor(
       session,
       "root-reconstruction",
@@ -356,6 +377,17 @@ export class ConversationThreadManager extends ThreadManager {
     }
     session.rolloutStore?.acknowledgeCompactionReconstruction(
       reconstruction.activeCompactionAttemptIds,
+    );
+    // The durable journal already holds turn and event ids up to the
+    // highest sub-id in the rollout; the resumed session must number its
+    // new turns after them or admission rejects the first model step.
+    session.seedInternalSubId(
+      highestInternalSubId(rolloutItems, session.conversationId) + 1,
+    );
+    appliedState = await closeTrailingDanglingToolCalls(
+      session,
+      appliedState,
+      opts.emitSynthesized === true,
     );
 
     // GOAL #4b Stage 1 — stash the reconstruction so the prewarm hook can
@@ -483,8 +515,20 @@ export class ConversationThreadManager extends ThreadManager {
     const record = this.upsertRecord(thread);
     record.prewarm = "running";
     delete record.prewarmError;
+    // Claim the deferral BEFORE the prewarm runs: `defaultStartupPrewarm`
+    // reads the same flag and skips the resume, so the pending marker and the
+    // skip must be decided from one value.
+    if (this.deferDurableTurnResume) {
+      this.pendingDurableTurnResumes.add(session);
+    }
     try {
-      await this.prewarm({ session, threadId: thread.threadId });
+      await this.prewarm({
+        session,
+        threadId: thread.threadId,
+        ...(this.deferDurableTurnResume
+          ? { deferDurableTurnResume: true }
+          : {}),
+      });
       record.prewarm = "ready";
     } catch (error) {
       record.prewarm = "failed";
@@ -492,6 +536,47 @@ export class ConversationThreadManager extends ThreadManager {
         error instanceof Error ? error.message : String(error);
     }
     return record.prewarm;
+  }
+
+  /**
+   * Drive the durable-turn resume that `runStartupPrewarm` skipped because
+   * this manager was constructed with `deferDurableTurnResume`.
+   *
+   * The daemon calls this after `#installDaemonApprovalBridge` has published
+   * `services.approvalResolver` and the agent is registered, so a resumed
+   * turn that needs approval reaches a client instead of the arbiter's
+   * default deny (#2239). It never throws: like the startup prewarm, a
+   * failure is recorded on the thread record.
+   *
+   * Runs at most once per session. Returns the neutral no-op outcome when
+   * nothing was deferred (fresh start, non-deferring embedder, second call).
+   */
+  async runDeferredDurableTurnResume(
+    session: Session,
+  ): Promise<DurableResumeAttempt> {
+    if (!this.pendingDurableTurnResumes.delete(session)) {
+      return { resumed: false };
+    }
+    const thread = this.threadManager.hasThread(session.conversationId)
+      ? this.threadManager.getThread(session.conversationId)
+      : this.registerRootSession(session);
+    const record = this.upsertRecord(thread);
+    try {
+      const attempt = await attemptDurableTurnResume(session);
+      if (attempt.freshTurnAllowed === false) {
+        // Same disposition the inline prewarm gives this case: the failure is
+        // reported on the record, the session keeps the fresh turn the
+        // prewarm already created.
+        record.prewarmError =
+          "durable resume halted after an incomplete checkpoint provider restore: " +
+          (attempt.failureDetail ?? "provider state could not be restored");
+      }
+      return attempt;
+    } catch (error) {
+      record.prewarmError =
+        error instanceof Error ? error.message : String(error);
+      return { resumed: false };
+    }
   }
 
   snapshot(threadId: ThreadId): ConversationThreadSnapshot {
@@ -644,6 +729,115 @@ export class ConversationThreadManager extends ThreadManager {
     }
     return undefined;
   }
+}
+
+export const DANGLING_TOOL_CALLS_CLOSED_CAUSE = "dangling_tool_calls_closed";
+
+/**
+ * Tool calls of the last assistant message that never received a result.
+ * A turn killed between the model's tool calls and their results (daemon
+ * restart, crash) leaves the persisted history ending in open calls; the live
+ * tool-pair gate then rejects every later message ("tool results must
+ * immediately follow their assistant calls"), so the session can never
+ * continue. Only the trailing assistant message is inspected: an unresolved
+ * call earlier in the history is already an invalid rollout.
+ */
+export function trailingDanglingToolCalls(
+  history: ReadonlyArray<unknown>,
+): ReadonlyArray<{ readonly id: string; readonly name: string }> {
+  const items = history.map(historyResponseItem);
+  const resolved = new Set<string>();
+  let index = items.length - 1;
+  while (index >= 0 && items[index]?.role === "tool") {
+    const toolCallId = items[index]?.toolCallId;
+    if (typeof toolCallId === "string") resolved.add(toolCallId);
+    index -= 1;
+  }
+  const assistant = items[index];
+  if (assistant?.role !== "assistant" || !Array.isArray(assistant.toolCalls)) {
+    return [];
+  }
+  return assistant.toolCalls
+    .filter((call) => !resolved.has(call.id))
+    .map((call) => ({ id: call.id, name: call.name }));
+}
+
+function historyResponseItem(item: unknown): ResponseItem | undefined {
+  if (typeof item !== "object" || item === null) return undefined;
+  const role = (item as { role?: unknown }).role;
+  return typeof role === "string" ? (item as ResponseItem) : undefined;
+}
+
+/** Model-facing body of a result synthesized for an interrupted tool call. */
+export function interruptedToolCallResultContent(call: {
+  readonly id: string;
+  readonly name: string;
+}): string {
+  return JSON.stringify({
+    tool_use_id: call.id,
+    is_error: true,
+    content: `<tool_use_error>interrupted: the runtime restarted before ${call.name} completed and no result was recorded; call it again if the result is still needed</tool_use_error>`,
+  });
+}
+
+/**
+ * Close the trailing dangling tool calls of a restored history with sealed,
+ * persisted error results so the resumed session can accept its next message.
+ * The results are sealed under the session's run id exactly like live tool
+ * results (`createToolResultIntegrity` + the durable projection), appended to
+ * the rollout through the live tool-pair gate, which resolves the open calls,
+ * and mirrored into the session history in the persisted item shape.
+ */
+async function closeTrailingDanglingToolCalls(
+  session: Session,
+  appliedState: SessionState,
+  emitWarning: boolean,
+): Promise<SessionState> {
+  const dangling = trailingDanglingToolCalls(appliedState.history);
+  if (dangling.length === 0) return appliedState;
+  const synthesized: ResponseItem[] = dangling.map((call) => {
+    const content = interruptedToolCallResultContent(call);
+    return llmMessageToDurableResponseItem({
+      role: "tool",
+      content,
+      toolCallId: call.id,
+      toolName: call.name,
+      runtimeOnly: {
+        toolResultIntegrity: createToolResultIntegrity({
+          runId: session.conversationId,
+          toolCallId: call.id,
+          content,
+        }),
+      },
+    });
+  });
+  for (const item of synthesized) {
+    session.rolloutStore?.appendRollout({ type: "response_item", payload: item });
+  }
+  const next = await session.state.update((current) => {
+    const updated: SessionState = {
+      ...current,
+      history: [...current.history, ...synthesized],
+    };
+    return { next: updated, result: updated };
+  });
+  // Like the other synthesized recovery events, the warning is emitted only
+  // when the caller replays with `emitSynthesized`: a bootstrap replay that
+  // has not seeded the live event sequence yet must not append events.
+  if (!emitWarning) return next;
+  session.emit({
+    id: session.nextInternalSubId(),
+    msg: {
+      type: "warning",
+      payload: {
+        cause: DANGLING_TOOL_CALLS_CLOSED_CAUSE,
+        message: `closed ${dangling.length} tool call(s) left without a result by an interrupted turn: ${dangling
+          .map((call) => `${call.name} ${call.id}`)
+          .join(", ")}`,
+      },
+    },
+  });
+  return next;
 }
 
 async function applyRolloutReconstructionToSession(
@@ -1028,9 +1222,27 @@ export async function resumeTurnFromCheckpoint(
   }
 }
 
+/**
+ * Resume-continue the orphaned in-flight turn surfaced by this session's
+ * reconstruction, if any. Returns the neutral no-op outcome when the session
+ * has no stashed reconstruction.
+ *
+ * Split out of `defaultStartupPrewarm` so the daemon can run this ONE step
+ * after its approval bridge is installed while the rest of the prewarm still
+ * happens inline inside bootstrap (#2239).
+ */
+async function attemptDurableTurnResume(
+  session: Session,
+): Promise<DurableResumeAttempt> {
+  const reconstruction = lastReconstructionBySession.get(session);
+  if (reconstruction === undefined) return { resumed: false };
+  return resumeTurnFromCheckpoint(session, reconstruction);
+}
+
 async function defaultStartupPrewarm({
   session,
   threadId,
+  deferDurableTurnResume,
 }: ConversationStartupPrewarmParams): Promise<void> {
   // GOAL #4b Stage 1 — if reconstruction surfaced an orphaned in-flight turn
   // with a valid durable checkpoint (and the build/prefix/lease gates pass),
@@ -1038,11 +1250,19 @@ async function defaultStartupPrewarm({
   // Absence and clean rejection retain the existing fresh-turn behavior.
   // An incomplete provider rollback stops startup before a fresh context can
   // use state whose authority is no longer provable.
-  const reconstruction = lastReconstructionBySession.get(session);
+  //
+  // `deferDurableTurnResume` hands exactly this step to the embedder. The
+  // session still gets its fresh default turn and provider prewarm here, so a
+  // deferring embedder that never drives the resume is no worse off than a
+  // session with no resumable turn.
+  const reconstruction =
+    deferDurableTurnResume === true
+      ? undefined
+      : lastReconstructionBySession.get(session);
   if (reconstruction !== undefined) {
     let attempt: DurableResumeAttempt | undefined;
     try {
-      attempt = await resumeTurnFromCheckpoint(session, reconstruction);
+      attempt = await attemptDurableTurnResume(session);
     } catch {
       // Resume is strictly best-effort; never let it block boot. Fall
       // through to the legacy fresh-turn prewarm.
@@ -1368,4 +1588,34 @@ function cloneResponseHistory(
 
 function cloneLlmHistory(history: ReadonlyArray<ResponseItem>) {
   return history.map(responseItemToLlmMessage);
+}
+
+/**
+ * Highest `sub-<conversationId>-N` id recorded in a rollout, from event ids
+ * and turn ids alike; -1 when none. Ids of other conversations are ignored.
+ */
+export function highestInternalSubId(
+  rolloutItems: ReadonlyArray<RolloutItem>,
+  conversationId: string,
+): number {
+  const prefix = `sub-${conversationId}-`;
+  let highest = -1;
+  const consider = (value: unknown): void => {
+    if (typeof value !== "string" || !value.startsWith(prefix)) return;
+    const ordinal = Number(value.slice(prefix.length));
+    if (Number.isSafeInteger(ordinal) && ordinal > highest) highest = ordinal;
+  };
+  for (const item of rolloutItems) {
+    if (item.type !== "event_msg") continue;
+    const payload = item.payload as {
+      readonly id?: unknown;
+      readonly msg?: { readonly payload?: unknown };
+    };
+    consider(payload.id);
+    const inner = payload.msg?.payload;
+    if (inner !== null && typeof inner === "object") {
+      consider((inner as { readonly turnId?: unknown }).turnId);
+    }
+  }
+  return highest;
 }

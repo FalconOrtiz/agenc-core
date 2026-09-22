@@ -1,3 +1,4 @@
+import type { BoundReadOnlyCwdCapability } from "../bound-readonly-cwd.js";
 /**
  * Cross-platform sandbox engine primitives.
  *
@@ -12,9 +13,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { canonicalAuthorityPath, isWithinAuthorityPath } from "../desktop-authority-protection.js";
 
-export const AGENC_LINUX_SANDBOX_ARG0 = "agenc-linux-sandbox";
-export const PROTECTED_METADATA_PATH_NAMES = [".git", ".agenc", ".agents"] as const;
+import { PROTECTED_METADATA_PATH_NAMES } from "./constants.js";
+export {
+  AGENC_INHERITED_CWD_SANDBOX_PATH,
+  AGENC_LINUX_SANDBOX_ARG0,
+  PROTECTED_METADATA_PATH_NAMES,
+} from "./constants.js";
 
 export type SandboxType =
   | "none"
@@ -60,6 +66,8 @@ export interface FileSystemSandboxPolicy {
   readonly entries: readonly FileSystemSandboxEntry[];
   readonly globScanMaxDepth?: number;
   readonly includePlatformDefaults?: boolean;
+  /** Native runtime reservations, never overrideable by additional/model grants. */
+  readonly reservedReadOnlyPaths?: readonly string[];
 }
 
 export interface NetworkPermissions {
@@ -88,6 +96,7 @@ export interface WritableRoot {
   readonly root: string;
   readonly readOnlySubpaths: readonly string[];
   readonly protectedMetadataNames?: readonly string[];
+  readonly reservedReadOnlyPaths?: readonly string[];
 }
 
 export interface SandboxCommand {
@@ -96,6 +105,7 @@ export interface SandboxCommand {
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
   readonly cwdBinding?: "inherited_readonly";
+  readonly cwdCapability?: BoundReadOnlyCwdCapability;
   readonly additionalPermissions?: AdditionalPermissionProfile;
 }
 
@@ -176,6 +186,7 @@ export function restrictedFileSystemPolicy(
   options: {
     readonly globScanMaxDepth?: number;
     readonly includePlatformDefaults?: boolean;
+    readonly reservedReadOnlyPaths?: readonly string[];
   } = {},
 ): FileSystemSandboxPolicy {
   return {
@@ -186,6 +197,9 @@ export function restrictedFileSystemPolicy(
       : {}),
     ...(options.includePlatformDefaults !== undefined
       ? { includePlatformDefaults: options.includePlatformDefaults }
+      : {}),
+    ...(options.reservedReadOnlyPaths !== undefined
+      ? { reservedReadOnlyPaths: [...options.reservedReadOnlyPaths] }
       : {}),
   };
 }
@@ -332,6 +346,9 @@ export function getWritableRootsWithCwd(
   const writableRoots = dedupPaths(writableEntries, true);
 
   return writableRoots.map((root) => {
+    const reservedReadOnlyPaths = (policy.reservedReadOnlyPaths ?? []).filter(
+      (reserved) => isWithinAuthorityPath(reserved, canonicalAuthorityPath(root)),
+    );
     const preserveRawCarveoutPaths = !isFilesystemRoot(root);
     const rawWritableRoots = writableEntries.filter(
       (entry) => normalizeEffectivePath(entry) === root,
@@ -357,10 +374,12 @@ export function getWritableRootsWithCwd(
     const readOnlySubpaths = dedupPaths([
       ...defaultCarveouts,
       ...explicitCarveouts,
+      ...reservedReadOnlyPaths,
     ]);
     return {
       root,
       readOnlySubpaths,
+      ...(reservedReadOnlyPaths.length > 0 ? { reservedReadOnlyPaths } : {}),
       protectedMetadataNames: protectedMetadataNamesForWritableRoot(
         policy,
         root,
@@ -456,16 +475,44 @@ export function canWritePathWithCwd(
   cwd: string,
   sessionTempRoot: string,
 ): boolean {
-  if (
-    !canWriteAccess(
-      resolveAccessWithCwd(policy, target, cwd, sessionTempRoot),
-    )
-  ) return false;
+  if (!writableRootsAllow(policy, target, cwd, sessionTempRoot)) return false;
   if (hasFullDiskWriteAccess(policy)) return true;
   return !isMetadataWriteDenied(policy, target, cwd, sessionTempRoot);
 }
 
+/**
+ * Write check for a location the runtime itself chose and declared through
+ * `ToolMetadata.fixedWriteTargets`. The model cannot steer such a path, so
+ * the protected-metadata rule (which keeps model-directed writes out of
+ * `.git`, `.agenc` and `.agents`) does not apply to it; containment in the
+ * writable roots and the reserved read-only paths still do.
+ */
+export function canWriteRuntimeOwnedPathWithCwd(
+  policy: FileSystemSandboxPolicy,
+  target: string,
+  cwd: string,
+  sessionTempRoot: string,
+): boolean {
+  return writableRootsAllow(policy, target, cwd, sessionTempRoot);
+}
+
+/** Containment in the writable roots, minus reserved read-only paths. */
+function writableRootsAllow(
+  policy: FileSystemSandboxPolicy,
+  target: string,
+  cwd: string,
+  sessionTempRoot: string,
+): boolean {
+  if ((policy.reservedReadOnlyPaths ?? []).some((root) =>
+    isWithinAuthorityPath(canonicalAuthorityPath(path.resolve(cwd, target)), root)
+  )) return false;
+  return canWriteAccess(
+    resolveAccessWithCwd(policy, target, cwd, sessionTempRoot),
+  );
+}
+
 export function hasFullDiskWriteAccess(policy: FileSystemSandboxPolicy): boolean {
+  if ((policy.reservedReadOnlyPaths?.length ?? 0) > 0) return false;
   switch (policy.kind) {
     case "unrestricted":
     case "external_sandbox":

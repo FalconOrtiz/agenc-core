@@ -64,6 +64,13 @@ export interface AgenCMcpCliOptions {
 }
 
 const MCP_MANAGEMENT_COMMANDS = new Set([
+  "capabilities",
+  "inventory",
+  "upsert",
+  "enable",
+  "disable",
+  "authenticate",
+  "logout",
   "add",
   "list",
   "get",
@@ -81,6 +88,13 @@ export function formatAgenCMcpCliHelpText(): string {
     "Usage: agenc mcp <command> [options]",
     "",
     "Commands:",
+    "  capabilities --json      Report supported MCP management contracts",
+    "  inventory --json         Redacted MCP configuration and authentication state",
+    "  upsert --json            Apply a revision-checked user MCP JSON patch from stdin",
+    "  enable <name>            Enable one exact MCP definition",
+    "  disable <name>           Disable one exact MCP definition",
+    "  authenticate <name>      Connect remote OAuth using the system browser",
+    "  logout <name>            Forget this MCP server's local OAuth credentials",
     "  serve                    Expose workspace-scoped prompts/resources over MCP",
     "  add                      Add an MCP server",
     "  list                     List configured MCP servers",
@@ -270,6 +284,48 @@ async function runMcpManagementCommand(
     const action = argv[0];
     const rest = argv.slice(1);
     switch (action) {
+      case "capabilities":
+      case "inventory":
+      case "upsert":
+      case "enable":
+      case "disable":
+      case "authenticate":
+      case "logout": {
+        const management = await import("../services/mcp/desktop-management.js");
+        try {
+          const parsed = parseSimpleOptions(rest, { boolean: new Set(["json"]) });
+          const context = { authority: configStore, environment, pluginStorageRoot };
+          const takesName = ["enable", "disable", "authenticate", "logout"].includes(action);
+          assertArity(parsed.positionals, takesName ? 1 : 0, "Invalid MCP management arguments");
+          const name = parsed.positionals[0]!;
+          let output: unknown;
+          if (action === "capabilities") output = management.MCP_DESKTOP_CAPABILITIES;
+          else if (action === "inventory") output = await management.mcpDesktopInventory(context);
+          else if (action === "upsert") {
+            await management.upsertMcpDesktop(context, await management.readMcpDesktopPatch(io.stdin));
+            output = { schemaVersion: 1, updated: true };
+          } else if (action === "enable" || action === "disable") {
+            await management.setMcpDesktopEnabled(context, name, action === "enable");
+            output = { schemaVersion: 1, name, enabled: action === "enable" };
+          } else if (action === "logout") {
+            await management.logoutMcpDesktop(context, name);
+            output = { schemaVersion: 1, name, authenticated: false };
+          } else {
+            const controller = new AbortController();
+            const cancel = () => controller.abort();
+            process.once("SIGINT", cancel);
+            process.once("SIGTERM", cancel);
+            try { await management.authenticateMcpDesktop(context, name, controller.signal); }
+            finally { process.removeListener("SIGINT", cancel); process.removeListener("SIGTERM", cancel); }
+            output = { schemaVersion: 1, name, authenticated: true };
+          }
+          io.stdout.write(`${JSON.stringify(output)}\n`);
+          return 0;
+        } catch (error) {
+          io.stderr.write(`agenc: ${management.safeMcpManagementError(error)}\n`);
+          return 1;
+        }
+      }
       case "add":
         await runMcpAddCommand(rest, io, configStore, environment);
         return 0;

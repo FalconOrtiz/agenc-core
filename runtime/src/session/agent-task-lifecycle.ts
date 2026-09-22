@@ -1,53 +1,43 @@
 /**
  * Agent task registration lifecycle.
  *
- * AgenC-specific session layer over the low-level agent-task
- * registration primitive that upstream agenc runtime exposes in
- * `agenc-rs/agent-identity/src/lib.rs::register_agent_task` (the
- * HTTP call that mints a `task_id` for a given agent runtime).
- * Upstream agenc runtime caches a single `task_id` per process in
- * `AgentIdentityAuth::ensure_runtime`
- * (`agenc-rs/login/src/auth/agent_identity.rs::ensure_runtime`) via a
- * `OnceCell`. No session-scoped cache, rollout persistence, identity
- * rotation handling, or double-checked registration lock exists in the
- * current agenc runtime tree; this module is the AgenC extension that adds
- * those. Each helper takes `session: Session` as its first argument.
+ * Session layer over the low-level agent-task registration primitive
+ * (the HTTP call that mints a `task_id` for a given agent runtime).
+ * This module adds the session-scoped cache, rollout persistence,
+ * identity rotation handling, and double-checked registration lock on
+ * top of that primitive. Each helper takes `session: Session` as its
+ * first argument.
  *
- * The only function in this module with a direct upstream port is
- * `recordInitialHistoryOnResume`, which mirrors the
- * `InitialHistory::Resumed` arm of
- * `agenc-rs/core/src/session/mod.rs::record_initial_history`
- * (model-change warning and token-info seed). See that function's
- * docstring for exact line references.
+ * `recordInitialHistoryOnResume` also owns the resume-time model-change
+ * warning and token-info seed.
  *
- * Integrations that land in later tranches:
- *   - T6 (event log / rollout) wires `persistRolloutItems` with the
- *     real rollout recorder.
- *
- * For T5 the forward-dep services return safe defaults so typechecking
- * succeeds end-to-end.
+ * `persistRolloutItems` writes through the session's rollout recorder
+ * when one is configured; forward-dep services return safe defaults
+ * otherwise so typechecking succeeds end-to-end.
  *
  * @module
  */
 
 import type { Session } from "./session.js";
-import type { RolloutItem } from "./rollout-item.js";
+import {
+  sessionStateUpdateAddressesSlot,
+  type RolloutItem,
+} from "./rollout-item.js";
+import { restorePersistedMemoryExtractionState } from "./memory-extraction-state.js";
 import type { TokenCountEvent } from "./event-log.js";
 
 export type { RolloutItem, SessionStateUpdate } from "./rollout-item.js";
 
 // ─────────────────────────────────────────────────────────────────────
-// Forward-dep types — real impls in T9 (agent_identity).
+// Forward-dep types. Real impls live in the agent identity subsystem.
 // ─────────────────────────────────────────────────────────────────────
 
 /**
  * AgenC-specific in-memory shape for a task registered with the
- * identity-binding service. Upstream agenc runtime does not define an
- * equivalent struct: `agenc-rs/agent-identity/src/lib.rs::register_agent_task`
- * returns only a `task_id: String`, and the surrounding agent runtime id
- * and registration timestamp live outside that return value. AgenC
- * groups them together so the session-scoped cache and rollout
- * persistence path have a single value to pass around.
+ * identity-binding service. The registration call returns only a task
+ * id; the agent runtime id and registration timestamp are grouped with
+ * it here so the session-scoped cache and rollout persistence path have
+ * a single value to pass around.
  */
 export interface RegisteredAgentTask {
   readonly agentRuntimeId: string;
@@ -57,10 +47,9 @@ export interface RegisteredAgentTask {
 
 /**
  * AgenC-specific wire representation of a RegisteredAgentTask used in
- * `RolloutItem::SessionState(update)` persistence. Upstream agenc runtime has
- * no equivalent struct in `agenc runtime-protocol` or elsewhere in the current
- * tree. Shape is kept identical to `RegisteredAgentTask` to keep the
- * conversion helpers below trivial.
+ * `RolloutItem::SessionState(update)` persistence. Shape is kept
+ * identical to `RegisteredAgentTask` to keep the conversion helpers
+ * below trivial.
  */
 export interface SessionAgentTask {
   readonly agentRuntimeId: string;
@@ -153,7 +142,8 @@ function identityManager(session: Session): AgentIdentityManagerProto {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Rollout persistence forward-dep. T6 wires real recorder.
+// Rollout persistence forward-dep: writes through the session's rollout
+// recorder when one is configured.
 // ─────────────────────────────────────────────────────────────────────
 
 async function persistRolloutItems(
@@ -168,23 +158,15 @@ async function persistRolloutItems(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Session-scoped task-registration lifecycle — AgenC-specific.
-// Upstream agenc runtime keeps only a process-wide `OnceCell<String>` cache in
-// `AgentIdentityAuth::ensure_runtime`
-// (`agenc-rs/login/src/auth/agent_identity.rs::ensure_runtime`) and
-// makes no attempt to invalidate on identity rotation, persist the
-// registration, or double-check a session-scoped cache. The helpers
-// below are the AgenC additions that wrap the same underlying HTTP
-// primitive with session-aware bookkeeping.
+// Session-scoped task-registration lifecycle.
+// The helpers below wrap the underlying HTTP registration primitive
+// with session-aware bookkeeping: invalidation on identity rotation,
+// rollout persistence, and a double-checked session-scoped cache.
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * AgenC-specific. Startup task registration is best-effort: regular
- * turns retry on demand, and a prewarm failure should not shut down the
- * session. agenc runtime's equivalent startup path is `ensure_runtime`
- * (`agenc-rs/login/src/auth/agent_identity.rs`), which has no
- * swallow-and-continue wrapper because it runs from the async auth
- * handshake, not the session boot.
+ * Startup task registration is best-effort: regular turns retry on
+ * demand, and a prewarm failure should not shut down the session.
  */
 export async function maybePrewarmAgentTaskRegistration(
   session: Session,
@@ -201,30 +183,30 @@ export async function maybePrewarmAgentTaskRegistration(
 /**
  * AgenC-specific. Walks rollout items in reverse and returns the
  * `SessionAgentTask | undefined` from the most recent `SessionState`
- * update, wrapped in a `{ value }` envelope so callers can distinguish
- * "no SessionState ever persisted" (returns `undefined`) from
- * "SessionState persisted with the slot explicitly cleared" (returns
- * `{ value: undefined }`). Upstream agenc runtime does not persist an
- * agent-task slot on rollout, so there is no equivalent walker.
+ * update that addresses the agent-task slot, wrapped in a `{ value }`
+ * envelope so callers can distinguish "no SessionState ever persisted"
+ * (returns `undefined`) from "SessionState persisted with the slot
+ * explicitly cleared" (returns `{ value: undefined }`). Items that only
+ * carry another slot (the memory-extraction cadence) are skipped: reading
+ * their missing key as a clear would drop the persisted task on every
+ * resume.
  */
 export function latestPersistedAgentTask(
   rolloutItems: ReadonlyArray<RolloutItem>,
 ): { value: SessionAgentTask | undefined } | undefined {
   for (let i = rolloutItems.length - 1; i >= 0; i -= 1) {
     const item = rolloutItems[i];
-    if (item && item.type === "session_state") {
-      return { value: item.payload.agentTask };
-    }
+    if (!item || item.type !== "session_state") continue;
+    if (!sessionStateUpdateAddressesSlot(item.payload, "agentTask")) continue;
+    return { value: item.payload.agentTask };
   }
   return undefined;
 }
 
 /**
- * AgenC-specific. If the most recent persisted `SessionState` has an
- * agent task, validate it against the current identity and either keep
- * it (on match) or clear the cached task (on mismatch). Upstream agenc runtime
- * has no persisted agent-task restore path; on process restart it
- * simply re-registers a fresh task through `ensure_runtime`.
+ * If the most recent persisted `SessionState` has an agent task,
+ * validate it against the current identity and either keep it (on
+ * match) or clear the cached task (on mismatch).
  */
 export async function restorePersistedAgentTask(
   session: Session,
@@ -251,13 +233,11 @@ export async function restorePersistedAgentTask(
 }
 
 /**
- * agenc runtime `Session::last_token_info_from_rollout`
- * (session/mod.rs:1257-1262). Walks rollout items in reverse and
- * returns the most recent `token_count` event payload. Returns
- * `undefined` if no token_count event was ever persisted.
+ * Walks rollout items in reverse and returns the most recent
+ * `token_count` event payload. Returns `undefined` if no token_count
+ * event was ever persisted.
  *
- * AgenC stores token usage in the `TokenCountEvent` payload; agenc runtime
- * uses `TokenUsageInfo` directly. The field set is equivalent.
+ * Token usage is stored in the `TokenCountEvent` payload.
  */
 export function lastTokenInfoFromRollout(
   rolloutItems: ReadonlyArray<RolloutItem>,
@@ -274,30 +254,24 @@ export function lastTokenInfoFromRollout(
 }
 
 /**
- * Port of the `InitialHistory::Resumed` arm of agenc runtime
- * `Session::record_initial_history`
- * (`agenc-rs/core/src/session/mod.rs::record_initial_history`,
- * function at lines 1151-1236; the Resumed arm runs roughly
- * 1172-1209).
+ * Resume-time history bookkeeping.
  *
- * Three resume-time behaviors are wired here so the AgenC bootstrap
+ * The resume-time behaviors are wired here so the AgenC bootstrap
  * has a single entrypoint for them:
  *
  *   1. **Agent-task restore.** Delegates to `restorePersistedAgentTask`.
- *      AgenC-specific: no equivalent exists in agenc runtime because agenc runtime does
- *      not persist the agent task to the rollout. Runs first so the
- *      cached task is consistent with the post-replay session identity
- *      before any model-dependent state mutations.
- *   2. **Model-change warning.** agenc runtime emits
- *      `EventMsg::Warning(WarningEvent { ... })` at
- *      `session/mod.rs:1185-1196` when the rollout's last
- *      `turn_context.model` differs from the session's active model.
- *      The warning wording mirrors agenc runtime's English sentence; "agenc runtime" is
- *      swapped for "AgenC".
+ *      Runs first so the cached task is consistent with the post-replay
+ *      session identity before any model-dependent state mutations.
+ *   1b. **Memory-extraction cadence restore.** Delegates to
+ *      `restorePersistedMemoryExtractionState`. AgenC-specific: seeds the
+ *      extraction service's eligible-turn count and processed-message
+ *      cursor per memory root so a restart does not begin the wait again.
+ *   2. **Model-change warning.** Emits a warning event when the
+ *      rollout's last `turn_context.model` differs from the session's
+ *      active model.
  *   3. **Token-info seed.** Sets `initialTokenUsage` on session state
  *      from the last persisted `token_count` event so UIs display
- *      cumulative usage immediately after resume. Mirrors
- *      `session/mod.rs:1200-1203`.
+ *      cumulative usage immediately after resume.
  *
  * Callers (bootstrap.ts resume branch) pass the rollout items read
  * from the JSONL file plus the already-computed `previousTurnSettings`
@@ -314,13 +288,18 @@ export async function recordInitialHistoryOnResume(
     readonly currentModel: string;
   },
 ): Promise<void> {
-  // 1. Agent-task restore. AgenC-specific (no upstream equivalent);
-  // run first so the cached task lines up with the restored session
+  // 1. Agent-task restore. Run first so the cached task lines up with
+  // the restored session
   // identity before any model-dependent state mutations.
   await restorePersistedAgentTask(session, rolloutItems);
 
-  // 2. Model-change warning. Matches agenc runtime's sentence at
-  // session/mod.rs:1189-1192 with "agenc runtime" → "AgenC".
+  // 1b. Memory-extraction cadence restore. AgenC-specific: the extraction
+  // service seeds its per-root lane from session state, so a restart
+  // continues the eligible-turn count and the processed-message cursor
+  // instead of starting both over.
+  await restorePersistedMemoryExtractionState(session, rolloutItems);
+
+  // 2. Model-change warning.
   if (
     opts.previousModel !== undefined &&
     opts.previousModel !== opts.currentModel
@@ -339,8 +318,7 @@ export async function recordInitialHistoryOnResume(
     });
   }
 
-  // 3. Seed token_info so downstream UIs see persisted usage. Mirrors
-  // agenc runtime session/mod.rs:1200-1203.
+  // 3. Seed token_info so downstream UIs see persisted usage.
   const info = lastTokenInfoFromRollout(rolloutItems);
   if (info !== undefined) {
     await session.state.with((s) => {
@@ -353,7 +331,8 @@ export async function recordInitialHistoryOnResume(
 /**
  * AgenC-specific. Persist a `SessionState` rollout item carrying the
  * current agent-task cache value (or an explicit clear when `agentTask`
- * is null). Upstream agenc runtime does not persist this slot.
+ * is null). The item carries this slot only; the memory-extraction slot
+ * has its own writer, and each walker skips the other's items.
  */
 async function persistAgentTaskUpdate(
   session: Session,
@@ -370,9 +349,8 @@ async function persistAgentTaskUpdate(
 }
 
 /**
- * AgenC-specific. Clear the cached task only if it still matches the
- * passed-in task, which avoids clobbering a task another flow wrote
- * concurrently. Upstream agenc runtime has no session-scoped cache to clear.
+ * Clear the cached task only if it still matches the passed-in task,
+ * which avoids clobbering a task another flow wrote concurrently.
  */
 async function clearCachedAgentTask(
   session: Session,
@@ -393,11 +371,8 @@ async function clearCachedAgentTask(
 }
 
 /**
- * AgenC-specific. Write the task into session state if it differs from
- * the current cached value, then persist the update to the rollout.
- * Upstream agenc runtime stores only a `OnceCell<String>` per process
- * (`agenc-rs/login/src/auth/agent_identity.rs::ensure_runtime`) and
- * never rewrites or persists it.
+ * Write the task into session state if it differs from the current
+ * cached value, then persist the update to the rollout.
  */
 async function cacheAgentTask(
   session: Session,
@@ -420,10 +395,8 @@ async function cacheAgentTask(
 }
 
 /**
- * AgenC-specific. Returns the cached task iff it still matches the
- * current agent identity; on mismatch, clears the cached value and
- * returns undefined. Upstream agenc runtime does no per-call identity match
- * check against its `OnceCell<String>` task cache.
+ * Returns the cached task iff it still matches the current agent
+ * identity; on mismatch, clears the cached value and returns undefined.
  */
 export async function cachedAgentTaskForCurrentIdentity(
   session: Session,
@@ -443,15 +416,10 @@ export async function cachedAgentTaskForCurrentIdentity(
 }
 
 /**
- * AgenC-specific session-scoped wrapper around the agenc runtime low-level
- * registration primitive `register_agent_task`
- * (`agenc-rs/agent-identity/src/lib.rs`, pub fn at line 109). agenc runtime's
- * only caller, `AgentIdentityAuth::ensure_runtime`
- * (`agenc-rs/login/src/auth/agent_identity.rs::ensure_runtime`), just
- * memoizes the returned task id in a `OnceCell<String>` and never
- * retries, re-validates, or double-checks.
+ * Session-scoped wrapper around the low-level agent-task registration
+ * primitive.
  *
- * AgenC adds:
+ * This wrapper adds:
  *   - fast-path return of the session-scoped cached task;
  *   - a registration lock + double-check so concurrent turns do not
  *     race-register duplicate tasks;

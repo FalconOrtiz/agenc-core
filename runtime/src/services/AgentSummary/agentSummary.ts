@@ -51,6 +51,8 @@ export function toSummaryCacheSafeParams(
 
 export interface AgentTranscript {
   readonly messages: readonly Message[];
+  /** Monotonic activity revision for bounded rolling transcripts. */
+  readonly revision?: number;
 }
 
 export interface AgentSummaryHandle {
@@ -223,10 +225,9 @@ export function startAgentSummarization(
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   let previousSummary: string | null = null;
-  // Message count at the last successful summary. Lets the periodic sweep skip
-  // a redundant LLM call when nothing new was produced since — the common case
-  // for a keep-alive worker sitting idle between turns, where re-summarizing
-  // the same transcript just burns tokens and an admission slot.
+  let lastSummarizedRevision: number | null = null;
+  // Fallback for transcript providers that do not expose a revision. Lets the
+  // periodic sweep skip a redundant LLM call while a keep-alive worker is idle.
   let lastSummarizedMessageCount = 0;
 
   function scheduleNext(): void {
@@ -250,10 +251,21 @@ export function startAgentSummarization(
         );
         return;
       }
-      // No new messages since the last summary — nothing to condense. This is
-      // what stops an idle keep-alive worker from re-forking its whole
-      // transcript into an LLM call every interval.
-      if (transcript.messages.length <= lastSummarizedMessageCount) {
+      const revision = transcript.revision;
+      const transcriptRevision =
+        typeof revision === "number" &&
+        Number.isSafeInteger(revision) &&
+        revision >= 0
+          ? revision
+          : null;
+      // Bounded transcripts eventually keep a stable message count, so prefer
+      // their monotonic revision. Callers without one retain the historical
+      // message-count behavior.
+      const hasNewActivity = transcriptRevision !== null
+        ? lastSummarizedRevision === null ||
+          transcriptRevision > lastSummarizedRevision
+        : transcript.messages.length > lastSummarizedMessageCount;
+      if (!hasNewActivity) {
         options.logDebug?.(
           `Skipping agent summary for ${options.taskId}: no new messages since last summary`,
         );
@@ -284,6 +296,7 @@ export function startAgentSummarization(
       if (!summaryText) return;
       previousSummary = summaryText;
       lastSummarizedMessageCount = transcript.messages.length;
+      lastSummarizedRevision = transcriptRevision;
       options.updateAgentSummary(options.taskId, summaryText);
     } catch (error) {
       if (!stopped) options.logError?.(error);

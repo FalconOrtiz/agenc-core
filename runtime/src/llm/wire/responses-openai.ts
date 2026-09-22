@@ -420,11 +420,13 @@ export function parseOpenAIResponsesResponse(
           id: String(item.call_id ?? item.id ?? ""),
           // Decode the strict-regex wire name back to the
           // internal-registry form before dispatch.
-          name: decodeMcpToolNameFromWire(String(item.name ?? "")),
+          name: decodeMcpToolNameFromWire(
+            String(item.name ?? ""),
+            request.tools.map((tool) => tool.function.name),
+          ),
           arguments: String(item.arguments ?? "{}"),
         }),
       ),
-    // branding-scan: allow real OpenAI provider identifier
     "OpenAI Responses response emitted invalid function_call",
   );
 

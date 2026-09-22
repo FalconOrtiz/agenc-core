@@ -1,7 +1,7 @@
 /**
  * Delegate — the canonical subagent spawn dispatcher.
  *
- * Hand-port of the donor spawn-dispatcher subset. Public entry point for:
+ * Public entry point for:
  *
  *   - Isolation setup (worktree create + bind CWD, or CWD-only)
  *   - Fork mode selection
@@ -17,6 +17,8 @@
  */
 
 import type { Session } from "../session/session.js";
+import { childReadOnlyDelegation } from "./readonly-delegation.js";
+import type { ToolEffectDispositionEvidence } from "../contracts/run-contracts.js";
 import type { LLMMessage } from "../llm/types.js";
 import type { LLMContentPart } from "../llm/types.js";
 import {
@@ -32,7 +34,7 @@ import {
   type AgentPath,
 } from "./registry.js";
 import type { ForkMode } from "./fork-context.js";
-import type { WorktreeHandle } from "./worktree.js";
+import type { WorktreeHandle, WorktreeTurnEvidence } from "./worktree.js";
 import type { AgentThread } from "./thread.js";
 import type {
   ChildToolPolicy,
@@ -50,6 +52,7 @@ import {
   hasWorktreeChanges,
   captureBaseCommit,
   removeAgentWorktree,
+  WorktreePreconditionError,
 } from "./worktree.js";
 import { runAgent } from "./run-agent.js";
 import { ResumeManager } from "./resume.js";
@@ -69,6 +72,8 @@ export type DelegateFinalMessageSink = AssistantOutputStreamSink;
 export interface DelegateOpts {
   readonly parent: Session;
   readonly parentPath: AgentPath;
+  /** Source-owned caller binding check, repeated across asynchronous setup. */
+  readonly assertParentSessionActive?: () => void;
   readonly control: AgentControl;
   readonly registry: AgentRegistry;
   readonly taskPrompt: string;
@@ -95,6 +100,7 @@ export interface DelegateOpts {
   readonly capacityPermit?: AgentCapacityPermit;
   readonly capacityOwnerId?: string;
   readonly silent?: boolean;
+  readonly deferInteractiveApprovals?: (toolName: string) => void;
   readonly resumeManager?: ResumeManager;
   /**
    * Keep the agent's downInbox loop alive between turns instead of
@@ -134,7 +140,20 @@ export type DelegateOutcome =
         | "retryable_capacity"
         | "spawn_failed";
       readonly reason: string;
+      readonly effectDisposition?: ToolEffectDispositionEvidence;
     };
+
+function delegateModelOptions(
+  opts: DelegateOpts,
+): Pick<DelegateOpts, "model" | "reasoningEffort" | "serviceTier"> {
+  return {
+    ...(opts.model !== undefined ? { model: opts.model } : {}),
+    ...(opts.reasoningEffort !== undefined
+      ? { reasoningEffort: opts.reasoningEffort }
+      : {}),
+    ...(opts.serviceTier !== undefined ? { serviceTier: opts.serviceTier } : {}),
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // delegate — main entry
@@ -148,9 +167,13 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
     code: Extract<DelegateOutcome, { kind: "rejected" }>["code"],
     category: Extract<DelegateOutcome, { kind: "rejected" }>["category"],
     reason: string,
+    effectDisposition?: ToolEffectDispositionEvidence,
   ): Extract<DelegateOutcome, { kind: "rejected" }> => {
     opts.capacityPermit?.cancel();
-    return { kind: "rejected", code, category, reason };
+    return {
+      kind: "rejected", code, category, reason,
+      ...(effectDisposition !== undefined ? { effectDisposition } : {}),
+    };
   };
 
   if (opts.invocationEnvelope !== undefined) {
@@ -181,11 +204,26 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
     );
   }
 
+  const parentThreadId = opts.registry.agentIdForPath?.(opts.parentPath);
+  const readOnlyConstraint = childReadOnlyDelegation(
+    opts.parent,
+    opts.control.roleCatalog?.require(opts.role),
+    parentThreadId === undefined ? undefined : opts.registry.agentMetadataForThread?.(parentThreadId)?.executionConstraint,
+  );
+  if (readOnlyConstraint !== undefined && isolation === "worktree") {
+    return reject(
+      "INVALID_DELEGATE_REQUEST",
+      "invalid_request",
+      "Read-only delegation cannot create a worktree. Use isolation none.",
+    );
+  }
+
   // Set up worktree if requested.
   let worktree: WorktreeHandle | undefined;
   let baseCommit: string | null = null;
   let worktreeSandboxExecutionBroker: SandboxExecutionBrokerLike | undefined;
   let preserveLiveAfterRoleProvenanceFailure = false;
+  let worktreeEvidenceRequiringReview: WorktreeTurnEvidence | undefined;
   if (isolation === "worktree") {
     const worktreeSlug = opts.worktreeSlug!;
     const workspaceRoot =
@@ -194,10 +232,14 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
       process.cwd();
     const canonicalGitRoot = findGitRoot(workspaceRoot);
     if (!canonicalGitRoot) {
+      const refusal = new WorktreePreconditionError(
+        "worktree isolation requested but cwd is not inside a git repository",
+      );
       return reject(
         "WORKTREE_UNAVAILABLE",
         "environment",
-        "worktree isolation requested but cwd is not inside a git repository",
+        refusal.message,
+        refusal.effectDisposition,
       );
     }
     try {
@@ -218,10 +260,30 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         worktreeSandboxExecutionBroker,
       );
     } catch (err) {
+      if (worktree?.created) {
+        try {
+          await removeAgentWorktree({
+            path: worktree.path,
+            branch: worktree.branch,
+            gitRoot: worktree.gitRoot,
+            sandboxExecutionBroker: worktreeSandboxExecutionBroker!,
+          });
+        } catch (cleanupError) {
+          emitWarning(
+            opts.parent.eventLog,
+            opts.parent.nextInternalSubId(),
+            "delegate_worktree_cleanup_failed",
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          );
+        }
+      }
       return reject(
         "WORKTREE_UNAVAILABLE",
         "environment",
         `worktree setup failed: ${err instanceof Error ? err.message : String(err)}`,
+        worktree === undefined && err instanceof WorktreePreconditionError
+          ? err.effectDisposition
+          : undefined,
       );
     }
   }
@@ -229,6 +291,7 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
   // Spawn the live agent (AgentControl owns depth + slot + metadata).
   let live: LiveAgent;
   try {
+    opts.assertParentSessionActive?.();
     live = await opts.control.spawn({
       parentPath: opts.parentPath,
       ...(opts.role !== undefined ? { roleName: opts.role } : {}),
@@ -254,7 +317,14 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
             opts.parent,
             worktree.gitRoot,
           ),
-      }).catch(() => {});
+      }).catch((cleanupError) => {
+        emitWarning(
+          opts.parent.eventLog,
+          opts.parent.nextInternalSubId(),
+          "delegate_worktree_cleanup_failed",
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        );
+      });
     }
     const reason = err instanceof Error ? err.message : String(err);
     if (err instanceof AgentConcurrencyLimitError) {
@@ -269,6 +339,7 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
   // Build the fork context.
   let fork: Awaited<ReturnType<typeof forkSubagent>>;
   try {
+    opts.assertParentSessionActive?.();
     const parentMessages =
       opts.parentMessagesOverride ?? opts.parent.snapshotHistoryMessages();
     fork = await forkSubagent({
@@ -287,6 +358,7 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         : {}),
       ...(worktree?.path !== undefined ? { worktreePath: worktree.path } : {}),
     });
+    opts.assertParentSessionActive?.();
   } catch (error) {
     const cleanupFailures: string[] = [];
     await opts.control
@@ -355,8 +427,9 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
       },
     );
 
-  const execute = async (thread: AgentThread): Promise<RunAgentResult> =>
-    runDelegateAgentLoop({
+  const execute = async (thread: AgentThread): Promise<RunAgentResult> => {
+    opts.assertParentSessionActive?.();
+    return runDelegateAgentLoop({
       thread,
       parent: opts.parent,
       parentPath: opts.parentPath,
@@ -377,17 +450,21 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         ? { externalSignal: opts.externalSignal }
         : {}),
       ...(opts.silent !== undefined ? { silent: opts.silent } : {}),
-      ...(opts.model !== undefined ? { model: opts.model } : {}),
-      ...(opts.reasoningEffort !== undefined
-        ? { reasoningEffort: opts.reasoningEffort }
-        : {}),
-      ...(opts.serviceTier !== undefined
-        ? { serviceTier: opts.serviceTier }
-        : {}),
+      ...(opts.deferInteractiveApprovals !== undefined
+        ? { deferInteractiveApprovals: opts.deferInteractiveApprovals } : {}),
+      ...delegateModelOptions(opts),
       ...(opts.resumeManager !== undefined
         ? { resumeManager: opts.resumeManager }
         : {}),
       ...(opts.keepAlive !== undefined ? { keepAlive: opts.keepAlive } : {}),
+      onWorktreeEvidence: (evidence) => {
+        if (
+          evidence.state !== "unchanged_clean" &&
+          evidence.state !== "committed_clean"
+        ) {
+          worktreeEvidenceRequiringReview = evidence;
+        }
+      },
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
       ...(opts.finalMessageSink !== undefined
         ? { finalMessageSink: opts.finalMessageSink }
@@ -396,6 +473,7 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         preserveLiveAfterRoleProvenanceFailure = true;
       },
     });
+  };
 
   if (
     !opts.forceSynchronous &&
@@ -430,6 +508,9 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
             registry: opts.registry,
             parent: opts.parent,
             shutdownAgent,
+            ...(worktreeEvidenceRequiringReview !== undefined
+              ? { worktreeEvidenceRequiringReview }
+              : {}),
             ...(baseCommit !== null ? { baseCommit } : {}),
           });
         }
@@ -452,6 +533,9 @@ export async function delegate(opts: DelegateOpts): Promise<DelegateOutcome> {
         registry: opts.registry,
         parent: opts.parent,
         shutdownAgent: true,
+        ...(worktreeEvidenceRequiringReview !== undefined
+          ? { worktreeEvidenceRequiringReview }
+          : {}),
         ...(baseCommit !== null ? { baseCommit } : {}),
       });
     }
@@ -533,11 +617,13 @@ async function runDelegateAgentLoop(opts: {
   readonly maxTurns?: number;
   readonly externalSignal?: AbortSignal;
   readonly silent?: boolean;
+  readonly deferInteractiveApprovals?: (toolName: string) => void;
   readonly model?: string;
   readonly reasoningEffort?: ReasoningEffort;
   readonly serviceTier?: string;
   readonly resumeManager?: ResumeManager;
   readonly keepAlive?: boolean;
+  readonly onWorktreeEvidence: (evidence: WorktreeTurnEvidence) => void;
   readonly onProgress?: (
     event: RunAgentProgressEvent,
     thread: AgentThread,
@@ -569,6 +655,8 @@ async function runDelegateAgentLoop(opts: {
           ? { externalSignal: opts.externalSignal }
           : {}),
         ...(opts.silent !== undefined ? { silent: opts.silent } : {}),
+        ...(opts.deferInteractiveApprovals !== undefined
+          ? { deferInteractiveApprovals: opts.deferInteractiveApprovals } : {}),
         ...(opts.model !== undefined ? { model: opts.model } : {}),
         ...(opts.reasoningEffort !== undefined
           ? { reasoningEffort: opts.reasoningEffort }
@@ -577,6 +665,7 @@ async function runDelegateAgentLoop(opts: {
           ? { serviceTier: opts.serviceTier }
           : {}),
         ...(opts.keepAlive !== undefined ? { keepAlive: opts.keepAlive } : {}),
+        onWorktreeEvidence: opts.onWorktreeEvidence,
         ...(opts.finalMessageSink !== undefined
           ? { finalMessageSink: opts.finalMessageSink }
           : {}),
@@ -758,6 +847,7 @@ async function teardown(opts: {
   readonly registry: AgentRegistry;
   readonly parent: Session;
   readonly shutdownAgent: boolean;
+  readonly worktreeEvidenceRequiringReview?: WorktreeTurnEvidence;
   readonly baseCommit?: string;
 }): Promise<void> {
   void opts.registry;
@@ -769,6 +859,18 @@ async function teardown(opts: {
 
   // If we own a worktree, decide keep-vs-remove.
   if (opts.thread.worktree && opts.baseCommit) {
+    // A terminal worker can still have uncertain effects. A fresh query under
+    // the parent's authority must not override the child's canonical evidence
+    // and turn a fail-closed receipt into destructive automatic cleanup.
+    if (opts.worktreeEvidenceRequiringReview !== undefined) {
+      emitWarning(
+        opts.parent.eventLog,
+        opts.parent.nextInternalSubId(),
+        "worktree_evidence_preserved",
+        `worktree ${opts.thread.worktree.path} was preserved for explicit review (evidence=${opts.worktreeEvidenceRequiringReview.state})`,
+      );
+      return;
+    }
     // A resumed worktree may contain commits retained from an earlier run.
     // The turn-start base only distinguishes this turn's output; it does not
     // prove the pre-existing worktree is safe to delete. Auto-cleanup is

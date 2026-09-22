@@ -139,6 +139,61 @@ describe("HomeContext", () => {
 });
 
 describe("strict layered repository", () => {
+  test("does not inherit retired home config through a home-level package marker", async () => {
+    const root = realpathSync(temp("agenc-selected-workspace-boundary"));
+    const platformHome = join(root, "Users", "tester");
+    const isolatedAgencHome = join(root, "desktop-user-data", "core");
+    const workspace = join(platformHome, "Documents", "huntsman-key");
+    mkdirSync(workspace, { recursive: true });
+    write(join(platformHome, "package.json"), "{}\n");
+    write(join(platformHome, ".agenc", "settings.json"), "{}\n");
+
+    const loaded = await loadLayeredConfig({
+      env: { AGENC_HOME: isolatedAgencHome, HOME: platformHome },
+      cwd: workspace,
+      managedConfigPath: join(root, "missing-managed.toml"),
+      managedDropInDir: join(root, "missing-managed.d"),
+    });
+
+    expect(loaded.projectRoot).toBe(workspace);
+    expect(loaded.sources).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: join(platformHome, ".agenc", "settings.json"),
+      }),
+    ]));
+  });
+
+  test("still discovers a package-rooted monorepo below the home boundary", async () => {
+    const root = realpathSync(temp("agenc-selected-monorepo-boundary"));
+    const platformHome = join(root, "Users", "tester");
+    const isolatedAgencHome = join(root, "desktop-user-data", "core");
+    const projectRoot = join(platformHome, "Documents", "workspace-monorepo");
+    const workspace = join(projectRoot, "packages", "huntsman-key");
+    const projectConfig = join(projectRoot, ".agenc", "config.toml");
+    mkdirSync(workspace, { recursive: true });
+    write(join(platformHome, "package.json"), "{}\n");
+    write(join(platformHome, ".agenc", "settings.json"), "{}\n");
+    write(join(projectRoot, "package.json"), "{}\n");
+    write(projectConfig, [
+      "config_version = 2",
+      'model = "grok-4.3"',
+      "",
+    ].join("\n"));
+
+    const loaded = await loadLayeredConfig({
+      env: { AGENC_HOME: isolatedAgencHome, HOME: platformHome },
+      cwd: workspace,
+      projectTrusted: true,
+      managedConfigPath: join(root, "missing-managed.toml"),
+      managedDropInDir: join(root, "missing-managed.d"),
+    });
+
+    expect(loaded.projectRoot).toBe(projectRoot);
+    expect(loaded.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ scope: "project", path: projectConfig }),
+    ]));
+  });
+
   test("keeps daemon configuration independent from the launch workspace", async () => {
     const root = temp("agenc-daemon-home-authority");
     const home = join(root, "home");
@@ -1172,59 +1227,6 @@ describe("explicit v2 migration", () => {
       }),
     ]));
     expect(plan.writes).toEqual([]);
-  });
-
-  test("maps the retired editor toggle into tui.vimMode", async () => {
-    const root = temp("agenc-v2-editor-mode");
-    const home = join(root, "home");
-    write(
-      join(home, "config.toml"),
-      'configVersion = 1\neditorMode = "vim"\n',
-    );
-
-    const plan = await checkConfigV2Migration({
-      env: {},
-      home,
-      projectRoot: join(root, "project"),
-      managedConfigPath: join(root, "managed", "config.toml"),
-      managedSettingsPath: join(root, "managed", "managed-settings.json"),
-      globalStatePath: join(root, "missing-global.json"),
-      id: "editor-mode",
-    });
-
-    expect(plan.conflicts).toEqual([]);
-    const configWrite = plan.writes.find(write => write.kind === "config");
-    expect(configWrite?.content).toMatch(/"?vimMode"?\s*=\s*true/u);
-    expect(configWrite?.content).not.toContain("editorMode");
-  });
-
-  test("refuses conflicting editorMode and tui.vimMode values", async () => {
-    const root = temp("agenc-v2-editor-conflict");
-    const home = join(root, "home");
-    write(
-      join(home, "config.toml"),
-      [
-        "configVersion = 1",
-        'editorMode = "vim"',
-        "[tui]",
-        "vimMode = false",
-        "",
-      ].join("\n"),
-    );
-
-    const plan = await checkConfigV2Migration({
-      env: {},
-      home,
-      projectRoot: join(root, "project"),
-      managedConfigPath: join(root, "managed", "config.toml"),
-      managedSettingsPath: join(root, "managed", "managed-settings.json"),
-      globalStatePath: join(root, "missing-global.json"),
-      id: "editor-conflict",
-    });
-
-    expect(plan.conflicts).toEqual([
-      expect.objectContaining({ field: "tui.vimMode" }),
-    ]);
   });
 
   test("consolidates legacy effort and sandbox policy into canonical fields", async () => {

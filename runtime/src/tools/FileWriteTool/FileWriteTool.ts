@@ -5,7 +5,7 @@ import { clearDeliveredDiagnosticsForFile } from '../../services/lsp/LSPDiagnost
 import { getLspServerManager } from '../../services/lsp/manager.js'
 import { peekAmbientRuntimeSession } from '../../session/current-session.js'
 import type { SandboxExecutionBrokerLike } from '../../sandbox/execution-broker.js'
-import { checkTeamMemSecrets } from '../../memory/index.js'
+import { checkMemorySecrets } from '../../memory/privacy.js'
 import type { ToolUseContext } from '../Tool.js'
 import { buildTool, type ToolDef } from '../Tool.js'
 import { logForDebugging } from 'src/utils/debug.js'
@@ -158,8 +158,9 @@ export const FileWriteTool = buildTool({
   async validateInput({ file_path, content }, toolUseContext: ToolUseContext) {
     const fullFilePath = expandPath(file_path)
 
-    // Reject writes to team memory files that contain secrets
-    const secretError = checkTeamMemSecrets(fullFilePath, content)
+    // Reject writes into durable memory (global, project, team) that
+    // contain secrets: memory is plain text and re-enters later prompts.
+    const secretError = checkMemorySecrets(fullFilePath, content)
     if (secretError) {
       return { result: false, message: secretError, errorCode: 0 }
     }
@@ -240,7 +241,7 @@ export const FileWriteTool = buildTool({
     // Ensure parent directory exists before the atomic read-modify-write section.
     // Must stay OUTSIDE the critical section below (a yield between the staleness
     // check and writeTextContent lets concurrent edits interleave), and BEFORE the
-    // write (lazy-mkdir-on-ENOENT would fire a spurious tengu_atomic_write_error
+    // write (lazy-mkdir-on-ENOENT would report a spurious atomic-write error
     // inside writeFileSyncAndFlush_DEPRECATED before ENOENT propagates back).
     await getFsImplementation().mkdir(dir)
     if (fileHistoryEnabled()) {

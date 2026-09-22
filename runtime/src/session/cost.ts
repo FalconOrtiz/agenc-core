@@ -161,6 +161,13 @@ const COST_TIER_GEMINI_3_FLASH_LITE = {
   inputUsdPer1K: 0.0003,
   outputUsdPer1K: 0.0025,
 } as const;
+// 3.1 Flash Lite $0.25/$1.50 per M (openrouter.ai/api/v1/models pass-through
+// of Google's list price, 2026-09-11; ai.google.dev's pricing page needs a
+// sign-in from this host).
+const COST_TIER_GEMINI_3_1_FLASH_LITE = {
+  inputUsdPer1K: 0.00025,
+  outputUsdPer1K: 0.0015,
+} as const;
 const COST_TIER_DEEPSEEK_V4_FLASH: Readonly<ModelCostEntry> = Object.freeze({
   inputUsdPer1K: 0.00014,
   outputUsdPer1K: 0.00028,
@@ -174,12 +181,92 @@ const COST_TIER_DEEPSEEK_V4_PRO: Readonly<ModelCostEntry> = Object.freeze({
   cachedInputIncludedInInputTokens: true,
 });
 
+// Native API estimates use the published peak rates (2026-09-11). Off-peak
+// calls cost half; these estimates are not authoritative managed-credit usage.
+// https://api-docs.deepseek.com/quick_start/pricing/
+const COST_TIER_DEEPSEEK_V41_FLASH_NATIVE: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0003,
+  outputUsdPer1K: 0.0012,
+  cachedInputUsdPer1K: 0.000006,
+  cachedInputIncludedInInputTokens: true,
+});
+const COST_TIER_DEEPSEEK_V4_PRO_NATIVE: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00132,
+  outputUsdPer1K: 0.00396,
+  cachedInputUsdPer1K: 0.000044,
+  cachedInputIncludedInInputTokens: true,
+});
+
 // Official Mistral API prices retrieved 2026-08-24:
 // https://docs.mistral.ai/inference/pricing
 const COST_TIER_MISTRAL_MEDIUM_3_5: Readonly<ModelCostEntry> = Object.freeze({
   inputUsdPer1K: 0.0015,
   outputUsdPer1K: 0.0075,
   cachedInputUsdPer1K: 0.00015,
+  cachedInputIncludedInInputTokens: true,
+});
+
+// Official Cerebras model/pricing pages retrieved 2026-09-04.
+// Qwen's Developer rate is authoritative over the public endpoint's transient
+// zero-price catalog value.
+// https://inference-docs.cerebras.ai/models/qwen-3.8-27b
+const COST_TIER_CEREBRAS_GPT_OSS_120B: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00035,
+  outputUsdPer1K: 0.00075,
+});
+const COST_TIER_CEREBRAS_QWEN_38_27B: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00099,
+  outputUsdPer1K: 0.00149,
+});
+const COST_TIER_CEREBRAS_GEMMA_4_31B: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00099,
+  outputUsdPer1K: 0.00149,
+});
+
+// Official Z.AI list prices retrieved 2026-09-04. GLM-5.3-Flash has a
+// temporary 50% launch discount; use the stable list rate so persisted budget
+// estimates do not understate cost after the promotion ends.
+// https://docs.z.ai/guides/overview/pricing
+const COST_TIER_ZAI_GLM_53: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0014,
+  outputUsdPer1K: 0.0044,
+  cachedInputUsdPer1K: 0.00026,
+  cachedInputIncludedInInputTokens: true,
+});
+const COST_TIER_ZAI_GLM_53_FLASH: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00015,
+  outputUsdPer1K: 0.0005,
+  cachedInputUsdPer1K: 0.00003,
+  cachedInputIncludedInInputTokens: true,
+});
+
+// Official Moonshot global API prices retrieved 2026-09-05.
+// https://platform.kimi.ai/docs/pricing/chat-k3
+// https://platform.kimi.ai/docs/pricing/chat-k27-code
+// https://platform.kimi.ai/docs/pricing/chat-k26
+const COST_TIER_KIMI_K3: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.003,
+  outputUsdPer1K: 0.015,
+  cachedInputUsdPer1K: 0.0003,
+  cachedInputIncludedInInputTokens: true,
+});
+const COST_TIER_KIMI_K27_CODE: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00095,
+  outputUsdPer1K: 0.004,
+  cachedInputUsdPer1K: 0.00019,
+  cachedInputIncludedInInputTokens: true,
+});
+const COST_TIER_KIMI_K27_CODE_HIGHSPEED: Readonly<ModelCostEntry> =
+  Object.freeze({
+    inputUsdPer1K: 0.0019,
+    outputUsdPer1K: 0.008,
+    cachedInputUsdPer1K: 0.00038,
+    cachedInputIncludedInInputTokens: true,
+  });
+const COST_TIER_KIMI_K26: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.00095,
+  outputUsdPer1K: 0.004,
+  cachedInputUsdPer1K: 0.00016,
   cachedInputIncludedInInputTokens: true,
 });
 
@@ -203,11 +290,64 @@ const COST_TIER_OPUS_LEGACY: Readonly<ModelCostEntry> = Object.freeze({
 // Current Opus tier ($5/$25 per Mtok) — Opus dropped to $5/$25 with 4.5, so 4.5
 // through 4.8 (and later) bill here. Mirrors utils/modelCost.ts COST_TIER_5_25
 // (the canonical AgenC pricing source of truth), expressed per-1K.
+const COST_TIER_MINIMAX_M3: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0003,
+  outputUsdPer1K: 0.0012,
+  cachedInputUsdPer1K: 0.00006,
+  cacheCreationUsdPer1K: 0.000375,
+  webSearchUsdPerRequest: 0,
+});
+const COST_TIER_MINIMAX_M2_7_HIGHSPEED: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0006,
+  outputUsdPer1K: 0.0024,
+  cachedInputUsdPer1K: 0.00006,
+  cacheCreationUsdPer1K: 0.000375,
+  webSearchUsdPerRequest: 0,
+});
+const COST_TIER_MINIMAX_M2: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0003,
+  outputUsdPer1K: 0.0012,
+  cachedInputUsdPer1K: 0.00003,
+  cacheCreationUsdPer1K: 0.000375,
+  webSearchUsdPerRequest: 0,
+});
+const COST_TIER_MINIMAX_M2_HIGHSPEED: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.0006,
+  outputUsdPer1K: 0.0024,
+  cachedInputUsdPer1K: 0.00003,
+  cacheCreationUsdPer1K: 0.000375,
+  webSearchUsdPerRequest: 0,
+});
+
+function minimaxCostAliases(
+  model: string,
+  entry: Readonly<ModelCostEntry>,
+): Record<string, Readonly<ModelCostEntry>> {
+  return { [`minimax:${model}`]: entry, [model]: entry };
+}
+
 const COST_TIER_OPUS_5_25: Readonly<ModelCostEntry> = Object.freeze({
   inputUsdPer1K: 0.005,
   outputUsdPer1K: 0.025,
   cachedInputUsdPer1K: 0.0005,
   cacheCreationUsdPer1K: 0.00625,
+  webSearchUsdPerRequest: 0.01,
+});
+
+// Claude Fable 5 / 5.1 at $10/$50 and Claude Sonnet 5 at $2/$10
+// (platform.claude.com models overview, 2026-09-11).
+const COST_TIER_FABLE_10_50: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.01,
+  outputUsdPer1K: 0.05,
+  cachedInputUsdPer1K: 0.001,
+  cacheCreationUsdPer1K: 0.0125,
+  webSearchUsdPerRequest: 0.01,
+});
+const COST_TIER_SONNET_2_10: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.002,
+  outputUsdPer1K: 0.01,
+  cachedInputUsdPer1K: 0.0002,
+  cacheCreationUsdPer1K: 0.0025,
   webSearchUsdPerRequest: 0.01,
 });
 
@@ -294,6 +434,8 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     // ($4 / $1 / $12); this table has no prompt-size tier, so a >200k turn is
     // under-counted. Under-counting is the deliberate side to err on — the
     // alternative trips dollar_cap budgets early on every short turn.
+    // Grok 4.7 launch pricing has the same base rates and long-context caveat.
+    ...grokCostAliases("grok-4.7", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.6", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.5", COST_TIER_GROK_45),
     ...grokCostAliases("grok-4.3", COST_TIER_GROK_4X_NON_REASONING),
@@ -326,47 +468,36 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     ...openAiCostAliases("o3", COST_TIER_O3),
     ...openAiCostAliases("o3-mini", COST_TIER_O3_MINI),
     ...openAiCostAliases("o4-mini", COST_TIER_O4_MINI),
-    // branding-scan: allow documented Anthropic API model identifier
+    "anthropic:claude-fable-5-1": COST_TIER_FABLE_10_50,
+    "claude-fable-5-1": COST_TIER_FABLE_10_50,
+    "anthropic:claude-fable-5": COST_TIER_FABLE_10_50,
+    "claude-fable-5": COST_TIER_FABLE_10_50,
+    "anthropic:claude-opus-5": COST_TIER_OPUS_5_25,
+    "claude-opus-5": COST_TIER_OPUS_5_25,
+    "anthropic:claude-sonnet-5": COST_TIER_SONNET_2_10,
+    "claude-sonnet-5": COST_TIER_SONNET_2_10,
     "anthropic:claude-sonnet-4-6": COST_TIER_SONNET,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-sonnet-4-6": COST_TIER_SONNET,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-sonnet-4-5": COST_TIER_SONNET,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-sonnet-4-5": COST_TIER_SONNET,
     // Current Opus generation (4.5-4.8) at $5/$25. canonicalModel routes the
     // whole modern family to claude-opus-4-8; the explicit slugs below keep the
     // exact-match lookup (which precedes canonical) on the same tier.
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-8": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-8": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-7": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-7": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-7-1m": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-7-1m": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-6": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-6": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-5": COST_TIER_OPUS_5_25,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-5": COST_TIER_OPUS_5_25,
     // Legacy Opus (4.0 / 4.1) remain $15/$75.
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4-1": COST_TIER_OPUS_LEGACY,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4-1": COST_TIER_OPUS_LEGACY,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-opus-4": COST_TIER_OPUS_LEGACY,
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-opus-4": COST_TIER_OPUS_LEGACY,
-    // branding-scan: allow documented Anthropic API model identifier
     "anthropic:claude-haiku-4-5": {
       inputUsdPer1K: 0.001,
       outputUsdPer1K: 0.005,
@@ -374,7 +505,6 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
       cacheCreationUsdPer1K: 0.00125,
       webSearchUsdPerRequest: 0.01,
     },
-    // branding-scan: allow documented Anthropic API model identifier
     "claude-haiku-4-5": {
       inputUsdPer1K: 0.001,
       outputUsdPer1K: 0.005,
@@ -390,14 +520,27 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
       inputUsdPer1K: 0.00059,
       outputUsdPer1K: 0.00079,
     },
-    "deepseek:deepseek-v4-flash": COST_TIER_DEEPSEEK_V4_FLASH,
-    "deepseek-v4-flash": COST_TIER_DEEPSEEK_V4_FLASH,
+    "deepseek:deepseek-flash": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
+    "deepseek-flash": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
+    "deepseek:deepseek-v4-flash": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
+    "deepseek-v4-flash": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
+    "deepseek:deepseek-v4-flash-vision-exp": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
+    "deepseek-v4-flash-vision-exp": COST_TIER_DEEPSEEK_V41_FLASH_NATIVE,
     "deepseek/deepseek-v4-flash": COST_TIER_DEEPSEEK_V4_FLASH,
     "openrouter:deepseek/deepseek-v4-flash": COST_TIER_DEEPSEEK_V4_FLASH,
-    "deepseek:deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO,
-    "deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO,
+    "deepseek:deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO_NATIVE,
+    "deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO_NATIVE,
     "deepseek/deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO,
     "openrouter:deepseek/deepseek-v4-pro": COST_TIER_DEEPSEEK_V4_PRO,
+    "cerebras:gpt-oss-120b": COST_TIER_CEREBRAS_GPT_OSS_120B,
+    "cerebras:qwen-3.8-27b": COST_TIER_CEREBRAS_QWEN_38_27B,
+    "cerebras:gemma-4-31b": COST_TIER_CEREBRAS_GEMMA_4_31B,
+    "zai:glm-5.3": COST_TIER_ZAI_GLM_53,
+    "zai:glm-5.3-flash": COST_TIER_ZAI_GLM_53_FLASH,
+    "kimi:kimi-k3": COST_TIER_KIMI_K3,
+    "kimi:kimi-k2.7-code": COST_TIER_KIMI_K27_CODE,
+    "kimi:kimi-k2.7-code-highspeed": COST_TIER_KIMI_K27_CODE_HIGHSPEED,
+    "kimi:kimi-k2.6": COST_TIER_KIMI_K26,
     "gemini:gemini-2.5-pro": {
       inputUsdPer1K: 0.00125,
       outputUsdPer1K: 0.01,
@@ -412,20 +555,37 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     // $0.30/$2.50.
     "gemini:gemini-3.1-pro-preview": COST_TIER_GEMINI_3_1_PRO,
     "gemini-3.1-pro-preview": COST_TIER_GEMINI_3_1_PRO,
+    // 3.8 Flash lists at the same $0.75/$3.75 as 3.7 (openrouter pass-through
+    // of Google's price, 2026-09-11).
+    "gemini:gemini-3.8-flash": COST_TIER_GEMINI_3_FLASH,
+    "gemini-3.8-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini:gemini-3.7-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini-3.7-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini:gemini-3.6-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini-3.6-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini:gemini-3.5-flash": COST_TIER_GEMINI_3_FLASH,
     "gemini-3.5-flash": COST_TIER_GEMINI_3_FLASH,
+    "gemini:gemini-3.1-flash-lite": COST_TIER_GEMINI_3_1_FLASH_LITE,
+    "gemini-3.1-flash-lite": COST_TIER_GEMINI_3_1_FLASH_LITE,
     "gemini:gemini-3.5-flash-lite": COST_TIER_GEMINI_3_FLASH_LITE,
     "gemini-3.5-flash-lite": COST_TIER_GEMINI_3_FLASH_LITE,
     "mistral:mistral-medium-latest": COST_TIER_MISTRAL_MEDIUM_3_5,
     "mistral-medium-latest": COST_TIER_MISTRAL_MEDIUM_3_5,
     "nvidia-nim:nvidia/llama-3.1-nemotron-70b-instruct": DEFAULT_UNKNOWN_MODEL_COST,
     "nvidia/llama-3.1-nemotron-70b-instruct": DEFAULT_UNKNOWN_MODEL_COST,
-    "minimax:MiniMax-M2.5": DEFAULT_UNKNOWN_MODEL_COST,
-    "MiniMax-M2.5": DEFAULT_UNKNOWN_MODEL_COST,
+    // MiniMax pay-as-you-go (platform.minimax.io/docs/guides/pricing-paygo,
+    // 2026-09-11, standard tier, prompts up to 512k): M3 $0.30/$1.20 per M
+    // with $0.06 cache reads; M2.7 the same; the other M2 generations read
+    // cache at $0.03; every highspeed variant doubles input and output.
+    // Cache writes are $0.375 per M across the line.
+    ...minimaxCostAliases("MiniMax-M3", COST_TIER_MINIMAX_M3),
+    ...minimaxCostAliases("MiniMax-M2.7", COST_TIER_MINIMAX_M3),
+    ...minimaxCostAliases("MiniMax-M2.7-highspeed", COST_TIER_MINIMAX_M2_7_HIGHSPEED),
+    ...minimaxCostAliases("MiniMax-M2.5", COST_TIER_MINIMAX_M2),
+    ...minimaxCostAliases("MiniMax-M2.5-highspeed", COST_TIER_MINIMAX_M2_HIGHSPEED),
+    ...minimaxCostAliases("MiniMax-M2.1", COST_TIER_MINIMAX_M2),
+    ...minimaxCostAliases("MiniMax-M2.1-highspeed", COST_TIER_MINIMAX_M2_HIGHSPEED),
+    ...minimaxCostAliases("MiniMax-M2", COST_TIER_MINIMAX_M2),
     "amazon-bedrock:amazon.nova-pro-v1:0": DEFAULT_UNKNOWN_MODEL_COST,
     "amazon.nova-pro-v1:0": DEFAULT_UNKNOWN_MODEL_COST,
     "agenc:agenc": DEFAULT_UNKNOWN_MODEL_COST,
@@ -591,7 +751,7 @@ export function resolveModelCostEntry(
   usage: Pick<ModelUsage, "model" | "provider">,
   registry: Readonly<Record<string, ModelCostEntry>>,
 ): { readonly key: string; readonly entry: ModelCostEntry } | null {
-  for (const key of costLookupKeys(usage.model, usage.provider)) {
+  for (const key of costLookupKeys(usage.model, usage.provider, registry)) {
     const entry = registry[key];
     if (entry) return { key, entry };
   }
@@ -649,11 +809,8 @@ function canonicalModel(model: string): string {
   if (unqualified.startsWith("gpt-4.1")) return "gpt-4.1";
   if (unqualified.startsWith("gpt-4o-mini")) return "gpt-4o-mini";
   if (unqualified.startsWith("gpt-4o")) return "gpt-4o";
-  // branding-scan: allow documented Anthropic API model identifier
   if (unqualified.startsWith("claude-haiku-4-5")) return "claude-haiku-4-5";
-  // branding-scan: allow documented Anthropic API model identifier
   if (unqualified.startsWith("claude-sonnet-4")) return "claude-sonnet-4-6";
-  // branding-scan: allow documented Anthropic API model identifier
   // Opus 4.5+ bills at $5/$25, Opus 4.0/4.1 at $15/$75. Parse the minor version
   // from a delimited group (not startsWith) so opus-4-1 is not confused with a
   // future opus-4-10+, and route each family to its representative priced slug.
@@ -673,6 +830,7 @@ function usageKey(model: string, provider: string | undefined): string {
 function costLookupKeys(
   model: string,
   provider: string | undefined,
+  registry: Readonly<Record<string, ModelCostEntry>>,
 ): string[] {
   const normalizedProvider = normalizeProviderMetadataIdentity(provider);
   const canonical = canonicalModel(model);
@@ -682,8 +840,23 @@ function costLookupKeys(
     if (canonical !== model) keys.push(`${normalizedProvider}:${canonical}`);
     keys.push(normalizedProvider);
   }
-  keys.push(model);
-  if (canonical !== model) keys.push(canonical);
+  // The provider-less fallbacks below exist so a bare model slug still prices.
+  // They must not hand a hosted provider the LOCAL free-inference entry:
+  // canonicalModel collapses every `ollama:`/`lmstudio:` slug onto a bare local
+  // key, and a bare `openai-compatible` slug already is one, so an ollama-cloud
+  // model would otherwise resolve as a KNOWN zero cost instead of unknown,
+  // hiding real spend. `localZeroCost` is the registry's own mark for those
+  // entries, so this reads the flag rather than naming the keys: a fourth local
+  // entry cannot silently reopen the hole. A different provider therefore skips
+  // that collapse; the local provider itself, and an unattributed slug, still
+  // reach it.
+  const collapsesToLocalZero = registry[canonical]?.localZeroCost === true;
+  const foreignProvider =
+    normalizedProvider !== undefined && normalizedProvider !== canonical;
+  if (!(collapsesToLocalZero && foreignProvider)) {
+    keys.push(model);
+    if (canonical !== model) keys.push(canonical);
+  }
   return [...new Set(keys)];
 }
 

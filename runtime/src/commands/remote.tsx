@@ -47,7 +47,7 @@ function RemotePairModal(props: {
   if (linked !== null) {
     return (
       <Box paddingX={1} borderStyle="round">
-        <Text>✓ Linked with {linked} — drive this Mac from your phone.</Text>
+        <Text>✓ Linked with {linked} — drive this computer from your phone.</Text>
       </Box>
     );
   }
@@ -60,13 +60,13 @@ function RemotePairModal(props: {
 }
 
 /**
- * `/remote [on|off|status]` — link this Mac to the AgenC phone app from inside an agent session.
+ * `/remote [on|off|status]` — link this computer to the AgenC phone app from inside an agent session.
  * `on` shows a code + QR as a PERSISTENT surface (it does not vanish after a few seconds) and
  * auto-closes the moment the phone pairs. `status`/`off` inspect or forget the pairing.
  */
 export const remoteCommand: SlashCommand = {
   name: "remote",
-  description: "Link this Mac to the AgenC phone app",
+  description: "Link this computer to the AgenC phone app",
   immediate: true,
   supportsNonInteractive: true,
   execute: async (ctx: SlashCommandContext): Promise<SlashCommandResult> => {

@@ -10,10 +10,11 @@
  * Mirrors agenc `query.ts:561-1082`.
  *
  * Invariants wired here:
- *   I-11 (stream idle watchdog, operator opt-in) — installStreamWatchdog
- *        wraps the stream; `kick()` fires on every chunk. An explicitly
- *        configured idle expiry aborts the underlying fetch via the scoped
- *        AbortController; unconfigured streams are unbounded.
+ *   I-11 (stream idle watchdog) — installStreamWatchdog wraps the stream;
+ *        `kick()` fires on every chunk. The canonical config carries a
+ *        ten-minute default idle expiry (`stream_watchdog_timeout_ms`,
+ *        `0` disables) that aborts the underlying fetch via the scoped
+ *        AbortController; sessions without a config store stay unbounded.
  *   I-22 (token budget mid-stream) — per-chunk
  *        `budgetTracker.addEmitted(..., "estimate") + sampleMidStream`
  *        keeps a coarse estimate during streaming, but the actual
@@ -30,6 +31,7 @@
  * @module
  */
 
+import { resolveReasoningEffort } from "../llm/reasoning-effort.js";
 import type {
   LLMChatOptions,
   LLMMessage,
@@ -46,6 +48,7 @@ import {
   resolveSessionStreamIdleTimeoutMs,
   STREAM_IDLE_ABORT_REASON,
 } from "../llm/stream-watchdog.js";
+import { DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS } from "../config/schema.js";
 import {
   CitationStreamParser,
   ProposedPlanStreamParser,
@@ -60,10 +63,32 @@ import {
   validateToolCallsForDispatch,
 } from "./execute-tools.js";
 import { isPlanMode } from "../session/plan-mode.js";
-import { getInitialEffortSetting } from "../utils/effort.js";
+import {
+  createProviderTraceSink,
+  providerTraceBodiesEnabled,
+  providerTraceEnabled,
+  type ProviderTraceSink,
+} from "../llm/provider-trace-sink.js";
+import { getAgencHomeDir } from "../session/session-store.js";
+import {
+  getInitialEffortSetting,
+} from "../utils/effort.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
+import { resolveGeminiReasoningEffort } from "../llm/registry/gemini-thinking-models.js";
 
 type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
+
+function resolveGeminiSessionReasoningEffort(
+  turnEffort: ReasoningEffort | undefined,
+  model: string,
+  effortSource: string | undefined,
+): WireReasoningEffort | undefined {
+  if (turnEffort !== undefined) return resolveGeminiReasoningEffort(model, turnEffort);
+  const configuredEffort = effortSource === "default"
+    ? undefined
+    : getInitialEffortSetting();
+  return resolveGeminiReasoningEffort(model, configuredEffort);
+}
 
 /**
  * Sessions created without an explicit reasoning effort — every
@@ -72,25 +97,57 @@ type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
  * provider default applies and grok-4.5 burns ~16k hidden reasoning
  * tokens per trivial reply at xAI's HIGH default (measured: ~2m30s for
  * a 150-word answer, matching the user's "grok is fucking slow").
- * An explicit per-session "none" stays respected as an opt-out; values
- * outside the wire vocabulary ("max", "none") are dropped rather than
- * sent upstream to a provider that would reject them.
+ * An explicit per-session "none" stays respected as an opt-out.
+ *
+ * Persistence historically spells Grok's deepest `xhigh` tier as `max`, while
+ * providers such as Z.AI use `max` as the literal wire value and do not accept
+ * `xhigh`. Resolve that alias against the selected model's catalog: prefer the
+ * requested top-tier spelling when supported, translate to the other top-tier
+ * spelling when that is the model's only form, and otherwise clamp to `high`.
  */
 function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
+  supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
+  selection?: {
+    readonly provider: string;
+    readonly model: string;
+    readonly effortSource?: string;
+  },
 ): WireReasoningEffort | undefined {
-  if (turnEffort !== undefined) {
-    return turnEffort === "none" ? undefined : turnEffort;
+  if (selection?.provider === "gemini") {
+    return resolveGeminiSessionReasoningEffort(
+      turnEffort,
+      selection.model,
+      selection.effortSource,
+    );
   }
-  const settingsEffort = getInitialEffortSetting();
-  switch (settingsEffort) {
-    case "low":
-    case "medium":
-    case "high":
-      return settingsEffort;
-    default:
-      return undefined;
+  const requested = turnEffort ?? getInitialEffortSetting();
+  if (requested === undefined || requested === "none") return undefined;
+  // Hosted providers can expose an effort contract absent from ModelInfo.
+  // Preserve accepted literal tiers before applying legacy max/xhigh aliases.
+  const contract = selection === undefined ? undefined : resolveReasoningEffort(selection);
+  if (selection?.provider === "anthropic" && contract?.registered === false) {
+    // Settings fallback is legacy configuration, not a literal session choice.
+    // Configured max is seeded as xhigh for these older models; an explicit
+    // applyConfig max remains max and must be forwarded exactly as accepted.
+    if (turnEffort === undefined && !contract.levels.includes("xhigh") &&
+        (requested === "max" || requested === "xhigh")) return "high";
+    if (contract.levels.includes(requested)) return requested;
+    if (requested === "max" || requested === "xhigh") return "high";
   }
+  if (contract?.registered === false && contract.levels.includes(requested)) {
+    return requested;
+  }
+  if (requested === "max" || requested === "xhigh") {
+    if (supportedReasoningLevels === undefined) {
+      return requested === "max" ? "xhigh" : requested;
+    }
+    if (supportedReasoningLevels.includes(requested)) return requested;
+    const topTierAlias = requested === "max" ? "xhigh" : "max";
+    if (supportedReasoningLevels.includes(topTierAlias)) return topTierAlias;
+    return "high";
+  }
+  return requested;
 }
 
 // Exported for unit tests; the wiring above is the single call site.
@@ -107,6 +164,8 @@ import type {
 import { runAdmittedModelCall } from "../budget/admitted-model-call.js";
 
 export interface StreamModelRequestContract {
+  /** Internal managed transport UUID, stable for every retry of this snapshot. */
+  readonly managedRequestId?: string;
   readonly input: ReadonlyArray<LLMMessage>;
   readonly tools: ReadonlyArray<LLMTool>;
   readonly parallelToolCalls: boolean;
@@ -221,19 +280,74 @@ function cloneProviderTools(tools: ReadonlyArray<LLMTool>): LLMTool[] {
   }));
 }
 
-function buildProviderOptions(
+/**
+ * Stable prompt-cache routing hint for one session. xAI (and the OpenAI
+ * Responses API) route requests carrying the same `prompt_cache_key` to the
+ * backend holding that conversation's cached prefix; without it 77 of 220
+ * calls in the reviewed desktop session lost part of the cached prefix and
+ * re-prefilled 20k-150k tokens each. Gemini reinterprets the same option as
+ * a `cachedContents/...` resource name, so it keeps its own configured value.
+ */
+function resolveSessionPromptCacheKey(session: Session): string | undefined {
+  if (session.services.provider.name === "gemini") return undefined;
+  const conversationId = String(session.conversationId ?? "").trim();
+  return conversationId.length > 0 ? conversationId : undefined;
+}
+
+/**
+ * One trace sink per session so the request sequence numbers the files of a
+ * whole conversation. `null` caches "tracing is off" for the session; the env
+ * gate is read once per session, not once per call.
+ */
+const providerTraceSinks = new WeakMap<Session, ProviderTraceSink | null>();
+
+function resolveProviderTraceSink(session: Session): ProviderTraceSink | undefined {
+  const cached = providerTraceSinks.get(session);
+  if (cached !== undefined) return cached ?? undefined;
+  let sink: ProviderTraceSink | null = null;
+  if (providerTraceEnabled()) {
+    try {
+      const configuredHome = (
+        session.services as {
+          configStore?: { homeContext?: { path?: string } };
+        }
+      ).configStore?.homeContext?.path;
+      sink = createProviderTraceSink({
+        agencHome: getAgencHomeDir(configuredHome),
+        conversationId: String(session.conversationId),
+        bodies: providerTraceBodiesEnabled(),
+      });
+    } catch {
+      sink = null;
+    }
+  }
+  providerTraceSinks.set(session, sink);
+  return sink ?? undefined;
+}
+
+export function buildProviderOptions(
   request: StreamModelRequestContract,
   ctx: TurnContext,
   signal: AbortSignal,
+  session: Session,
 ): LLMChatOptions {
   const allowedToolNames = request.tools.map((spec) => spec.function.name);
   const planMode = isPlanMode(ctx);
   const systemPrompt = request.baseInstructions.trim();
+  const promptCacheKey = resolveSessionPromptCacheKey(session);
+  const traceSink = resolveProviderTraceSink(session);
   return {
     signal,
+    ...(request.managedRequestId !== undefined
+      ? { managedRequestId: request.managedRequestId }
+      : {}),
     tools: cloneProviderTools(request.tools),
     parallelToolCalls: request.parallelToolCalls,
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
+    ...(promptCacheKey !== undefined ? { promptCacheKey } : {}),
+    ...(traceSink !== undefined
+      ? { trace: { onProviderTraceEvent: traceSink.onProviderTraceEvent } }
+      : {}),
     ...(request.contextWindowTokens !== undefined
       ? { contextWindowTokens: request.contextWindowTokens }
       : {}),
@@ -249,7 +363,16 @@ function buildProviderOptions(
         ? { toolChoice: "required" as const }
         : {}),
     toolRouting: { allowedToolNames },
-    reasoningEffort: resolveSessionReasoningEffort(ctx.reasoningEffort),
+    reasoningEffort: resolveSessionReasoningEffort(
+      ctx.reasoningEffort,
+      ctx.modelInfo.supportedReasoningLevels,
+      {
+        provider: session.services.provider.name,
+        model: session.config?.model ?? ctx.modelInfo.slug,
+        effortSource: session.services.configStore
+          ?.provenance?.("reasoning_effort")?.scope,
+      },
+    ),
     reasoningSummary: ctx.reasoningSummary,
     modelVerbosity: ctx.modelVerbosity,
     serviceTier:
@@ -599,7 +722,8 @@ function assistantMessageFromResponse(
         : response.finishReason === "content_filter"
           ? "refusal"
           : undefined;
-  const allowToolCalls = response.finishReason !== "length";
+  const allowToolCalls =
+    response.finishReason === "stop" || response.finishReason === "tool_calls";
   // I-55: normalize tool_use blocks into canonical shape before the
   // validator sees them (provider-family quirks collapsed here).
   const normalizedToolCalls = normalizeToolCallsForProvider(
@@ -787,6 +911,30 @@ export function emitThinkingChunkEvents(
   }
 }
 
+/**
+ * Emit a synthetic `assistant_thinking_block_stop` for every display still
+ * open, draining the sanitizer carry first (gaphunt3 #43) so a
+ * reasoning_summary stream with no explicit block_stop still surfaces its
+ * final held-back text. Idempotent per block.
+ */
+function closeOpenThinkingDisplays(
+  displays: Map<string, ThinkingDisplayState>,
+  session: Session,
+): void {
+  for (const state of displays.values()) {
+    if (state.closed) continue;
+    state.closed = true;
+    flushSanitizedThinkingDelta(state, session);
+    session.emit({
+      id: session.nextInternalSubId(),
+      msg: {
+        type: "assistant_thinking_block_stop",
+        payload: { index: state.index, kind: state.kind },
+      },
+    });
+  }
+}
+
 export type { ThinkingDisplayState };
 
 /**
@@ -850,6 +998,48 @@ function extractToolUseId(raw: unknown): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
+/** Canonical config key carrying the stream-idle deadline. */
+const STREAM_WATCHDOG_CONFIG_KEY = "stream_watchdog_timeout_ms";
+
+/**
+ * The slice of a config store this file reads. Duck-typed because embedders
+ * (and fixtures) supply their own store shapes; `provenance` is the
+ * ConfigStore surface that names the layer a key came from.
+ */
+type StreamWatchdogConfigStore = {
+  current?: () => { stream_watchdog_timeout_ms?: number };
+  provenance?: (key: string) => { scope?: string } | undefined;
+};
+
+/**
+ * Did an operator choose this stream-idle deadline, or is it just the built-in
+ * default?
+ *
+ * Only sessions that own their own deadline (the one-shot review delegate) ask.
+ * They opt out of the ambient default, not out of the documented setting: an
+ * operator who writes `stream_watchdog_timeout_ms` in config.toml, or sets
+ * `AGENC_STREAM_IDLE_TIMEOUT_MS`, must still get that deadline inside a review
+ * delegate, the way every session did before the default existed.
+ *
+ * A value that differs from the built-in default was necessarily chosen by
+ * someone. A value that equals it is explicit only when the config store can
+ * name the layer it came from and that layer is not `default` — stores without
+ * provenance (fixtures, embedder-supplied stubs) read as ambient, which is the
+ * conservative answer for a session that already has a deadline of its own.
+ */
+function isOperatorConfiguredStreamWatchdog(
+  store: StreamWatchdogConfigStore | undefined,
+  value: number,
+): boolean {
+  if (value !== DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS) return true;
+  try {
+    const scope = store?.provenance?.(STREAM_WATCHDOG_CONFIG_KEY)?.scope;
+    return scope !== undefined && scope !== "default";
+  } catch {
+    return false;
+  }
+}
+
 export async function streamModel(
   state: TurnState,
   ctx: TurnContext,
@@ -861,12 +1051,21 @@ export async function streamModel(
   if (signal?.aborted) {
     throw new StreamModelError(new Error("aborted before provider call"));
   }
+  state.pendingTextToolCallCorrection = undefined;
+  state.textToolCallCorrectionFailure = undefined;
+
+  // The prepared provider contract, after all model/turn filters, is the
+  // authority for discovery's "advertised" state. Keep a request snapshot
+  // for both mid-stream and post-stream execution of this response's calls.
+  state.samplingRequestToolNames = Object.freeze(
+    request.tools.map(tool => tool.function.name),
+  );
 
   const planMode = isPlanMode(ctx);
 
-  // Scoped AbortController: always follows the external signal. An
-  // operator-configured stream watchdog may also abort it, but there is no
-  // implicit idle deadline.
+  // Scoped AbortController: always follows the external signal. The stream
+  // watchdog (canonical config default of ten minutes, `0` disables) may also
+  // abort it.
   const scoped = new AbortController();
   const onExternalAbort = () => {
     if (!scoped.signal.aborted) {
@@ -877,24 +1076,41 @@ export async function streamModel(
     signal.addEventListener("abort", onExternalAbort, { once: true });
   }
 
-  // I-11 watchdog wiring is installed before the stream begins, but is a
-  // no-op unless the operator explicitly configures a positive idle timeout.
-  // Provider suggestions may raise an explicit value; they never invent one.
-  // A healthy provider can remain completely silent while reasoning or
-  // generating a large tool payload, so silence alone must not end a turn.
+  // I-11 watchdog wiring is installed before the stream begins and takes its
+  // idle timeout from the canonical config snapshot (default ten minutes,
+  // `0` disables). Provider suggestions may raise a configured value; they
+  // never invent one. xAI streams reasoning deltas continuously, so ten
+  // minutes of total silence is a dead socket rather than thinking; the
+  // watchdog warns at half time and the abort is retryable (`stream_idle`).
   const configuredWatchdogMs = (() => {
     const services = session.services as {
-      configStore?: { current?: () => { stream_watchdog_timeout_ms?: number } };
+      configStore?: StreamWatchdogConfigStore;
+      streamIdleWatchdogDisabled?: boolean;
     };
+    let value: number | undefined;
     try {
-      const value =
-        services.configStore?.current?.()?.stream_watchdog_timeout_ms;
-      return typeof value === "number" && Number.isFinite(value) && value > 0
-        ? value
-        : undefined;
+      const raw = services.configStore?.current?.()?.stream_watchdog_timeout_ms;
+      value =
+        typeof raw === "number" && Number.isFinite(raw) && raw > 0
+          ? raw
+          : undefined;
     } catch {
       return undefined;
     }
+    if (value === undefined) return undefined;
+    // One-shot review delegates carry their own deadline and their own
+    // classification of it, so the ambient *default* must not add a second,
+    // worse-typed one on top. See SessionServices.streamIdleWatchdogDisabled.
+    // The opt-out stops there: a `stream_watchdog_timeout_ms` the operator
+    // actually configured is documented as their idle deadline and still
+    // applies inside the delegate, as it did before the opt-out existed.
+    if (
+      services.streamIdleWatchdogDisabled === true &&
+      !isOperatorConfiguredStreamWatchdog(services.configStore, value)
+    ) {
+      return undefined;
+    }
+    return value;
   })();
   const watchdog = installStreamWatchdog({
     abortController: scoped,
@@ -1072,7 +1288,7 @@ export async function streamModel(
   ): Promise<LLMResponse> => {
     resetCanonicalAssistantOutput();
     const messages = buildProviderMessages(request);
-    const options = buildProviderOptions(request, ctx, scoped.signal);
+    const options = buildProviderOptions(request, ctx, scoped.signal, session);
     const recoveryFallback = state.pendingAdmissionFallback;
     const clearRecoveryFallback = (): void => {
       // Do not clear a newer recovery decision installed while this attempt
@@ -1136,6 +1352,12 @@ export async function streamModel(
         ? await callProvider(startupPrewarmHandle, "prewarm")
         : await callProvider(session.services.provider, "primary");
   } catch (error) {
+    // A failed attempt leaves its thinking blocks open. Close them before the
+    // error propagates so a retried attempt (reconnect ladder or the prewarm
+    // fallback below) streams into fresh blocks instead of appending to, or
+    // duplicating, reasoning the UI already rendered.
+    closeOpenThinkingDisplays(thinkingDisplays, session);
+    thinkingDisplays.clear();
     if (
       startupPrewarmHandle !== undefined &&
       !receivedProviderChunk &&
@@ -1246,10 +1468,7 @@ export async function streamModel(
     state.needsFollowUp = false;
   } else {
     const mergedToolBlocks = new Map(streamedToolBlocks);
-    const admittedAssistantToolCalls = assistant.toolCalls.filter(
-      (call) => !state.editorToolCallLimitDeniedIds.has(call.id),
-    );
-    for (const block of parseToolUseBlocks(admittedAssistantToolCalls)) {
+    for (const block of parseToolUseBlocks([...assistant.toolCalls])) {
       mergedToolBlocks.set(block.id, block);
     }
     state.toolUseBlocks = [...mergedToolBlocks.values()];
@@ -1261,21 +1480,7 @@ export async function streamModel(
   // explicit block_stop event). Messages-API providers emit
   // content_block_stop so their blocks are already marked `closed: true`
   // by the chunk handler.
-  for (const state of thinkingDisplays.values()) {
-    if (state.closed) continue;
-    state.closed = true;
-    // gaphunt3 #43: drain the carry tail before the synthetic block_stop so a
-    // reasoning_summary stream (no explicit block_stop) still surfaces its
-    // final held-back text.
-    flushSanitizedThinkingDelta(state, session);
-    session.emit({
-      id: session.nextInternalSubId(),
-      msg: {
-        type: "assistant_thinking_block_stop",
-        payload: { index: state.index, kind: state.kind },
-      },
-    });
-  }
+  closeOpenThinkingDisplays(thinkingDisplays, session);
 
   // Full final assistant_message event for renderers that batch on
   // completion rather than consuming per-chunk deltas.
@@ -1341,9 +1546,7 @@ export async function streamModel(
       ...(availability !== undefined ? { availability } : {}),
       ...(provenance !== undefined ? { provenance } : {}),
     };
-    // Cross-turn token accumulator — agenc runtime
-    // `Session::update_token_info_from_usage` (session/mod.rs:2739-2749)
-    // plus `TokenUsageInfo::append_last_usage` (protocol.rs:2294-2297).
+    // Cross-turn token accumulator.
     // Runs under the session state lock so the mid-turn compact gate in
     // run-turn.ts sees a consistent read even when a concurrent
     // recovery path also touches state. Providers that don't surface
@@ -1383,6 +1586,12 @@ export async function streamModel(
   state.messages.push({
     role: "assistant",
     content: response.content,
+    ...(response.providerReasoningContent !== undefined
+      ? { providerReasoningContent: response.providerReasoningContent }
+      : {}),
+    ...(response.providerReasoningProvenance !== undefined
+      ? { providerReasoningProvenance: response.providerReasoningProvenance }
+      : {}),
     toolCalls:
       !maxOutputTruncated && assistant.toolCalls.length > 0
         ? [...assistant.toolCalls]
@@ -1447,6 +1656,28 @@ export async function streamModel(
 
   if (response.error) {
     throw new StreamModelError(response.error, response);
+  }
+  if (response.toolCallRecovery !== undefined) {
+    const marker = response.toolCallRecovery;
+    const advertised = state.samplingRequestToolNames ?? [];
+    const safeName = typeof marker.toolName === "string" &&
+      marker.toolName.length <= 256 && /^[A-Za-z0-9_.:-]+$/.test(marker.toolName);
+    const safeMessage = typeof marker.message === "string" &&
+      marker.message.length > 0 && marker.message.length <= 1_024 &&
+      !/[\u0000-\u001f\u007f]/.test(marker.message);
+    const validTarget = marker.reason === "invalid_arguments"
+      ? advertised.includes(marker.toolName)
+      : marker.reason === "not_advertised" &&
+        advertised.includes("system.searchTools") &&
+        !advertised.includes(marker.toolName) &&
+        /^mcp\.[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$/.test(marker.toolName);
+    if (providerName !== "ollama" || !safeName || !safeMessage || !validTarget ||
+        response.content !== "" || response.toolCalls.length !== 0 ||
+        streamedToolCalls.size !== 0 || state.toolUseBlocks.length !== 0 ||
+        response.finishReason !== "stop") {
+      throw new StreamModelError(new Error("Invalid tool-call correction response; no correction was admitted."), response);
+    }
+    state.pendingTextToolCallCorrection = { toolName: marker.toolName, reason: marker.reason };
   }
   return state;
 }

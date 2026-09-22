@@ -50,6 +50,10 @@ import {
   AGENC_TRAJECTORY_EXPORT_PATH_ENV,
   TRAJECTORY_EXPORT_SCHEMA_VERSION,
 } from "./trajectory-export.js";
+import {
+  SLOW_STORE_OP_THRESHOLD_MS,
+  setSlowStoreOpReporter,
+} from "../utils/slow-store-op.js";
 
 describe("session-store", () => {
   let home = "";
@@ -1705,6 +1709,41 @@ describe("session-store", () => {
     rollout.close();
   });
 
+  test("rollout-commit callback failures do not fail or duplicate a canonical flush", () => {
+    const rollout = new RolloutStore({
+      cwd: "/home/test-rollout-commit-callback",
+      sessionId: "sess-rollout-commit-callback",
+      agencVersion: "0.2.0",
+      sessionTempRoot: tmpdir(),
+      autoStartScheduler: false,
+    });
+    rollout.open({
+      sessionId: "sess-rollout-commit-callback",
+      timestamp: new Date().toISOString(),
+      cwd: "/home/test-rollout-commit-callback",
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    });
+    let callbacks = 0;
+    rollout.setOnRolloutCommitted(() => {
+      callbacks += 1;
+      throw new Error("injected mirror failure");
+    });
+    rollout.appendRollout({
+      type: "response_item",
+      payload: { role: "user", content: "written once" },
+    });
+
+    expect(() => rollout.flushDurable()).not.toThrow();
+    expect(callbacks).toBe(1);
+    expect(readFileSync(rollout.store.rolloutPath, "utf8")).toContain(
+      "written once",
+    );
+    expect(() => rollout.flushDurable()).not.toThrow();
+    expect(callbacks).toBe(1);
+
+    rollout.close();
+  });
   test("explicit canonical-tail sync fsyncs an empty pending batch and propagates failure", () => {
     const rollout = new RolloutStore({
       cwd: "/home/test-explicit-tail-sync",
@@ -2024,6 +2063,73 @@ describe("session-store", () => {
       store.setFsyncImplForTest(fsyncSync);
       store.close();
     }
+  });
+
+  test("a slow flush reports its timing without appending to the rollout", () => {
+    const store = new SessionStore({
+      cwd: "/home/test-slow-flush",
+      sessionId: "sess-slow-flush",
+      agencVersion: "0.2.0",
+    });
+    store.open({
+      sessionId: "sess-slow-flush",
+      timestamp: new Date().toISOString(),
+      cwd: "/home/test-slow-flush",
+      originator: "agenc-cli",
+      agencVersion: "0.2.0",
+    });
+
+    // A mounted session turns every store diagnostic into `session.emit`,
+    // which appends a live-sequenced event to the rollout being flushed. If a
+    // slow flush went down that channel, the journal's contents would depend
+    // on how long one fsync took, and the appended warning would itself be
+    // flushed durably — so the slower the disk, the more it writes.
+    const diagnostics: string[] = [];
+    store.setDiagnosticListener((d) => {
+      diagnostics.push(d.cause);
+    });
+    const slowOps: string[] = [];
+    setSlowStoreOpReporter((warning) => {
+      slowOps.push(warning.label);
+    });
+    store.setFsyncImplForTest((fd: number) => {
+      const until = performance.now() + SLOW_STORE_OP_THRESHOLD_MS + 10;
+      while (performance.now() < until) {
+        // busy wait: the guard measures synchronous work on the event loop
+      }
+      return fsyncSync(fd);
+    });
+
+    try {
+      store.append(
+        {
+          id: "durable-slow",
+          seq: 1,
+          msg: { type: "turn_complete", payload: { turnId: "turn-slow" } },
+        },
+        { durable: true },
+      );
+    } finally {
+      store.setFsyncImplForTest(fsyncSync);
+      setSlowStoreOpReporter(undefined);
+    }
+
+    expect(diagnostics).not.toContain("slow_store_op");
+    expect(slowOps).toContain("rollout_flush_durable");
+    const eventTypes = readFileSync(store.rolloutPath, "utf8")
+      .trim()
+      .split("\n")
+      .map(
+        (line) =>
+          JSON.parse(line) as {
+            readonly type?: string;
+            readonly payload?: { readonly msg?: { readonly type?: string } };
+          },
+      )
+      .filter((item) => item.type === "event_msg")
+      .map((item) => item.payload?.msg?.type);
+    expect(eventTypes).toEqual(["turn_complete"]);
+    store.close();
   });
 
   test("appendRollout inherits durable flushing for terminal event_msg rows", () => {
@@ -2401,10 +2507,42 @@ describe("session-store", () => {
     }
   });
 
+  test("findProjectRootSync excludes a home-level marker without hiding a nested monorepo", () => {
+    const platformHome = mkdtempSync(join(tmpdir(), "agenc-root-boundary-"));
+    try {
+      writeFileSync(join(platformHome, "package.json"), "{}\n");
+      const standaloneWorkspace = join(
+        platformHome,
+        "Documents",
+        "huntsman-key",
+      );
+      mkdirSync(standaloneWorkspace, { recursive: true });
+
+      expect(findProjectRootSync(
+        standaloneWorkspace,
+        ["package.json"],
+        { stopBefore: platformHome },
+      )).toBeNull();
+
+      const monorepo = join(platformHome, "Documents", "workspace-monorepo");
+      const nestedWorkspace = join(monorepo, "packages", "huntsman-key");
+      mkdirSync(nestedWorkspace, { recursive: true });
+      writeFileSync(join(monorepo, "package.json"), "{}\n");
+
+      expect(findProjectRootSync(
+        nestedWorkspace,
+        ["package.json"],
+        { stopBefore: platformHome },
+      )).toEqual({ rootDir: monorepo, marker: "package.json" });
+    } finally {
+      rmSync(platformHome, { recursive: true, force: true });
+    }
+  });
+
   test("DEFAULT_SESSION_ROOT_MARKERS covers common ecosystem roots", () => {
     // Guards against accidental drift between this list and the
     // project-instructions loader; a full equality check would couple
-    // the two, so just assert coverage of the agenc runtime-rooted minimum.
+    // the two, so just assert coverage of the minimum.
     expect(DEFAULT_SESSION_ROOT_MARKERS).toContain(".git");
     expect(DEFAULT_SESSION_ROOT_MARKERS).toContain("package.json");
   });

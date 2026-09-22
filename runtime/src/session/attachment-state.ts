@@ -1,8 +1,7 @@
 /**
  * Per-session attachment-tracking state.
  *
- * Hand-port of agenc `bootstrap/state.ts:1622-1626 + :1333-1346`,
- * scoped to the AgenC session via WeakMap. Matches the existing AgenC
+ * Scoped to the AgenC session via WeakMap. Matches the existing AgenC
  * pattern in `runtime/src/prompts/memory/attachments.ts:47` (sessionBudgets)
  * and `runtime/src/prompts/memory/auto-save.ts:114`.
  *
@@ -28,6 +27,10 @@
  */
 
 import type { SwarmRoutingDecision } from "../agents/swarm-routing.js";
+import {
+  createAttachmentRetentionLedger,
+  type AttachmentRetentionLedger,
+} from "./attachment-retention.js";
 
 /**
  * Tracking fields owned by the per-turn attachments orchestrator.
@@ -73,8 +76,6 @@ export interface AttachmentTrackingState {
   lastMcpInstructionsHash?: string;
   /** Exact root-human turn whose MCP resource mentions were consumed. */
   lastMcpResourceMentionTurnId?: string;
-  /** Hash of the skill listing last announced to the model. */
-  lastSkillListingHash?: string;
   /**
    * Map of MCP server name → instruction block last announced. Same
    * rationale as `lastDeferredToolsSet`. MCP instructions are immutable
@@ -138,15 +139,17 @@ export interface AttachmentTrackingState {
    */
   sessionStartMemoryRecallChecked: boolean;
   /**
-   * Paths of learned memory files surfaced by `relevant_memories` in this
-   * session. Relevant-memory recall is allowed to reset after compaction
-   * in future, but a stable set prevents rapid same-session repeats today.
+   * Paths of learned memory files surfaced by `relevant_memories` in the
+   * current request. The producer clears it at the start of every run:
+   * attachments never enter durable history, so a memory must be surfaced
+   * again on every request it matches.
    */
   surfacedRelevantMemoryPaths: Set<string>;
   /**
    * Approximate bytes of learned memory content surfaced by
-   * `relevant_memories` in this session. Bounds cumulative recall context
-   * even when many distinct memory files match a long conversation.
+   * `relevant_memories` since the last compaction. Bounds cumulative recall
+   * context even when many distinct memory files match a long conversation;
+   * `resetRelevantMemoryBudget` zeroes it when compaction replaces history.
    */
   surfacedRelevantMemoryBytes: number;
   /**
@@ -166,6 +169,31 @@ export interface AttachmentTrackingState {
     readonly note: string;
     readonly rolloutIds: readonly string[];
   }>;
+  /**
+   * Every attachment block the model has seen, anchored to the history
+   * message it was shown with, so later projections keep the prompt bytes
+   * in place (see session/attachment-retention.ts).
+   */
+  retainedAttachments: AttachmentRetentionLedger;
+  /**
+   * Skill names already in front of the model through the session listing or
+   * a per-request relevance block; the skill listing producer never repeats
+   * them.
+   */
+  listedSkillNames: Set<string>;
+  /** Exact root-human turn already covered by a listing/relevance evaluation. */
+  lastSkillListingRootTurnId?: string;
+  /**
+   * Workspace-instruction and memory-index texts at the head of the prompt,
+   * frozen for the session so the cached prefix holds (prompts/instruction-head.ts).
+   */
+  instructionHead?: { readonly workspaceText: string; readonly memoryText: string };
+  /** The workspace (turn cwd) the head was taken for; another cwd starts a new head. */
+  instructionHeadScope?: string;
+  /** The latest version of those texts the model has been told about. */
+  instructionAnnounced?: { readonly workspaceText: string; readonly memoryText: string };
+  /** A change waiting to be delivered by the instruction_update producer. */
+  pendingInstructionUpdate?: { readonly workspaceText?: string; readonly memoryText?: string };
 }
 
 const sessionAttachmentState = new WeakMap<object, AttachmentTrackingState>();
@@ -194,10 +222,30 @@ export function getAttachmentTrackingState(
       surfacedRelevantMemoryBytes: 0,
       memoryMode: "enabled",
       memoryCitations: [],
+      retainedAttachments: createAttachmentRetentionLedger(),
+      listedSkillNames: new Set(),
     };
     sessionAttachmentState.set(sessionKey, state);
   }
   return state;
+}
+
+/**
+ * Reset the cumulative relevant-memory byte budget. Called when compaction
+ * replaces the conversation history: everything surfaced so far left the
+ * model's context with it, so the budget starts over for the new history.
+ */
+export function resetRelevantMemoryBudget(sessionKey: object): void {
+  const state = sessionAttachmentState.get(sessionKey);
+  if (state === undefined) return;
+  state.surfacedRelevantMemoryBytes = 0;
+  state.surfacedRelevantMemoryPaths.clear();
+  // The compacted history is new bytes anyway: start the instruction head
+  // from the current files instead of carrying a stale snapshot forward.
+  state.instructionHead = undefined;
+  state.instructionHeadScope = undefined;
+  state.instructionAnnounced = undefined;
+  state.pendingInstructionUpdate = undefined;
 }
 
 /** Clears all tracking state for a session. Test-only. */

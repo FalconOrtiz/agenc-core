@@ -11,7 +11,7 @@ AgenC runs concurrent agent work on two related surfaces:
 ## Multi-agent v2 tool surface
 
 Implementation: `runtime/src/agents/v2/`. Parity notes:
-[`runtime/src/agents/v2/PARITY.md`](../../runtime/src/agents/v2/PARITY.md).
+[`runtime/src/agents/v2/README.md`](../../runtime/src/agents/v2/README.md).
 
 The six v2 tools are registered by `createMultiAgentV2Tools()`
 (`runtime/src/agents/v2/index.ts`). CSV job tools are a sibling registration
@@ -25,13 +25,42 @@ in `runtime/src/bin/model-facing-tools.ts`, not inside `v2/index.ts`.
 | `assign_task` | Admit one new task to an idle reusable worker (**triggers a turn**). Argument, identity, and target-resolution refusals plus the four no-mutation admission rejections are confirmed no-effect: [agent validation refusals](#agent-validation-refusals). |
 | `send_message` | Queue passive context (**does not** trigger a turn). The same pre-delivery refusals as `assign_task` are confirmed no-effect: [agent validation refusals](#agent-validation-refusals). |
 | `list_agents` | Read the live agent tree and current statuses. Optional `path_prefix`. |
-| `spawn_agents_on_csv` | Fan out workers from CSV rows (job orchestrator) |
-| `report_agent_job_result` | Report a CSV/job worker result back to the orchestrator |
-| `inspect_csv_agent_job` | Read a bounded job summary and keyset item page |
-| `read_csv_agent_job_result` | Read one bounded base64 result chunk |
-| `list_csv_job_reviews` | List a bounded page of unknown-outcome reviews |
-| `show_csv_job_review` | Read one bounded review record |
-| `resolve_csv_job_review` | Approval-gated operator resolution with canonical evidence |
+| `spawn_agents_on_csv` | Fan out workers from CSV rows (job orchestrator). Deferred: load with `system.searchTools` (`select:spawn_agents_on_csv`). |
+| `report_agent_job_result` | Report a CSV/job worker result back to the orchestrator. Visible by default because row workers call it. |
+| `inspect_csv_agent_job` | Read a bounded job summary and keyset item page (deferred) |
+| `read_csv_agent_job_result` | Read one bounded base64 result chunk (deferred) |
+| `list_csv_job_reviews` | List a bounded page of unknown-outcome reviews (deferred) |
+| `show_csv_job_review` | Read one bounded review record (deferred) |
+| `resolve_csv_job_review` | Approval-gated operator resolution with canonical evidence (deferred) |
+
+### Read-only planning workers
+
+Plan mode can spawn workers with `isolation: "none"`. AgenC assigns those
+workers a permanent read-only constraint, regardless of the requested role.
+The built-in `Plan` and `scanner` roles have that constraint in every mode.
+Their descendants inherit it, including after reconnect or restoration.
+
+Constrained workers can read and search files, run supported literal
+inspection commands, and coordinate their own constrained descendants. They
+cannot edit files, create worktrees, schedule work, request wider permissions,
+or direct writable workers. Shell inspection uses direct arguments, a
+sanitized environment, and required read-only process isolation with network
+access disabled. If that isolation is unavailable, the command is refused.
+Constrained shell inspection is unavailable on Windows; native file reads
+and searches remain available within the worker's read permissions.
+
+Constrained workers reject `git status` and `git diff`, which can invoke
+repository-configured conversion filters. Object-only Git inspection is
+available only when the original filesystem authority permits unrestricted
+reads and no read-path denial applies. Git objects can otherwise reveal
+denied file contents. PDF reads that require an external converter are also
+unavailable to these workers. These restrictions do not change ordinary
+coding or verification workers.
+
+Changing the parent to YOLO does not make existing planning workers writable.
+Spawn a new coding or verification worker after leaving plan mode when the
+task requires edits, builds, or tests. Ordinary workers keep the parent's
+authorized permission behavior.
 
 ### CSV job contract
 
@@ -115,9 +144,12 @@ count; a tool-using task may make multiple provider calls. The originating
 `task_id` is the spawn/assignment call correlation ID.
 
 A keep-alive worker that hits `max_turns`, `max_budget_usd`, the
-no-progress backstop, or `compact_failed` returns to `idle` after that
-turn. The same bounded stop on a one-shot / compatibility agent is
-terminal (`errored` / failed run). Interactive session survival:
+no-progress backstop, `compact_failed`, or `empty_response` returns to
+`idle` after that failed turn. Its correlated task receipt has outcome
+`errored` and a failure reason; returning to idle does not mark the task
+successful. The canonical turn terminal is `turn_failed`. The same stop
+on a one-shot / compatibility agent is terminal (`errored` / failed run).
+Interactive session survival:
 [daemon.md](daemon.md#interactive-session-survival). Compact skip:
 [daemon.md](daemon.md#compact-skip-stays-per-turn).
 
@@ -200,7 +232,13 @@ prompt; consumed or indeterminate outcomes are not duplicated. Per model
 turn, agent projection is capped at 32 records / 128 KiB. Oversized first
 records are visibly truncated for forward progress; only deferred triggers
 schedule autonomous follow-up turns, while passive context waits for the next
-human/root turn.
+human/root turn. A user Stop or explicit approval denial holds deferred
+triggers: until the user
+speaks again, a child receipt stays in the mailbox instead of starting a parent
+turn, so stopping a turn does not let its verifiers resume it. Only a message
+the daemon admits counts as speaking again; a prompt refused while the stop is
+still unwinding leaves the hold in place. The hold survives session recovery;
+queued child receipts cannot clear it or restart the denied turn.
 
 `wait_agent` drains all currently delivered updates, not one named worker. It
 is therefore mutating and intentionally has no target filter. Use
@@ -477,13 +515,15 @@ session when the feature is available (`AGENC_COORDINATOR_MODE` /
 | `agent.logs` | Fetch agent logs |
 
 `agent.create` accepts `deferInitialTurn: true` to provision a live session
-without submitting a first model turn (Editor cold-start). Startup hooks
-and Agent side effects stay deferred until the first non-Editor message.
+without submitting a first model turn. Startup hooks and Agent side effects
+stay deferred until the first message.
 The flag cannot combine with `initialContent` or other first-turn fields
 (`runtime/src/app-server/daemon-dispatcher.ts`). The thread sits in
 `pending_init`; `ifBusy: "reject"` on `message.send` refuses only an
 in-flight or queued turn, not `pending_init`. Rejecting the first prompt would
-deadlock the session. See [daemon.md](daemon.md).
+deadlock the session. While a user Stop is unwinding, the same refusal names
+the stop and counts the agents still stopping instead of reporting a turn the
+user never stopped. See [daemon.md](daemon.md).
 
 SDK helpers on `AgencClient`: `spawnAgent`, `listAgents`, `attachAgent`,
 `stopAgent`, `agentLogs`. See [`../sdk.md`](../sdk.md).
@@ -517,7 +557,6 @@ and automation.
 | Worktree isolation | `runtime/src/agents/worktree.ts` |
 | Thread / mailbox | `runtime/src/agents/thread*.ts`, `mailbox.ts` |
 | Job orchestrator (CSV multi-spawn etc.) | `runtime/src/agents/jobs/` |
-| TUI Agents rail | `runtime/src/tui/workbench/` (Agents pane at wide widths) |
 
 ### Workspace-scoped custom roles
 
@@ -576,6 +615,5 @@ does not abort the session.
 
 ## Validation
 
-- Agent surface contract: `npm run check:agent-surface-contract`
 - Multi-agent / tool-registry suites under `runtime/tests/`
 - Eval gate after turn-loop changes: see [`../agent-eval-reports.md`](../agent-eval-reports.md)

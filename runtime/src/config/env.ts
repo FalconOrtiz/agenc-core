@@ -10,6 +10,9 @@
 //   AGENC_MAX_TURNS                               → max_turns
 //   AGENC_COORDINATOR_MODE                        → coordinator_mode
 //   AGENC_STREAM_IDLE_TIMEOUT_MS                  → stream_watchdog_timeout_ms
+//   AGENC_PROVIDER_OUTAGE_WAIT_MS                 → provider_outage_wait_ms
+//   AGENC_PROVIDER_OUTAGE_RETRY_MS                → provider_outage_retry_ms
+//   AGENC_XAI_INCREMENTAL                         → providers.grok.incremental_continuation
 //   AGENC_WORKSPACE is consumed only by pre-repository bootstrap cwd
 //   resolution. It is captured here but is not projected into AgenCConfig.
 //   AGENC_HOME                                     → ~/.agenc override
@@ -56,6 +59,9 @@ export interface EnvSnapshot {
   readonly AGENC_MAX_TURNS?: string;
   readonly AGENC_COORDINATOR_MODE?: string;
   readonly AGENC_STREAM_IDLE_TIMEOUT_MS?: string;
+  readonly AGENC_PROVIDER_OUTAGE_WAIT_MS?: string;
+  readonly AGENC_PROVIDER_OUTAGE_RETRY_MS?: string;
+  readonly AGENC_XAI_INCREMENTAL?: string;
   readonly AGENC_DISABLE_STREAM_WATCHDOG?: string;
   readonly AGENC_ENABLE_STREAM_WATCHDOG?: string;
   readonly AGENC_ALWAYS_ENABLE_EFFORT?: string;
@@ -105,6 +111,24 @@ export interface EnvSnapshot {
   readonly GROQ_BASE_URL?: string;
   readonly DEEPSEEK_API_KEY?: string;
   readonly DEEPSEEK_BASE_URL?: string;
+  readonly MODEL_API_KEY?: string;
+  readonly META_BASE_URL?: string;
+  readonly DASHSCOPE_API_KEY?: string;
+  readonly QWEN_API_KEY?: string;
+  readonly QWEN_TOKEN_PLAN_API_KEY?: string;
+  readonly DASHSCOPE_TOKEN_PLAN_API_KEY?: string;
+  readonly DASHSCOPE_BASE_URL?: string;
+  readonly QWEN_BASE_URL?: string;
+  readonly QWEN_TOKEN_PLAN_BASE_URL?: string;
+  readonly DASHSCOPE_TOKEN_PLAN_BASE_URL?: string;
+  readonly OLLAMA_API_KEY?: string;
+  readonly CEREBRAS_API_KEY?: string;
+  readonly CEREBRAS_BASE_URL?: string;
+  readonly ZAI_API_KEY?: string;
+  readonly ZAI_BASE_URL?: string;
+  readonly ZAI_CODING_PLAN_API_KEY?: string;
+  readonly ZAI_CODING_PLAN_BASE_URL?: string;
+  readonly MOONSHOT_API_KEY?: string;
   readonly GEMINI_API_KEY?: string;
   readonly GEMINI_BASE_URL?: string;
   readonly GOOGLE_API_KEY?: string;
@@ -349,14 +373,15 @@ export function applyEnvOverrides(
   if (e.AGENC_EFFORT_LEVEL !== undefined) {
     const effort = readNonEmpty(e.AGENC_EFFORT_LEVEL)?.toLowerCase();
     if (
-      effort === "low" || effort === "medium" ||
-      effort === "high" || effort === "xhigh" || effort === "none"
+      effort === "minimal" || effort === "low" || effort === "medium" ||
+      effort === "high" || effort === "xhigh" || effort === "max" ||
+      effort === "none"
     ) {
       override.reasoning_effort = effort;
     } else {
       throw new Error(
         `invalid AGENC_EFFORT_LEVEL="${e.AGENC_EFFORT_LEVEL}"; ` +
-          "expected one of low, medium, high, xhigh, or none",
+          "expected one of minimal, low, medium, high, xhigh, max, or none",
       );
     }
   }
@@ -426,6 +451,45 @@ export function applyEnvOverrides(
     } else if (e.AGENC_STREAM_IDLE_TIMEOUT_MS.trim().length > 0) {
       onWarn?.(
         `[agenc:config] invalid AGENC_STREAM_IDLE_TIMEOUT_MS="${e.AGENC_STREAM_IDLE_TIMEOUT_MS}"; expected a non-negative integer`,
+      );
+    }
+  }
+  if (e.AGENC_PROVIDER_OUTAGE_WAIT_MS !== undefined) {
+    const waitMs = readNonNegativeInteger(e.AGENC_PROVIDER_OUTAGE_WAIT_MS);
+    if (waitMs !== undefined) {
+      override.provider_outage_wait_ms = waitMs;
+    } else if (e.AGENC_PROVIDER_OUTAGE_WAIT_MS.trim().length > 0) {
+      onWarn?.(
+        `[agenc:config] invalid AGENC_PROVIDER_OUTAGE_WAIT_MS="${e.AGENC_PROVIDER_OUTAGE_WAIT_MS}"; expected a non-negative integer`,
+      );
+    }
+  }
+  if (e.AGENC_PROVIDER_OUTAGE_RETRY_MS !== undefined) {
+    const retryMs = readNonNegativeInteger(e.AGENC_PROVIDER_OUTAGE_RETRY_MS);
+    if (retryMs !== undefined && retryMs > 0) {
+      override.provider_outage_retry_ms = retryMs;
+    } else if (e.AGENC_PROVIDER_OUTAGE_RETRY_MS.trim().length > 0) {
+      onWarn?.(
+        `[agenc:config] invalid AGENC_PROVIDER_OUTAGE_RETRY_MS="${e.AGENC_PROVIDER_OUTAGE_RETRY_MS}"; expected a positive integer`,
+      );
+    }
+  }
+  if (e.AGENC_XAI_INCREMENTAL !== undefined) {
+    // Opt-in for Responses `previous_response_id` continuation on streaming
+    // Grok turns. Folded into the provider table here so the adapter never
+    // reads process env; the factory projects it onto GrokProviderConfig.
+    const incremental = readBoolean(e.AGENC_XAI_INCREMENTAL);
+    if (incremental !== undefined) {
+      override.providers = {
+        ...override.providers,
+        grok: {
+          ...override.providers?.grok,
+          incremental_continuation: incremental,
+        },
+      };
+    } else if (e.AGENC_XAI_INCREMENTAL.trim().length > 0) {
+      onWarn?.(
+        `[agenc:config] invalid AGENC_XAI_INCREMENTAL="${e.AGENC_XAI_INCREMENTAL}"; expected boolean-like value`,
       );
     }
   }

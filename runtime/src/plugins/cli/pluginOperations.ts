@@ -44,6 +44,8 @@ import {
   type PluginResolutionKind,
   type ResolvedPluginSource,
 } from "../resolution.js";
+import { parsePluginIdentifier } from "../identifier.js";
+import { skillDisplayNameFromMarkdown } from "../skill-display-metadata.js";
 
 export type PluginScope = "user" | "project" | "local";
 
@@ -65,6 +67,7 @@ export interface PluginOperationOptions {
 
 export interface PluginComponentRow {
   readonly name: string;
+  readonly displayName?: string;
   readonly description?: string;
 }
 
@@ -501,34 +504,62 @@ export async function installPluginOp(
   }
 }
 
+/**
+ * `plugin marketplace install name@marketplace` installs the plugin under its
+ * bare name: the marketplace is where it came from, not part of its installed
+ * identity. Uninstall and update therefore accept the same qualified id the
+ * operator installed with. The qualified form is tried first so a plugin whose
+ * own name legitimately contains "@" keeps resolving as before.
+ */
+async function resolveInstalledPluginForRemoval(
+  requestedId: string,
+  scope: PluginScope,
+  options: PluginOperationOptions,
+): Promise<{ readonly pluginId: string; readonly roots: string[] }> {
+  const direct = await resolvePluginRootsForRemoval(requestedId, scope, options);
+  if (direct.length > 0) return { pluginId: requestedId, roots: direct };
+  const parsed = parsePluginIdentifier(requestedId);
+  if (parsed.marketplace === undefined || parsed.name.length === 0) {
+    return { pluginId: requestedId, roots: [] };
+  }
+  const bare = await resolvePluginRootsForRemoval(parsed.name, scope, options);
+  return bare.length > 0
+    ? { pluginId: parsed.name, roots: bare }
+    : { pluginId: requestedId, roots: [] };
+}
+
 export async function uninstallPluginOp(
   input: UninstallPluginInput,
 ): Promise<UninstallPluginResult> {
   const scope = input.scope ?? "user";
-  const targetRoots = await resolvePluginRootsForRemoval(input.pluginId, scope, input);
+  const { pluginId, roots: targetRoots } = await resolveInstalledPluginForRemoval(
+    input.pluginId,
+    scope,
+    input,
+  );
   if (targetRoots.length === 0) {
     throw new Error(`plugin is not installed in ${scope} scope: ${input.pluginId}`);
   }
   for (const root of targetRoots) {
     await rm(root, { recursive: true, force: true });
   }
-  const remainsInstalled = await pluginIdRemainsInstalled(input.pluginId, input);
+  const remainsInstalled = await pluginIdRemainsInstalled(pluginId, input);
   const removedConfig = remainsInstalled
     ? false
-    : await removePluginConfigEntry(input.pluginId, input);
+    : await removePluginConfigEntry(pluginId, input);
   let removedData = false;
   if (!remainsInstalled && input.keepData !== true) {
     const authority = {
       pluginStorageRoot: input.pluginStorageRoot,
     };
-    const dataDir = pluginDataDirPath(input.pluginId, authority);
+    const dataDir = pluginDataDirPath(pluginId, authority);
     if (await pathExists(dataDir)) {
-      await deletePluginDataDir(input.pluginId, authority);
+      await deletePluginDataDir(pluginId, authority);
       removedData = !(await pathExists(dataDir));
     }
   }
   return {
-    pluginId: input.pluginId,
+    pluginId,
     removedRoots: targetRoots,
     removedConfig,
     removedData,
@@ -570,7 +601,11 @@ export async function updatePluginOp(
 ): Promise<UpdatePluginResult> {
   const scope = input.scope ?? "user";
   const workspaceRoot = resolvePluginWorkspaceRoot(input);
-  const roots = await resolvePluginRootsForRemoval(input.pluginId, scope, input);
+  const { pluginId, roots } = await resolveInstalledPluginForRemoval(
+    input.pluginId,
+    scope,
+    input,
+  );
   if (roots.length === 0) {
     throw new Error(`plugin is not installed in ${scope} scope: ${input.pluginId}`);
   }
@@ -595,7 +630,7 @@ export async function updatePluginOp(
   const installed = await installPluginOp({
     ...input,
     source,
-    name: input.pluginId,
+    name: pluginId,
     scope,
     force: true,
     refreshCache: true,
@@ -718,9 +753,9 @@ function summarizeLoadedPlugin(plugin: LoadedPlugin): InstalledPluginSummary {
 /** Bounded frontmatter read: a skill listing must never slurp documents. */
 const SKILL_FRONTMATTER_MAX_BYTES = 8 * 1024;
 
-async function skillDescriptionAt(
+async function skillMetadataAt(
   skillDir: string,
-): Promise<string | undefined> {
+): Promise<Omit<PluginComponentRow, "name"> | undefined> {
   try {
     const handle = await open(join(skillDir, "SKILL.md"), "r");
     try {
@@ -728,7 +763,12 @@ async function skillDescriptionAt(
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       const head = buffer.subarray(0, bytesRead).toString("utf8");
       const match = /^description:\s*(.+)$/mu.exec(head);
-      return match?.[1]?.trim().slice(0, 280);
+      const description = match?.[1]?.trim().slice(0, 280);
+      const displayName = skillDisplayNameFromMarkdown(head);
+      return {
+        ...(description !== undefined ? { description } : {}),
+        ...(displayName !== undefined ? { displayName } : {}),
+      };
     } finally {
       await handle.close();
     }
@@ -744,13 +784,13 @@ async function describeSkills(
   // conventional `skills/` root whose child dirs are the skills.
   const rows: PluginComponentRow[] = [];
   const seen = new Set<string>();
-  const push = (name: string, description: string | undefined): void => {
+  const push = (name: string, metadata: Omit<PluginComponentRow, "name"> | undefined): void => {
     if (name.length === 0 || seen.has(name)) return;
     seen.add(name);
-    rows.push({ name, ...(description !== undefined ? { description } : {}) });
+    rows.push({ name, ...metadata });
   };
   for (const skillPath of skillsPaths) {
-    const direct = await skillDescriptionAt(skillPath);
+    const direct = await skillMetadataAt(skillPath);
     let directExists = direct !== undefined;
     if (!directExists) {
       try {
@@ -776,7 +816,7 @@ async function describeSkills(
       } catch {
         continue;
       }
-      push(child, await skillDescriptionAt(childDir));
+      push(child, await skillMetadataAt(childDir));
     }
   }
   return rows;

@@ -18,6 +18,7 @@ import {
 import { readOpenAiOauthCredentials } from "../utils/openAiOauthCredentials.js";
 import type { HomeContext } from "../config/home.js";
 import type { ProviderEnvironment } from "../llm/provider-options.js";
+import { providerAuthPreference } from "../llm/provider-auth-selection.js";
 
 export type OpenAiModelsCliCommand =
   | { readonly kind: "list"; readonly json: boolean }
@@ -121,10 +122,15 @@ export async function runOpenAiModelsCli(
   const fetchImpl: FetchLike =
     io.fetchImpl ?? (fetch as unknown as FetchLike);
   const stored = readOpenAiOauthCredentials(runtime.home);
+  const preference = providerAuthPreference("openai", runtime.environment);
 
-  // A subscription sign-in wins, mirroring the provider's credential order.
+  // Automatic mode keeps the legacy order; explicit modes never cross billing paths.
   const subscription = resolveStoredChatGptSubscriptionCredentials(stored);
-  if (stored?.authMode === "chatgpt" && subscription !== undefined) {
+  if (
+    preference !== "api-key" &&
+    (stored?.authMode === "chatgpt" || preference === "oauth") &&
+    subscription !== undefined
+  ) {
     let payload: unknown;
     try {
       // The backend 400s without a client_version; any well-formed value
@@ -159,7 +165,12 @@ export async function runOpenAiModelsCli(
     return 0;
   }
 
-  const apiKey = stored?.apiKey ?? runtime.environment.OPENAI_API_KEY?.trim();
+  if (preference === "oauth") {
+    return fail("The selected OAuth mode requires a stored ChatGPT subscription sign-in.");
+  }
+  const apiKey = preference === "api-key"
+    ? runtime.environment.OPENAI_API_KEY?.trim() || stored?.apiKey
+    : stored?.apiKey ?? runtime.environment.OPENAI_API_KEY?.trim();
   if (apiKey === undefined || apiKey.length === 0) {
     return fail(
       "Sign in with ChatGPT or add an OpenAI API key before refreshing models.",

@@ -49,6 +49,8 @@ function createListClient(
 }
 
 describe("app-server-client daemon helpers", () => {
+  const additionalDirectories = ["../shared workspace", "/tmp/shared"];
+
   it("collects daemon agent pages until the cursor ends", async () => {
     const client = createListClient([
       {
@@ -315,6 +317,7 @@ describe("app-server-client daemon helpers", () => {
         cwd: "/workspace",
         model: "grok-4.3",
         provider: "grok",
+        addDirs: [...additionalDirectories, additionalDirectories[0]!],
         permissionMode: "acceptEdits",
         env: { AGENC_ALLOW_UNTRUSTED_HOOKS: "true" },
       });
@@ -326,6 +329,7 @@ describe("app-server-client daemon helpers", () => {
           cwd: "/workspace",
           model: "grok-4.3",
           provider: "grok",
+          addDirs: additionalDirectories,
           permissionMode: "acceptEdits",
           runtimeOptions: expect.objectContaining({
             simpleMode: false,
@@ -380,6 +384,7 @@ describe("app-server-client daemon helpers", () => {
         model: "grok-4.3",
         profile: "fast",
         configPath: "operator.toml",
+        addDirs: [...additionalDirectories, additionalDirectories[0]!],
         initialContent: [
           { type: "text", text: "describe this" },
           {
@@ -388,21 +393,6 @@ describe("app-server-client daemon helpers", () => {
           },
         ],
         initialDisplayUserMessage: "Explain the selected code",
-        initialEditorInteraction: {
-          interactionId: "interaction-client-explain",
-          kind: "explain",
-          policy: "read_only",
-          editorInstanceId: "editor-client",
-          bufferHandle: 7,
-          changedtick: 12,
-          contentSha256: "c".repeat(64),
-          path: "/workspace/src/main.ts",
-          range: {
-            start: { line: 2, column: 3 },
-            end: { line: 4, column: 0 },
-          },
-          selectionMode: "character",
-        },
       });
 
       expect(createAgent).toHaveBeenCalledWith(
@@ -417,6 +407,7 @@ describe("app-server-client daemon helpers", () => {
           model: "grok-4.3",
           profile: "fast",
           configPath: "/workspace/operator.toml",
+          addDirs: additionalDirectories,
           initialContent: [
             { type: "text", text: "describe this" },
             {
@@ -425,21 +416,6 @@ describe("app-server-client daemon helpers", () => {
             },
           ],
           initialDisplayUserMessage: "Explain the selected code",
-          initialEditorInteraction: {
-            interactionId: "interaction-client-explain",
-            kind: "explain",
-            policy: "read_only",
-            editorInstanceId: "editor-client",
-            bufferHandle: 7,
-            changedtick: 12,
-            contentSha256: "c".repeat(64),
-            path: "/workspace/src/main.ts",
-            range: {
-              start: { line: 2, column: 3 },
-              end: { line: 4, column: 0 },
-            },
-            selectionMode: "character",
-          },
         }),
       );
       await startAgenCDaemonPromptAgent({
@@ -543,7 +519,7 @@ describe("app-server-client daemon helpers", () => {
     }
   });
 
-  it("hydrates config-default bypass authority from the live attach snapshot", async () => {
+  it.each(["low", "high", "max"] as const)("hydrates bypass authority and native %s effort from the live attach snapshot", async (reasoningEffort) => {
     const agencHome = mkdtempSync(join(tmpdir(), "agenc-live-bypass-home-"));
     const workspace = mkdtempSync(join(tmpdir(), "agenc-live-bypass-workspace-"));
     writeFileSync(
@@ -587,7 +563,7 @@ describe("app-server-client daemon helpers", () => {
           provider: "grok",
           model: "grok-live-model",
           profile: "live",
-          reasoningEffort: "high",
+          reasoningEffort,
           modelVerbosity: "low",
           serviceTier: "flex",
           hooksDisabled: false,
@@ -607,7 +583,7 @@ describe("app-server-client daemon helpers", () => {
         provider: { slug: "grok" },
         collaborationMode: {
           model: "grok-live-model",
-          reasoningEffort: "high",
+          reasoningEffort,
         },
         modelVerbosity: "low",
         serviceTier: "flex",

@@ -31,6 +31,7 @@ import {
 } from "../session/cost.js";
 import { AdmissionDeniedError } from "./admission-client.js";
 import { hitM4DurabilityFailpoint } from "../durability/failpoints.js";
+import { LLMManagedAdmissionError } from "../llm/errors.js";
 
 export interface AdmittedModelCallOptions {
   readonly session: Session;
@@ -67,7 +68,7 @@ function nonBlankString(value: unknown): string | undefined {
   return normalized.length > 0 ? normalized : undefined;
 }
 
-function accountingOptionsForProvider(
+export function accountingOptionsForProvider(
   provider: LLMProvider,
   factoryOptions: ProviderFactoryOptions,
   options: LLMChatOptions,
@@ -102,7 +103,15 @@ function accountingOptionsForProvider(
   };
 }
 
-function providerNativeToolsForAccounting(
+export function projectProviderAccountingRequest(
+  provider: LLMProvider,
+  messages: readonly LLMMessage[],
+  options: LLMChatOptions,
+): { readonly messages: readonly LLMMessage[]; readonly options: LLMChatOptions } {
+  return provider.projectRequestForAccounting?.(messages, options) ?? { messages, options };
+}
+
+export function providerNativeToolsForAccounting(
   provider: LLMProvider,
   providerName: string,
   model: string,
@@ -343,6 +352,42 @@ function isSameModelIdentity(reported: string, requested: string): boolean {
   return normalize(reported) === normalize(requested);
 }
 
+/**
+ * Smallest answer worth admitting a turn for.
+ *
+ * Below this the window is genuinely spent: the reply would be truncated into
+ * uselessness and the turn is better refused with a reason than answered with
+ * a fragment. Compaction is the path back from here, not a smaller ceiling.
+ */
+const MIN_ADMISSIBLE_OUTPUT_TOKENS = 1_024;
+
+/**
+ * Shared context-fit authority for admission and advisory-compaction preflight.
+ * Keep the complete input; only lower the requested output ceiling. A caller's
+ * explicit smaller ceiling remains valid when it fits without clamping.
+ */
+export function fitOutputReservationToContext(
+  accounting: Pick<TokenAccountingResult, "admissible" | "inputTokens" | "totalTokens">,
+  contextWindowTokens: number,
+  maxOutputTokens: number,
+  // Room the provider itself withholds before it will accept a request. A
+  // provider that declares nothing keeps the previous arithmetic exactly.
+  providerContextSafetyBufferTokens = 0,
+): number | undefined {
+  if (!accounting.admissible) return undefined;
+  const providerBuffer = Number.isFinite(providerContextSafetyBufferTokens)
+    ? Math.max(0, Math.floor(providerContextSafetyBufferTokens))
+    : 0;
+  if (accounting.totalTokens + providerBuffer <= contextWindowTokens) {
+    return maxOutputTokens;
+  }
+  const roomLeftByPrompt =
+    contextWindowTokens - accounting.inputTokens - providerBuffer;
+  return roomLeftByPrompt >= MIN_ADMISSIBLE_OUTPUT_TOKENS
+    ? Math.min(maxOutputTokens, roomLeftByPrompt)
+    : undefined;
+}
+
 export async function runAdmittedModelCall(
   params: AdmittedModelCallOptions,
 ): Promise<LLMResponse> {
@@ -475,11 +520,16 @@ export async function runAdmittedModelCall(
     providerFactoryOptions.extra ?? {},
     accountingOptions,
   );
+  const accountingProjection = projectProviderAccountingRequest(params.provider, params.messages, accountingOptions);
   const accountingRequest = createTokenAccountingRequest({
     provider: effectiveProvider,
     model: effectiveModel,
-    messages: params.messages,
-    options: accountingOptions,
+    // The usage this call reports calibrates later fallback estimates in the conversation.
+    ...(params.session.conversationId
+      ? { calibrationScope: params.session.conversationId }
+      : {}),
+    messages: accountingProjection.messages,
+    options: accountingProjection.options,
     ...(providerNativeTools.length > 0 ? { providerNativeTools } : {}),
     endpointIdentity: providerFactoryOptions.baseURL,
     configurationRevision: createTokenAccountingConfigurationRevision({
@@ -495,6 +545,10 @@ export async function runAdmittedModelCall(
   });
   let accountingResult: TokenAccountingResult | undefined;
   let accountingFailureReason: string | undefined;
+  // Reduced below when the prompt leaves less room than the reservation asks
+  // for. Everything downstream — cost ceiling, lease, provider request — reads
+  // the admitted value, so the reservation and the wire request cannot drift.
+  let admittedMaxOutputTokens = maxOutputTokens;
   try {
     accountingResult = await tokenAccountingService.count(accountingRequest, {
       ...(params.provider.tokenCountCapability !== undefined
@@ -504,8 +558,25 @@ export async function runAdmittedModelCall(
     });
     if (!accountingResult.admissible) {
       accountingFailureReason = "token_accounting_uncertain";
-    } else if (accountingResult.totalTokens > contextWindowTokens) {
-      accountingFailureReason = "context_window_exceeded";
+    } else {
+      // The prompt and the reservation share one window, and only the prompt
+      // is fixed. Denying here throws away a turn the model could still have
+      // answered, just more briefly, so spend what the prompt left instead.
+      //
+      // The reservation is a ceiling on the answer, not a promise of one, and
+      // it only ever shrinks on this path: a caller cannot widen its budget by
+      // sending a longer prompt. Deny remains for the case that is genuinely
+      // unanswerable, where the prompt alone leaves less room than a usable
+      // reply needs.
+      const fittedOutputTokens = fitOutputReservationToContext(
+        accountingResult, contextWindowTokens, maxOutputTokens,
+        profile?.contextSafetyBufferTokens ?? 0,
+      );
+      if (fittedOutputTokens === undefined) {
+        accountingFailureReason = "context_window_exceeded";
+      } else {
+        admittedMaxOutputTokens = fittedOutputTokens;
+      }
     }
   } catch (error) {
     if (params.signal?.aborted === true) {
@@ -540,7 +611,7 @@ export async function runAdmittedModelCall(
     effectiveModel,
     effectiveProvider,
     maxInputTokens,
-    maxOutputTokens,
+    admittedMaxOutputTokens,
     accountingOptions,
   );
   const denialReason =
@@ -563,6 +634,18 @@ export async function runAdmittedModelCall(
     }
     return params.invoke({
       ...accountingOptions,
+      ...(configuredMaxOutputTokens !== undefined
+        ? { maxOutputTokens: admittedMaxOutputTokens }
+        : {}),
+      // Warning only, and only when fitting actually took something away.
+      // The adapter would otherwise see the fitted value as the request and
+      // could not report the squeeze. Omitted when nothing was lowered, so a
+      // call that was never squeezed dispatches exactly the options it did
+      // before. Never widens the wire ceiling.
+      ...(configuredMaxOutputTokens !== undefined &&
+      admittedMaxOutputTokens < configuredMaxOutputTokens
+        ? { requestedMaxOutputTokens: configuredMaxOutputTokens }
+        : {}),
       ...(accountingResult !== undefined
         ? { accountedInputTokens: accountingResult.inputTokens }
         : {}),
@@ -604,7 +687,7 @@ export async function runAdmittedModelCall(
         model: effectiveModel,
         provider: effectiveProvider,
         maxInputTokens,
-        maxOutputTokens,
+        maxOutputTokens: admittedMaxOutputTokens,
         maxCostUsd: maximumCost,
         ...(denialReason !== undefined ? { denialReason } : {}),
       },
@@ -648,13 +731,20 @@ export async function runAdmittedModelCall(
               routedFromProvider: params.providerName,
             }
           : {}),
-        maxOutputTokens,
+        maxOutputTokens: admittedMaxOutputTokens,
         tokenAccountingSource: accountingResult?.source,
         tokenAccountingConfidence: accountingResult?.confidence,
         tokenAccountingCoverageComplete: accountingResult?.coverage.complete,
       },
     });
     dispatched = true;
+    // The lease minimum can be lower than the admitted ceiling, so this is the
+    // figure actually dispatched and therefore the one a squeeze is measured
+    // against.
+    const dispatchedMaxOutputTokens = Math.min(
+      admittedMaxOutputTokens,
+      lease.request.estimate.maxOutputTokens,
+    );
     const response = await params.invoke({
       ...accountingOptions,
       ...(profile?.providerExecutionHandle !== undefined
@@ -669,10 +759,12 @@ export async function runAdmittedModelCall(
         : {}),
       // The admitted maximum is the provider-facing maximum. A caller cannot
       // raise it after reservation by mutating/rebuilding options.
-      maxOutputTokens: Math.min(
-        maxOutputTokens,
-        lease.request.estimate.maxOutputTokens,
-      ),
+      maxOutputTokens: dispatchedMaxOutputTokens,
+      // Warning only, as above, measured against what is actually dispatched.
+      ...(configuredMaxOutputTokens !== undefined &&
+      dispatchedMaxOutputTokens < configuredMaxOutputTokens
+        ? { requestedMaxOutputTokens: configuredMaxOutputTokens }
+        : {}),
       // The lease signal also carries parent cancellation, deadline expiry,
       // daemon shutdown, and restart recovery decisions.
       signal: lease.signal,
@@ -766,6 +858,10 @@ export async function runAdmittedModelCall(
     if (settled) {
       // Reconciliation/unknown-hold already reached an exactly-once terminal
       // state. Never overwrite it from a broad catch path.
+    } else if (dispatched && params.providerName === "agenc" && error instanceof LLMManagedAdmissionError) {
+      // The trusted gateway rejected this exact attempt before provider work.
+      // Keep unrelated unknown holds, but do not fabricate usage for this one.
+      client.reconcile(reservationId, { inputTokens: 0, outputTokens: 0, costUsd: 0 });
     } else if (dispatched) {
       client.holdUnknown(reservationId, "provider_call_failed_after_dispatch");
     } else {

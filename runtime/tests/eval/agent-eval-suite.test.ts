@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -14,7 +15,9 @@ import { runtimeRootPath } from "../helpers/source-path.ts";
 
 const runnerScriptPath = resolve(runtimeRootPath, "scripts", "run-agent-eval.mjs");
 const suitePath = resolve(runtimeRootPath, "eval", "tasks");
-const SUITE_TASK_COUNT = 12;
+const SUITE_TASK_COUNT = 13;
+const SESSION_TASK_ID = "asteroid-drift-15";
+const SESSION_STEP_COUNT = 15;
 const controlledTmpDir = mkdtempSync(join(tmpdir(), "agenc-eval-test-tmp-"));
 
 // Prove copied fixtures do not inherit an unrelated module type from the host.
@@ -25,11 +28,22 @@ writeFileSync(
 
 afterAll(() => rmSync(controlledTmpDir, { force: true, recursive: true }));
 
+interface StepResult {
+  id: string;
+  status: string;
+  durationMs: number;
+  metrics?: Record<string, unknown>;
+  verifiers: { name: string; status: string }[];
+}
+
 interface TaskResult {
   id: string;
+  kind?: string;
   status: string;
   tokens?: { input?: number; output?: number; total?: number };
   verifiers: { name: string; status: string }[];
+  steps?: StepResult[];
+  metrics?: { steps?: number; toolCalls?: number };
   riskFlags?: string[];
 }
 
@@ -133,9 +147,136 @@ describe("agent eval suite (mock executor)", () => {
       expect(report.run.environment?.commit).toBeTruthy();
       expect(report.run.environment?.executor).toBe("mock");
       expect(report.run.environment?.configFingerprint).toMatch(/^[0-9a-f]{16}$/u);
+
+      const session = report.tasks.find((task) => task.id === SESSION_TASK_ID);
+      expect(session, "the session task is part of the suite").toBeDefined();
+      expect(session?.kind).toBe("session");
+      expect(session?.steps).toHaveLength(SESSION_STEP_COUNT);
+      for (const step of session?.steps ?? []) {
+        expect(step.status, `step ${step.id} should pass`).toBe("passed");
+        expect(step.verifiers.length, `step ${step.id} has verifiers`).toBeGreaterThan(0);
+        expect(step.metrics, `step ${step.id} carries metrics`).toBeDefined();
+      }
+      expect(session?.metrics?.steps).toBe(SESSION_STEP_COUNT);
+      // Every step's verifiers plus the task verifier ran against the same tree.
+      expect(session?.verifiers.map((verifier) => verifier.status)).toEqual(["passed"]);
+    },
+    180_000,
+  );
+
+  test(
+    "a session solution that skips the final step fails at the final verifier only",
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), "agenc-eval-session-sabotage-"));
+      cpSync(join(suitePath, SESSION_TASK_ID), join(dir, SESSION_TASK_ID), {
+        recursive: true,
+      });
+      // Prompt 15 asks for CHANGELOG.md; a solution without it must go red
+      // there and nowhere else.
+      rmSync(join(dir, SESSION_TASK_ID, "solution", "CHANGELOG.md"));
+      const manifest = JSON.parse(
+        readFileSync(join(suitePath, "manifest.json"), "utf8"),
+      ) as { tasks: { id: string }[] };
+      writeFileSync(
+        join(dir, "manifest.json"),
+        JSON.stringify(
+          {
+            benchmark: "session-sabotage",
+            tasks: manifest.tasks.filter((task) => task.id === SESSION_TASK_ID),
+          },
+          null,
+          2,
+        ),
+      );
+      const result = runRunner(["--suite", dir, "--executor", "mock"]);
+      expect(result.status, result.stderr).toBe(0);
+      const report = JSON.parse(result.stdout) as EvalReport;
+      const [task] = report.tasks;
+      expect(task.status).toBe("failed");
+      const failedSteps = (task.steps ?? []).filter((step) => step.status !== "passed");
+      expect(failedSteps.map((step) => step.id)).toEqual(["15-final"]);
+      expect(task.verifiers[0]?.status).toBe("failed");
+      expect(task.riskFlags).toContain("verifier_failed");
     },
     120_000,
   );
+
+  test("writes the report into a directory that does not exist yet", () => {
+    const dir = mkdtempSync(join(controlledTmpDir, "fresh-reports-"));
+    const output = join(dir, "reports", "nested", "report.json");
+    const result = runRunner(["--suite", suitePath, "--executor", "mock", "--output", output]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(output, "utf8")).toContain('"schemaVersion"');
+  });
+
+  test("a session task can run through an external agent command, one step at a time", () => {
+    // Both live under the controlled temp root, which afterAll removes.
+    const dir = mkdtempSync(join(controlledTmpDir, "external-"));
+    const home = mkdtempSync(join(controlledTmpDir, "external-home-"));
+    const taskDir = join(dir, "notes");
+    mkdirSync(join(taskDir, "fixture"), { recursive: true });
+    writeFileSync(join(taskDir, "fixture", "README.md"), "# notes\n");
+    // The fake agent appends the prompt it received, plus argv, to a log and
+    // prints a usage object the way an --output-format json agent would.
+    const agent = join(dir, "agent.mjs");
+    writeFileSync(agent, [
+      'import { appendFileSync } from "node:fs";',
+      'const args = process.argv.slice(2);',
+      'appendFileSync("agent.log", JSON.stringify(args) + "\\n");',
+      'console.log(JSON.stringify({ usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 } }));',
+    ].join("\n"));
+    writeFileSync(join(dir, "tasks.json"), JSON.stringify({
+      benchmark: "external-agent-check",
+      tasks: [{
+        id: "notes",
+        kind: "session",
+        dir: "notes",
+        fixture: "fixture",
+        steps: [
+          { id: "one", prompt: "first prompt", verifiers: [{ name: "logged", command: "grep -q 'first prompt' agent.log" }] },
+          { id: "two", prompt: "second prompt", verifiers: [{ name: "resumed", command: "grep -q -- '--resume-last' agent.log" }] },
+        ],
+        verifiers: [{ name: "two-calls", command: "test \"$(wc -l < agent.log | tr -d ' ')\" = 2" }],
+      }],
+    }));
+    const output = join(dir, "report.json");
+    const result = spawnSync(process.execPath, [
+      runnerScriptPath,
+      "--tasks", join(dir, "tasks.json"),
+      "--executor", "real",
+      "--agent-command", "true",
+      "--session-command", `${JSON.stringify(process.execPath)} ${JSON.stringify(agent)} {continue} --prompt {prompt} --step {stepId}`,
+      "--session-continue-arg", "--resume-last",
+      "--agent-name", "fake-external",
+      "--output", output,
+    ], { encoding: "utf8", env: { ...process.env, AGENC_HOME: home } });
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(readFileSync(output, "utf8"));
+    const task = report.tasks[0];
+    expect(task.status).toBe("passed");
+    expect(task.steps.map((step: { id: string; status: string }) => [step.id, step.status])).toEqual([["one", "passed"], ["two", "passed"]]);
+    expect(task.commands).toHaveLength(2);
+    expect(task.commands[0].command).not.toContain("--resume-last");
+    expect(task.commands[1].command).toContain("--resume-last");
+    expect(task.tokens).toEqual({ input: 20, output: 10, total: 30 });
+    expect(task.riskFlags).toContain("external_agent_no_session_metrics");
+    expect(task.notes).toContain("steps after the first carried --resume-last");
+    expect(report.run.agent.name).toBe("fake-external");
+  });
+
+  test("a session task without steps is a manifest error", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agenc-eval-session-invalid-"));
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({
+        benchmark: "invalid",
+        tasks: [{ id: "no-steps", kind: "session", dir: "x" }],
+      }),
+    );
+    const result = runRunner(["--suite", dir, "--executor", "mock"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("needs a non-empty steps array");
+  });
 
   test(
     "a no-op solution makes the task checker fail (checkers are revert-sensitive)",

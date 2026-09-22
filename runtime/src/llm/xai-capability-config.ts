@@ -19,6 +19,7 @@ import { normalizeProviderIdentity } from "../provider-identity.js";
 import type { ProviderRuntimeExtra } from "./provider.js";
 import { isDynamicSessionCredentialEnvironmentKey } from "../session/environment.js";
 import { resolveProviderApiKeyEnvironment } from "./registry/provider-ingress.js";
+import { providerAuthPreference } from "./provider-auth-selection.js";
 
 const DIRECT_XAI_HOST_SUFFIXES = [".x.ai", ".grok.com"] as const;
 
@@ -291,14 +292,14 @@ export function hasXaiCredentials(
   home: HomeContext,
   env?: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
 ): boolean {
-  if (readXaiOauthAccessToken(home) !== undefined) return true;
-  return resolveProviderApiKeyEnvironment("grok", env ?? {}) !== undefined;
+  return resolveGrokProviderCredential(home, undefined, env).value !== undefined;
 }
 
 /**
  * Resolve a bearer for direct xAI REST / Grok inference.
  *
- * **Product rule:** `/grok-login` OAuth **always wins** over env BYOK.
+ * In automatic mode, `/grok-login` OAuth wins over env BYOK.
+ * Explicit GROK_AUTH_MODE selects one credential source without logging out.
  * Signing in with X means the user wants subscription Grok Build access —
  * leftover `XAI_API_KEY` in the shell must not shadow that.
  *
@@ -312,16 +313,7 @@ export function resolveXaiBearerToken(
   env?: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>,
   sessionApiKey?: string,
 ): string | undefined {
-  const oauth = readXaiOauthAccessToken(home);
-  if (oauth !== undefined) return oauth;
-  const session = sessionApiKey?.trim();
-  if (session && session.length > 0) {
-    // Prefer session bearer before raw env when it is the OAuth token, but
-    // OAuth was already checked. Session key may be BYOK injected by factory.
-    // Still prefer OAuth-first: if no oauth, session then BYOK.
-    return session;
-  }
-  return resolveProviderApiKeyEnvironment("grok", env ?? {})?.value;
+  return resolveGrokProviderCredential(home, sessionApiKey, env).value;
 }
 
 export interface ResolvedGrokProviderCredential {
@@ -336,13 +328,15 @@ export function resolveGrokProviderCredential(
   explicitApiKey: string | undefined,
   env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>> = {},
 ): ResolvedGrokProviderCredential {
-  const oauth = readXaiOauthAccessToken(home);
+  const preference = providerAuthPreference("grok", env);
+  const oauth = preference === "api-key" ? undefined : readXaiOauthAccessToken(home);
   if (oauth !== undefined) {
     return Object.freeze({
       value: oauth,
       isOAuth: true,
     });
   }
+  if (preference === "oauth") return Object.freeze({ isOAuth: false });
   const explicit = explicitApiKey?.trim();
   if (explicit && explicit.toLowerCase() !== "undefined") {
     return Object.freeze({
@@ -360,7 +354,7 @@ export function resolveGrokProviderCredential(
 }
 
 /**
- * Resolve the Grok provider API key: OAuth login always beats env BYOK.
+ * Resolve Grok auth: explicit session selection, otherwise OAuth before BYOK.
  * Used by factory + resolve-provider so one rule owns the product.
  */
 export function resolveGrokProviderApiKey(

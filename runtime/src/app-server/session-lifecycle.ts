@@ -106,6 +106,7 @@ interface MutableSession {
   metadata?: JsonObject;
   closedAt?: string;
   terminationReason?: string;
+  terminationPending?: boolean;
   recoveredFromThreadStore?: boolean;
   attachments: Map<string, AgenCSessionAttachment>;
 }
@@ -140,6 +141,11 @@ export class AgenCDaemonSessionManager {
   readonly #threadStore: ThreadStore | undefined;
   readonly #onSessionTerminated:
     ((sessionId: string) => void | Promise<void>) | undefined;
+  readonly #terminationTasks = new Map<string, Promise<void>>();
+  readonly #attachmentClaims = new WeakMap<AgenCSessionAttachment, {
+    readonly owners: Set<symbol>;
+    committed: boolean;
+  }>();
 
   constructor(options: AgenCSessionLifecycleOptions = {}) {
     this.#createSessionId =
@@ -466,6 +472,25 @@ export class AgenCDaemonSessionManager {
   async attachSession(
     params: SessionAttachParams,
   ): Promise<SessionAttachResult> {
+    const receipt = await this.attachSessionWithOwnership(params);
+    if (!await this.commitSessionAttachment(receipt.attachment, receipt.owner)) {
+      throw new AgenCSessionLifecycleError(
+        "SESSION_CLOSED",
+        `AgenC daemon session attachment is no longer active: ${params.sessionId}`,
+      );
+    }
+    return receipt.attachment;
+  }
+
+  /** Internal lease: concurrent attempts share provisional attachment state. */
+  async attachSessionWithOwnership(
+    params: SessionAttachParams,
+    owner = Symbol("session attachment owner"),
+  ): Promise<{
+    readonly attachment: SessionAttachResult;
+    readonly created: boolean;
+    readonly owner: symbol;
+  }> {
     return this.#state.with((state) => {
       const session = this.#requireOpenSession(state, params.sessionId);
       const existing =
@@ -474,7 +499,8 @@ export class AgenCDaemonSessionManager {
           : undefined;
 
       if (existing !== undefined) {
-        return toAttachResult(session, existing);
+        this.#attachmentClaims.get(existing)!.owners.add(owner);
+        return { attachment: toAttachResult(session, existing), created: false, owner };
       }
 
       const attachment: AgenCSessionAttachment = {
@@ -484,7 +510,40 @@ export class AgenCDaemonSessionManager {
         ...(params.clientId !== undefined ? { clientId: params.clientId } : {}),
       };
       session.attachments.set(attachment.attachmentId, attachment);
-      return toAttachResult(session, attachment);
+      this.#attachmentClaims.set(attachment, { owners: new Set([owner]), committed: false });
+      return { attachment: toAttachResult(session, attachment), created: true, owner };
+    });
+  }
+
+  /** Publish one successful adoption independently of other pending attempts. */
+  async commitSessionAttachment(
+    params: { readonly sessionId: string; readonly attachmentId: string },
+    owner: symbol,
+  ): Promise<boolean> {
+    return this.#state.with((state) => {
+      const attachment = state.sessions.get(params.sessionId)?.attachments.get(params.attachmentId);
+      const claims = attachment === undefined ? undefined : this.#attachmentClaims.get(attachment);
+      if (claims === undefined || !claims.owners.delete(owner)) return false;
+      claims.committed = true;
+      return true;
+    });
+  }
+
+  /** Last failing owner removes only an attachment nobody committed. */
+  async rollbackSessionAttachment(
+    params: { readonly sessionId: string; readonly attachmentId: string },
+    owner: symbol,
+  ): Promise<boolean> {
+    return this.#state.with((state) => {
+      const session = state.sessions.get(params.sessionId);
+      const attachment = session?.attachments.get(params.attachmentId);
+      const claims = attachment === undefined ? undefined : this.#attachmentClaims.get(attachment);
+      if (attachment === undefined || claims === undefined || !claims.owners.delete(owner)) {
+        return false;
+      }
+      if (claims.committed || claims.owners.size > 0) return false;
+      session!.attachments.delete(attachment.attachmentId);
+      return true;
     });
   }
 
@@ -520,33 +579,64 @@ export class AgenCDaemonSessionManager {
       const session = this.#requireSession(state, params.sessionId);
 
       if (session.status === "closed") {
-        this.#archiveRecoveredThread(session);
         return toTerminateResult(session, false);
       }
 
       session.status = "closed";
+      session.terminationPending = true;
       session.closedAt = this.#now();
       session.attachments.clear();
       if (params.reason !== undefined)
         session.terminationReason = params.reason;
-      this.#archiveRecoveredThread(session);
       return toTerminateResult(session, true);
     });
-    if (result.terminated) {
-      await this.#onSessionTerminated?.(result.sessionId);
+    // Closing revokes new attachments immediately, but callers must also wait
+    // for resource disposal. Failed disposal remains retryable on a later
+    // terminate request; a closed projection alone is not cleanup completion.
+    let task = this.#terminationTasks.get(result.sessionId);
+    if (task === undefined) {
+      task = this.#finalizeSessionTermination(result.sessionId);
+      this.#terminationTasks.set(result.sessionId, task);
+    }
+    try {
+      await task;
+    } finally {
+      if (this.#terminationTasks.get(result.sessionId) === task) {
+        this.#terminationTasks.delete(result.sessionId);
+      }
     }
     return result;
   }
 
-  #archiveRecoveredThread(session: MutableSession): void {
-    if (!session.recoveredFromThreadStore || this.#threadStore === undefined) {
-      return;
+  async #finalizeSessionTermination(sessionId: string): Promise<void> {
+    const pending = await this.#state.with((state) => {
+      const session = this.#requireSession(state, sessionId);
+      return {
+        archive: session.recoveredFromThreadStore === true,
+        notify: session.terminationPending === true,
+      };
+    });
+    const errors: unknown[] = [];
+    if (pending.archive && this.#threadStore !== undefined) {
+      try {
+        this.#threadStore.archiveThread({ threadId: sessionId });
+      } catch (error) {
+        if (!(error instanceof ThreadNotFoundError)) errors.push(error);
+      }
     }
-    try {
-      this.#threadStore.archiveThread({ threadId: session.sessionId });
-    } catch (error) {
-      if (error instanceof ThreadNotFoundError) return;
-      throw error;
+    if (pending.notify) {
+      try {
+        await this.#onSessionTerminated?.(sessionId);
+        await this.#state.with((state) => {
+          this.#requireSession(state, sessionId).terminationPending = false;
+        });
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "Session termination cleanup failed");
     }
   }
 
@@ -759,6 +849,7 @@ function storedThreadToSessionSummary(
 ): SessionSummary {
   const roleWorkspace = roleWorkspaceFromThreadSource(thread.source);
   const metadata: JsonObject = {
+    ...(thread.parentThreadId !== undefined ? { parentThreadId: thread.parentThreadId } : {}),
     source:
       thread.source === undefined
         ? undefined

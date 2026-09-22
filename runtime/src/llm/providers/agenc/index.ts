@@ -62,6 +62,7 @@ const CONCRETE_PROVIDER_NAMES = [
   "groq",
   "deepseek",
   "gemini",
+  "qwen",
 ] as const satisfies readonly ConcreteProviderName[];
 
 export class AgenCProvider implements LLMProvider {
@@ -69,7 +70,10 @@ export class AgenCProvider implements LLMProvider {
 
   readonly #config: AgenCProviderConfig;
   readonly #delegates = new Map<string, Promise<ResolvedAgenCDelegate>>();
-  readonly #preparedExecutions = new WeakMap<object, ResolvedAgenCDelegate>();
+  readonly #preparedExecutions = new WeakMap<object, {
+    delegate: ResolvedAgenCDelegate;
+    innerHandle?: object;
+  }>();
 
   constructor(config: AgenCProviderConfig) {
     this.#config = config;
@@ -107,65 +111,6 @@ export class AgenCProvider implements LLMProvider {
     }
   }
 
-  /**
-   * Create a tool-free provider owned by the editor prediction service.
-   *
-   * This intentionally does not share delegate instances or provider-side
-   * conversation state with the primary Agent session. A concrete override
-   * vends its own short-lived credential through the same session-scoped auth
-   * backend; the default route remains hosted AgenC model inference.
-   */
-  async forkForCodePrediction(options: {
-    readonly provider?: ProviderName;
-    readonly model?: string;
-    readonly timeoutMs: number;
-    readonly maxOutputTokens: number;
-  }): Promise<LLMProvider> {
-    if (options.provider === undefined || options.provider === "agenc") {
-      return new AgenCProvider({
-        ...this.#config,
-        model:
-          firstNonEmpty(options.model, this.#config.model) ??
-          BUILT_IN_PROVIDER_DEFAULT_MODELS.agenc,
-        tools: [],
-        timeoutMs: options.timeoutMs,
-        maxTokens: options.maxOutputTokens,
-        maxRetries: 0,
-        providerFallback: undefined,
-      });
-    }
-    const provider = concreteProviderName(options.provider);
-    const key = await this.#config.authBackend.vendKey(
-      provider,
-      this.#config.sessionId,
-    );
-    if (key.provider !== provider || key.sessionId !== this.#config.sessionId) {
-      throw new Error(`prediction credential route mismatch for ${provider}`);
-    }
-    const apiKey = requireVendedApiKey(
-      key,
-      `prediction credential vending for ${provider}`,
-    );
-    const baseURL = firstNonEmpty(
-      key.baseUrl,
-      this.#config.providerOptions?.baseURL,
-    );
-    return this.#config.providerFactory(provider, {
-      apiKey,
-      ...(baseURL !== undefined ? { baseURL } : {}),
-      ...(options.model !== undefined ? { model: options.model } : {}),
-      tools: [],
-      timeoutMs: options.timeoutMs,
-      extra: {
-        ...(this.#config.providerOptions?.extra ?? {}),
-        maxTokens: options.maxOutputTokens,
-        maxRetries: 0,
-        temperature: 0,
-        ...(key.baseUrl !== undefined ? { managedGateway: true } : {}),
-      },
-    });
-  }
-
   async dispose(): Promise<void> {
     const delegates = [...this.#delegates.values()];
     this.#delegates.clear();
@@ -191,7 +136,7 @@ export class AgenCProvider implements LLMProvider {
       supportsMaxOutputTokens: false,
     };
     const providerExecutionHandle = Object.freeze({});
-    this.#preparedExecutions.set(providerExecutionHandle, delegate);
+    this.#preparedExecutions.set(providerExecutionHandle, { delegate, innerHandle: profile.providerExecutionHandle });
     return {
       ...profile,
       // The resolved delegate is authoritative. A concrete adapter profile may
@@ -201,6 +146,17 @@ export class AgenCProvider implements LLMProvider {
       model: delegate.model,
       providerExecutionHandle,
     };
+  }
+
+  projectRequestForAccounting(messages: readonly LLMMessage[], options: LLMChatOptions) {
+    const prepared = options.providerExecutionHandle && this.#preparedExecutions.get(options.providerExecutionHandle);
+    if (!prepared) throw new Error("AgenCProvider accounting requires its prepared execution handle");
+    const delegateOptions = {
+      ...withoutExecutionHandle(options),
+      model: prepared.delegate.model,
+      ...(prepared.innerHandle ? { providerExecutionHandle: prepared.innerHandle } : {}),
+    };
+    return prepared.delegate.instance.projectRequestForAccounting?.(messages, delegateOptions) ?? { messages, options: delegateOptions };
   }
 
   private async executionFor(options?: LLMChatOptions): Promise<{
@@ -214,8 +170,8 @@ export class AgenCProvider implements LLMProvider {
         delegateOptions: withoutExecutionHandle(options),
       };
     }
-    const delegate = this.#preparedExecutions.get(handle);
-    if (delegate === undefined) {
+    const prepared = this.#preparedExecutions.get(handle);
+    if (prepared === undefined) {
       throw new Error(
         "AgenCProvider received an invalid or already-consumed execution handle",
       );
@@ -224,8 +180,11 @@ export class AgenCProvider implements LLMProvider {
     // adapters are separately constrained to one wire attempt by admission.
     this.#preparedExecutions.delete(handle);
     return {
-      delegate,
-      delegateOptions: withoutExecutionHandle(options),
+      delegate: prepared.delegate,
+      delegateOptions: {
+        ...withoutExecutionHandle(options),
+        ...(prepared.innerHandle ? { providerExecutionHandle: prepared.innerHandle } : {}),
+      },
     };
   }
 

@@ -15,6 +15,8 @@
  */
 
 import { isJsonObject, type JsonObject, type JsonValue } from "./protocol.js";
+import { classifyTurnTerminal } from "./turn-terminal.generated.js";
+export type { TurnFailedEvent, TurnTerminal } from "./turn-terminal.generated.js";
 
 export type AgencStopReason = "completed" | "errored" | "stopped";
 
@@ -57,7 +59,10 @@ export type AgencPromptEvent = AgencPromptEventIdentity &
       }
     | {
         readonly type: "permission_request";
+        /** Opaque permission occurrence; echo unchanged in tool.approve/deny. */
         readonly requestId: string;
+        /** Stable tool invocation identity, distinct from the permission occurrence. */
+        readonly callId?: string;
         readonly toolName?: string;
         readonly permissions: readonly string[];
         readonly input?: JsonValue;
@@ -88,6 +93,7 @@ export type AgencPromptEvent = AgencPromptEventIdentity &
         readonly afterSequence?: number;
         readonly firstAvailableSequence?: number;
         readonly retiredCount: number;
+        readonly retiredCountKnown?: boolean;
       }
     | {
         readonly type: "session_event";
@@ -164,12 +170,15 @@ export function messageChunkFromNotification(
 /**
  * Detect the terminal status of a turn from a daemon notification. Mirrors
  * the CLI's `daemonOneShotFinalStatus`: `event.agent_status` with a terminal
- * run status, or a nested transcript `turn_complete`/`error` event.
+ * run status, or a nested explicit turn-terminal event.
  */
 export function terminalStatusFromNotification(
   message: JsonObject,
+  expectedTurnId?: string,
 ): AgencTerminalStatus | null {
   const params = eventParams(message);
+  const notificationTurnId = typeof params?.turnId === "string" ? params.turnId : undefined;
+  if (expectedTurnId !== undefined && notificationTurnId !== undefined && notificationTurnId !== expectedTurnId) return null;
   if (message.method === "event.agent_status" && params !== null) {
     const runStatus =
       typeof params.runStatus === "string" ? params.runStatus : undefined;
@@ -197,31 +206,18 @@ export function terminalStatusFromNotification(
     }
   }
   const transcriptEvent = nestedTranscriptEvent(message);
-  if (transcriptEvent === null) return null;
-  const payload = isJsonObject(transcriptEvent.payload)
-    ? transcriptEvent.payload
-    : null;
-  if (transcriptEvent.type === "turn_complete") {
-    const finalMessage =
-      payload !== null && typeof payload.lastAgentMessage === "string"
-        ? payload.lastAgentMessage
-        : undefined;
-    return {
-      code: 0,
-      ...(finalMessage !== undefined ? { message: finalMessage } : {}),
-    };
-  }
-  if (transcriptEvent.type === "error") {
-    const errorMessage =
-      payload !== null && typeof payload.message === "string"
-        ? payload.message
-        : undefined;
-    return {
-      code: 1,
-      ...(errorMessage !== undefined ? { message: errorMessage } : {}),
-    };
-  }
-  return null;
+  if (transcriptEvent === null || typeof transcriptEvent.type !== "string") return null;
+  const terminal = classifyTurnTerminal({
+    type: transcriptEvent.type,
+    payload: transcriptEvent.payload,
+    turnId: transcriptEvent.turnId ?? notificationTurnId,
+  }, {
+    expectedTurnId: expectedTurnId ?? notificationTurnId,
+  });
+  return terminal === undefined ? null : {
+    code: terminal.code,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
 }
 
 export function stopReasonFromExitCode(code: number): AgencStopReason {
@@ -247,7 +243,8 @@ export function promptEventFromNotification(
       params.reason !== "retention" ||
       typeof params.sessionId !== "string" ||
       !Number.isSafeInteger(params.retiredCount) ||
-      (params.retiredCount as number) < 1
+      (params.retiredCount as number) < 0 ||
+      (params.retiredCount === 0 && params.retiredCountKnown !== false)
     ) {
       return null;
     }
@@ -262,6 +259,7 @@ export function promptEventFromNotification(
       ...identity,
       sessionId: params.sessionId,
       retiredCount: params.retiredCount as number,
+      ...(params.retiredCountKnown === false ? { retiredCountKnown: false } : {}),
       ...(typeof params.runId === "string" ? { runId: params.runId } : {}),
       ...(afterSequence !== undefined ? { afterSequence } : {}),
       ...(firstAvailableSequence !== undefined
@@ -347,6 +345,7 @@ export function promptEventFromNotification(
     return {
       type: "permission_request",
       requestId: params.requestId,
+      ...(typeof params.callId === "string" ? { callId: params.callId } : {}),
       permissions,
       ...identity,
       ...(typeof params.toolName === "string"

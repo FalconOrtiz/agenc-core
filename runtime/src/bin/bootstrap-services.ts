@@ -9,7 +9,6 @@ import type { ReviewDecision } from "../permissions/review-decision.js";
 import { createPermissionAuditFileLogger } from "../permissions/permission-audit-log.js";
 import {
   PermissionModeRegistry,
-  removeOverlyBroadShellAllowRules,
   type PendingPermissionAuthorityPublication,
 } from "../permissions/permission-mode.js";
 import {
@@ -26,7 +25,10 @@ import {
 import { Policy } from "../sandbox/execpolicy/policy.js";
 import { createLocalSkillsServices } from "../skills/local-loader.js";
 import { createGuardianRejectionCircuitBreaker } from "../permissions/guardian/rejection-circuit-breaker.js";
-import { createDefaultGuardianApprovalReviewer } from "../permissions/guardian/reviewer.js";
+import {
+  createDefaultGuardianApprovalReviewer,
+  PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+} from "../permissions/guardian/reviewer.js";
 import { ReviewManager } from "../session/review.js";
 import { createMcpStartupCancellationToken } from "../session/mcp-startup.js";
 import {
@@ -85,6 +87,7 @@ import { createHookExecutionAuthority } from "../hooks/execution-authority.js";
 import { createAutoFixPostToolHook } from "../services/autoFix/autoFixHook.js";
 import { isProjectTrustedSync } from "../permissions/trust/project-trust.js";
 import { parseLspServersConfig } from "../services/lsp/config.js";
+import { builtinLspServerConfigs } from "../services/lsp/builtinServers.js";
 import {
   getInitializationStatus as getLspInitializationStatus,
   initializeLspServerManager,
@@ -473,8 +476,20 @@ export function loadBootstrapHooks(opts: {
 
 function readConfiguredLspServers(
   cfg: ReturnType<ConfigStore["current"]>,
+  workspaceRoot?: string,
 ): ReturnType<typeof parseLspServersConfig> {
-  return parseLspServersConfig(cfg.lsp_servers);
+  const parsed = parseLspServersConfig(cfg.lsp_servers);
+  if (!parsed.success) return parsed;
+  // Built-in profiles fill in a language server for TypeScript, Python, Go and
+  // Rust when the binary is on PATH; a configured server that claims any of
+  // the same extensions wins. See builtinServers.ts for why only PATH counts.
+  return {
+    success: true,
+    servers: {
+      ...builtinLspServerConfigs({ configured: parsed.servers, workspaceRoot }),
+      ...parsed.servers,
+    },
+  };
 }
 
 interface BootstrapLspServerOptions {
@@ -486,7 +501,7 @@ export async function loadBootstrapLspServers(
   cfg: ReturnType<ConfigStore["current"]>,
   opts: BootstrapLspServerOptions = {},
 ): Promise<void> {
-  const parsed = readConfiguredLspServers(cfg);
+  const parsed = readConfiguredLspServers(cfg, opts.workspaceRoot);
   const managerOptions = {
     ...(opts.workspaceRoot !== undefined
       ? { workspaceRoot: opts.workspaceRoot }
@@ -762,13 +777,7 @@ export function buildBootstrapSessionServices(
     const publication = permissionReloadTail.then(async () => {
       if (permissionReloadDisposed) return;
       await authorityPublication.publish((current) => {
-        let next = applyPermissionRulesSnapshot(current, snapshot);
-        if (
-          opts.env.USER_TYPE === "ant" &&
-          opts.env.AGENC_ENTRYPOINT !== "local-agent"
-        ) {
-          next = removeOverlyBroadShellAllowRules(next);
-        }
+        const next = applyPermissionRulesSnapshot(current, snapshot);
         return {
           next,
           result: () => undefined,
@@ -894,7 +903,14 @@ export function buildBootstrapSessionServices(
     },
     guardianRejections: new Map(),
     guardianRejectionCircuitBreaker: createGuardianRejectionCircuitBreaker(),
-    guardianApprovalReviewer: createDefaultGuardianApprovalReviewer(),
+    // Bounded on purpose: this reviewer fronts an approval the user is
+    // waiting on, and the review delegate opts out of the ambient stream-idle
+    // watchdog, so this deadline is the only thing between a dead provider
+    // socket and an approval that hangs until the user cancels. Expiry lands
+    // on the reviewer's typed `timed_out` decision, not a risk verdict.
+    guardianApprovalReviewer: createDefaultGuardianApprovalReviewer({
+      timeoutMs: PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+    }),
     reviewManager: new ReviewManager(),
     skillsManager: skillsServices.skillsManager,
     pluginsManager: skillsServices.pluginsManager,

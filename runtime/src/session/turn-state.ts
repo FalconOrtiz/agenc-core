@@ -1,10 +1,8 @@
 /**
  * TurnState — mutable working set carried across phase-machine iterations.
  *
- * Hand-port of agenc `src/query.ts`'s `State` type (query.ts:203) plus
- * the 22 loop-local variables the body destructures/re-assigns each iteration
- * (query.ts:315-339). Every field below cites its exact AgenC source
- * line per `docs/plan/translation-conventions.md` "full-port with citations".
+ * Holds the per-turn `State` plus the loop-local variables the phase
+ * machine destructures and re-assigns each iteration.
  * Cross-subsystem fields are bound to the concrete in-tree contracts that
  * currently own those runtime surfaces.
  *
@@ -18,7 +16,10 @@
  * @module
  */
 
+import type { CompactionLadderTier } from "../services/compact/ladder.js";
 import type { LLMMessage, LLMToolCall, LLMUsage } from "../llm/types.js";
+import type { CompletionGatePlan } from "../phases/completion-gate.js";
+import { readTextToolCallCorrection, type TextToolCallCorrection } from "../recovery/rejected-text-tool-call.js";
 import type { TokenBudgetDecision as BoundaryTokenBudgetDecision } from "../conversation/token-budget.js";
 import type { StreamingToolExecutor } from "../tools/streaming-executor.js";
 import type { TurnContext } from "./turn-context.js";
@@ -33,24 +34,21 @@ import {
 } from "./turn-checkpoint-slice.js";
 
 /**
- * Continue — the 8 recovery re-entry reasons captured at each
- * AgenC query.ts continue site. Used on `TurnState.transition`
+ * Continue: the recovery re-entry reasons captured at each
+ * continue site of the turn loop. Used on `TurnState.transition`
  * so the phase machine can route correctly on the next iteration
  * and so tests can assert which recovery path fired without peeking
- * at message contents. Mirrors agenc `Continue` from
- * `src/query/transitions.ts` (source exists in upstream head; cited
- * as per transition literal sites in query.ts).
+ * at message contents.
  *
- * Sites (AgenC query.ts line → reason):
- *   981  → collapse_drain_retry (implied by context-collapse retry)
- *   1142 → collapse_drain_retry
- *   1195 → reactive_compact_retry
- *   1251 → max_output_tokens_escalate
- *   1281 → max_output_tokens_recovery
- *   1338 → stop_hook_blocking
- *   1375 → token_budget_continuation
- *   1457 → continuation_nudge
- * Plus agenc runtime model-fallback site → model_fallback.
+ * Reasons:
+ *   collapse_drain_retry (context-collapse retry)
+ *   reactive_compact_retry
+ *   max_output_tokens_escalate
+ *   max_output_tokens_recovery
+ *   stop_hook_blocking
+ *   token_budget_continuation
+ *   continuation_nudge
+ *   model_fallback (model-fallback site)
  *
  * T8 disambiguation:
  *   - `model_fallback` is reserved for `onFallbackError` (FallbackTriggeredError
@@ -70,13 +68,16 @@ export type ContinueReason =
   | "stop_hook_blocking"
   | "token_budget_continuation"
   | "plan_tool_required"
-  | "continuation_nudge";
+  | "text_tool_call_correction"
+  | "continuation_nudge"
+  | "completion_gate"
+  | "goal_gate";
 
 export interface Continue {
   readonly reason: ContinueReason;
 }
 
-export type ModelSampleResumePrompt = "continuation_nudge" | "empty_response";
+export type ModelSampleResumePrompt = "continuation_nudge" | "empty_response" | "text_tool_call_correction";
 
 /**
  * Terminal — why the run-turn generator returned. Mirrors agenc
@@ -98,7 +99,9 @@ export type TerminalReason =
   | "max_turns"
   | "max_budget_usd"
   | "cancelled"
-  | "no_progress"; // behavioral backstop (semantic non-termination, goal #3)
+  | "no_progress" // behavioral backstop (semantic non-termination, goal #3)
+  | "effect_review_required" // live-effect gate refused a call nobody can unblock now (#2501)
+  | "deadline_reached"; // the run's --deadline passed (#2503)
 
 export interface Terminal {
   readonly reason: TerminalReason;
@@ -280,6 +283,20 @@ export interface TurnState {
    *  compaction pipeline. AgenC query.ts:369. */
   messagesForQuery: LLMMessage[];
 
+  /** `messages.length` when the current sampling request was prepared. A
+   *  recovery that must drop the sampled batch truncates back to it rather
+   *  than copying `messagesForQuery`, whose per-request attachments,
+   *  pointer-swapped tool bodies and microcompacted history the rollout never
+   *  stores. */
+  messagesAtSampleStart?: number;
+
+  /**
+   * Set once the turn's first sampling request has placed its attachments
+   * before the prompt; later requests of the same turn append theirs after
+   * the newest history item so the bytes already sent stay in place.
+   */
+  attachmentsAnchoredForTurn?: boolean;
+
   /**
    * Fully resolved system/developer/workspace instruction envelope for this
    * turn. Kept outside conversation history so providers receive it exactly
@@ -287,11 +304,20 @@ export interface TurnState {
    */
   modelInstructions: string;
 
+  /** Immutable catalog of the exact sampling request that produced this
+   * iteration's calls. Captured before streaming starts, never recomputed
+   * from a mutable registry/discovery set during tool execution. */
+  samplingRequestToolNames?: readonly string[];
+
   /** Auto-compact tracking (turn counter since last compact, consecutive
    *  failure count for circuit breaker). AgenC query.ts:371, 531.
    *  Reset on every successful compact so `turnsSincePreviousCompact`
    *  reflects the most recent compaction event. */
   autoCompactTracking: AutoCompactTrackingState | undefined;
+
+  /** Degraded compaction tiers attempted since the last committed compaction
+   *  in this turn (#2497). In-memory only; a commit resets the episode. */
+  compactionLadder: { tiersAttempted: CompactionLadderTier[] } | undefined;
 
   /** task_budget.remaining tracking across compaction boundaries.
    *  Undefined until first compact fires. AgenC query.ts:295, 521.
@@ -368,6 +394,12 @@ export interface TurnState {
    *  continue site, checked before re-entering stream. */
   recoveryReentryCount: number;
 
+  /** Strictly bounded across all samples and durable resumes of this turn. */
+  textToolCallCorrectionCount: number;
+  textToolCallCorrection: TextToolCallCorrection | undefined;
+  pendingTextToolCallCorrection: TextToolCallCorrection | undefined;
+  textToolCallCorrectionFailure: string | undefined;
+
   /** Durable routing evidence consumed by the next admitted model attempt. */
   pendingAdmissionFallback: PendingAdmissionFallback | undefined;
 
@@ -389,6 +421,31 @@ export interface TurnState {
    *  AgenC query.ts:1456. */
   continuationNudgeCount: number;
 
+  // ── Phase 4b — completion gate (non-interactive verification) — turn-scoped ──
+  /** Resolved once per turn; undefined = the gate does not apply to this turn. */
+  completionGate: CompletionGatePlan | undefined;
+  /** Verification prompts injected this turn. Checkpointed; bounds the loop. */
+  completionGateRound: number;
+  /** `completedToolResults.length` when the last gate prompt was injected. */
+  completionGateToolLedgerMark: number;
+  /** Latched once a final answer was accepted (verified, exhausted or skipped). */
+  completionGateSettled: boolean;
+  /**
+   * Whether the gate itself asked for proof of an unavailable check this turn.
+   * Runtime-authored provenance: the injected request is an ordinary user
+   * message, so its presence in the transcript proves nothing about who wrote
+   * it. Turn-scoped like the ledger mark, and deliberately not journaled.
+   */
+  completionGateUnavailablePrompted: boolean;
+
+  // ── Phase 4c — goal gate (`/goal`) — turn-scoped ──
+  /**
+   * `completedToolResults.length` when the goal gate last injected. The goal
+   * itself (rounds, verdicts) is session state; only the stall window is
+   * turn-scoped, and a resumed turn restarting it is harmless.
+   */
+  goalGateToolLedgerMark: number;
+
   // ── Phase 5 — execute tools (AgenC query.ts:572, 1467-1635) ──
   /** Streaming tool executor instance (T7). Kept loop-local so the
    *  next iteration can await pending executor completion before
@@ -402,6 +459,22 @@ export interface TurnState {
   /** Tool hook requested keeping the completed result while ending the turn. */
   preventContinuation: boolean;
 
+  /**
+   * Set alongside `preventContinuation` when a tool-phase guard found the
+   * turn going nowhere (the identical-failing-call refusal). The turn then
+   * ends the way the behavioral backstop ends one: the explanation becomes
+   * the last assistant message and the terminal is `no_progress`, not
+   * `completed`, so hooks and subagents see a bounded stop.
+   */
+  noProgressStop?: { readonly explanation: string };
+
+  /**
+   * Set alongside `preventContinuation` when the live-effect gate refused a
+   * side-effecting call and the run cannot wait for review (#2501). The turn
+   * ends with the bounded `effect_review_required` terminal.
+   */
+  effectReviewStop?: { readonly explanation: string };
+
   /** Cached token-budget decision captured mid-stream (I-22). Acted on
    *  in commit phase to decide continuation vs terminate. */
   pendingBudgetDecision: TokenBudgetDecision | undefined;
@@ -412,13 +485,6 @@ export interface TurnState {
    *  auto-compact + budget decisions. Cleared at iteration start by
    *  resetIterationFields. */
   lastResponseUsage: LLMUsage | undefined;
-
-  /** Request-scoped Editor tools admitted before executor dispatch. */
-  editorToolCallsAdmitted: number;
-  /** IDs denied by the fixed Editor tool-call quota in this iteration. */
-  editorToolCallLimitDeniedIds: Set<string>;
-  /** Turn-scoped latch forcing a structured limit terminal after pairing. */
-  editorToolCallLimitExceeded: boolean;
 
   // ── Phase 6 — commit (AgenC query.ts:1192-1465) ──────────────
   /** Number of model turns consumed this session. Compared against
@@ -466,7 +532,7 @@ export interface TurnState {
 // (see session/turn-context.ts). Phases read the frozen config from
 // `ctx.configSnapshot`, never from `session.state` directly. TurnState
 // does not duplicate the snapshot — there is exactly one immutable
-// snapshot per turn, on the TurnContext, mirroring agenc runtime's pattern.
+// snapshot per turn, on the TurnContext.
 
 // ─────────────────────────────────────────────────────────────────────
 // Builder
@@ -500,6 +566,7 @@ export function buildInitialTurnState(
     messagesForQuery: [],
     modelInstructions: opts?.modelInstructions ?? _ctx.baseInstructions ?? "",
     autoCompactTracking: undefined,
+    compactionLadder: undefined,
     taskBudgetRemaining: undefined,
     snipTokensFreed: 0,
     pendingMemoryPrefetch: undefined,
@@ -519,20 +586,28 @@ export function buildInitialTurnState(
     skipCacheWrite: opts?.initialSkipCacheWrite,
     maxOutputTokensRecoveryCount: 0,
     recoveryReentryCount: 0,
+    textToolCallCorrectionCount: 0,
+    textToolCallCorrection: undefined,
+    pendingTextToolCallCorrection: undefined,
+    textToolCallCorrectionFailure: undefined,
     pendingAdmissionFallback: undefined,
     modelSampleOrdinal: 0,
     modelSampleResumePrompt: undefined,
     // Phase 4
     continuationNudgeCount: 0,
+    // Phase 4b
+    completionGate: undefined,
+    completionGateRound: 0,
+    completionGateToolLedgerMark: 0,
+    completionGateSettled: false,
+    completionGateUnavailablePrompted: false,
+    goalGateToolLedgerMark: 0,
     // Phase 5
     streamingToolExecutor: null,
     pendingToolUseSummary: undefined,
     preventContinuation: false,
     pendingBudgetDecision: undefined,
     lastResponseUsage: undefined,
-    editorToolCallsAdmitted: 0,
-    editorToolCallLimitDeniedIds: new Set(),
-    editorToolCallLimitExceeded: false,
     // Phase 6
     turnCount: 1,
     // Recovery transition
@@ -585,10 +660,12 @@ export function toCheckpointSlice(state: TurnState): TurnCheckpointSlice {
     continuationNudgeCount: number;
     stopHookBlockingCount: number;
     planToolRequiredRetryCount?: number;
-    editorToolCallsAdmitted?: number;
+    completionGateRound?: number;
     pendingAdmissionFallback?: PendingAdmissionFallback;
     modelSampleOrdinal?: number;
     modelSampleResumePrompt?: ModelSampleResumePrompt;
+    textToolCallCorrectionCount?: number;
+    textToolCallCorrection?: TextToolCallCorrection;
     taskBudgetRemaining?: number;
     autoCompactTracking?: AutoCompactTrackingState;
     transition?: { readonly reason: ContinueReason };
@@ -604,8 +681,8 @@ export function toCheckpointSlice(state: TurnState): TurnCheckpointSlice {
     planToolRequiredRetryCount: state.planToolRequiredRetryCount,
     modelSampleOrdinal: state.modelSampleOrdinal,
   };
-  if (state.editorToolCallsAdmitted > 0) {
-    slice.editorToolCallsAdmitted = state.editorToolCallsAdmitted;
+  if (state.completionGateRound > 0) {
+    slice.completionGateRound = state.completionGateRound;
   }
   if (state.pendingAdmissionFallback !== undefined) {
     const fallback = validatePendingAdmissionFallbackSlice(
@@ -619,6 +696,14 @@ export function toCheckpointSlice(state: TurnState): TurnCheckpointSlice {
   }
   if (state.modelSampleResumePrompt !== undefined) {
     slice.modelSampleResumePrompt = state.modelSampleResumePrompt;
+  }
+  if (state.textToolCallCorrectionCount > 0) {
+    slice.textToolCallCorrectionCount = state.textToolCallCorrectionCount;
+  }
+  if (state.textToolCallCorrection !== undefined) {
+    const correction = readTextToolCallCorrection(state.textToolCallCorrection);
+    if (!correction) throw new Error("cannot serialize invalid tool-call correction");
+    slice.textToolCallCorrection = correction;
   }
   if (typeof state.taskBudgetRemaining === "number") {
     slice.taskBudgetRemaining = state.taskBudgetRemaining;
@@ -653,7 +738,10 @@ const CONTINUE_REASONS: ReadonlySet<string> = new Set<ContinueReason>([
   "stop_hook_blocking",
   "token_budget_continuation",
   "plan_tool_required",
+  "text_tool_call_correction",
   "continuation_nudge",
+  "completion_gate",
+  "goal_gate",
 ]);
 
 /**
@@ -680,9 +768,18 @@ export function restoreFromCheckpoint(
   }
   if (
     slice.modelSampleResumePrompt === "continuation_nudge" ||
-    slice.modelSampleResumePrompt === "empty_response"
+    slice.modelSampleResumePrompt === "empty_response" ||
+    slice.modelSampleResumePrompt === "text_tool_call_correction"
   ) {
     state.modelSampleResumePrompt = slice.modelSampleResumePrompt;
+  }
+  if (slice.textToolCallCorrectionCount !== undefined && Number.isSafeInteger(slice.textToolCallCorrectionCount) && slice.textToolCallCorrectionCount >= 0) {
+    state.textToolCallCorrectionCount = slice.textToolCallCorrectionCount;
+  }
+  state.textToolCallCorrection = readTextToolCallCorrection(slice.textToolCallCorrection);
+  if (state.modelSampleResumePrompt === "text_tool_call_correction" &&
+      (!state.textToolCallCorrection || state.textToolCallCorrectionCount < 1)) {
+    throw new Error("Cannot resume tool-call correction without its validated identity and spent correction count.");
   }
   if (Number.isFinite(slice.maxOutputTokensRecoveryCount)) {
     state.maxOutputTokensRecoveryCount = slice.maxOutputTokensRecoveryCount;
@@ -700,11 +797,11 @@ export function restoreFromCheckpoint(
     state.planToolRequiredRetryCount = slice.planToolRequiredRetryCount;
   }
   if (
-    slice.editorToolCallsAdmitted !== undefined &&
-    Number.isFinite(slice.editorToolCallsAdmitted) &&
-    slice.editorToolCallsAdmitted >= 0
+    slice.completionGateRound !== undefined &&
+    Number.isSafeInteger(slice.completionGateRound) &&
+    slice.completionGateRound >= 0
   ) {
-    state.editorToolCallsAdmitted = slice.editorToolCallsAdmitted;
+    state.completionGateRound = slice.completionGateRound;
   }
   if (
     slice.pendingAdmissionFallback !== undefined &&
@@ -788,10 +885,11 @@ export function resetIterationFields(state: TurnState): void {
   state.toolResults = [];
   state.needsFollowUp = false;
   state.preventContinuation = false;
+  state.noProgressStop = undefined;
+  state.effectReviewStop = undefined;
   state.snipTokensFreed = 0;
   state.pendingBudgetDecision = undefined;
   state.lastResponseUsage = undefined;
-  state.editorToolCallLimitDeniedIds.clear();
   // pendingToolUseSummary + streamingToolExecutor intentionally NOT
   // cleared here — they are awaited in executeTools and cleared by
   // commit phase after their resolution.
@@ -800,4 +898,7 @@ export function resetIterationFields(state: TurnState): void {
   // turn-scoped (like `turnCount`), not iteration-scoped. Clearing them
   // here would reset the no-progress detector every iteration and defeat
   // the whole backstop. (Asserted by the run-turn progress test suite.)
+  //
+  // completionGate* fields are turn-scoped too: the round counter bounds
+  // the verification loop across every iteration of the turn.
 }

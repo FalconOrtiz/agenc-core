@@ -26,6 +26,11 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { WorkflowApprovalFailure } from "../../permissions/approval-failure.js";
+import { markWorkflowApprovalSession } from "../../permissions/approval-failure.js";
+import { observeChildApprovalSessions } from "../../agents/child-approval-context.js";
+import type { LiveApprovalBroker } from "../live-approval-broker.js";
+import { resolvePermissionDecisionTimeoutMs } from "../background-agent-runner/tool-recovery.js";
 
 import type {
   AgenCBootstrapFunction,
@@ -61,8 +66,12 @@ import type { SandboxExecutionBrokerLike } from "../../sandbox/execution-broker.
 import { runSupervisedProcess } from "../../utils/supervisedProcess.js";
 import { applyUnattendedPermissionPolicyToContext } from "../../permissions/unattended-policy.js";
 import type { PermissionModeRegistry } from "../../permissions/permission-mode.js";
+import type { PermissionMode } from "../../permissions/types.js";
 import type { StateRunDurabilityRepository } from "../../state/run-durability.js";
-import type { ReviewerInvoker } from "../../workflow/independent-review.js";
+import {
+  ReviewInvocationError,
+  type ReviewerInvoker,
+} from "../../workflow/independent-review.js";
 import type {
   WorkflowCommandResult,
   WorkflowCommandRunner,
@@ -109,6 +118,7 @@ export class WorkflowSessionSeamError extends Error {
 }
 
 export interface WorkflowSessionSeamsOptions {
+  readonly approvalBroker?: LiveApprovalBroker;
   readonly agencHome: string;
   readonly env: NodeJS.ProcessEnv;
   /** Executable and entrypoint coordinates; daemon launch flags are ignored. */
@@ -155,6 +165,7 @@ export interface WorkflowSessionSeams {
 }
 
 interface RunSessionEntry {
+  readonly unregisterApprovals: () => void;
   readonly runId: string;
   readonly repoPath: string;
   readonly bootstrap: LocalRuntimeBootstrap;
@@ -246,6 +257,31 @@ export function workflowChildFailureMessage(
       ? ""
       : `: ${boundedWorkflowDiagnostic(result.error)}`;
   return `workflow ${kind} child ${result.outcome}${reason}`;
+}
+
+/**
+ * The workflow reviewer seam turns a settled one-shot into text, or a
+ * typed invocation failure when the model never answered.
+ *
+ * Soak F76: a 403 on the reviewer's single call was rethrown as a plain
+ * error and the controller, knowing only `ReviewParseError`, recorded the
+ * run as `unknown_outcome`. `ReviewInvocationError` is what the
+ * controller already treats as a known, retryable failure.
+ */
+export function reviewOneShotTextOrThrow(outcome: {
+  readonly rawText: string | null;
+  readonly error?: unknown;
+  readonly verdict: string;
+}): string {
+  if (outcome.rawText !== null) {
+    return outcome.rawText;
+  }
+  throw new ReviewInvocationError(
+    outcome.error !== undefined
+      ? errorMessage(outcome.error)
+      : `verdict ${outcome.verdict}`,
+    outcome.error !== undefined ? { cause: outcome.error } : undefined,
+  );
 }
 
 /**
@@ -370,12 +406,20 @@ class SessionWorkflowJournal implements WorkflowRunJournal {
   readonly #contexts = new Map<string, StepJournalContext>();
   #lastSequence = 0;
 
-  constructor(entry: RunSessionEntry, onClose: () => Promise<void>) {
+  constructor(
+    entry: RunSessionEntry,
+    onClose: () => Promise<void>,
+    private readonly readPermissionMode: () => PermissionMode | undefined,
+  ) {
     this.#entry = entry;
     this.#onClose = onClose;
     this.runId = entry.runId;
     this.sessionId = entry.bootstrap.session.conversationId;
     this.epoch = entry.bootstrap.rolloutStore.runEpoch;
+  }
+
+  get effectivePermissionMode(): PermissionMode | undefined {
+    return this.readPermissionMode();
   }
 
   #emitDurable(msg: EventMsg, what: string): Event {
@@ -430,6 +474,9 @@ class SessionWorkflowJournal implements WorkflowRunJournal {
       intentDigest: input.intentDigest,
       attempt: parseWorkflowStepId(input.stepId)?.attempt ?? 1,
       recordedAt: input.intentAt,
+      ...(input.childRunId !== undefined
+        ? { childRunId: input.childRunId }
+        : {}),
     };
     const event = this.#emitDurable(
       { type: "effect_intent", payload },
@@ -601,6 +648,7 @@ export function createWorkflowSessionSeams(
   });
   const runtimeOptions = resolveAgentRuntimeOptions(environment);
   const entries = new Map<string, Promise<RunSessionEntry>>();
+  const readyEntries = new Map<Promise<RunSessionEntry>, RunSessionEntry>();
   const worktreeRunIds = new Map<string, string>();
 
   const openEntry = (
@@ -642,7 +690,17 @@ export function createWorkflowSessionSeams(
           resolvedPolicy,
         );
       }
+      const unregisterApprovals = options.approvalBroker?.register(boot.session, {
+        workflow: true,
+        isActive: () => entries.get(runId) === pending && !boot.session.abortController.signal.aborted,
+        timeoutMs: resolvePermissionDecisionTimeoutMs(),
+      }) ?? (() => {
+        const unmark = markWorkflowApprovalSession(boot.session);
+        const unsubscribe = observeChildApprovalSessions(boot.session, markWorkflowApprovalSession);
+        return () => { unsubscribe(); unmark(); };
+      })();
       return {
+        unregisterApprovals,
         runId,
         repoPath: resolvedRepoPath,
         bootstrap: boot,
@@ -652,9 +710,14 @@ export function createWorkflowSessionSeams(
       };
     })();
     entries.set(runId, pending);
-    pending.catch(() => {
-      if (entries.get(runId) === pending) entries.delete(runId);
-    });
+    pending.then(
+      (entry) => {
+        if (entries.get(runId) === pending) readyEntries.set(pending, entry);
+      },
+      () => {
+        if (entries.get(runId) === pending) entries.delete(runId);
+      },
+    );
     return pending;
   };
 
@@ -662,8 +725,10 @@ export function createWorkflowSessionSeams(
     const pending = entries.get(runId);
     if (pending === undefined) return;
     entries.delete(runId);
+    readyEntries.delete(pending);
     try {
       const entry = await pending;
+      entry.unregisterApprovals();
       await entry.bootstrap.shutdown();
     } catch (error) {
       options.warn(
@@ -690,10 +755,23 @@ export function createWorkflowSessionSeams(
     return pending;
   };
 
+  const currentEntry = (runId: string): RunSessionEntry | undefined => {
+    const pending = entries.get(runId);
+    const entry = pending === undefined ? undefined : readyEntries.get(pending);
+    return entry?.bootstrap.session.isShuttingDown === true ? undefined : entry;
+  };
   const journal: WorkflowJournalWriter = {
+    currentPermissionMode: (runId) =>
+      currentEntry(runId)?.bootstrap.session.permissionModeRegistry.current().mode,
     open: async (runId, context) => {
       const entry = await openEntry(runId, context?.repoPath, context?.policy);
-      return new SessionWorkflowJournal(entry, () => closeEntry(runId));
+      return new SessionWorkflowJournal(
+        entry,
+        () => closeEntry(runId),
+        () => currentEntry(runId) === entry
+          ? entry.bootstrap.session.permissionModeRegistry.current().mode
+          : undefined,
+      );
     },
   };
 
@@ -753,6 +831,7 @@ export function createWorkflowSessionSeams(
 
   const commands: WorkflowCommandRunner = {
     run: async (input): Promise<WorkflowCommandResult> => {
+      input.signal?.throwIfAborted();
       const runId = worktreeRunIds.get(input.cwd);
       const entry = await requireEntry(runId, "commands.run");
       const broker = sessionBroker(entry, input.cwd);
@@ -771,10 +850,14 @@ export function createWorkflowSessionSeams(
       const startedAt = performance.now();
       const result = await runSupervisedProcess(command, {
         maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
         ...(input.timeoutMs !== undefined
           ? { timeoutMs: input.timeoutMs }
           : {}),
       });
+      // The supervisor settles the owned process tree before cancellation
+      // propagates to the workflow controller.
+      input.signal?.throwIfAborted();
       return {
         exitCode:
           result.stopReason === "spawn_error"
@@ -880,6 +963,9 @@ export function createWorkflowSessionSeams(
         }
         return {
           status,
+          ...(result.error instanceof WorkflowApprovalFailure
+            ? { stopReason: result.error.stopReason }
+            : {}),
           finalMessage:
             result.finalMessage ??
             workflowChildFailureMessage(input.kind, result),
@@ -973,15 +1059,7 @@ export function createWorkflowSessionSeams(
           reuseKey: false,
         },
       );
-      if (outcome.rawText === null) {
-        throw (
-          outcome.error ??
-          new WorkflowSessionSeamError(
-            `independent review produced no output (${outcome.verdict})`,
-          )
-        );
-      }
-      return outcome.rawText;
+      return reviewOneShotTextOrThrow(outcome);
     },
   };
 

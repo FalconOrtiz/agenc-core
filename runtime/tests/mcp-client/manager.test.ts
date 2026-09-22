@@ -10,6 +10,7 @@ import {
   transitionSandboxExecutionBroker,
 } from "../sandbox/execution-lifecycle.js";
 import { MCPTransportCleanupError } from "./transports/connect-with-cleanup.js";
+import { McpAuthenticationError } from "../services/mcp/auth-errors.js";
 
 // Mock the connection and tools modules
 vi.mock("./connection.js", () => ({
@@ -283,6 +284,17 @@ describe("MCPManager", () => {
     expect(mockCreateMCPConnection).toHaveBeenCalledTimes(1);
     expect(manager.getConnectedServers()).toEqual(["srv1"]);
     expect(manager.getConnectionState("srv2")).toEqual({ type: "disabled" });
+  });
+
+  it("preserves an immutable OAuth config and reports explicit needs-auth without a browser", async () => {
+    const scopes = ["read"];
+    mockCreateMCPConnection.mockRejectedValue(new McpAuthenticationError("MCP server needs authentication."));
+    const manager = new MCPManager([{ name: "oauth", transport: "http", endpoint: "https://mcp.example.test", oauth: { scopes, clientId: "public" } }]);
+    scopes.push("write");
+    await manager.start();
+    expect(manager.getServerConfig("oauth")?.oauth?.scopes).toEqual(["read"]);
+    expect(manager.getConnectionState("oauth")).toEqual({ type: "needs-auth" });
+    await manager.stop();
   });
 
   it("drops invalid server default approval modes before bridge creation", async () => {

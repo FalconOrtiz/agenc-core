@@ -11,8 +11,14 @@ import {
   isWithheld413Message,
   isWithheldMaxOutputTokens,
   parsePromptTooLongTokenCounts,
+  isResampleableStreamInterruption,
 } from "./api-errors.js";
-import { LLMProviderError } from "../llm/errors.js";
+import {
+  LLMRequestRebuiltError,
+  LLMProviderError,
+  LLMStreamTruncatedError,
+  mapLLMError,
+} from "../llm/errors.js";
 import type { AssistantMessage, TurnState } from "../session/turn-state.js";
 
 function mkMsg(
@@ -98,6 +104,25 @@ describe("Media / max-output-tokens / withhold helpers", () => {
   });
 });
 
+describe("isResampleableStreamInterruption", () => {
+  test("transient faults before any streamed tool call can be re-sampled", () => {
+    const cut = Object.assign(new Error("terminated"), {});
+    expect(isResampleableStreamInterruption(cut, 0)).toBe(true);
+    expect(isResampleableStreamInterruption(Object.assign(new Error("x"), { code: "ECONNRESET" }), 0)).toBe(true);
+  });
+
+  test("a streamed tool call or a non-transient fault keeps the partial response", () => {
+    expect(isResampleableStreamInterruption(new Error("terminated"), 1)).toBe(false);
+    expect(isResampleableStreamInterruption(new Error("invalid request"), 0)).toBe(false);
+  });
+});
+
+describe("LLMRequestRebuiltError", () => {
+  test("is transient: the adapter already rebuilt its plan for the next attempt", () => {
+    expect(isTransientProviderError(new LLMRequestRebuiltError("grok", "store refused"))).toBe(true);
+  });
+});
+
 describe("isTransientProviderError", () => {
   test("ECONNRESET + 502 + stream_idle → transient", () => {
     expect(isTransientProviderError(new Error("ECONNRESET"))).toBe(true);
@@ -106,6 +131,55 @@ describe("isTransientProviderError", () => {
     expect(isTransientProviderError(err502)).toBe(true);
     expect(isTransientProviderError(new Error("stream_idle"))).toBe(true);
   });
+  test("a stream that ended before its terminal event is transient", () => {
+    // The transport delivered a clean end and no status or socket code marks
+    // it, so only the typed error identifies the truncation.
+    const truncated = new LLMStreamTruncatedError(
+      "grok",
+      "Stream closed without a response.completed or response.failed event",
+    );
+    expect(isTransientProviderError(truncated)).toBe(true);
+    expect(
+      isTransientProviderError(new LLMProviderError("grok", truncated.message)),
+    ).toBe(false);
+  });
+  test("an SDK connection error is transient, raw and after mapLLMError", () => {
+    // openai's APIConnectionError: fixed message, no status, the socket error as cause.
+    const socket = Object.assign(new Error("other side closed"), {
+      code: "UND_ERR_SOCKET",
+    });
+    const sdkError = Object.assign(new Error("Connection error."), {
+      name: "APIConnectionError",
+      cause: socket,
+    });
+    expect(isTransientProviderError(sdkError)).toBe(true);
+    const mapped = mapLLMError("grok", sdkError, 30_000);
+    expect(mapped).toBeInstanceOf(LLMProviderError);
+    expect(mapped.message).toBe("grok error: Connection error.");
+    expect(isTransientProviderError(mapped)).toBe(true);
+    // A bland message still classifies through the preserved cause code.
+    const bland = mapLLMError(
+      "grok",
+      Object.assign(new Error("request failed"), { cause: socket }),
+      30_000,
+    );
+    expect(isTransientProviderError(bland)).toBe(true);
+    // A mapped 4xx with a plain message stays non-transient.
+    expect(
+      isTransientProviderError(
+        mapLLMError("grok", Object.assign(new Error("bad request"), { status: 400 }), 30_000),
+      ),
+    ).toBe(false);
+  });
+
+  test("a body that ends mid-stream (undici \"terminated\") is transient", () => {
+    const terminated = new TypeError("terminated");
+    expect(isTransientProviderError(terminated)).toBe(true);
+    const mapped = mapLLMError("grok", terminated, 30_000);
+    expect(mapped.message).toBe("grok error: terminated");
+    expect(isTransientProviderError(mapped)).toBe(true);
+  });
+
   test("401 + generic syntax → not transient", () => {
     const err401 = new Error("unauthorized");
     (err401 as unknown as { status: number }).status = 401;

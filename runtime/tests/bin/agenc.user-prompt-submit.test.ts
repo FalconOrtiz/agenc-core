@@ -11,16 +11,15 @@ import {
   type PreparedTurnRuntimeInputs,
 } from "./agenc-main.js";
 import { __installDaemonTurnDriverHooksForTest } from "../app-server/background-agent-runner.js";
+import { DAEMON_LOCAL_MCP_ACCESS, DAEMON_USER_PROMPT_PREPARED } from "../app-server/background-agent-runner/shared.js";
+import { hasLocalMcpAccess } from "../mcp-client/local-control.js";
 import { defaultConfig } from "../config/schema.js";
 import {
   resolveProjectTrustRootSync,
   trustProjectSync,
 } from "../permissions/trust/project-trust.js";
 import type { PhaseEvent } from "../phases/events.js";
-import {
-  AutonomousKeepaliveScheduler,
-  type SessionEditorInteraction,
-} from "../session/autonomous-mode.js";
+import { AutonomousKeepaliveScheduler } from "../session/autonomous-mode.js";
 import {
   canonicalizePath,
   clearSessionReadState,
@@ -35,6 +34,8 @@ function fakeSession(cwd: string) {
   const events: unknown[] = [];
   const session = {
     abortController: new AbortController(),
+    clearUserStop: vi.fn(),
+    userStopGeneration: 7,
     activeTurn: { unsafePeek: () => null },
     conversationId: "conv-hooks",
     emit: (event: unknown) => {
@@ -56,6 +57,14 @@ function fakeSession(cwd: string) {
     permissionModeRegistry: {
       current: () => ({ mode: "default" }),
     },
+    pendingProviderSwitch: null as {
+      provider: string;
+      model: string;
+    } | null,
+    consumePendingProviderSwitch: async () => ({
+      applied: false as const,
+      reason: "no pending provider switch",
+    }),
     services: {
       hooks: {
         userPromptSubmitHooks: [] as Array<(input: unknown) => unknown>,
@@ -71,26 +80,6 @@ function fakeSession(cwd: string) {
     },
   };
   return { session, events };
-}
-
-function daemonEditorInteraction(
-  interactionId: string,
-): SessionEditorInteraction {
-  return {
-    interactionId,
-    kind: "explain",
-    policy: "read_only",
-    editorInstanceId: "editor-prompt-hook-test",
-    bufferHandle: 12,
-    changedtick: 4,
-    contentSha256: "f".repeat(64),
-    path: "src/prompt-hook.ts",
-    range: {
-      start: { line: 1, column: 0 },
-      end: { line: 2, column: 3 },
-    },
-    selectionMode: "character",
-  };
 }
 
 const EMPTY_TURN_INPUTS: PreparedTurnRuntimeInputs = {
@@ -211,6 +200,74 @@ function installOneShotDaemonSpies() {
 }
 
 describe("UserPromptSubmit prompt ingress", () => {
+  it("cannot authorize release of a newer stop raised during prompt preparation", async () => {
+    const { session } = fakeSession("/workspace");
+    session.services.hooks.userPromptSubmitHooks.push(() => {
+      session.userStopGeneration += 1;
+      return {};
+    });
+    const runSingleTurnFn = vi.fn(async function* () {
+      return { reason: "completed" };
+    });
+    const uninstall = __installTuiSessionContractForTest({
+      session: session as never,
+      configStore: { current: () => defaultConfig },
+      agencHome: "/tmp/agenc",
+      resolvedProvider: "stub",
+      autonomousModeEnabled: false,
+      loadTurnInputsFn: async () => EMPTY_TURN_INPUTS,
+      runSingleTurnFn: runSingleTurnFn as never,
+    });
+    try {
+      await session.submit("new prompt", { source: "user" });
+      expect(runSingleTurnFn).toHaveBeenCalledWith(expect.objectContaining({ userStopGenerationToRelease: 7 }));
+      expect(session.userStopGeneration).toBe(8);
+      expect(session.clearUserStop).not.toHaveBeenCalled();
+    } finally {
+      uninstall();
+    }
+  });
+
+  it.each([
+    { source: "user", blocked: false, releasesStop: true },
+    { source: "user", blocked: true, releasesStop: false },
+    { source: undefined, blocked: false, releasesStop: false },
+    { source: "autonomous_tick", blocked: false, releasesStop: false },
+  ] as const)("releases local stop only after trusted human admission ($source, $blocked)", async ({ source, blocked, releasesStop }) => {
+    const { session } = fakeSession("/workspace");
+    session.services.hooks.userPromptSubmitHooks.push(() => {
+      expect(session.clearUserStop).not.toHaveBeenCalled();
+      return blocked ? { blockingError: { blockingError: "policy denied" } } : {};
+    });
+    const runSingleTurnFn = vi.fn(async function* (options: { userStopGenerationToRelease?: number }) {
+      expect(session.clearUserStop).not.toHaveBeenCalled();
+      expect(options.userStopGenerationToRelease).toBe(releasesStop ? 7 : undefined);
+      yield {
+        type: "turn_complete",
+        content: "ok",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: "completed",
+      } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    const uninstall = __installTuiSessionContractForTest({
+      session: session as never,
+      configStore: { current: () => defaultConfig },
+      agencHome: "/tmp/agenc",
+      resolvedProvider: "stub",
+      autonomousModeEnabled: false,
+      loadTurnInputsFn: async () => EMPTY_TURN_INPUTS,
+      runSingleTurnFn: runSingleTurnFn as never,
+    });
+    try {
+      await session.submit("new prompt", { source });
+    } finally {
+      uninstall();
+    }
+    expect(session.clearUserStop).not.toHaveBeenCalled();
+    expect(runSingleTurnFn).toHaveBeenCalledTimes(blocked || source === "autonomous_tick" ? 0 : 1);
+  });
+
   it.each([
     {
       label: "a compact failure",
@@ -218,29 +275,12 @@ describe("UserPromptSubmit prompt ingress", () => {
       stopReason: "compact_failed",
       errorMessage: "compaction could not shrink the context",
       prompt: "hello",
-      editorInteraction: undefined,
-    },
-    {
-      label: "a request-scoped Editor failure",
-      content: "Editor interaction stopped at its request-scoped limit.",
-      stopReason: "editor_request_failed",
-      errorMessage: "editor_interaction_limit: request cap reached",
-      prompt: "explain this selection",
-      editorInteraction: {
-        interactionId: "editor-request-failed",
-        policy: "read_only",
-        bufferHandle: 1,
-        changedtick: 1,
-        contentSha256: "a".repeat(64),
-        range: { startLine: 1, startColumn: 0, endLine: 1, endColumn: 1 },
-      },
     },
   ] as const)("blocks autonomous keepalive after $label", async ({
     content,
     stopReason,
     errorMessage,
     prompt,
-    editorInteraction,
   }) => {
     const { session } = fakeSession("/workspace");
     const setContextBlocked = vi.spyOn(
@@ -268,10 +308,7 @@ describe("UserPromptSubmit prompt ingress", () => {
     });
 
     try {
-      await session.submit(
-        prompt,
-        editorInteraction === undefined ? undefined : { editorInteraction },
-      );
+      await session.submit(prompt);
       expect(setContextBlocked).toHaveBeenCalledWith(true);
     } finally {
       uninstall();
@@ -614,6 +651,24 @@ describe("UserPromptSubmit prompt ingress", () => {
     );
   });
 
+  it("carries trusted local MCP authority through the actual turn driver and revokes it afterward", async () => {
+    const { session } = fakeSession("/workspace");
+    const observed: boolean[] = [];
+    const runTurnFn = vi.fn(async function* () {
+      await Promise.resolve();
+      observed.push(hasLocalMcpAccess());
+      yield { type: "turn_complete", content: "ok", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 }, stopReason: "completed" } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    __installDaemonTurnDriverHooksForTest(session as never, { current: () => defaultConfig } as never, runTurnFn as never);
+    await session.submit("local", { [DAEMON_USER_PROMPT_PREPARED]: true, [DAEMON_LOCAL_MCP_ACCESS]: true });
+    expect(hasLocalMcpAccess()).toBe(false);
+    await session.submit("remote", { [DAEMON_USER_PROMPT_PREPARED]: true, [DAEMON_LOCAL_MCP_ACCESS]: false });
+    await session.submit("unknown", { [DAEMON_USER_PROMPT_PREPARED]: true, localMcpAccess: true });
+    expect(observed).toEqual([true, false, false]);
+    expect(hasLocalMcpAccess()).toBe(false);
+  });
+
   it("runs the owning daemon session hook exactly once and sends its context to the model", async () => {
     const { session } = fakeSession("/workspace");
     const hook = vi.fn(() => ({
@@ -659,6 +714,89 @@ describe("UserPromptSubmit prompt ingress", () => {
     expect(String(modelInputs[0])).toContain("daemon-owned hook context");
   });
 
+  it("applies a staged daemon model switch before freezing the next turn context", async () => {
+    const { session } = fakeSession("/workspace");
+    let activeModel = "kimi-k2.6";
+    session.pendingProviderSwitch = {
+      provider: "kimi",
+      model: "kimi-k3",
+    };
+    const consumePendingProviderSwitch = vi.fn(async () => {
+      activeModel = "kimi-k3";
+      session.pendingProviderSwitch = null;
+      return { applied: true as const, provider: "kimi", model: activeModel };
+    });
+    session.consumePendingProviderSwitch = consumePendingProviderSwitch;
+    session.newDefaultTurn = () => ({
+      subId: "turn-after-switch",
+      config: {},
+      modelInfo: {},
+      collaborationMode: { model: activeModel },
+    });
+    const observedContexts: unknown[] = [];
+    const runTurnFn = vi.fn(async function* (
+      _session: unknown,
+      ctx: unknown,
+    ) {
+      observedContexts.push(ctx);
+      yield {
+        type: "turn_complete",
+        content: "switched",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: "completed",
+      } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    __installDaemonTurnDriverHooksForTest(
+      session as never,
+      { current: () => defaultConfig } as never,
+      runTurnFn as never,
+    );
+
+    await session.submit("continue on K3");
+
+    expect(consumePendingProviderSwitch).toHaveBeenCalledTimes(1);
+    expect(runTurnFn).toHaveBeenCalledTimes(1);
+    expect(observedContexts).toEqual([
+      expect.objectContaining({
+        collaborationMode: { model: "kimi-k3" },
+      }),
+    ]);
+  });
+
+  it("rejects a daemon submit when its staged model switch cannot be applied", async () => {
+    const { session } = fakeSession("/workspace");
+    session.pendingProviderSwitch = {
+      provider: "kimi",
+      model: "kimi-k3",
+    };
+    const consumePendingProviderSwitch = vi.fn(async () => {
+      session.pendingProviderSwitch = null;
+      return { applied: false as const, reason: "injected rejection" };
+    });
+    session.consumePendingProviderSwitch = consumePendingProviderSwitch;
+    const runTurnFn = vi.fn(async function* () {
+      yield {
+        type: "turn_complete",
+        content: "must not run",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: "completed",
+      } satisfies PhaseEvent;
+      return { reason: "completed" };
+    });
+    __installDaemonTurnDriverHooksForTest(
+      session as never,
+      { current: () => defaultConfig } as never,
+      runTurnFn as never,
+    );
+
+    await expect(session.submit("must fail closed")).rejects.toThrow(
+      "provider switch to kimi/kimi-k3 could not be applied before turn: injected rejection",
+    );
+    expect(consumePendingProviderSwitch).toHaveBeenCalledTimes(1);
+    expect(runTurnFn).not.toHaveBeenCalled();
+  });
+
   it("blocks daemon turn execution when the owning session hook rejects the prompt", async () => {
     const { session, events } = fakeSession("/workspace");
     const hook = vi.fn(() => ({
@@ -695,51 +833,6 @@ describe("UserPromptSubmit prompt ingress", () => {
             message: expect.stringContaining("daemon policy denied"),
           }),
         }),
-      }),
-    );
-  });
-
-  it("bypasses UserPromptSubmit hooks for daemon editor interactions", async () => {
-    const { session } = fakeSession("/workspace");
-    const hook = vi.fn(() => ({
-      blockingError: { blockingError: "must not run for editor input" },
-    }));
-    session.services.hooks.userPromptSubmitHooks.push(hook);
-    const modelInputs: unknown[] = [];
-    const turnOptions: unknown[] = [];
-    const runTurnFn = vi.fn(async function* (
-      _session: unknown,
-      _ctx: unknown,
-      input: unknown,
-      options: unknown,
-    ) {
-      modelInputs.push(input);
-      turnOptions.push(options);
-      yield {
-        type: "turn_complete",
-        content: "ok",
-        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-        stopReason: "completed",
-      } satisfies PhaseEvent;
-      return { reason: "completed" };
-    });
-    __installDaemonTurnDriverHooksForTest(
-      session as never,
-      { current: () => defaultConfig } as never,
-      runTurnFn as never,
-    );
-
-    await session.submit("explain this selection", {
-      editorInteraction: daemonEditorInteraction("editor-hook-bypass"),
-    });
-
-    expect(hook).not.toHaveBeenCalled();
-    expect(runTurnFn).toHaveBeenCalledTimes(1);
-    expect(modelInputs).toEqual(["explain this selection"]);
-    expect(turnOptions).toContainEqual(
-      expect.objectContaining({
-        systemPrompt: expect.stringContaining("<editor_interaction_policy>"),
-        systemPromptTrust: "trusted_internal",
       }),
     );
   });

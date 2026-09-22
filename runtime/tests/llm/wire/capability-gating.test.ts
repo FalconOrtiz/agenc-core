@@ -10,7 +10,6 @@ import { buildChatCompletionsRequest } from "./chat-completions.js";
 describe("chatCompletionsCapabilityHintsForProvider", () => {
   describe("acceptsReasoningEffort", () => {
     test("openai reasoning-family models accept reasoning_effort", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         chatCompletionsCapabilityHintsForProvider("openai", "gpt-5")
           .acceptsReasoningEffort,
@@ -26,7 +25,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("openai non-reasoning models do not accept reasoning_effort", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         chatCompletionsCapabilityHintsForProvider("openai", "gpt-4o")
           .acceptsReasoningEffort,
@@ -38,7 +36,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("documented grok reasoning models accept reasoning_effort", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         chatCompletionsCapabilityHintsForProvider("grok", "grok-4.3")
           .acceptsReasoningEffort,
@@ -88,8 +85,20 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
       expect(request.reasoning_effort).toBe("xhigh");
     });
 
+    test("grok-4.7 chat completions serializes reasoning_effort=xhigh", () => {
+      const request = buildChatCompletionsRequest({
+        model: "grok-4.7",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [],
+        options: { reasoningEffort: "xhigh" },
+        providerCapabilityHints:
+          chatCompletionsCapabilityHintsForProvider("grok", "grok-4.7"),
+      });
+
+      expect(request.reasoning_effort).toBe("xhigh");
+    });
+
     test("undocumented grok models do not accept reasoning_effort", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         chatCompletionsCapabilityHintsForProvider("grok", "grok-4")
           .acceptsReasoningEffort,
@@ -101,7 +110,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("rejects the retired xai provider selector", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         () => chatCompletionsCapabilityHintsForProvider(
           "xai",
@@ -111,7 +119,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("nim reasoning families accept only their documented enum", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       const cases: readonly {
         readonly model: string;
         readonly allowed: readonly string[];
@@ -178,7 +185,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("nim models without a documented effort field stay stripped", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       const models = [
         "moonshotai/kimi-k2.6",
         "moonshotai/kimi-k2-thinking",
@@ -197,7 +203,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("nim enums do not leak to other providers or hint shapes", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       expect(
         chatCompletionsCapabilityHintsForProvider(
           "openrouter",
@@ -211,7 +216,6 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
     });
 
     test("non-openai non-grok providers never accept reasoning_effort", () => {
-      // branding-scan: allow real model identifiers used as test fixtures
       const providers = [
         "lmstudio",
         "ollama",
@@ -317,6 +321,31 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
       },
     );
 
+    test("ollama takes the reduced tool catalog without the grammar gate", () => {
+      // Ollama serves the same 7-32B model class, so it needs the small
+      // catalog. It is not grammar-constrained: it accepts the full JSON
+      // Schema dialect, so schema rewriting and the /no_think suffix stay
+      // off until they are measured against it.
+      expect(usesLocalToolProfile("ollama")).toBe(true);
+
+      const hints = chatCompletionsCapabilityHintsForProvider(
+        "ollama",
+        "qwen2.5-coder:7b",
+      );
+      expect(hints.requiresGrammarSafeToolSchemas).toBe(false);
+      expect(hints.outputTokensCeiling).toBeUndefined();
+      expect(hints.reasoningSoftSwitchSuffix).toBeUndefined();
+    });
+
+    test("a local qwen3 on ollama still gets no prompt-level think switch", () => {
+      const hints = chatCompletionsCapabilityHintsForProvider(
+        "ollama",
+        "qwen3:8b",
+      );
+      expect(hints.reasoningSoftSwitchSuffix).toBeUndefined();
+      expect(hints.requiresGrammarSafeToolSchemas).toBe(false);
+    });
+
     test("only local qwen3 models receive the no-think prompt switch", () => {
       expect(
         chatCompletionsCapabilityHintsForProvider(
@@ -372,6 +401,45 @@ describe("chatCompletionsCapabilityHintsForProvider", () => {
         );
       },
     );
+  });
+
+  describe("DeepSeek stream finalization", () => {
+    const FINALIZATION = {
+      requiresToolCallsFinishReason: true,
+      rejectsPartialToolCalls: true,
+      requiresExplicitFinishReason: true,
+    } as const;
+
+    test("the native DeepSeek slug requires a finish_reason and finalized tool calls", () => {
+      expect(
+        chatCompletionsCapabilityHintsForProvider("deepseek", "deepseek-flash"),
+      ).toMatchObject(FINALIZATION);
+      expect(
+        chatCompletionsCapabilityHintsForProvider("deepseek", "deepseek-v4-pro"),
+      ).toMatchObject(FINALIZATION);
+      expect(
+        chatCompletionsCapabilityHintsForProvider("deepseek", "any-model"),
+      ).toMatchObject(FINALIZATION);
+    });
+
+    test("managed and third-party DeepSeek routes keep their own stream contracts", () => {
+      expect(
+        chatCompletionsCapabilityHintsForProvider(
+          "openrouter",
+          "deepseek/deepseek-v4-flash-0731",
+          { managedGateway: true },
+        ),
+      ).not.toMatchObject(FINALIZATION);
+      expect(
+        chatCompletionsCapabilityHintsForProvider(
+          "openrouter",
+          "deepseek/deepseek-v4-flash-0731",
+        ),
+      ).not.toMatchObject(FINALIZATION);
+      expect(
+        chatCompletionsCapabilityHintsForProvider("openai", "gpt-4o"),
+      ).not.toMatchObject(FINALIZATION);
+    });
   });
 
   test("undefined provider name resolves to safe defaults", () => {

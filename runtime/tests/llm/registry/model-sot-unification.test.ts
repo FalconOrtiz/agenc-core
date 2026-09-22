@@ -26,6 +26,7 @@ import {
   deriveFlatCatalog,
   listRegisteredModelCatalogEntries,
   resolveModelCatalogMetadata,
+  resolveRegisteredModelCatalogEntry,
 } from "../../../src/llm/registry/model-catalog.js";
 import {
   BUILT_IN_PROVIDER_DEFAULT_MODELS,
@@ -48,7 +49,6 @@ const TOUCHED_ENV_KEYS = [
   "AGENC_HOME",
   "AGENC_PROVIDER",
   "AGENC_MAX_CONTEXT_TOKENS",
-  "USER_TYPE",
   "XAI_API_KEY",
 ] as const;
 
@@ -144,10 +144,10 @@ describe("model SoT: one catalog entry surfaces everywhere", () => {
 
 describe("retired models remain historical metadata, not live choices", () => {
   it("uses only reachable provider defaults and catalog rows", () => {
-    expect(BUILT_IN_PROVIDER_DEFAULT_MODELS.deepseek).toBe("deepseek-v4-flash");
+    expect(BUILT_IN_PROVIDER_DEFAULT_MODELS.deepseek).toBe("deepseek-flash");
     expect(BUILT_IN_PROVIDER_DEFAULT_MODELS.mistral).toBe("mistral-medium-latest");
     expect(BUILT_IN_PROVIDER_MODEL_CATALOG.deepseek).toEqual([
-      "deepseek-v4-flash",
+      "deepseek-flash",
       "deepseek-v4-pro",
     ]);
     expect(BUILT_IN_PROVIDER_MODEL_CATALOG.groq).not.toContain(
@@ -190,10 +190,11 @@ describe("canonical provider catalogs preserve supported selection rows", () => 
 
   it("keeps the complete unique NVIDIA NIM selection surface", () => {
     const models = BUILT_IN_PROVIDER_MODEL_CATALOG["nvidia-nim"];
-    expect(models).toHaveLength(110);
-    expect(new Set(models)).toHaveLength(110);
+    expect(models).toHaveLength(111);
+    expect(new Set(models)).toHaveLength(111);
     expect(models).toEqual(
       expect.arrayContaining([
+        "openai/gpt-oss-120b",
         "nvidia/cosmos-reason2-8b",
         "meta/codellama-70b",
         "nvidia/llama-3.3-nemotron-super-49b-v1.5",
@@ -220,18 +221,36 @@ describe("canonical provider catalogs preserve supported selection rows", () => 
     );
   });
 
+  it("gives GPT-5 the effort ladder its API accepts and keeps xhigh for the later generations", () => {
+    // Probed on the Responses API 2026-09-11: gpt-5 rejects xhigh
+    // ("Supported values are: minimal, low, medium, high"); gpt-5.5 and
+    // gpt-5.4 accept xhigh and reject max; gpt-5.3-codex rejects minimal.
+    expect(
+      resolveRegisteredModelCatalogEntry({ provider: "openai", model: "gpt-5" })
+        ?.supportedReasoningLevels,
+    ).toEqual(["minimal", "low", "medium", "high"]);
+    for (const model of ["gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.2"]) {
+      const levels = resolveRegisteredModelCatalogEntry({ provider: "openai", model })
+        ?.supportedReasoningLevels;
+      expect(levels, model).toContain("xhigh");
+      expect(levels, model).not.toContain("minimal");
+      expect(levels, model).not.toContain("max");
+    }
+  });
+
   it("keeps every supported MiniMax generation in one catalog", () => {
     const models = BUILT_IN_PROVIDER_MODEL_CATALOG.minimax;
+    // The lineup MiniMax documents for its OpenAI-compatible route
+    // (platform.minimax.io, 2026-09-11), newest first.
     expect(models).toEqual([
       "MiniMax-M3",
       "MiniMax-M2.7",
-      "MiniMax-M2",
-      "MiniMax-M2.1",
+      "MiniMax-M2.7-highspeed",
       "MiniMax-M2.5",
-      "MiniMax-Text-01",
-      "MiniMax-Text-01-Preview",
-      "MiniMax-Vision-01",
-      "MiniMax-Vision-01-Fast",
+      "MiniMax-M2.5-highspeed",
+      "MiniMax-M2.1",
+      "MiniMax-M2.1-highspeed",
+      "MiniMax-M2",
     ]);
     expect(new Set(models)).toHaveLength(models.length);
     expect(buildProviderModelCatalog(defaultConfig()).minimax).toEqual(models);

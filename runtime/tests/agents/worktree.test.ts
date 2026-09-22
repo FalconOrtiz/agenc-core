@@ -11,6 +11,10 @@ import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, existsSync: vi.fn(actual.existsSync) };
+});
 import {
   STALE_WORKTREE_AGE_MS,
   captureWorktreeTurnEvidence as captureWorktreeTurnEvidenceUnbound,
@@ -203,13 +207,23 @@ describe("findGitRoot", () => {
     expect(findGitRoot(nested)).toBe(canonicalRoot);
   });
 
-  it("falls back to the local root when .git is just a plain gitdir file", () => {
+  it("skips a dangling ancestor gitdir file and keeps a linked worktree canonical root", () => {
     writeFileSync(join(tmpRoot, ".git"), "gitdir: /elsewhere/.git/worktrees/x");
-    expect(findGitRoot(tmpRoot)).toBe(tmpRoot);
+    const canonicalRoot = join(tmpRoot, "origin-repo");
+    const worktreeRoot = join(tmpRoot, "linked-wt");
+    const nested = join(worktreeRoot, "pkg");
+    createLinkedWorktree(canonicalRoot, worktreeRoot, "feat");
+    mkdirSync(nested, { recursive: true });
+    expect(findGitRoot(nested)).toBe(canonicalRoot);
+    expect(findGitRoot(tmpRoot)).toBeNull();
   });
 
   it("returns null when no .git ancestor", () => {
-    expect(findGitRoot(tmpRoot)).toBeNull();
+    // A developer may keep their temporary directory inside a checkout.
+    // This case specifically exercises walking to the root without a marker.
+    const probe = vi.mocked(existsSync).mockReturnValue(false);
+    try { expect(findGitRoot(tmpRoot)).toBeNull(); }
+    finally { probe.mockReset(); }
   });
 });
 

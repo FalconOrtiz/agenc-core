@@ -2,11 +2,8 @@
  * File-history sidecar — per-message snapshots of edited files with
  * versioned backups.
  *
- * Hand-port of agenc `src/utils/fileHistory.ts` (1,115 LOC). The
- * AgenC implementation is tightly coupled to React-hook-style
- * state updaters + global session state. This AgenC port preserves
- * the on-disk format + data shapes but restructures around
- * `SessionStore` + `SidecarManager`.
+ * Structured around `SessionStore` + `SidecarManager` rather than
+ * React-hook-style state updaters or global session state.
  *
  * Invariants wired here:
  *   I-28 (file-history LRU eviction) — snapshots capped at
@@ -44,18 +41,13 @@ import {
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { collectShellWorkspaceDeletionTargets } from "../llm/shell-write-policy.js";
 import { monotonicMs } from "./_deps/utils.js";
 import { DegradedStore } from "./degraded-store.js";
 import type { Event } from "./event-log.js";
 import type { RolloutItem } from "./rollout-item.js";
 import { isDegradedErrno } from "./session-store.js";
 import type { Sidecar } from "./sidecar.js";
-import {
-  completeWorkspaceTopologyMutation,
-  reserveWorkspaceTopologyMutation,
-  workspaceLoadedEditorPathConflict,
-  workspaceMutationPathConflict,
-} from "../workspace/mutation-coordinator.js";
 
 const MAX_SNAPSHOTS = 100;
 
@@ -72,7 +64,7 @@ export interface FileHistoryBackup {
 }
 
 /**
- * Port of agenc `DiffStats` + `computeDiffStats`. Counts line-
+ * `DiffStats` + `computeDiffStats`. Counts line-
  * level insertions/deletions relative to the previous version of the
  * same tracked file.
  */
@@ -611,6 +603,13 @@ export interface FileHistorySidecarOpts {
    *  Edit + Write tools. T7 wires per-tool concurrency classes; this
    *  sidecar picks based on tool name prefix match. */
   readonly editToolNames?: ReadonlyArray<string>;
+  /**
+   * Workspace root used to resolve the files a shell command removes or
+   * moves (`rm`, `rmdir`, `unlink`, `mv`), so they are backed up before the
+   * command runs the way Edit and Write targets are. Without it shell
+   * deletions are not tracked.
+   */
+  readonly workspaceRoot?: string;
 }
 
 const DEFAULT_EDIT_TOOL_NAMES: ReadonlyArray<string> = [
@@ -620,6 +619,17 @@ const DEFAULT_EDIT_TOOL_NAMES: ReadonlyArray<string> = [
   "NotebookEdit",
   "apply_patch",
 ];
+
+/**
+ * Shell tools whose command text names the files they delete, and where each
+ * one keeps its command line and working directory in its args.
+ */
+const SHELL_TOOL_ARG_KEYS: Readonly<
+  Record<string, { readonly command: string; readonly cwd: string }>
+> = {
+  exec_command: { command: "cmd", cwd: "workdir" },
+  "system.bash": { command: "command", cwd: "cwd" },
+};
 
 const APPLY_PATCH_FILE_MARKERS = [
   "*** Add File: ",
@@ -660,11 +670,13 @@ export class FileHistorySidecar implements Sidecar {
   readonly name = "file-history";
   private readonly history: FileHistory;
   private readonly editToolNames: ReadonlyArray<string>;
+  private readonly workspaceRoot: string | undefined;
   private lastEditStartedAtMs: number | null = null;
 
   constructor(opts: FileHistorySidecarOpts) {
     this.history = opts.fileHistory;
     this.editToolNames = opts.editToolNames ?? DEFAULT_EDIT_TOOL_NAMES;
+    this.workspaceRoot = opts.workspaceRoot;
   }
 
   async start(): Promise<void> {
@@ -687,6 +699,15 @@ export class FileHistorySidecar implements Sidecar {
         const args = this.tryParseArgs(msg.payload.args);
         for (const filePath of extractEditedFilePaths(args)) {
           void this.history.trackEdit(filePath, event.id);
+        }
+      } else {
+        const deleted = this.shellDeletionPaths(
+          msg.payload.toolName,
+          this.tryParseArgs(msg.payload.args),
+        );
+        if (deleted.length > 0) {
+          this.lastEditStartedAtMs = monotonicMs();
+          void this.trackShellDeletions(deleted, event.id);
         }
       }
     } else if (msg.type === "tool_call_completed") {
@@ -716,6 +737,53 @@ export class FileHistorySidecar implements Sidecar {
     }
   }
 
+  /**
+   * Workspace files a shell tool call is about to remove or move. Resolved
+   * against the call's working directory under the sidecar's workspace root;
+   * empty when the root is unknown or the tool is not a shell.
+   */
+  private shellDeletionPaths(
+    toolName: string,
+    args: Record<string, unknown> | null,
+  ): ReadonlyArray<string> {
+    const keys = SHELL_TOOL_ARG_KEYS[toolName];
+    if (keys === undefined || this.workspaceRoot === undefined || args === null) {
+      return [];
+    }
+    const command = args[keys.command];
+    if (typeof command !== "string" || command.trim().length === 0) return [];
+    const cwd = args[keys.cwd];
+    return collectShellWorkspaceDeletionTargets({
+      toolName,
+      args: {
+        command,
+        ...(Array.isArray(args.args) ? { args: args.args } : {}),
+        ...(typeof cwd === "string" ? { cwd } : {}),
+      },
+      workspaceRoot: this.workspaceRoot,
+    });
+  }
+
+  /**
+   * Back up the regular files among `paths` before the shell removes them.
+   * Directories and missing paths have no content to preserve; a later
+   * snapshot records the removal itself, as it does for any tracked file.
+   */
+  private async trackShellDeletions(
+    paths: ReadonlyArray<string>,
+    messageId: string,
+  ): Promise<void> {
+    for (const filePath of paths) {
+      let isFile = false;
+      try {
+        isFile = (await stat(filePath)).isFile();
+      } catch {
+        isFile = false;
+      }
+      if (isFile) await this.history.trackEdit(filePath, messageId);
+    }
+  }
+
   getSnapshotState(): FileHistoryState {
     return this.history.getState();
   }
@@ -724,8 +792,7 @@ export class FileHistorySidecar implements Sidecar {
 // ─────────────────────────────────────────────────────────────────────
 // Session-resume surface — module-level helpers
 //
-// Port of agenc `utils/fileHistory.ts` lines 347-397, 399-408,
-// 414-484, 494-531, 600-634, 888-917, 922-1046. The AgenC port reuses
+// These helpers reuse
 // the existing FileHistory on-disk layout (`backupFileName` is the
 // absolute path to the backup artifact under `projectDir/file-history/
 // <pathHash>/v<N>`), so a snapshot carries the fully-resolved backup
@@ -791,7 +858,6 @@ async function hashFileContent(filePath: string): Promise<string | null> {
 }
 
 /**
- * Port of agenc `checkOriginFileChanged` (fileHistory.ts:600-634).
  * Hash-compares current disk state to the recorded origin (v1) backup.
  * Returns `true` when the file differs (including presence mismatch)
  * or when `backupFileName` is `null` but the file exists on disk.
@@ -823,7 +889,6 @@ export async function checkOriginFileChanged(
 }
 
 /**
- * Port of agenc `fileHistoryCanRestore` (fileHistory.ts:399-408).
  * Returns `true` when a snapshot for `messageId` exists AND every
  * tracked file in that snapshot has a reachable backup on disk (i.e.
  * the backup files themselves have not been garbage-collected).
@@ -843,7 +908,6 @@ export async function fileHistoryCanRestore(
 }
 
 /**
- * Port of agenc `fileHistoryRewind` (fileHistory.ts:347-397).
  * Rewind the tracked files on disk to the snapshot identified by
  * `messageId`. Returns the list of files that changed. Throws when
  * the snapshot does not exist so callers can surface a clear error.
@@ -858,30 +922,7 @@ export async function fileHistoryRewind(
       `FileHistory: Snapshot for messageId=${messageId} not found`,
     );
   }
-  for (const trackingPath of state.trackedFiles) {
-    const conflict = workspaceMutationPathConflict(trackingPath);
-    if (conflict !== null) {
-      throw new Error(
-        `Cannot rewind ${trackingPath}: ${conflict.path} has ${
-          conflict.authority === "editor_dirty"
-            ? "unsaved editor changes"
-            : "unreconciled editor changes"
-        }. Resolve the Editor buffer first.`,
-      );
-    }
-    const loadedConflict = workspaceLoadedEditorPathConflict(trackingPath);
-    if (loadedConflict !== null) {
-      throw new Error(
-        `Cannot rewind ${trackingPath}: ${loadedConflict.path} is loaded in Editor. Close that buffer before rewinding.`,
-      );
-    }
-  }
-  const reservation = await reserveWorkspaceTopologyMutation(
-    [...state.trackedFiles].map((path) => ({ path })),
-    "rewind",
-  );
   const changed: string[] = [];
-  let outcomeUnknown = false;
   for (const trackingPath of state.trackedFiles) {
     const targetBackup = target.trackedFileBackups[trackingPath];
     const origin = targetBackup ?? getOriginBackup(state, trackingPath);
@@ -894,9 +935,7 @@ export async function fileHistoryRewind(
           await rm(trackingPath);
           changed.push(trackingPath);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            outcomeUnknown = true;
-          }
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
         continue;
       }
@@ -906,21 +945,14 @@ export async function fileHistoryRewind(
         changed.push(trackingPath);
       }
     } catch {
-      // Rewind is historically best-effort, but an attempted filesystem
-      // effect still has to be represented truthfully to a concurrent editor.
-      outcomeUnknown = true;
+      // Rewind is best-effort: a path that cannot be restored is skipped.
     }
   }
-  await completeWorkspaceTopologyMutation(
-    reservation,
-    outcomeUnknown ? "unknown_outcome" : "applied",
-  );
   return changed;
 }
 
 /**
- * Port of agenc `fileHistoryGetDiffStats` (fileHistory.ts:414-484),
- * generalized to diff between two snapshot points. When `fromMessageId`
+ * Diff between two snapshot points. When `fromMessageId`
  * is omitted, diffs against the first recorded snapshot (the origin).
  * Returns per-file insertions/deletions plus an aggregate.
  */
@@ -983,8 +1015,7 @@ export async function fileHistoryGetDiffStats(
 }
 
 /**
- * Port of agenc `fileHistoryHasAnyChanges` (fileHistory.ts:494-531)
- * specialized to "any edit ever recorded" — true iff at least one
+ * "Any edit ever recorded": true iff at least one
  * tracked-file backup exists across the snapshot log. Complements the
  * disk-vs-snapshot variant exposed via the `FileHistory` class.
  */
@@ -1032,8 +1063,7 @@ function isPersistedSnapshot(value: unknown): value is PersistedSnapshot {
 }
 
 /**
- * Port of agenc `fileHistoryRestoreStateFromLog` (fileHistory.ts:
- * 888-917). Rebuild `FileHistoryState` by walking the rollout items
+ * Rebuild `FileHistoryState` by walking the rollout items
  * and collecting any `event_msg` payload whose `msg.type ===
  * "file_history_snapshot"` carries a `PersistedSnapshot`. Unknown or
  * malformed payloads are skipped (I-26 forward-compat posture).
@@ -1081,8 +1111,7 @@ export function fileHistoryRestoreStateFromLog(
 }
 
 /**
- * Port of agenc `copyFileHistoryForResume` (fileHistory.ts:922-
- * 1046). AgenC snapshots carry absolute backup paths, so resuming a
+ * AgenC snapshots carry absolute backup paths, so resuming a
  * session does not require per-session backup-dir migration: the new
  * session can read the existing backup artifacts directly. This helper
  * therefore reduces to a structural deep clone of the state so the

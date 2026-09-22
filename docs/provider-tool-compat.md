@@ -11,6 +11,31 @@ exactly now fail in-process with `LLMProviderError` instead of reaching
 Local window probes and `context_window_exceeded` text:
 [providers.md](reference/providers.md#local-context-windows).
 
+## Reasoning providers and execution backends
+
+The model that selects a client tool and the service that executes that tool
+are separate identities. A tool-capable reasoning provider is not required to
+own a tool's backend. Backend authority does not follow the reasoning provider
+slug. Before Session attachment, `ImagineImage` remains universally
+discoverable but deferred so the same registry can survive a later provider
+switch; execution re-resolves current credentials and fails closed if no image
+backend exists.
+
+For example, a Meta Muse Spark or OpenAI model can invoke `XSearch`,
+`ImagineImage`, or `ImagineVideo`. `XSearch` then performs native X search
+through an independently authenticated direct-xAI Grok backend;
+`ImagineVideo` similarly uses xAI Imagine. `ImagineImage` can use Meta Muse
+Image, QwenCloud image models, Z.AI GLM-Image, or xAI Imagine with each
+backend's separate credential. A matching Meta, QwenCloud, Z.AI Pay-As-You-Go, or direct
+Grok session may reuse only its own native authority. The reasoning session's
+API key and base URL are never borrowed for a different provider's backend;
+Z.AI Coding Plan credentials remain chat-only.
+
+This does not turn provider-native server tools into generic wire features.
+Native `x_search`, for example, is still sent only on the internal compatible
+Grok request. The original reasoning model sees and invokes the AgenC client
+tool, while AgenC owns the backend-specific request.
+
 ## Object-root tools (Grok / DeepSeek)
 
 Strict OpenAI-compatible providers (x.ai / Grok, DeepSeek) require each tool
@@ -23,7 +48,7 @@ input shapes, for example:
   "anyOf": [ { "required": ["cmd"] }, { "required": ["command"] } ] }
 ```
 
-Lenient providers (OpenAI / Codex) accept this. Strict ones reject the whole
+Lenient providers (OpenAI) accept this. Strict ones reject the whole
 request:
 
 ```
@@ -86,8 +111,8 @@ for these providers.
 `usesLocalToolProfile` / `filterToolsForLocalProfile` advertise this reduced
 catalog to the two grammar-constrained provider slugs:
 
-`exec_command`, `write_stdin`, `kill_process`, `FileRead`, `Edit`,
-`MultiEdit`, `Write`, `Glob`, `Grep`, `Orient`, `AskUserQuestion`,
+`exec_command`, `write_stdin`, `kill_process`, `list_processes`, `FileRead`,
+`Edit`, `MultiEdit`, `Write`, `Glob`, `Grep`, `Orient`, `AskUserQuestion`,
 `TodoWrite`, `EnterPlanMode`, `ExitPlanMode`, `system.searchTools`,
 `SendUserMessage` (`BRIEF_TOOL_NAME`), `StructuredOutput`.
 
@@ -108,6 +133,18 @@ everywhere llama.cpp serves Qwen3.
 that enum (`kimi-k3`, `deepseek-v4-{pro,flash}`, `gpt-oss-<digits>b`,
 `nemotron-3-super`, `nemotron-3-ultra`). Other NIM families strip the field so
 the host default runs. Out-of-enum values are not translated.
+
+### Meta Muse request controls
+
+Meta Muse Spark chat models forward `reasoning_effort` only for `minimal`,
+`low`, `medium`, `high`, and `xhigh`; `none` and `max` are stripped because the
+Model API rejects them. Meta accepts only `tool_choice: "auto"`: required and
+named choices are normalized to `auto`, while `none` removes tools from the
+request. Caller-supplied stop sequences are stripped because Meta rejects the
+`stop` field. Meta requests use `max_completion_tokens`; Muse Spark supports
+image input, JSON-schema structured output, and parallel function calls. Those
+function calls can target the same backend-qualified AgenC tool catalog as
+calls from other cloud providers.
 
 ## Gemini native JSON Schema
 

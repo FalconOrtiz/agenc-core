@@ -128,12 +128,15 @@ function getServerUrl(config: McpServerConfig): string | null {
  * Two configs with the same signature are considered "the same server" for
  * plugin deduplication. Ignores env (plugins always inject AGENC_PLUGIN_ROOT)
  * and headers (same URL = same server regardless of auth).
+ * Stdio identity includes cwd: identical relative commands in different plugin
+ * roots launch different servers. An unspecified cwd is not an explicit one.
  * Returns null only for configs with neither command nor url (sdk type).
  */
 export function getMcpServerSignature(config: McpServerConfig): string | null {
   const cmd = getServerCommandArray(config)
   if (cmd) {
-    return `stdio:${jsonStringify(cmd)}`
+    const cwd = (config as McpStdioServerConfig).cwd ?? null
+    return `stdio:${jsonStringify([cmd, cwd])}`
   }
   const url = getServerUrl(config)
   if (url) {
@@ -903,6 +906,7 @@ export interface ResolvedMcpServerDefinition {
 export type McpSessionServerDisposition = 'active' | 'shadowed' | 'blocked'
 
 export interface McpConfigResolutionOptions {
+  readonly readOnly?: boolean
   readonly signal?: AbortSignal
   readonly pluginStorageRoot: string
 }
@@ -1306,6 +1310,7 @@ export async function getAllMcpConfigs(
           raceMcpResolutionWithAbort(
             loadPluginMcpServerRegistrations({
               pluginStorageRoot,
+              readOnly: options.readOnly,
               workspaceRoot: resolutionAuthority.projectRoot,
               config: resolutionAuthority.current(),
               env: { ...environment },

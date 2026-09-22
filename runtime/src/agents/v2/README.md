@@ -1,0 +1,53 @@
+# Multi-Agent v2 Tools
+
+This directory owns the model-facing v2 agent tools.
+
+## Tool Map
+
+| Local target      | Model-facing tool       |
+| ----------------- | ----------------------- |
+| `spawn.ts`        | `spawn_agent`           |
+| `wait.ts`         | `wait_agent`            |
+| `close-agent.ts`  | `close_agent`           |
+| `assign-task.ts`  | `assign_task`           |
+| `send-message.ts` | `send_message`          |
+| `list-agents.ts`  | `list_agents`           |
+| `message-tool.ts` | shared message dispatch |
+
+The previous `followup_task` compatibility alias (`followup-task.ts`) has been
+deleted — `assign_task` is the only trigger-turn spelling. Historical
+transcripts that recorded `followup_task` calls still render via the
+transcript's collab-tool suppression set.
+
+## Guarded Behavior
+
+- `assign_task` and `send_message` share strict `target` plus `message`
+  validation and the same event envelope.
+- `assign_task` atomically admits one correlated task only when its target is
+  an idle reusable worker and its authenticated sender is a strict ancestor;
+  busy, self-targeted, peer, and outstanding-assignment requests are rejected.
+  `send_message` remains passive and does not trigger a turn.
+- `assign_task` rejects assigning work to the root agent and does not enqueue
+  root mail on that failure.
+- Completed agents are terminal; only `idle` keep-alive workers are reusable.
+- Reusable agents durably record one correlated completed, errored, interrupted,
+  or NACK receipt per accepted task before projecting it to the parent.
+- Omitting `fork_turns` is the documented clean-fork default; `all` is opt-in.
+- `wait_agent` drains all delivered receipts and is therefore mutating. It has
+  no target filter that could discard unrelated agents' messages.
+- All v2 path resolution registers the current root thread before resolving
+  relative or canonical targets.
+- Nested tool identity is accepted only as a valid HMAC-signed
+  `__agencSessionId` / `__agencSessionIdSig` pair for a known live agent.
+  Missing halves, forged/mismatched signatures, and unknown signed sessions
+  return `invalid-runtime-identity`; root fallback is allowed only when both
+  internal fields are absent.
+- Argument and identity refusals on `close_agent`, `assign_task`, and
+  `send_message` attest `confirmed_no_effect` /
+  `tool:agents.v2:validation` before shutdown or delivery. The typed
+  `self_target`, `sender_not_ancestor`, `worker_not_idle`, and
+  `assignment_outstanding` admission rejections are also pre-mutation.
+  Mailbox backpressure and unclassified failures from `shutdown()`,
+  `assignTask()`, or `sendInterAgentCommunication()` stay unknown-effect.
+  Operator detail:
+  [agents.md](../../../../docs/reference/agents.md#agent-validation-refusals).

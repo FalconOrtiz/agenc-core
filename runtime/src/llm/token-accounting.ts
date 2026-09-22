@@ -10,8 +10,13 @@ import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import { LLMContextWindowExceededError } from "./errors.js";
+import { getTokenizerConfigForProvider } from "./token-estimation.js";
 import type { LLMChatOptions, LLMMessage, LLMTool } from "./types.js";
-import { prepareMessagesForWire } from "./wire/shared.js";
+import { chatCompletionsCapabilityHintsForProvider } from "./wire/capability-gating.js";
+import {
+  applyToolResultImagePolicyForWire,
+  prepareMessagesForWire,
+} from "./wire/shared.js";
 
 export const TOKEN_COUNT_CACHE_MAX_ENTRIES = 1_024;
 export const TOKEN_COUNT_CACHE_MAX_BYTES = 67_108_864;
@@ -23,6 +28,16 @@ export const MAX_TOKEN_COUNT_WAITER_BYTES = 4_194_304;
 export const MAX_TOKEN_ACCOUNTING_REQUEST_BYTES = 16_777_216;
 export const TOKEN_COUNT_PROVIDER_TIMEOUT_MS = 5_000;
 export const TOKEN_ACCOUNTING_METRICS_MAX_PARTITIONS = 4_096;
+/**
+ * Provider-usage calibration of the conservative fallback. When a provider reports more input tokens than the fallback
+ * estimated, later fallback estimates in the same conversation, for the same provider, model and endpoint, are scaled
+ * by the largest ratio seen, plus headroom because the ratio drifts as a transcript grows. The ratio is empirical, not
+ * a bound: a first request, a restart, or content with a different byte-to-token ratio can still undercount. The factor
+ * cap and the scope limit are resource controls.
+ */
+export const TOKEN_ACCOUNTING_CALIBRATION_HEADROOM = 1.02;
+export const TOKEN_ACCOUNTING_CALIBRATION_MAX_FACTOR = 4;
+export const TOKEN_ACCOUNTING_CALIBRATION_MAX_SCOPES = 256;
 export const TOKEN_FALLBACK_MARGIN_RATIO = 0.1;
 export const TOKEN_FALLBACK_MARGIN_TOKENS = 256;
 
@@ -44,6 +59,14 @@ const TOKEN_ACCOUNTING_MESSAGE_FRAME_TOKENS = 8;
 const TOKEN_ACCOUNTING_TOOL_FRAME_TOKENS = 16;
 const TOKEN_ACCOUNTING_TOOL_CHOICE_FRAME_TOKENS = 8;
 const TOKEN_ACCOUNTING_MEDIA_FRAME_TOKENS = 64;
+const TOKEN_ACCOUNTING_IMAGE_PATCH_PIXELS = 32 * 32;
+const TOKEN_ACCOUNTING_MIN_IMAGE_PIXELS = 256 * 256;
+const TOKEN_ACCOUNTING_MAX_IMAGE_PIXELS = 4_096 * 4_096;
+const TOKEN_ACCOUNTING_IMAGE_HEADER_BYTES = 256 * 1_024;
+export const TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS =
+  Math.ceil(
+    TOKEN_ACCOUNTING_MAX_IMAGE_PIXELS / TOKEN_ACCOUNTING_IMAGE_PATCH_PIXELS,
+  ) + 2;
 const TOKEN_ACCOUNTING_MINIMUM_INPUT_TOKENS = 1;
 const TOKEN_ACCOUNTING_UTF8_WORST_CASE_BYTES_PER_TOKEN = 1;
 
@@ -67,8 +90,43 @@ const TOKEN_ACCOUNTING_UTF8_WORST_CASE_BYTES_PER_TOKEN = 1;
  * 2 keeps a conservative floor — still below every catalogued ratio, so the
  * estimate stays an upper bound — without gating admission on a bound no
  * tokenizer can reach.
+ *
+ * It is only a floor. Where a tokenizer IS catalogued, that ratio is the
+ * better bound and `conservativeBytesPerToken` prefers it: 2 is what we use
+ * when nothing is known about the endpoint, not a ceiling on what we may know.
+ * Keeping the floor everywhere costs nothing on a large window and is fatal on
+ * a small one. Measured against a real 32k-window local model, the serialized
+ * prompt was 75,075 bytes; at 2 that reserves 42,214 tokens against a 31,129
+ * window and admission denies before the model is ever called, while the
+ * model's own tokenizer counts 15,055 — 4.99 bytes per token. A window under
+ * ~64k cannot absorb a 2.8x over-estimate, so on local runtimes the floor does
+ * not degrade admission, it removes it.
  */
 const TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN = 2;
+
+/**
+ * The bytes-per-token bound to estimate this request with.
+ *
+ * Prefers the catalogued tokenizer for the endpoint and falls back to the
+ * floor when the endpoint matches nothing. The catalogue is deliberately set
+ * below measured ratios (ollama is listed at 3.8 against 4.99 measured), so
+ * preferring it keeps the estimate an upper bound rather than abandoning one.
+ */
+export function conservativeBytesPerToken(
+  provider: string | undefined,
+  model: string | undefined,
+): number {
+  const config = getTokenizerConfigForProvider({
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+  });
+  // An unmatched endpoint tells us nothing, and DEFAULT_BYTES_PER_TOKEN is a
+  // guess, not a bound. Hold the floor for those.
+  if (config.modelFamily === "unknown") {
+    return TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN;
+  }
+  return Math.max(TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN, config.bytesPerToken);
+}
 const TOKEN_ACCOUNTING_MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const TOKEN_ACCOUNTING_METRICS_OVERFLOW_MODEL = "other";
 const TOKEN_ACCOUNTING_METRICS_OVERFLOW_PROVIDER = "other";
@@ -115,6 +173,14 @@ export interface TokenAccountingCoverage {
   readonly uncertainComponents: readonly string[];
 }
 
+export interface TokenAccountingCalibration {
+  /** Largest ratio of provider-reported to estimated input tokens seen in this scope, capped. */
+  readonly factor: number;
+  /** The uncalibrated fallback estimate the factor was applied to. */
+  readonly basisInputTokens: number;
+  readonly headroom: number;
+}
+
 export interface TokenAccountingResult {
   readonly inputTokens: number;
   readonly reservedOutputTokens: number;
@@ -128,6 +194,8 @@ export interface TokenAccountingResult {
   readonly calibrationVersion: string;
   readonly safetyMarginTokens: number;
   readonly admissible: boolean;
+  /** Present only when a provider-usage calibration scaled this conservative fallback estimate. */
+  readonly calibration?: TokenAccountingCalibration;
 }
 
 export interface ProviderNativeTokenCountResult {
@@ -164,6 +232,8 @@ export interface TokenAccountingRequest {
   readonly endpointCapabilityVersion?: string;
   readonly contextWindowTokens?: number;
   readonly reservedOutputTokens: number;
+  /** Conversation whose reported usage calibrates this request's conservative fallback estimate. */
+  readonly calibrationScope?: string;
 }
 
 export interface CreateTokenAccountingRequestOptions {
@@ -180,6 +250,7 @@ export interface CreateTokenAccountingRequestOptions {
   readonly endpointCapabilityVersion?: string;
   readonly contextWindowTokens?: number;
   readonly reservedOutputTokens?: number;
+  readonly calibrationScope?: string;
 }
 
 export interface TokenAccountingCountOptions {
@@ -197,6 +268,7 @@ export interface TokenAccountingServiceLimits {
   readonly maxWaiterBytes?: number;
   readonly maxRequestBytes?: number;
   readonly providerTimeoutMs?: number;
+  readonly calibrationMaxScopes?: number;
 }
 
 export interface TokenAccountingServiceOptions extends TokenAccountingServiceLimits {
@@ -235,6 +307,19 @@ interface PreparedAccountingRequest {
   readonly request: TokenAccountingRequest;
   readonly digest: string;
   readonly fallback: TokenAccountingResult;
+}
+
+interface InlineImageAccounting {
+  readonly identity: Readonly<Record<string, unknown>>;
+  readonly sourceBytes: number;
+  readonly tokens: number;
+}
+
+interface PreparedMessageAccountingProjection {
+  readonly wireMessages: readonly LLMMessage[];
+  readonly messages: readonly unknown[];
+  readonly inlineImages: ReadonlyMap<string, InlineImageAccounting>;
+  readonly inlineSourceBytes: number;
 }
 
 interface TokenCountFlight {
@@ -286,11 +371,17 @@ export class TokenAccountingService {
   readonly #maxWaiterBytes: number;
   readonly #maxRequestBytes: number;
   readonly #providerTimeoutMs: number;
+  readonly #calibrationMaxScopes: number;
 
   readonly #cache = new Map<string, CacheEntry>();
   readonly #flights = new Map<string, TokenCountFlight>();
   readonly #abandonedDigests = new Set<string>();
   readonly #metrics = new Map<string, MutableTokenAccountingMetric>();
+  readonly #calibrationFactors = new Map<string, number>();
+  readonly #calibrationBases = new WeakMap<
+    TokenAccountingResult,
+    { readonly key: string; readonly basisInputTokens: number }
+  >();
 
   #cacheBytes = 0;
   #physicalFlights = 0;
@@ -335,11 +426,22 @@ export class TokenAccountingService {
       options.providerTimeoutMs,
       TOKEN_COUNT_PROVIDER_TIMEOUT_MS,
     );
+    this.#calibrationMaxScopes = positiveLimit(
+      options.calibrationMaxScopes,
+      TOKEN_ACCOUNTING_CALIBRATION_MAX_SCOPES,
+    );
   }
 
   async count(
     request: TokenAccountingRequest,
     options: TokenAccountingCountOptions = {},
+  ): Promise<TokenAccountingResult> {
+    return this.#calibrate(request, await this.#countUncalibrated(request, options));
+  }
+
+  async #countUncalibrated(
+    request: TokenAccountingRequest,
+    options: TokenAccountingCountOptions,
   ): Promise<TokenAccountingResult> {
     throwIfAborted(options.signal);
     const prepared = prepareAccountingRequest(
@@ -375,6 +477,40 @@ export class TokenAccountingService {
       return withCacheStatus(prepared.fallback, "bypass");
     }
     return this.#awaitFlight(flight, prepared.fallback, options.signal, shared);
+  }
+
+  /**
+   * Scales a conservative fallback estimate by the calibration its scope has learned. It runs after any shared cache
+   * read and is never written back, so a scaled result cannot reach another scope or an unscoped caller.
+   */
+  #calibrate(
+    request: TokenAccountingRequest,
+    result: TokenAccountingResult,
+  ): TokenAccountingResult {
+    const scope = request.calibrationScope;
+    if (
+      scope === undefined ||
+      scope.length === 0 ||
+      result.source !== "conservative_fallback"
+    ) {
+      return result;
+    }
+    const key = calibrationKeyFor(scope, request);
+    const factor = this.#calibrationFactors.get(key);
+    if (factor !== undefined) {
+      // Reading a scope keeps it recent, so an active conversation is not the one evicted.
+      this.#calibrationFactors.delete(key);
+      this.#calibrationFactors.set(key, factor);
+    }
+    const calibrated =
+      factor !== undefined && factor > 1
+        ? withCalibration(result, factor)
+        : { ...result };
+    this.#calibrationBases.set(calibrated, {
+      key,
+      basisInputTokens: result.inputTokens,
+    });
+    return calibrated;
   }
 
   recordProviderUsage(
@@ -441,6 +577,35 @@ export class TokenAccountingService {
       );
     }
     this.#metrics.set(key, metric);
+    const calibration = this.#calibrationBases.get(result);
+    if (
+      calibration !== undefined &&
+      result.source === "conservative_fallback" &&
+      reportedInputTokens > 0 &&
+      calibration.basisInputTokens > 0
+    ) {
+      this.#learnCalibration(
+        calibration.key,
+        reportedInputTokens / calibration.basisInputTokens,
+      );
+    }
+  }
+
+  /** Raises a scope's factor to the reported ratio. It never lowers one; the ratio is measured against the basis. */
+  #learnCalibration(key: string, ratio: number): void {
+    if (!Number.isFinite(ratio) || ratio <= 1) return;
+    const factor = Math.min(
+      TOKEN_ACCOUNTING_CALIBRATION_MAX_FACTOR,
+      Math.max(this.#calibrationFactors.get(key) ?? 1, ratio),
+    );
+    this.#calibrationFactors.delete(key);
+    this.#calibrationFactors.set(key, factor);
+    while (this.#calibrationFactors.size > this.#calibrationMaxScopes) {
+      const oldest = this.#calibrationFactors.keys().next().value as
+        string | undefined;
+      if (oldest === undefined) break;
+      this.#calibrationFactors.delete(oldest);
+    }
   }
 
   metricsSnapshot(): readonly TokenAccountingMetric[] {
@@ -469,6 +634,7 @@ export class TokenAccountingService {
     this.#cache.clear();
     this.#cacheBytes = 0;
     this.#metrics.clear();
+    this.#calibrationFactors.clear();
   }
 
   #readCache(digest: string): TokenAccountingResult | undefined {
@@ -709,6 +875,9 @@ export function createTokenAccountingRequest(
       : {}),
     ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
     reservedOutputTokens,
+    ...(input.calibrationScope !== undefined && input.calibrationScope.length > 0
+      ? { calibrationScope: input.calibrationScope }
+      : {}),
   };
 }
 
@@ -753,6 +922,47 @@ export function assertTokenAccountingWithinContext(
       maxTokens: normalizedWindow,
     },
   );
+}
+
+const TOKEN_ACCOUNTING_CALIBRATION_KEY_DOMAIN = "agenc.token-accounting.calibration.v1";
+
+function calibrationKeyFor(
+  scope: string,
+  request: TokenAccountingRequest,
+): string {
+  return stableStringify({
+    domain: TOKEN_ACCOUNTING_CALIBRATION_KEY_DOMAIN,
+    scope,
+    provider: request.provider,
+    model: request.model,
+    endpoint: canonicalTokenEndpointIdentity(
+      request.endpointIdentity,
+      request.provider,
+    ),
+  });
+}
+
+function withCalibration(
+  result: TokenAccountingResult,
+  factor: number,
+): TokenAccountingResult {
+  const scaled = Math.ceil(
+    result.inputTokens * factor * TOKEN_ACCOUNTING_CALIBRATION_HEADROOM,
+  );
+  const inputTokens = Math.max(
+    result.inputTokens,
+    Math.min(Number.MAX_SAFE_INTEGER, scaled),
+  );
+  return {
+    ...result,
+    inputTokens,
+    totalTokens: safeTokenSum(inputTokens, result.reservedOutputTokens),
+    calibration: {
+      factor,
+      basisInputTokens: result.inputTokens,
+      headroom: TOKEN_ACCOUNTING_CALIBRATION_HEADROOM,
+    },
+  };
 }
 
 export function canonicalTokenEndpointIdentity(
@@ -809,9 +1019,29 @@ function prepareAccountingRequest(
   let promptIdentity: Readonly<Record<string, unknown>>;
   let cacheIdentity: Readonly<Record<string, unknown>>;
   let serializedCacheIdentity: string;
+  let messageProjection: PreparedMessageAccountingProjection;
   try {
     snapshot = snapshotAccountingRequest(request);
-    promptIdentity = promptIdentityForRequest(snapshot);
+    const normalizedMessages = prepareMessagesForWire(
+      snapshot.messages,
+      snapshot.options,
+    );
+    const toolResultImagePolicy =
+      chatCompletionsCapabilityHintsForProvider(
+        snapshot.provider,
+        snapshot.model,
+      ).toolResultImagePolicy;
+    messageProjection = projectMessagesForAccounting(
+      applyToolResultImagePolicyForWire(
+        normalizedMessages,
+        toolResultImagePolicy,
+      ),
+      maxRequestBytes,
+    );
+    promptIdentity = promptIdentityForRequest(
+      snapshot,
+      messageProjection.messages,
+    );
     cacheIdentity = cacheIdentityForRequest(
       snapshot,
       promptIdentity,
@@ -819,12 +1049,18 @@ function prepareAccountingRequest(
     );
     serializedCacheIdentity = stableStringify(cacheIdentity);
   } catch (error) {
+    if (error instanceof TokenAccountingError) throw error;
     throw new TokenAccountingError(
       "request_not_canonicalizable",
       `token accounting request is not canonicalizable: ${errorMessage(error)}`,
     );
   }
-  const requestBytes = utf8Length(serializedCacheIdentity);
+  // Preserve the original aggregate request bound even though inline Base64
+  // is replaced by a compact binary-media identity for token estimation and
+  // cache keys. Count every inline source occurrence, then add the projected
+  // request bytes. The small metadata overlap intentionally errs conservative.
+  const requestBytes =
+    utf8Length(serializedCacheIdentity) + messageProjection.inlineSourceBytes;
   if (requestBytes > maxRequestBytes) {
     throw new TokenAccountingError(
       "request_too_large",
@@ -838,7 +1074,11 @@ function prepareAccountingRequest(
   return {
     request: snapshot,
     digest,
-    fallback: conservativeFallbackResult(snapshot, promptIdentity),
+    fallback: conservativeFallbackResult(
+      snapshot,
+      promptIdentity,
+      messageProjection,
+    ),
   };
 }
 
@@ -883,12 +1123,19 @@ function snapshotAccountingRequest(
 
 function promptIdentityForRequest(
   request: TokenAccountingRequest,
+  projectedMessages: readonly unknown[],
 ): Readonly<Record<string, unknown>> {
   const options = request.options;
   return {
     version: TOKEN_ACCOUNTING_REQUEST_VERSION,
     system: options.systemPrompt ?? "",
-    messages: prepareMessagesForWire(request.messages, options),
+    // Inline images are binary media, not text. The projection keeps an exact
+    // digest and structural metadata without charging each Base64 character as
+    // a language token. Its wrapper cannot collide with a valid wire message.
+    messages: {
+      kind: "agenc_accounting_messages_v1",
+      entries: projectedMessages,
+    },
     tools: options.tools ?? [],
     providerNativeTools: request.providerNativeTools ?? [],
     toolChoice: options.toolChoice ?? null,
@@ -948,28 +1195,32 @@ function cacheIdentityForRequest(
 function conservativeFallbackResult(
   request: TokenAccountingRequest,
   promptIdentity: Readonly<Record<string, unknown>>,
+  messageProjection: PreparedMessageAccountingProjection,
 ): TokenAccountingResult {
   const inspection = inspectRequestContent(
-    request.messages,
+    messageProjection.wireMessages,
     request.options.tools,
     request.providerNativeTools,
     request.provider,
     request.options.promptCacheKey,
+    messageProjection.inlineImages,
   );
   const promptTokens = estimateUtf8TokenUnits(
     stableStringify(promptIdentity),
-    TOKEN_ACCOUNTING_CONSERVATIVE_BYTES_PER_TOKEN,
+    conservativeBytesPerToken(request.provider, request.model),
   );
   const frameTokens =
     TOKEN_ACCOUNTING_REQUEST_FRAME_TOKENS +
-    request.messages.length * TOKEN_ACCOUNTING_MESSAGE_FRAME_TOKENS +
+    messageProjection.wireMessages.length *
+      TOKEN_ACCOUNTING_MESSAGE_FRAME_TOKENS +
     ((request.options.tools?.length ?? 0) +
       (request.providerNativeTools?.length ?? 0)) *
       TOKEN_ACCOUNTING_TOOL_FRAME_TOKENS +
     (request.options.toolChoice === undefined
       ? 0
       : TOKEN_ACCOUNTING_TOOL_CHOICE_FRAME_TOKENS) +
-    inspection.mediaCount * TOKEN_ACCOUNTING_MEDIA_FRAME_TOKENS;
+    inspection.mediaCount * TOKEN_ACCOUNTING_MEDIA_FRAME_TOKENS +
+    inspection.imageTokens;
   const beforeMargin = safeTokenSum(promptTokens, frameTokens);
   const safetyMarginTokens = safetyMarginForTokens(beforeMargin);
   const inputTokens = Math.max(
@@ -1072,16 +1323,19 @@ function inspectRequestContent(
   providerNativeTools: readonly Readonly<Record<string, unknown>>[] | undefined,
   provider: string,
   promptCacheKey: string | undefined,
+  inlineImages: ReadonlyMap<string, InlineImageAccounting>,
 ): {
   readonly contentTypes: readonly TokenAccountingContentType[];
   readonly uncertainComponents: readonly string[];
   readonly mediaCount: number;
+  readonly imageTokens: number;
   readonly hasImages: boolean;
   readonly hasDocuments: boolean;
 } {
   const contentTypes = new Set<TokenAccountingContentType>();
   const uncertainComponents = new Set<string>();
   let mediaCount = 0;
+  let imageTokens = 0;
   let hasImages = false;
   let hasDocuments = false;
 
@@ -1125,6 +1379,15 @@ function inspectRequestContent(
         const url = part.image_url?.url?.trim() ?? "";
         if (isInlineDataUrl(url)) {
           contentTypes.add("image_inline");
+          const accounting = requireInlineImageAccounting(
+            inlineImages,
+            messageIndex,
+            partIndex,
+          );
+          imageTokens = safeTokenSum(
+            imageTokens,
+            accounting.tokens,
+          );
         } else {
           contentTypes.add("image_remote");
           uncertainComponents.add(
@@ -1141,6 +1404,15 @@ function inspectRequestContent(
           : {};
         if (source.type === "base64" && typeof source.data === "string") {
           contentTypes.add("image_inline");
+          const accounting = requireInlineImageAccounting(
+            inlineImages,
+            messageIndex,
+            partIndex,
+          );
+          imageTokens = safeTokenSum(
+            imageTokens,
+            accounting.tokens,
+          );
         } else {
           contentTypes.add("image_remote");
           uncertainComponents.add(
@@ -1175,6 +1447,7 @@ function inspectRequestContent(
     contentTypes: [...contentTypes].sort(),
     uncertainComponents: [...uncertainComponents].sort(),
     mediaCount,
+    imageTokens,
     hasImages,
     hasDocuments,
   };
@@ -1346,6 +1619,344 @@ function normalizeEndpointPath(pathname: string): string {
 
 function isInlineDataUrl(value: string): boolean {
   return /^data:image\/[a-z0-9.+-]+(?:;[^,]*)?;base64,/iu.test(value);
+}
+
+interface InlineImageData {
+  readonly mediaType: string;
+  readonly decodedBytes: number;
+  readonly width?: number;
+  readonly height?: number;
+}
+
+/**
+ * Conservative image-token estimate for inline image media.
+ *
+ * Qwen3.8/3.7/3.6 meter image input by 32x32 visual patches (+2 framing
+ * tokens), not by the size of its Base64 transport. The same projection is a
+ * safe local fallback for providers without a native preflight counter: known
+ * dimensions are bounded to the supported 4K-square envelope and unknown
+ * formats reserve that whole envelope.
+ */
+export function estimateInlineImageTokenUnits(dataUrl: string): number {
+  const sourceBytes = utf8Length(dataUrl);
+  assertInlineImageSourceWithinLimit(
+    sourceBytes,
+    MAX_TOKEN_ACCOUNTING_REQUEST_BYTES,
+  );
+  return imageTokenUnits(parseInlineImageDataUrl(dataUrl));
+}
+
+function imageTokenUnits(parsed: InlineImageData | undefined): number {
+  if (parsed?.width === undefined || parsed.height === undefined) {
+    return TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS;
+  }
+  const pixels = Math.min(
+    TOKEN_ACCOUNTING_MAX_IMAGE_PIXELS,
+    Math.max(
+      TOKEN_ACCOUNTING_MIN_IMAGE_PIXELS,
+      parsed.width * parsed.height,
+    ),
+  );
+  return Math.ceil(pixels / TOKEN_ACCOUNTING_IMAGE_PATCH_PIXELS) + 2;
+}
+
+function projectMessagesForAccounting(
+  wireMessages: readonly LLMMessage[],
+  maxRequestBytes: number,
+): PreparedMessageAccountingProjection {
+  const inlineImages = new Map<string, InlineImageAccounting>();
+  let inlineSourceBytes = 0;
+  const messages = wireMessages.map((message, messageIndex) => {
+    if (typeof message.content === "string") return message;
+    return {
+      ...message,
+      content: message.content.map((part, partIndex): unknown => {
+        if (part.type === "image_url") {
+          const url = part.image_url.url;
+          if (!isInlineDataUrl(url)) return part;
+          const accounting = createInlineImageAccounting(
+            url,
+            inlineSourceBytes,
+            maxRequestBytes,
+          );
+          inlineSourceBytes += accounting.sourceBytes;
+          inlineImages.set(
+            inlineImageLocation(messageIndex, partIndex),
+            accounting,
+          );
+          const { image_url: _wireImageUrl, ...rest } = part;
+          return {
+            ...rest,
+            accountingInlineImage: accounting.identity,
+          };
+        }
+        const providerPart = part as unknown as Record<string, unknown>;
+        if (providerPart.type !== "image" || !isPlainRecord(providerPart.source)) {
+          return part;
+        }
+        const source = providerPart.source;
+        if (source.type !== "base64" || typeof source.data !== "string") {
+          return part;
+        }
+        const mediaType =
+          typeof source.media_type === "string"
+            ? source.media_type
+            : "image/unknown";
+        const accounting = createInlineImageAccounting(
+          inlineImageDataUrl(mediaType, source.data),
+          inlineSourceBytes,
+          maxRequestBytes,
+        );
+        inlineSourceBytes += accounting.sourceBytes;
+        inlineImages.set(
+          inlineImageLocation(messageIndex, partIndex),
+          accounting,
+        );
+        const { source: _wireSource, ...rest } = providerPart;
+        return {
+          ...rest,
+          source: {
+            accountingInlineImage: accounting.identity,
+          },
+        };
+      }),
+    };
+  });
+  return {
+    wireMessages,
+    messages,
+    inlineImages,
+    inlineSourceBytes,
+  };
+}
+
+function createInlineImageAccounting(
+  dataUrl: string,
+  currentInlineSourceBytes: number,
+  maxRequestBytes: number,
+): InlineImageAccounting {
+  const sourceBytes = utf8Length(dataUrl);
+  assertInlineImageSourceWithinLimit(
+    sourceBytes,
+    maxRequestBytes - currentInlineSourceBytes,
+  );
+  const parsed = parseInlineImageDataUrl(dataUrl);
+  const digest = createHash("sha256")
+    .update("agenc-inline-image-identity-v1\0")
+    .update(dataUrl, "utf8")
+    .digest("hex");
+  return {
+    sourceBytes,
+    tokens: imageTokenUnits(parsed),
+    identity: {
+      kind: "agenc_inline_image_identity_v1",
+      sha256: digest,
+      sourceBytes,
+      mediaType: parsed?.mediaType ?? null,
+      decodedBytes: parsed?.decodedBytes ?? null,
+      width: parsed?.width ?? null,
+      height: parsed?.height ?? null,
+    },
+  };
+}
+
+function assertInlineImageSourceWithinLimit(
+  sourceBytes: number,
+  remainingBytes: number,
+): void {
+  if (sourceBytes <= remainingBytes) return;
+  throw new TokenAccountingError(
+    "request_too_large",
+    `inline image sources exceed the ${Math.max(0, remainingBytes)}-byte remaining request budget`,
+  );
+}
+
+function inlineImageLocation(messageIndex: number, partIndex: number): string {
+  return `${messageIndex}:${partIndex}`;
+}
+
+function requireInlineImageAccounting(
+  inlineImages: ReadonlyMap<string, InlineImageAccounting>,
+  messageIndex: number,
+  partIndex: number,
+): InlineImageAccounting {
+  const accounting = inlineImages.get(
+    inlineImageLocation(messageIndex, partIndex),
+  );
+  if (accounting !== undefined) return accounting;
+  throw new TokenAccountingError(
+    "request_not_canonicalizable",
+    "inline image accounting projection is inconsistent",
+  );
+}
+
+function inlineImageDataUrl(mediaType: string, payload: string): string {
+  return `data:${mediaType};base64,${payload}`;
+}
+
+function parseInlineImageDataUrl(dataUrl: string): InlineImageData | undefined {
+  const match = /^data:(image\/[a-z0-9.+-]+)(?:;[^,]*)?;base64,([a-z0-9+/_-]+={0,2})$/isu.exec(
+    dataUrl,
+  );
+  if (match === null) return undefined;
+  const mediaType = match[1]!.toLowerCase();
+  const payload = match[2]!;
+  const remainder = payload.length % 4;
+  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+  if (remainder === 1 || (padding > 0 && remainder !== 0)) return undefined;
+  const decodedBytes = Math.floor((payload.length * 3) / 4) - padding;
+  const headerChars = Math.min(
+    payload.length,
+    Math.floor((TOKEN_ACCOUNTING_IMAGE_HEADER_BYTES * 4) / 3 / 4) * 4,
+  );
+  const header = Buffer.from(payload.slice(0, headerChars), "base64");
+  const dimensions = imageDimensions(header, mediaType, decodedBytes);
+  return {
+    mediaType,
+    decodedBytes,
+    ...(dimensions ?? {}),
+  };
+}
+
+function imageDimensions(
+  bytes: Buffer,
+  mediaType: string,
+  decodedBytes: number,
+): { readonly width: number; readonly height: number } | undefined {
+  if (
+    mediaType === "image/png" &&
+    decodedBytes >= 33 &&
+    bytes.length >= 33 &&
+    bytes.subarray(0, 8).equals(
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    ) &&
+    bytes.readUInt32BE(8) === 13 &&
+    bytes.toString("ascii", 12, 16) === "IHDR" &&
+    crc32(bytes.subarray(12, 29)) === bytes.readUInt32BE(29) &&
+    validPngHeader(bytes)
+  ) {
+    return positiveDimensions(bytes.readUInt32BE(16), bytes.readUInt32BE(20));
+  }
+  if (mediaType === "image/jpeg" || mediaType === "image/jpg") {
+    return jpegDimensions(bytes);
+  }
+  if (mediaType === "image/webp") return webpDimensions(bytes, decodedBytes);
+  return undefined;
+}
+
+function validPngHeader(bytes: Buffer): boolean {
+  const bitDepth = bytes[24]!;
+  const colorType = bytes[25]!;
+  const validDepth =
+    (colorType === 0 && [1, 2, 4, 8, 16].includes(bitDepth)) ||
+    (colorType === 2 && [8, 16].includes(bitDepth)) ||
+    (colorType === 3 && [1, 2, 4, 8].includes(bitDepth)) ||
+    ((colorType === 4 || colorType === 6) && [8, 16].includes(bitDepth));
+  return (
+    validDepth &&
+    bytes[26] === 0 &&
+    bytes[27] === 0 &&
+    (bytes[28] === 0 || bytes[28] === 1)
+  );
+}
+
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function jpegDimensions(
+  bytes: Buffer,
+): { readonly width: number; readonly height: number } | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return undefined;
+  }
+  let offset = 2;
+  while (offset + 8 < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = bytes[offset + 1]!;
+    offset += 2;
+    if (marker === 0xd8 || marker === 0xd9 || marker === 0x01) continue;
+    if (offset + 2 > bytes.length) return undefined;
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) return undefined;
+    if (
+      ((marker >= 0xc0 && marker <= 0xc3) ||
+        (marker >= 0xc5 && marker <= 0xc7) ||
+        (marker >= 0xc9 && marker <= 0xcb) ||
+        (marker >= 0xcd && marker <= 0xcf)) &&
+      segmentLength >= 7
+    ) {
+      return positiveDimensions(
+        bytes.readUInt16BE(offset + 5),
+        bytes.readUInt16BE(offset + 3),
+      );
+    }
+    offset += segmentLength;
+  }
+  return undefined;
+}
+
+function webpDimensions(
+  bytes: Buffer,
+  decodedBytes: number,
+): { readonly width: number; readonly height: number } | undefined {
+  if (
+    bytes.length < 30 ||
+    bytes.toString("ascii", 0, 4) !== "RIFF" ||
+    bytes.toString("ascii", 8, 12) !== "WEBP" ||
+    bytes.readUInt32LE(4) + 8 !== decodedBytes
+  ) {
+    return undefined;
+  }
+  const chunk = bytes.toString("ascii", 12, 16);
+  if (chunk === "VP8X") {
+    return positiveDimensions(
+      1 + bytes.readUIntLE(24, 3),
+      1 + bytes.readUIntLE(27, 3),
+    );
+  }
+  if (chunk === "VP8L" && bytes.length >= 25 && bytes[20] === 0x2f) {
+    const bits = bytes.readUInt32LE(21);
+    return positiveDimensions(
+      (bits & 0x3fff) + 1,
+      ((bits >>> 14) & 0x3fff) + 1,
+    );
+  }
+  if (
+    chunk === "VP8 " &&
+    bytes.length >= 30 &&
+    bytes[23] === 0x9d &&
+    bytes[24] === 0x01 &&
+    bytes[25] === 0x2a
+  ) {
+    return positiveDimensions(
+      bytes.readUInt16LE(26) & 0x3fff,
+      bytes.readUInt16LE(28) & 0x3fff,
+    );
+  }
+  return undefined;
+}
+
+function positiveDimensions(
+  width: number,
+  height: number,
+): { readonly width: number; readonly height: number } | undefined {
+  return Number.isSafeInteger(width) &&
+    Number.isSafeInteger(height) &&
+    width > 0 &&
+    height > 0
+    ? { width, height }
+    : undefined;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

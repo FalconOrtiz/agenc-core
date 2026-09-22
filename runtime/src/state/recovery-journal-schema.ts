@@ -1,4 +1,9 @@
 import type { EventMsg } from "../session/event-log.js";
+import { RUN_RUNTIME_REASONING_EFFORTS } from "../contracts/run-contracts.js";
+import {
+  MAX_TURN_FAILURE_MESSAGE_LENGTH,
+  validFailureCode,
+} from "../contracts/turn-terminal.js";
 import type {
   RunResumeReason,
   RunRuntimeModelVerbosity,
@@ -14,6 +19,7 @@ import {
   type CompactionRolloutType,
 } from "../session/compaction-event-reader.js";
 import { validatePendingAdmissionFallbackSlice } from "../session/turn-checkpoint-slice.js";
+import { isAdmissionUsageSummary } from "../session/usage-summary.js";
 
 type KnownRolloutItem = Exclude<RolloutItem, { readonly type: "unknown" }>;
 type KnownRolloutType = KnownRolloutItem["type"];
@@ -105,6 +111,12 @@ const LEGACY_EVENT_TYPES = Object.freeze({
 
 const isString: Validator<string> = (value): value is string =>
   typeof value === "string";
+const isTurnFailureId: Validator<string> = (value): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+const isTurnFailureMessage: Validator<string> = (value): value is string =>
+  typeof value === "string" && value.length <= MAX_TURN_FAILURE_MESSAGE_LENGTH;
+const isTurnFailureTime: Validator<number> = (value): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
 const isRunSuspensionReason: Validator<RunSuspensionReason> = (
   value,
 ): value is RunSuspensionReason => value === "daemon_shutdown_idle";
@@ -122,15 +134,8 @@ const isRunRuntimePermissionMode: Validator<RunRuntimePermissionMode> = (
   value === "dontAsk" ||
   value === "auto" ||
   value === "unattended";
-const isRunRuntimeReasoningEffort: Validator<RunRuntimeReasoningEffort> = (
-  value,
-): value is RunRuntimeReasoningEffort =>
-  value === "minimal" ||
-  value === "low" ||
-  value === "medium" ||
-  value === "high" ||
-  value === "xhigh" ||
-  value === "none";
+const isRunRuntimeReasoningEffort: Validator<RunRuntimeReasoningEffort> =
+  oneOf(...RUN_RUNTIME_REASONING_EFFORTS);
 const isRunRuntimeModelVerbosity: Validator<RunRuntimeModelVerbosity> = (
   value,
 ): value is RunRuntimeModelVerbosity =>
@@ -159,6 +164,14 @@ const isNonNegativeInteger: Validator<number> = (value): value is number =>
 const isPositiveInteger: Validator<number> = (value): value is number =>
   Number.isSafeInteger(value) && (value as number) > 0;
 const isRecord: Validator<Record<string, unknown>> = isPlainRecord;
+/** Warning `details` values: flat facts a reader can print without recursion. */
+const isScalarOrNull: Validator<string | number | boolean | null> = (
+  value,
+): value is string | number | boolean | null =>
+  value === null ||
+  typeof value === "string" ||
+  typeof value === "boolean" ||
+  (typeof value === "number" && Number.isFinite(value));
 const isUnknown: Validator<unknown> = (_value): _value is unknown => true;
 const isNullableString = nullable(isString);
 const isStringArray = arrayOf(isString);
@@ -249,6 +262,12 @@ const isSessionAgentTask = objectShape({
   registeredAt: isString,
 });
 
+const isSessionMemoryExtractionState = objectShape({
+  memoryRoot: isString,
+  processedVisibleCount: isNonNegativeInteger,
+  turnsSinceLastExtraction: isNonNegativeInteger,
+});
+
 const isFileSystemSandboxPolicy = objectShape({
   allowWrite: isStringArray,
   denyWrite: isStringArray,
@@ -259,7 +278,7 @@ const isFileSystemSandboxPolicy = objectShape({
 const isCollaborationMode = objectShape(
   { model: isString },
   {
-    reasoningEffort: oneOf("low", "medium", "high", "xhigh", "none"),
+    reasoningEffort: isRunRuntimeReasoningEffort,
     developerInstructions: isString,
   },
 );
@@ -428,6 +447,7 @@ const isCheckpointSlice = objectShape(
   },
   {
     planToolRequiredRetryCount: isNonNegativeInteger,
+    completionGateRound: isNonNegativeInteger,
     editorToolCallsAdmitted: isNonNegativeInteger,
     pendingAdmissionFallback: isPendingAdmissionFallback,
     modelSampleOrdinal: isNonNegativeInteger,
@@ -460,6 +480,10 @@ const isCollabAgentRef = objectShape(
 );
 
 type AgentStatusPayload = EventPayload<"collab_agent_spawn_end">["status"];
+const isNativeWorkerTiming = objectShape(
+  { turnId: isString, startedAt: isNonNegativeInteger },
+  { endedAt: isNonNegativeInteger },
+);
 type CollabTaskStatus = Extract<
   EventPayload<"collab_agent_status">["status"],
   string
@@ -658,6 +682,14 @@ const isTurnCheckpoint: Validator<
   AllKeys<TurnCheckpointPayload>
 > = (value): value is TurnCheckpointPayload => isTurnCheckpointShape(value);
 
+const isSessionUsage: Validator<
+  EventPayload<"session_usage">,
+  AllKeys<EventPayload<"session_usage">>
+> = isAdmissionUsageSummary;
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
 const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
   session_meta: objectShape(
     {
@@ -674,6 +706,10 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       model: isString,
       modelProvider: isString,
       memoryMode: isString,
+      admissionOwner: objectShape(
+        { workspaceId: isNonEmptyString, runId: isNonEmptyString },
+        { parentRunId: isNonEmptyString },
+      ),
     },
   ),
   session_configured: objectShape(
@@ -817,8 +853,8 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
     { callId: isString, result: isString, isError: isBoolean },
     {
       toolName: isString,
-      editorInteractionId: isString,
       metadata: isRecord,
+      durationMs: isNumber,
     },
   ),
   tool_progress: objectShape(
@@ -837,6 +873,11 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       input: isRecord,
       planContent: isString,
       planFilePath: isString,
+      fileWritePreview: either(
+        objectShape({ kind: literal("existing"), content: isString }),
+        objectShape({ kind: literal("missing") }),
+        objectShape({ kind: literal("unavailable"), reason: isString }),
+      ),
       recordedAt: isString,
     },
   ),
@@ -927,6 +968,10 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
     },
   ),
   turn_aborted: objectShape({ reason: isString }, { turnId: isString }),
+  turn_failed: objectShape(
+    { turnId: isTurnFailureId, code: validFailureCode, message: isTurnFailureMessage },
+    { completedAt: isTurnFailureTime, durationMs: isTurnFailureTime },
+  ),
   turn_checkpoint: isTurnCheckpoint,
   turn_resumed: objectShape(
     {
@@ -935,6 +980,78 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       fromIteration: isNonNegativeInteger,
     },
     { haltedSideEffectingTools: isStringArray },
+  ),
+  goal_changed: objectShape(
+    {
+      goal: objectShape(
+        {
+          id: isNonEmptyString,
+          objective: isNonEmptyString,
+          verification: arrayOf(
+            objectShape({ label: isString, script: isNonEmptyString }),
+          ),
+          criteria: isStringArray,
+          constraints: isStringArray,
+          budget: objectShape(
+            { maxRounds: isPositiveInteger },
+            { maxCostUsd: isNumber, deadlineAt: isString },
+          ),
+          status: oneOf(
+            "active",
+            "paused",
+            "met",
+            "impossible",
+            "blocked",
+            "budget_exhausted",
+            "stalled",
+            "cleared",
+          ),
+          rounds: isNonNegativeInteger,
+          stalledRounds: isNonNegativeInteger,
+          startedAt: isString,
+          startCostUsd: isNumber,
+        },
+        {
+          baseCommit: isString,
+          pauseReason: isString,
+          lastVerdict: objectShape({
+            verdict: oneOf(
+              "met",
+              "not_met",
+              "impossible",
+              "blocked",
+              "verification_failed",
+            ),
+            reason: isString,
+            at: isString,
+          }),
+        },
+      ),
+      cause: oneOf("set", "round", "settled", "paused", "resumed", "cleared"),
+    },
+    { turnId: isString },
+  ),
+  completion_gate: objectShape(
+    {
+      turnId: isString,
+      round: isNonNegativeInteger,
+      maxRounds: isPositiveInteger,
+      outcome: oneOf("injected", "verified", "partial", "exhausted", "skipped"),
+      reason: oneOf(
+        "initial",
+        "no_verification",
+        "no_checklist",
+        "unmet_items",
+        "unavailable_unproven",
+        "verified_with_tools",
+        "unavailable_checks",
+        "rounds_exhausted",
+        "no_tool_use",
+        "deadline_reserve",
+      ),
+      toolCallsSinceInjection: isNonNegativeInteger,
+    },
+    { unmetItems: isStringArray },
   ),
   thread_rolled_back: objectShape(
     { numTurns: isNonNegativeInteger },
@@ -948,7 +1065,10 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
     { cause: isString, message: isString },
     { provider: isString, status: isNumber },
   ),
-  warning: objectShape({ cause: isString, message: isString }),
+  warning: objectShape(
+    { cause: isString, message: isString },
+    { turnId: isString, details: recordOf(isScalarOrNull) },
+  ),
   effect_intent: objectShape(
     {
       runId: isString,
@@ -964,6 +1084,7 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       formatVersion: literal(2),
       minimumReaderRuntime: isString,
       idempotencyKey: isString,
+      childRunId: isString,
     },
   ),
   effect_result: objectShape(
@@ -1149,6 +1270,7 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       details: isRecord,
     },
   ),
+  session_usage: isSessionUsage,
   guardian_assessment: objectShape(
     {
       id: isString,
@@ -1284,6 +1406,7 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       status: isAgentStatus,
     },
     {
+      timing: isNativeWorkerTiming,
       newThreadId: isString,
       newAgentPath: isString,
       newAgentNickname: isString,
@@ -1302,6 +1425,7 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
       status: isCollabStatus,
     },
     {
+      timing: isNativeWorkerTiming,
       agentPath: isString,
       agentNickname: isString,
       agentRole: isString,
@@ -1434,7 +1558,14 @@ const EVENT_PAYLOAD_VALIDATORS = defineEventPayloadValidators({
 
 const ROLLOUT_PAYLOAD_VALIDATORS = defineRolloutPayloadValidators({
   session_meta: EVENT_PAYLOAD_VALIDATORS.session_meta,
-  session_state: objectShape({}, { agentTask: isSessionAgentTask }),
+  session_state: objectShape(
+    {},
+    {
+      agentTask: isSessionAgentTask,
+      memoryExtraction: isSessionMemoryExtractionState,
+      userStop: objectShape({ stopped: isBoolean, generation: isNonNegativeInteger }),
+    },
+  ),
   response_item: isResponseItem,
   compacted: objectShape(
     { message: isString },

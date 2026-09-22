@@ -45,9 +45,10 @@ import {
   verifyCompactionPayloadManifestV1,
 } from "../services/compact/payload-manifest.js";
 import {
+  digestSourceWithDomain,
   digestWithDomain,
-  validateProgrammaticCompactionBodyV1,
   validateCompactionProvenance,
+  validateProgrammaticCompactionBodyV1,
   verifyCompactionSummaryDigest,
 } from "../services/compact/summary-v1.js";
 import { canonicalCompactionProjectionMessages } from "../services/compact/projection-digest.js";
@@ -864,7 +865,7 @@ function assertSummaryLeavesBindSource(
       last_history_index: active.history_index,
       contributing_ref_ids: [active.ref_id],
     }));
-    const expectedSha256 = digestWithDomain(COMPACTION_SOURCE_DIGEST_DOMAIN, {
+    const expectedSha256 = digestSourceWithDomain(COMPACTION_SOURCE_DIGEST_DOMAIN, {
       source_sha256: source.source_sha256,
       message_sources: messageSources,
     });
@@ -1000,7 +1001,7 @@ function readRollback(value: unknown): CompactionRollbackCommittedV1 {
   );
   const historyDigest = digest(record.history_digest, "history_digest");
   if (
-    digestWithDomain(
+    digestSourceWithDomain(
       COMPACTION_SOURCE_DIGEST_DOMAIN,
       canonicalCompactionProjectionMessages(sourceHistory),
     ) !== historyDigest
@@ -1384,7 +1385,7 @@ function readProjectionMessage(
     [
       "toolCalls", "toolCallId", "toolName", "id", "phase", "endTurn",
       "toolResultIntegrity", "agentInvocation",
-      "compactionHistory",
+      "compactionHistory", "providerReasoning",
     ],
     "replacement-history message",
   );
@@ -1410,6 +1411,9 @@ function readProjectionMessage(
   if (record.endTurn !== undefined && typeof record.endTurn !== "boolean") {
     throw malformed("replacement-history endTurn must be boolean");
   }
+  const providerReasoning = record.providerReasoning === undefined
+    ? undefined
+    : readProviderReasoningReplay(record.providerReasoning);
   if (record.toolResultIntegrity !== undefined) {
     if (toolCallId === undefined) {
       throw malformed("tool-result integrity requires toolCallId");
@@ -1433,6 +1437,7 @@ function readProjectionMessage(
     ...(id !== undefined ? { id } : {}),
     ...(phase !== undefined ? { phase } : {}),
     ...(record.endTurn !== undefined ? { endTurn: record.endTurn } : {}),
+    ...(providerReasoning !== undefined ? { providerReasoning } : {}),
     ...(record.toolResultIntegrity !== undefined
       ? { toolResultIntegrity: record.toolResultIntegrity as CompactionProjectionMessageV1["toolResultIntegrity"] }
       : {}),
@@ -1455,6 +1460,32 @@ function readProjectionMessage(
     }
   }
   return result;
+}
+
+function readProviderReasoningReplay(
+  value: unknown,
+): NonNullable<CompactionProjectionMessageV1["providerReasoning"]> {
+  const candidate = plainRecord(value, "provider reasoning replay");
+  if (candidate.version === 1) {
+    const record = exact(candidate, ["version", "content"]);
+    if (typeof record.content !== "string" || record.content.length === 0) {
+      throw malformed("provider reasoning content must be nonempty");
+    }
+    return { version: 1, content: record.content };
+  }
+  if (candidate.version === 2) {
+    const record = exact(candidate, ["version", "content", "provider", "model"]);
+    if (typeof record.content !== "string" || record.content.length === 0) {
+      throw malformed("provider reasoning content must be nonempty");
+    }
+    return {
+      version: 2,
+      content: record.content,
+      provider: text(record.provider, "provider reasoning provider"),
+      model: text(record.model, "provider reasoning model"),
+    };
+  }
+  throw malformed("unsupported provider reasoning replay version");
 }
 
 function readCompactionHistoryMarker(value: unknown): CompactionHistoryMarkerV1 {

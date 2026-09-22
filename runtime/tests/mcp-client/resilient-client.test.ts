@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ResilientMCPBridge } from "./resilient-client.js";
+import {
+  ResilientMCPBridge,
+  toToolCatalogPolicyConfig,
+} from "./resilient-client.js";
 import type { MCPToolBridgePermissionOptions } from "./tools.js";
 import type { MCPServerConfig, MCPToolBridge } from "./types.js";
 import { EMPTY_MCP_REQUEST_ENVIRONMENT } from "./environment.js";
+import { createToolEffectDispositionEvidence } from "../tools/effect-boundary.js";
 
 vi.mock("./connection.js", () => ({
   createMCPConnection: vi.fn(),
@@ -41,6 +45,51 @@ describe("ResilientMCPBridge", () => {
     vi.useRealTimers();
     vi.clearAllMocks();
   });
+
+  it("preserves a bound terminal receipt despite connection-like text in a result URL", async () => {
+    const effectDisposition = createToolEffectDispositionEvidence({ disposition: "confirmed_committed", evidenceKind: "provider_receipt", evidenceRef: "desktop-mcp:call:browser_navigate", evidenceMaterial: "observed terminal failure" });
+    const result = { isError: true, content: "Navigation finished at http://127.0.0.1/econnreset with a known error page", effectDisposition };
+    const inner = makeBridge("agenc-desktop-control", vi.fn().mockResolvedValue(result));
+    const bridge = new ResilientMCPBridge({ name: inner.serverName, command: "node" }, inner);
+    expect(await bridge.tools[0]!.execute({})).toBe(result);
+    expect(mockCreateMCPConnection).not.toHaveBeenCalled();
+    await bridge.dispose();
+  });
+
+  it.each(["default", "managed", "user"] as const)(
+    "propagates virtual non-filesystem write tools from %s authority",
+    (scope) => {
+      expect(toToolCatalogPolicyConfig({
+        name: "desktop",
+        command: "node",
+        origin: { scope },
+        virtual_no_fs_write_tools: ["browser_navigate"],
+      })).toMatchObject({
+        virtualNoFsWriteTools: ["browser_navigate"],
+      });
+    },
+  );
+
+  it.each([
+    "project",
+    "local",
+    "flag",
+    "profile",
+    "environment",
+    "cli",
+    "plugin",
+    "session",
+  ] as const)(
+    "does not propagate virtual non-filesystem write tools from %s authority",
+    (scope) => {
+      expect(toToolCatalogPolicyConfig({
+        name: "desktop",
+        command: "node",
+        origin: { scope },
+        virtual_no_fs_write_tools: ["browser_navigate"],
+      })).toBeUndefined();
+    },
+  );
 
   it("retries a rejected inner disposal and caches the successful retry", async () => {
     const cleanupError = new Error("owned client still alive");
@@ -276,9 +325,7 @@ describe("ResilientMCPBridge", () => {
 
   it("re-applies the catalog policy (pin + allow/deny + approval mode) on reconnect (#6)", async () => {
     vi.useFakeTimers();
-    // Catalog-policy fields live alongside MCPServerConfig but are not part of
-    // its public surface, mirroring how manager.ts forwards them.
-    const config = {
+    const config: MCPServerConfig = {
       name: "srv1",
       command: "npx",
       args: ["-y", "@test/srv1"],
@@ -286,8 +333,10 @@ describe("ResilientMCPBridge", () => {
       enabled_tools: ["safe_tool"],
       disabled_tools: ["dangerous_tool"],
       default_tools_approval_mode: "never",
+      virtual_no_fs_write_tools: ["browser_navigate"],
+      origin: { scope: "user" },
       pinnedCatalogSha256: "a".repeat(64),
-    } as unknown as MCPServerConfig;
+    };
 
     const initialBridge = makeBridge(
       "srv1",
@@ -318,6 +367,7 @@ describe("ResilientMCPBridge", () => {
       allowedTools: ["safe_tool"],
       deniedTools: ["dangerous_tool"],
       defaultToolsApprovalMode: "never",
+      virtualNoFsWriteTools: ["browser_navigate"],
     });
 
     await bridge.dispose();

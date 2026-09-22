@@ -29,6 +29,8 @@ import {
   xaiOauthTokensToBlob,
 } from "../utils/xaiOauthCredentials.js";
 import type { HomeContext } from "../config/home.js";
+import { providerAuthSelection, type ProviderAuthEnvironment } from "../llm/provider-auth-selection.js";
+import { resolveProviderApiKeyEnvironment } from "../llm/registry/provider-ingress.js";
 
 export type GrokAuthCliCommand =
   | { readonly kind: "login"; readonly json: boolean; readonly device: boolean }
@@ -45,6 +47,7 @@ export interface GrokAuthCliIo {
 
 export interface GrokAuthCliRuntime {
   readonly home: HomeContext;
+  readonly environment?: ProviderAuthEnvironment;
 }
 
 export function parseGrokAuthCliArgs(
@@ -95,6 +98,7 @@ export function formatGrokAuthCliHelpText(): string {
     "The consent screen may be labeled \"Grok Build\": that is xAI's shared",
     "CLI OAuth client. A stored sign-in wins over XAI_API_KEY / GROK_API_KEY",
     "while the selected provider is grok; logout returns to API-key billing.",
+    "Set GROK_AUTH_MODE=oauth or api-key to choose without signing out.",
     "",
     "Aliases: xai-login, xai-logout, xai-auth-status",
   ].join("\n");
@@ -127,6 +131,10 @@ export async function runGrokAuthCli(
       {
         ok: true,
         signedIn: existing !== undefined,
+        authSelection: providerAuthSelection("grok", runtime.environment ?? {}, {
+          oauth: Boolean(existing?.accessToken?.trim()) && existing?.quarantinedAt === undefined,
+          apiKey: resolveProviderApiKeyEnvironment("grok", runtime.environment ?? {}) !== undefined,
+        }),
         ...(existing?.accountLabel !== undefined
           ? { account: existing.accountLabel }
           : {}),

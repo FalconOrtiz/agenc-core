@@ -72,6 +72,20 @@ wrapper fields fail before commit.
 complete trusted wrapper with `summary_sha256` omitted. The response must finish
 with `stop`, satisfy the strict schema and provenance graph, fit the target
 context, save at least 1,024 tokens, and reduce tokens by at least 20 percent.
+The shrink measurement compares the request the model would actually be sent
+before and after: both histories pass through the same inline-image budget the
+sampling path applies (`AGENC_CONTEXT_IMAGE_BUDGET_BYTES`), never the raw
+history, which is capped at 16 MiB by token accounting and overflowed on a
+30-screenshot Terminal-Bench session. The summarizer itself never receives
+image bytes; media parts are placeholders in its projection.
+
+Payload bundles (`source_history`, `active_history_refs`, `final_summary`,
+`summary_dag`, `replacement_history`) are written as a chain of chunks, each
+under one 4 MiB canonical line, kind by kind. The strict reader accepts a
+kind's chunks back to back and refuses a kind switch while the previous kind is
+incomplete or a kind that resumes after another was written. It used to refuse
+the second chunk of the same kind, so any bundle over one line failed at
+commit as `durable compaction commit failed` (#2499).
 
 ### Failure, commit, and projection
 
@@ -80,6 +94,13 @@ injection, no-shrink, or commit-precondition failure leaves original history
 active and appends a typed, flushed `compaction_failed` event. If that failure
 event cannot be recorded, the pin remains for startup reconciliation. A
 deterministic extract may support diagnostics but can never replace history.
+The `compaction_failed` event carries only a digest of the detail; the
+readable cause travels in the turn's `auto_compact_failed` warning. A
+`commit_failed` wrap names the adapter's error (name, message, Node error
+code, syscall, path) and the commit's size facts in its message and as
+structured warning `details` (`runtime/src/services/compact/failure-details.ts`),
+so a disk-full write, a size cap, and a validation refusal are told apart
+after the fact.
 
 The loop guard permits at most two failed automatic attempts for the same source
 history/configuration digest. Restart reconstructs that guard; only changed
@@ -212,9 +233,9 @@ and `budget/admitted-model-call.ts`.
 | --- | --- | --- |
 | `/compact [focus]` | Manual. `querySource: "compact"`. Not gated by the disable env vars. | Error only. History stays as-is until a durable `compaction_committed`. |
 | Model-downshift pre-turn | Next turn after a switch to a smaller-window model (`maybeRunPreviousModelInlineCompact`). The previous slug differs, the old window is larger, and usage is greater than the new pre-sampling limit or at least the new window. Compacts against the **previous** model's context. | No-op continues the turn. Thrown errors propagate (`propagateErrors: true`). |
-| Pre-sampling auto | `autoCompactIfNeeded` when estimated tokens ≥ the safety threshold. | Increments `consecutiveFailures` on turn state even when tracking was never initialized. Three failures skip later autos this turn. User/provider abort does not count. |
-| Mid-turn sampling loop | Last sample `promptTokens` is at least the mid-turn outer limit and the turn still needs follow-up (tools, mailbox, or `needsFollowUp`). | A thrown error or a no-op compact terminates this turn with event cause `mid_turn_compact_failed`. A no-op compact puts `mid_turn_compact_skipped` in the event message. |
-| Post-tool follow-up | Last sample `promptTokens` is at least the same outer limit and tools still require follow-up. | The loop repeats only after a committed compact. A no-op result continues to the commit phase. |
+| Pre-sampling auto | `autoCompactIfNeeded` when estimated tokens ≥ the safety threshold. | Increments `consecutiveFailures` on turn state even when tracking was never initialized. Three failures skip later autos this turn. User/provider abort and safely deferred `no_shrink` do not count. |
+| Mid-turn sampling loop | Last sample `promptTokens` is at least the mid-turn outer limit and the turn still needs follow-up (tools, mailbox, or `needsFollowUp`). | A thrown error or no committed result ends the turn with `turn_failed`, code `compact_failed`, except a safely deferred `no_shrink`. A failed no-op puts `mid_turn_compact_skipped` in the warning message. |
+| Post-tool follow-up | The greater of the last sample's `promptTokens` and projected next-request tokens reaches the pre-sampling limit, and tools still require follow-up. | A committed compact restarts the loop. No committed result closes the turn with `turn_failed`, code `compact_failed`, except a safely deferred `no_shrink`. |
 
 Same-context callers serialize on a `WeakMap` (`compactConversation`). A
 second `/compact` or mid-turn auto against the same `CompactContext` awaits
@@ -277,10 +298,11 @@ Truthy values are `1`, `true`, `yes`, `on` (case-insensitive).
 outer gate can still require a compact. `autoCompactIfNeeded` then returns
 `wasCompacted: false`. The sampling loop terminates the turn with event cause
 `mid_turn_compact_failed` and a message that starts with
-`mid_turn_compact_skipped`. That close is a `warning` plus `compact_failed`,
-not run death. See [compact skip and session survival](#compact-skip-and-session-survival).
-The post-tool checkpoint does not terminate on that no-op. It continues to
-commit.
+`mid_turn_compact_skipped`. The kernel emits `turn_failed` with code
+`compact_failed` after the warning. Keep-alive sessions remain promptable.
+See [compact skip and session survival](#compact-skip-and-session-survival).
+The post-tool checkpoint also fails the turn when the gate requires
+compaction but no result commits, except a safely deferred `no_shrink`.
 
 Model-downshift can still enter the dispatcher when usage is at the new
 window even if `AGENC_DISABLE_AUTO_COMPACT` hid the pre-sampling limit.
@@ -288,18 +310,32 @@ window even if `AGENC_DISABLE_AUTO_COMPACT` hid the pre-sampling limit.
 
 ### Compact skip and session survival
 
-Mid-turn skip-or-throw and pre-sampling throw emit a session `warning`
+Mid-turn threshold failures and pre-sampling throws emit a session `warning`
 (causes `mid_turn_compact_failed` / `pre_sampling_compact_failed`) and
 close the turn with `stopReason: "compact_failed"`. They do not emit
-canonical `error`. Keep-alive daemon sessions stay promptable. The
-daemon-backed `--print` / `--no-tui` path currently maps the resulting
-`turn_complete` to exit code 0; the compatibility `runAgent` path with
-`keepAlive: false` reports failure. `--autonomous` keepalive
+canonical `error`. Every `compact_failed` stop emits canonical `turn_failed`
+with code `compact_failed`. Prepared-request fit checks can fail without
+a separate threshold warning.
+Keep-alive daemon sessions stay promptable. Daemon-backed `--print` /
+`--no-tui` exits 1, and the compatibility `runAgent` path with
+`keepAlive: false` reports failure. Keep-alive task receipts record
+`errored` before the worker returns to idle. `--autonomous` keepalive
 blocks further ticks after `compact_failed` (same as hard `error`).
 
 Pre-sampling no-op (`wasCompacted: false`) continues the turn. Mid-turn
-no-op after the outer gate is met does not; that is the skip path
-above. Post-tool no-op still continues to commit.
+and post-tool no-op after the outer gate is met fail the turn unless the
+failure is a safely deferred `no_shrink`.
+
+A typed `no_shrink` means the proposed summary did not meet the minimum
+reduction and durable history is unchanged. AgenC defers repeated advisory
+attempts and prepares the next full sampling request. It can continue only
+if that request fits the effective hard context window, including current
+instructions, visible schemas, tool results, and reserved output. Once the
+request is too large, AgenC attempts necessary compaction once, prepares
+the request again, and requires it to fit or emits `turn_failed` with code
+`compact_failed`. Other failures do not qualify for `no_shrink` deferral.
+Existing retry and pre-sampling failure handling remain in place, as do
+normal model-admission checks.
 
 Legacy live `type: "error"` records are diagnostic regardless of cause.
 `projectTelemetryErrorAsSessionOnly` in `background-agent-runner.ts` projects
@@ -322,6 +358,52 @@ Accepted output is still strict `CompactionSummaryV1`. Shrink must save at
 least **1,024** tokens and **20 percent**. Automatic compaction is suppressed
 after **two** durable `compaction_failed` rows for the same
 history/configuration digest; `/compact` (manual) is the explicit retry.
+
+### Compaction transaction wall budget
+
+`/compact` and every automatic transactional compact share one
+whole-transaction wall budget: **900 seconds**
+(`MAX_COMPACTION_WALL_MS` in `transaction-types.ts`). It is not a
+per-call timeout and is not an environment or `config.toml` override.
+
+The timer starts when `compactConversationTransactionally` creates the
+deadline, after the exclusive lease and admission scope. Two checks
+enforce it:
+
+1. Before each admitted summary call, `compactionWallTimeExceeded`
+   throws `wall_time_exceeded` once elapsed time is greater than 900 s.
+2. A `setTimeout` aborts the transaction controller with
+   `compaction exceeded its 900000 ms wall-clock deadline`. Admission
+   cancellation then uses cause `compaction_wall_time_exceeded`.
+
+The former 300 s bound cut off a measured grok-4.6 compaction of a
+~356k-token source at effort high (observed healthy calls 109–290 s).
+The current bound is three times that cutoff.
+
+On expiry:
+
+- Durable history stays unchanged. Only a flushed `compaction_committed`
+  replaces it.
+- After intent exists, the adapter records `compaction_failed` with
+  `reason: "wall_time_exceeded"`. A wall abort before intent is rethrown
+  without that durable row (PreCompact and planning sit on the same
+  timer).
+- The summarizer is given **5 seconds**
+  (`MAX_COMPACTION_ABORT_QUIESCENCE_MS`) to settle. If it does not, the
+  recorded reason becomes `recovery_interrupted`
+  (`compaction provider did not quiesce within 5000 ms after cancellation`).
+- Automatic compact is suppressed after **two** durable failures for the
+  same history/configuration digest. `/compact` remains the explicit
+  retry.
+- A thrown compact still follows the
+  [compact-skip session survival](#compact-skip-and-session-survival)
+  turn mapping.
+
+This bound is not the source-span rollback window. An active retention
+pin does not expire by wall clock. It is also not `provider_timeout`
+(that classify path is only for errors that are not already a
+`CompactionTransactionError`) and not `mid_turn_compact_skipped` (that
+is a no-op after the outer token gate).
 
 ### Rollback and retention
 
@@ -369,11 +451,12 @@ checkpoint. See [checkpoint prefix items](../durable-runs-effects-events.md#chec
 
 | Symptom | What to check |
 | --- | --- |
-| Event cause is `mid_turn_compact_failed` and its message starts with `mid_turn_compact_skipped` | The outer condition was met and compact returned no committed result. Check `AGENC_DISABLE_COMPACT`, the 3-strike counter, and the 2-failure digest guard. The event is a `warning`; the turn stop is `compact_failed`. |
-| Keep-alive session answers `no longer running (status: error)` after that warning | Unexpected after the warning remap. Confirm the event is `warning` (or a legacy `error` with `statusProjection: "session_only"`). The daemon-backed one-shot CLI exits 0 on the resulting `turn_complete`; the compatibility `runAgent` path fails. Autonomous keepalive ticks stop after `compact_failed` by design. See [daemon.md](../../reference/daemon.md#compact-skip-stays-per-turn). |
+| Event cause is `mid_turn_compact_failed` and its message starts with `mid_turn_compact_skipped` | The outer condition was met and compact returned no committed result. Check `AGENC_DISABLE_COMPACT`, the 3-strike counter, and the 2-failure digest guard. The warning is followed by canonical `turn_failed` with code `compact_failed`. |
+| Keep-alive session answers `no longer running (status: error)` after that warning | Unexpected. Current writers emit a compact warning and canonical `turn_failed` with code `compact_failed`; legacy diagnostic `error` events carry `statusProjection: "session_only"`. The daemon-backed one-shot CLI exits 1, and the compatibility `runAgent` path fails. Autonomous keepalive ticks stop after `compact_failed` by design. See [daemon.md](../../reference/daemon.md#compact-skip-stays-per-turn). |
 | Auto never runs, then the next turn is `context_window_exceeded` | Confirm the live window instead of assuming the 128k fallback. Above 13k, the threshold is `min(window-13k, 75%)`. Also check `AGENC_AUTOCOMPACT_PCT_OVERRIDE` and `AGENC_DISABLE_AUTO_COMPACT`. |
 | A post-compact checkpoint reports `compactionHistory requires prefix hash version 3` | The rollout pairs marker-bearing history with an old checkpoint or hash version. Preserve the rollout and let the schema upgrader validate the old checkpoint before rewriting it; do not edit the version fields by hand. |
 | After switching to a smaller-window model, the first turn overflows | Model-downshift only runs when the previous slug differs, the old window is larger, and usage is greater than the new pre-sampling limit or at least the new window. Three failed automatic attempts skip later ones this turn. `AGENC_DISABLE_AUTO_COMPACT` makes the compact return without changing history. |
+| Compact runs ~15 min then `compaction_failed` / `wall_time_exceeded` | The whole-transaction wall budget fired. Check the rollout `compaction_failed.reason`. History should be unchanged. Manual `/compact` retries; a second auto failure for the same digest is suppressed. Distinct from `provider_timeout` and from `mid_turn_compact_skipped`. If the reason is `recovery_interrupted` after 5 s, the summarizer ignored abort. See [compaction transaction wall budget](#compaction-transaction-wall-budget). |
 | A summary call includes a client or provider-native tool | This violates the summary-call contract. Summary calls must send an empty client catalog and an empty native-tool routing allowlist. Admission must account the same selected native catalog as the wire. |
 | History vanished after a failed compact | Only a flushed `compaction_committed` may replace active history. Any earlier replacement is a transaction bug and must not be treated as a commit. |
 | `/compact` says durable adapter unavailable | Compaction requires the canonical rollout owner (`readCompactionTransactionAdapter`). There is no character-extract fallback. |

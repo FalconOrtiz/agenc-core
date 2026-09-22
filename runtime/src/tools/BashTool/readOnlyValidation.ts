@@ -15,6 +15,7 @@ import {
   DOCKER_READ_ONLY_COMMANDS,
   EXTERNAL_READONLY_COMMANDS,
   type FlagArgType,
+  GH_READ_ONLY_COMMANDS,
   GIT_READ_ONLY_COMMANDS,
   PYRIGHT_READ_ONLY_COMMANDS,
   RIPGREP_READ_ONLY_COMMANDS,
@@ -29,6 +30,7 @@ import {
   type PathCommand,
 } from './pathValidation.js'
 import { sedCommandIsAllowedByAllowlist } from './sedValidation.js'
+import { MACOS_READ_ONLY_COMMANDS } from './macosReadOnlyCommands.js'
 
 // Unified command validation configuration system
 type CommandConfig = {
@@ -161,6 +163,13 @@ const COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
   },
   // All git read-only commands from shared validation map
   ...GIT_READ_ONLY_COMMANDS,
+  /* The same curated gh listing surface the PowerShell validator has consulted
+     all along. It was defined beside the git map and imported by only one of
+     the two shells, so `gh pr list` fell through to "no opinion" here while
+     `git log` was allowed. Each entry carries its own safe-flag allowlist and
+     the shared dangerous-argument callback, so this admits the listed
+     subcommands and nothing else: `gh pr merge` is not in the map. */
+  ...GH_READ_ONLY_COMMANDS,
   file: {
     safeFlags: {
       // Output format flags
@@ -1142,6 +1151,9 @@ const COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
 
 function getCommandAllowlist(): Record<string, CommandConfig> {
   let allowlist: Record<string, CommandConfig> = COMMAND_ALLOWLIST
+  if (getPlatform() === 'macos') {
+    allowlist = { ...allowlist, ...MACOS_READ_ONLY_COMMANDS }
+  }
   // On Windows, xargs can be used as a data-to-code bridge: if a file contains
   // a UNC path, `cat file | xargs cat` feeds that path to cat, triggering SMB
   // resolution. Since the UNC path is in file contents (not the command string),

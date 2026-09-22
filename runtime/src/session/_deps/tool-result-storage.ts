@@ -1,7 +1,6 @@
 /**
- * Content-replacement state — port of AgenC
- * `utils/toolResultStorage.ts::ContentReplacementState` adapted to gut's
- * flat `LLMMessage` shape.
+ * Content-replacement state for tool results, keyed on the flat
+ * `LLMMessage` shape.
  *
  * Implements I-88 in-memory invariants:
  *   - `seenIds`: every tool-call id whose tool-role message has passed
@@ -101,10 +100,8 @@ function reconstructContentReplacementState(
 
 /**
  * Provision replacement state at turn-state-build time. Mirrors
- * agenc `provisionContentReplacementState` minus the GrowthBook
- * gate (gut runs the budget unconditionally — there is no
- * `tengu_hawthorn_steeple` flag in this runtime, so the feature is
- * always on for I-88 compliance).
+ * `provisionContentReplacementState` without a remote gate: the budget
+ * runs unconditionally, so the feature is always on (I-88).
  *
  *   - No priorMessages → fresh state.
  *   - priorMessages present → reconstruct so prior unreplaced results

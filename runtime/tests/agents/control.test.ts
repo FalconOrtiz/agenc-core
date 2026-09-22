@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
+import { createEmptyToolPermissionContext } from "../../src/permissions/types.js";
+import { createMultiAgentV2Tools } from "../../src/agents/v2/index.js";
+import { injectChildToolArgs } from "../../src/agents/run-agent.js";
 import {
   AgentControl,
   AgentAssignmentRejectedError,
@@ -159,6 +162,99 @@ afterEach(() => {
 });
 
 describe("AgentControl", () => {
+  it("preserves actual turn timing when interrupting a worker by its thread ID", async () => {
+    const session = stubSession();
+    const control = new AgentControl({ session, registry: new AgentRegistry() });
+    control.registerSessionRoot(session.conversationId);
+    const worker = await control.spawn({ parentPath: "/root" });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    try {
+      worker.status.markRunning("executing-turn");
+      clock.mockReturnValue(130_000);
+      control.interrupt(worker.agentId, "user_cancel");
+      expect(worker.status.value).toMatchObject({ status: "interrupted", turnId: "executing-turn" });
+      clock.mockReturnValue(200_000);
+      worker.status.markInterrupted("executing-turn", "user_cancel");
+      expect(control.snapshotNativeWorkers(session.conversationId)[0]?.timing)
+        .toEqual({ turnId: "executing-turn", startedAt: 100_000, endedAt: 130_000 });
+    } finally {
+      clock.mockRestore();
+      await control.shutdownAll();
+    }
+  });
+
+  it("snapshots only current native descendants of the requested parent, including idle workers", async () => {
+    const session = stubSession();
+    const control = new AgentControl({ session, registry: new AgentRegistry(), maxDepth: 3 });
+    control.registerSessionRoot(session.conversationId);
+    const parent = await control.spawn({ parentPath: "/root" });
+    const sibling = await control.spawn({ parentPath: "/root" });
+    const child = await control.spawn({ parentPath: parent.agentPath });
+    parent.status.markRunning("parent-turn");
+    parent.status.markIdle("parent-turn");
+    child.status.markRunning("child-turn");
+    child.toolCallCount = 4;
+    child.tokenUsage.totalTokens = 321;
+    expect(control.snapshotNativeWorkers(parent.agentId)).toEqual([
+      expect.objectContaining({ agentId: child.agentId, status: "running", toolUseCount: 4, tokenCount: 321 }),
+    ]);
+    expect(control.snapshotNativeWorkers(session.conversationId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: parent.agentId, status: "idle" }),
+      expect.objectContaining({ agentId: sibling.agentId, status: "pending_init" }),
+    ]));
+    expect(control.snapshotNativeWorkers("unrelated-parent")).toEqual([]);
+    await control.closeAgent(child.agentId);
+    expect(control.snapshotNativeWorkers(parent.agentId)).toEqual([]);
+    expect(control.snapshotNativeWorkers(session.conversationId)).toHaveLength(2);
+    await control.shutdownAll();
+  });
+
+  it("retains planning authority through a live nested spawn after YOLO, without restricting an ordinary verification sibling", async () => {
+    const session = stubSession();
+    let context = createEmptyToolPermissionContext({ mode: "plan" });
+    Object.assign(session, { permissionModeRegistry: { current: () => context } });
+    const registry = new AgentRegistry();
+    const control = new AgentControl({ session, registry, maxDepth: 3 });
+    const inspector = await control.spawn({ parentPath: "/root", roleName: "default" });
+    expect(inspector.metadata.executionConstraint).toMatchObject({ kind: "read-only", ownerThreadId: session.conversationId });
+    context = createEmptyToolPermissionContext({ mode: "bypassPermissions" });
+    const descendant = await control.spawn({ parentPath: inspector.agentPath, roleName: "verification" });
+    const sibling = await control.spawn({ parentPath: "/root", roleName: "verification" });
+    expect(descendant.metadata.executionConstraint).toEqual(inspector.metadata.executionConstraint);
+    expect(sibling.metadata.executionConstraint).toBeUndefined();
+  });
+
+  it("restores a persisted planning constraint even under a writable current parent", async () => {
+    const session = stubSession();
+    let context = createEmptyToolPermissionContext({ mode: "plan" });
+    Object.assign(session, { permissionModeRegistry: { current: () => context } });
+    const registry = new AgentRegistry();
+    const control = new AgentControl({ session, registry });
+    const inspector = await control.spawn({ parentPath: "/root", roleName: "default" });
+    context = createEmptyToolPermissionContext({ mode: "bypassPermissions" });
+    const recovered = await control.spawn({ parentPath: "/root", expectedRoleProvenance: JSON.parse(JSON.stringify(inspector.metadata)) });
+    expect(recovered.metadata.executionConstraint).toEqual(inspector.metadata.executionConstraint);
+  });
+
+  it("uses the signed child sender's readonly authority in root-owned coordinator closures", async () => {
+    const session = stubSession();
+    let context = createEmptyToolPermissionContext({ mode: "plan" });
+    Object.assign(session, { permissionModeRegistry: { current: () => context } });
+    const registry = new AgentRegistry();
+    const control = new AgentControl({ session, registry, maxDepth: 3 });
+    const inspector = await control.spawn({ parentPath: "/root", roleName: "default" });
+    context = createEmptyToolPermissionContext({ mode: "bypassPermissions" });
+    const writer = await control.spawn({ parentPath: "/root", roleName: "default" });
+    const tools = createMultiAgentV2Tools({ getSession: () => session, workspace: control.roleWorkspace, roleCatalog: control.roleCatalog, ensureAgentControl: () => ({ control, registry }) });
+    for (const name of ["send_message", "assign_task", "close_agent"]) {
+      const tool = tools.find((candidate) => candidate.name === name)!;
+      const args = injectChildToolArgs({ target: writer.agentPath, ...(name !== "close_agent" ? { message: "change something" } : {}) }, name, { childConversationId: inspector.agentId });
+      const result = await tool.execute(args);
+      expect(result.isError, result.content).toBe(true);
+      expect(result.content).toContain("own constrained descendants");
+    }
+  });
+
   it("spawn() produces a LiveAgent with allocated path + nickname", async () => {
     const session = stubSession();
     const registry = new AgentRegistry();

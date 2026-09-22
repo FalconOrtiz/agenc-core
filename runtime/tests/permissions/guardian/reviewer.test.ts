@@ -12,6 +12,7 @@ import {
   createDefaultGuardianApprovalReviewer,
   GUARDIAN_PREFERRED_MODEL,
   parseGuardianAssessment,
+  PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
 } from "./reviewer.js";
 import { PermissionModeRegistry } from "../permission-mode.js";
 import { createEmptyToolPermissionContext } from "../types.js";
@@ -592,6 +593,48 @@ describe("guardian approval reviewer", () => {
     const result = await promise;
 
     expect(result.decision.kind).toBe("approved");
+  });
+
+  it("the deadline production runs under expires into a timeout, never a denial", async () => {
+    // Production wires this deadline (bootstrap-services) precisely so a dead
+    // provider socket cannot park an approval the user is waiting on. The
+    // expiry has to land on the reviewer's own `timed_out` path: fails closed,
+    // tells the agent it may retry or ask, and leaves the rejection circuit
+    // breaker alone. A stalled socket rendered as "rejected due to
+    // unacceptable risk" would be a safety verdict nobody reached.
+    vi.useFakeTimers();
+    const { session, breaker } = mkSession({
+      provider: mkProvider({
+        content: ALLOW_ASSESSMENT,
+        delayMs: PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS * 2,
+      }),
+    });
+    const turn = newDefaultTurnWithSubId(session, "turn-production-deadline");
+    const reviewer = createDefaultGuardianApprovalReviewer({
+      timeoutMs: PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+    });
+    expect(reviewer.reviewTimeoutMs).toBe(
+      PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+    );
+
+    const promise = reviewer.reviewApprovalRequest({
+      ctx: mkApprovalCtx(session, turn),
+      args: { path: "file.txt", content: "ok" },
+    });
+    await vi.advanceTimersByTimeAsync(
+      PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS,
+    );
+    await vi.advanceTimersByTimeAsync(600);
+    const result = await promise;
+    vi.useRealTimers();
+
+    expect(result.decision.kind).toBe("timed_out");
+    expect(result.countedDenial).toBe(false);
+    expect(result.reason ?? "").not.toContain("unacceptable risk");
+    expect(breaker.peek("turn-production-deadline")).toMatchObject({
+      consecutiveDenials: 0,
+      totalDenials: 0,
+    });
   });
 
   it("timeout fails closed without counting as a breaker denial", async () => {

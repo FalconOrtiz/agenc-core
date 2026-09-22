@@ -1,20 +1,18 @@
 /**
- * Ports the donor runtime's `request_user_input` tool schema,
- * mode-gating, and argument normalization onto AgenC model-facing tools.
+ * The `request_user_input` tool schema, mode-gating, and argument
+ * normalization for AgenC model-facing tools.
  *
- * Why this lives here / shape difference from upstream:
- *   - The donor tool handler calls directly into a session method. AgenC
- *     keeps the same call boundary, but exposes it through the generic
- *     `Tool` interface used by `runtime/src/bin/model-facing-tools.ts`.
- *
- * Cross-cuts deliberately NOT carried:
- *   - Provider-specific tool declaration objects. The registry converts
+ * Design notes:
+ *   - The tool handler calls into a session method, exposed through the
+ *     generic `Tool` interface used by `runtime/src/bin/model-facing-tools.ts`.
+ *   - Provider-specific tool declaration objects are not built here. The registry converts
  *     AgenC `Tool` objects into provider declarations later.
  *
  * @module
  */
 
 import type { Tool, ToolResult } from "../tools/types.js";
+import { preEffectRefusal } from "../tools/results.js";
 import { safeStringify, type ToolExecutionInjectedArgs } from "../tools/types.js";
 import type {
   ManagedFeatures,
@@ -66,6 +64,9 @@ function json(content: unknown, isError?: boolean): ToolResult {
     ...(isError ? { isError: true } : {}),
   };
 }
+
+const refuse = (message: string): ToolResult =>
+  preEffectRefusal("request_user_input", message);
 
 function err(message: string): ToolResult {
   return json({ error: message }, true);
@@ -300,16 +301,16 @@ export function createRequestUserInputTool(
     async execute(args: Record<string, unknown>): Promise<ToolResult> {
       const liveSession = opts.getSession();
       if (liveSession === null) {
-        return err("request_user_input requires an active session");
+        return refuse("request_user_input requires an active session");
       }
       if (isSubagentSession(liveSession.sessionConfiguration.sessionSource)) {
-        return err("request_user_input can only be used by the root thread");
+        return refuse("request_user_input can only be used by the root thread");
       }
       const modes = requestUserInputAvailableModes(liveSession.features);
       const mode = liveSession.permissionModeRegistry.current().mode;
       const unavailable = requestUserInputUnavailableMessage(mode, modes);
       if (unavailable !== null) {
-        return err(unavailable);
+        return refuse(unavailable);
       }
 
       let normalized: RequestUserInputArgs;

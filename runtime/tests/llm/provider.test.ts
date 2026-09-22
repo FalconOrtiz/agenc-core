@@ -404,6 +404,9 @@ describe("createProvider", () => {
         OPENROUTER_BASE_URL: undefined,
         GROQ_BASE_URL: undefined,
         DEEPSEEK_BASE_URL: undefined,
+        CEREBRAS_BASE_URL: undefined,
+        ZAI_BASE_URL: undefined,
+        ZAI_CODING_PLAN_BASE_URL: undefined,
         GEMINI_BASE_URL: undefined,
         MISTRAL_BASE_URL: undefined,
         NVIDIA_BASE_URL: undefined,
@@ -423,6 +426,9 @@ describe("createProvider", () => {
         OPENROUTER_API_KEY: undefined,
         GROQ_API_KEY: undefined,
         DEEPSEEK_API_KEY: undefined,
+        CEREBRAS_API_KEY: undefined,
+        ZAI_API_KEY: undefined,
+        ZAI_CODING_PLAN_API_KEY: undefined,
         GEMINI_API_KEY: undefined,
         MISTRAL_API_KEY: undefined,
         NVIDIA_API_KEY: undefined,
@@ -1573,7 +1579,7 @@ describe("createProvider", () => {
     expect(provider).toBeInstanceOf(AnthropicProvider);
     expect(
       (provider as unknown as { config: { model: string } }).config.model,
-    ).toBe("claude-opus-4-7");
+    ).toBe("claude-opus-5");
   });
 
   test("routes 'ollama' to OllamaProvider and strips a trailing /v1 host suffix", () => {

@@ -4,10 +4,7 @@
  * --approval-policy). Previously stripRoutingFlags removed each such flag AND
  * its following value before the residue became the prompt, so the user's
  * intent (e.g. the fork target) silently vanished with no behavior change and
- * no feedback. After the fix these flags fall through as visible prompt text.
- *
- * Each test below fails if the fix is reverted (the flag+value is swallowed,
- * leaving an empty prompt) and passes with it (the flag text is preserved).
+ * no feedback.
  */
 
 import { describe, expect, it } from "vitest";
@@ -34,29 +31,22 @@ describe("gaphunt3 #37: unconsumed value flags are no longer silently swallowed"
     expect(stripRoutingFlags([flag, value])).toEqual([flag, value]);
   });
 
-  it("classifyCLI('agenc --fork <id>') preserves the fork id as prompt text instead of dropping it", () => {
+  it("classifyCLI rejects unsupported fork options instead of sending a prompt", () => {
     const plan = classifyCLI({
       argv: [NODE, SCRIPT, "--fork", "conv-abc123"],
       isTTY: true,
       isStdoutTTY: true,
     });
-    // Must be a bootTUI plan that still carries the user's intent. Before the
-    // fix this was a bootTUI plan with NO initialPrompt (fork id swallowed).
-    expect(plan.kind).toBe("bootTUI");
-    if (plan.kind !== "bootTUI") throw new Error("expected bootTUI plan");
-    expect(plan.args.initialPrompt).toBe("--fork conv-abc123");
+    expect(plan).toMatchObject({ kind: "errorAndExit", exitCode: 2 });
   });
 
-  it("classifyCLI('agenc --sandbox strict \"do X\"') keeps both the flag/value and the real prompt", () => {
+  it("classifyCLI rejects unsupported sandbox options instead of sending a prompt", () => {
     const plan = classifyCLI({
       argv: [NODE, SCRIPT, "--sandbox", "strict", "do", "X"],
       isTTY: true,
       isStdoutTTY: true,
     });
-    expect(plan.kind).toBe("bootTUI");
-    if (plan.kind !== "bootTUI") throw new Error("expected bootTUI plan");
-    // Before the fix "--sandbox strict" was swallowed, leaving "do X".
-    expect(plan.args.initialPrompt).toBe("--sandbox strict do X");
+    expect(plan).toMatchObject({ kind: "errorAndExit", exitCode: 2 });
   });
 
   it("still strips genuinely-consumed value flags (--model, --provider, --config, --resume)", () => {
@@ -116,17 +106,65 @@ describe("gaphunt3 #37: unconsumed value flags are no longer silently swallowed"
   });
 });
 
-describe("todo-122: --continue requires a TTY (mirror --resume)", () => {
-  it("rejects -c in a non-TTY context", () => {
+describe("todo-122: --continue and --resume outside a TTY take the one-shot path", () => {
+  it("routes -c in a non-TTY context to a one-shot continue of the latest session", () => {
     const plan = classifyCLI({
       argv: [NODE, SCRIPT, "-c"],
       isTTY: false,
       isStdoutTTY: false,
     });
-    expect(plan.kind).toBe("errorAndExit");
-    if (plan.kind !== "errorAndExit") throw new Error("expected error");
-    expect(plan.message).toMatch(/--continue requires an interactive terminal/);
-    expect(plan.exitCode).toBe(2);
+    expect(plan).toEqual({
+      kind: "oneShotCLI",
+      userMessage: "",
+      continueSession: { kind: "latest" },
+    });
+  });
+
+  it("routes -c -p <prompt> to a one-shot continue with the prompt intact, even in a TTY", () => {
+    expect(
+      classifyCLI({
+        argv: [NODE, SCRIPT, "-c", "-p", "add a", "clamp"],
+        isTTY: true,
+        isStdoutTTY: true,
+      }),
+    ).toEqual({
+      kind: "oneShotCLI",
+      userMessage: "add a clamp",
+      continueSession: { kind: "latest" },
+    });
+    expect(
+      classifyCLI({
+        argv: [NODE, SCRIPT, "--continue", "--no-tui", "next step"],
+        isTTY: true,
+        isStdoutTTY: true,
+      }),
+    ).toMatchObject({
+      kind: "oneShotCLI",
+      userMessage: "next step",
+      continueSession: { kind: "latest" },
+    });
+  });
+
+  it("routes --resume <id> -p <prompt> to a one-shot continue of that session", () => {
+    expect(
+      classifyCLI({
+        argv: [NODE, SCRIPT, "--resume", "conv-abc123", "-p", "finish it"],
+        isTTY: false,
+        isStdoutTTY: false,
+      }),
+    ).toEqual({
+      kind: "oneShotCLI",
+      userMessage: "finish it",
+      continueSession: { kind: "resume", sessionId: "conv-abc123" },
+    });
+    // The TTY resume path is unchanged when no headless flag is present.
+    expect(
+      classifyCLI({
+        argv: [NODE, SCRIPT, "-r", "conv-abc123"],
+        isTTY: true,
+        isStdoutTTY: true,
+      }),
+    ).toEqual({ kind: "resumeTUI", args: { resumeId: "conv-abc123" } });
   });
 
   it("accepts -c in a TTY", () => {

@@ -1,8 +1,10 @@
+import { withPromotionWalletAmounts } from "../promotion-allowance.js";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type {
   AuthBackend,
+  AuthAgencModel,
   AuthIdentity,
   AuthInferAgencModelParams,
   AuthInferredAgencModel,
@@ -34,6 +36,8 @@ import {
   type RemoteBearerCredential,
 } from "../native-credentials.js";
 import { getProxyFetchOptions } from "../../utils/proxy.js";
+import { normalizePilotAccess } from "../pilot-access.js";
+import { parseAgencModelCatalog } from "../account-access.js";
 
 const DEFAULT_REMOTE_AUTH_KEY_VENDING_URL =
   "https://id.agenc.ag/v1/auth/llm-credential" as const;
@@ -62,6 +66,7 @@ const REMOTE_AUTH_TOKEN_ENV = "AGENC_REMOTE_AUTH_TOKEN" as const;
 const REMOTE_AUTH_STATE_FILENAME = "auth.json" as const;
 const REMOTE_AUTH_STATE_VERSION = 1 as const;
 const REMOTE_AUTH_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
+const REMOTE_AUTH_REQUEST_TIMEOUT_MS = 30_000;
 const REMOTE_AUTH_MIN_LOGIN_POLL_INTERVAL_MS = 5_000;
 const REMOTE_AUTH_STATE_VERIFY_MAX_ATTEMPTS = 3;
 const REMOTE_AUTH_STATE_LOCK_OPTIONS = {
@@ -168,6 +173,7 @@ export interface RemoteAuthBackendOptions {
   readonly sleepMs?: (ms: number) => Promise<void>;
   readonly tierEndpoint?: string;
   readonly usageEndpoint?: string;
+  readonly modelsEndpoint?: string;
   readonly token?: string;
 }
 
@@ -187,6 +193,7 @@ export class RemoteAuthBackend implements AuthBackend {
   readonly #modelInferer: RemoteAuthModelInferer;
   readonly #subscriptionTierResolver: RemoteAuthSubscriptionTierResolver;
   readonly #llmUsageResolver: RemoteAuthLlmUsageResolver;
+  readonly #listAgencModels: () => Promise<readonly AuthAgencModel[]>;
   readonly #managedKeysEnabled: boolean;
   readonly #keyCacheTtlMs: number;
   readonly #now: () => Date;
@@ -222,6 +229,7 @@ export class RemoteAuthBackend implements AuthBackend {
     this.#llmUsageResolver =
       scopedOptions.llmUsageResolver ??
       createHttpRemoteAuthLlmUsageResolver(scopedOptions, this.#home);
+    this.#listAgencModels = createHttpAgencModelCatalogResolver(scopedOptions, this.#home);
     this.#managedKeysEnabled = scopedOptions.managedKeysEnabled === true;
     this.#keyCacheTtlMs = positiveTtlMs(scopedOptions.keyCacheTtlMs);
     this.#now = scopedOptions.now ?? (() => new Date());
@@ -232,6 +240,8 @@ export class RemoteAuthBackend implements AuthBackend {
   authFile(): string {
     return this.#authFilePath;
   }
+
+  get managedKeysEnabled(): boolean { return this.#managedKeysEnabled; }
 
   async login(params: AuthLoginParams = {}): Promise<AuthLoginResult> {
     const result = normalizeRemoteAuthLoginResult(
@@ -431,6 +441,10 @@ export class RemoteAuthBackend implements AuthBackend {
     params: AuthSessionRef = {},
   ): Promise<AuthLlmUsage> {
     return this.#requestLlmUsage(params);
+  }
+
+  async listAgencModels(): Promise<readonly AuthAgencModel[]> {
+    return this.#listAgencModels();
   }
 
   async #requestVendedKey(
@@ -857,6 +871,28 @@ function createHttpRemoteAuthLlmUsageResolver(
   };
 }
 
+function createHttpAgencModelCatalogResolver(
+  options: RemoteAuthBackendOptions,
+  home: HomeContext,
+): () => Promise<readonly AuthAgencModel[]> {
+  const env = options.env ?? process.env;
+  const usageEndpoint = trimNonEmpty(options.usageEndpoint) ??
+    trimNonEmpty(env[REMOTE_AUTH_USAGE_URL_ENV]) ?? DEFAULT_REMOTE_AUTH_USAGE_URL;
+  const endpoint = trimNonEmpty(options.modelsEndpoint) ??
+    new URL("./openrouter/v1/models", usageEndpoint).toString();
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch?.bind(globalThis);
+  return async () => {
+    const token = await resolveRemoteAuthToken(options, home);
+    if (token === undefined) return [];
+    if (fetchImpl === undefined) throw new Error("AgenC model discovery requires fetch");
+    const response = await remoteAuthFetch(fetchImpl, endpoint, {
+      method: "GET", headers: remoteAuthJsonHeaders(token), redirect: "error",
+    }, "model catalog", env, options.fetchImpl === undefined);
+    if (!response.ok) throw new Error(`AgenC model discovery failed with HTTP ${response.status}`);
+    return parseAgencModelCatalog(await readRemoteAuthJsonResponse(response, "model catalog"));
+  };
+}
+
 function remoteAuthJsonHeaders(
   token: string | undefined,
 ): Record<string, string> {
@@ -874,10 +910,14 @@ async function remoteAuthFetch(
   environment: EnvSnapshot,
   configureTransport: boolean,
 ): Promise<Response> {
+  const deadline = AbortSignal.timeout(REMOTE_AUTH_REQUEST_TIMEOUT_MS);
   try {
     return await fetchImpl(input, {
       ...init,
       ...(configureTransport ? getProxyFetchOptions({ environment }) : {}),
+      signal: init.signal == null
+        ? deadline
+        : AbortSignal.any([init.signal, deadline]),
     });
   } catch (error) {
     throw new Error(
@@ -1061,8 +1101,11 @@ async function readRemoteAuthJsonResponse(
 ): Promise<unknown> {
   try {
     return await response.json();
-  } catch {
-    throw new Error(`RemoteAuthBackend ${operation} returned invalid JSON`);
+  } catch (error) {
+    const message = error instanceof SyntaxError
+      ? `RemoteAuthBackend ${operation} returned invalid JSON`
+      : `RemoteAuthBackend ${operation} response read failed: ${formatRemoteAuthNetworkError(error)}`;
+    throw new Error(message, { cause: error });
   }
 }
 
@@ -1256,11 +1299,13 @@ function normalizeRemoteAuthLlmUsage(value: Partial<AuthLlmUsage>): AuthLlmUsage
   if (subscriptionTier === undefined) {
     throw new Error("RemoteAuthBackend LLM usage response has invalid subscriptionTier");
   }
-  const allowance = normalizeRemoteAuthLlmUsageAllowance(value.modelAllowance);
+  const allowance = withPromotionWalletAmounts(normalizeRemoteAuthLlmUsageAllowance(value.modelAllowance), value.creditWallet);
+  const pilotAccess = normalizePilotAccess(value.pilotAccess);
   return {
     managedModelsEnabled: value.managedModelsEnabled === true,
     modelAllowance: allowance,
     subscriptionTier,
+    ...(pilotAccess !== undefined ? { pilotAccess } : {}),
   };
 }
 
@@ -1295,6 +1340,9 @@ function normalizeRemoteAuthLlmUsageAllowance(
     status,
     ...(readFiniteNumber(record.usedUsd) !== undefined
       ? { usedUsd: readFiniteNumber(record.usedUsd) }
+      : {}),
+    ...(readFiniteNumber(record.pendingUsd) !== undefined
+      ? { pendingUsd: readFiniteNumber(record.pendingUsd) }
       : {}),
   };
 }

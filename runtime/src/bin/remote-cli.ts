@@ -1,9 +1,9 @@
-// `agenc remote` — link this Mac to the AgenC phone app and bridge the relay to the local daemon.
+// `agenc remote` — link this computer to the AgenC phone app and bridge the relay to the local daemon.
 //
 // Pairing replaces account-as-room routing: the backend mints a per-pair `pairingId` (the relay
-// room), a single-use human code, and a 256-bit hostSecret held ONLY by this Mac. The phone redeems
+// room), a single-use human code, and a 256-bit hostSecret held ONLY by this computer. The phone redeems
 // the code; both sides then reach the same isolated relay room. The backend is the sole holder of the
-// relay signing secret and mints every host ticket — this Mac never holds it. The connector dials OUT
+// relay signing secret and mints every host ticket — this computer never holds it. The connector dials OUT
 // to the relay (no inbound ports) and transparently pipes the app-server JSON-RPC to/from the local
 // daemon, injecting the loopback cookie into the phone's `initialize` so the phone never holds it.
 
@@ -14,7 +14,9 @@ import {
   readFileSync,
   rmSync,
   writeFileSync,
+  watch,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import QRCode from "qrcode";
@@ -51,12 +53,12 @@ export function parseAgenCRemoteCliArgs(argv: readonly string[]): RemoteCliComma
 
 export function formatAgenCRemoteCliHelpText(): string {
   return [
-    "agenc remote — control this Mac from the AgenC phone app, from anywhere.",
+    "agenc remote — control this computer from the AgenC phone app, from anywhere.",
     "",
     "Usage:",
-    "  agenc remote on        Pair (first run shows a code) then keep this Mac reachable.",
-    "  agenc remote status    Show whether this Mac is linked to a phone.",
-    "  agenc remote off       Forget this Mac's pairing locally.",
+    "  agenc remote on        Pair (first run shows a code) then keep this computer reachable.",
+    "  agenc remote status    Show whether this computer is linked to a phone.",
+    "  agenc remote off       Forget this computer's pairing locally.",
     "",
     "Environment:",
     "  AGENC_BACKEND_URL   Identity backend (default https://id.agenc.ag).",
@@ -91,6 +93,16 @@ function remoteDir(context: RemoteCliRuntimeContext): string {
 }
 function pairPath(context: RemoteCliRuntimeContext): string {
   return join(remoteDir(context), "pair.json");
+}
+const activeLegacyBridges = new Map<string, () => void>();
+function stopMarker(context: RemoteCliRuntimeContext): string {
+  try { return readFileSync(join(remoteDir(context), "stopped"), "utf8"); } catch { return ""; }
+}
+function stopLegacyRemote(context: RemoteCliRuntimeContext): void {
+  mkdirSync(remoteDir(context), { recursive: true, mode: 0o700 });
+  writeFileSync(join(remoteDir(context), "stopped"), randomUUID(), { mode: 0o600 });
+  activeLegacyBridges.get(context.home.path)?.();
+  rmSync(pairPath(context), { force: true });
 }
 function cookiePath(context: RemoteCliRuntimeContext): string {
   return join(context.home.path, "daemon.cookie");
@@ -148,9 +160,11 @@ async function postJson(
   url: string,
   body: Record<string, unknown>,
   authToken?: string,
+  signal?: AbortSignal,
 ): Promise<PostResult> {
   const res = await fetch(url, {
     method: "POST",
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
     headers: {
       "content-type": "application/json",
       ...(authToken !== undefined ? { authorization: `Bearer ${authToken}` } : {}),
@@ -188,10 +202,10 @@ async function renderCodeBox(
   try {
     qr = await QRCode.toString(deepLink, { type: opts.qrType, small: true });
   } catch {
-    /* QR is optional — the code still links the Mac */
+    /* QR is optional — the code still links the computer */
   }
 
-  const out: string[] = ["", `  ${accent}${bold}⬡  Link this Mac to the AgenC app${reset}`, ""];
+  const out: string[] = ["", `  ${accent}${bold}⬡  Link this computer to the AgenC app${reset}`, ""];
   if (qr) {
     for (const qrLine of qr.replace(/\n+$/, "").split("\n")) out.push("  " + qrLine);
     out.push("");
@@ -200,7 +214,7 @@ async function renderCodeBox(
   const bar = "─".repeat(code.length + pad * 2);
   out.push(
     `  ${dim}1.${reset} Scan the QR with your phone's camera, or`,
-    `  ${dim}2.${reset} open the app → ${bold}Link a Mac${reset} ${dim}→ enter the code:${reset}`,
+    `  ${dim}2.${reset} open the app → ${bold}Link a computer${reset} ${dim}→ enter the code:${reset}`,
     "",
     `      ┌${bar}┐`,
     `      │${" ".repeat(pad)}${bold}${code}${reset}${" ".repeat(pad)}│`,
@@ -251,15 +265,17 @@ export async function runAgenCRemoteCli(
 
   if (command.kind === "off") {
     if (existsSync(pairPath(context))) {
-      rmSync(pairPath(context), { force: true });
-      process.stdout.write("Forgot this Mac's pairing. Stop a running `agenc remote on` with Ctrl-C.\n");
+      stopLegacyRemote(context);
+      process.stdout.write("Remote access stopped and the local pairing was removed.\n");
     } else {
-      process.stdout.write("This Mac is not linked.\n");
+      stopLegacyRemote(context);
+      process.stdout.write("This computer is not linked.\n");
     }
     return 0;
   }
 
   // command.kind === "on"
+  const activationMarker = stopMarker(context);
   const authToken = remoteAuthSessionTokenSync(context);
   if (authToken === undefined) {
     process.stderr.write(`${REMOTE_LOGIN_REQUIRED_MESSAGE}\n`);
@@ -281,7 +297,7 @@ export async function runAgenCRemoteCli(
     }, authToken);
     if (status === 410) {
       rmSync(pairPath(context), { force: true });
-      process.stdout.write("This Mac was unlinked from the phone — re-pairing.\n");
+      process.stdout.write("This computer was unlinked from the phone — re-pairing.\n");
       pair = null;
     } else if (status === 200 && typeof json.hostTicket === "string") {
       pairingId = pair.pairingId;
@@ -297,7 +313,7 @@ export async function runAgenCRemoteCli(
   }
 
   if (!pair) {
-    const name = hostname() || "A Mac";
+    const name = hostname() || "A computer";
     const { status, json } = await postJson(`${backend}/v1/pair/start`, { machineName: name }, authToken);
     if (status !== 200 || typeof json.pairingId !== "string") {
       process.stderr.write(`Could not start pairing (${status}).\n`);
@@ -308,6 +324,7 @@ export async function runAgenCRemoteCli(
     relayUrl = json.relayUrl as string;
     hostTicket = json.hostTicket as string;
     machineName = name;
+    if (activationMarker !== stopMarker(context)) return 0;
     writePairFile(context, {
       pairingId,
       hostSecret,
@@ -322,6 +339,7 @@ export async function runAgenCRemoteCli(
     // Wait for the phone to redeem the code.
     for (;;) {
       await sleep(2000);
+      if (activationMarker !== stopMarker(context)) return 0;
       const poll = await postJson(`${backend}/v1/pair/host-poll`, { pairingId, hostSecret }, authToken);
       if (poll.status === 410) {
         process.stderr.write("Pairing was revoked. Run `agenc remote on` to try again.\n");
@@ -330,7 +348,7 @@ export async function runAgenCRemoteCli(
       if (poll.status === 200 && poll.json.status === "active") {
         hostTicket = (poll.json.hostTicket as string) ?? hostTicket;
         const who = (poll.json.appLabel as string) ?? "your phone";
-        process.stdout.write(`✓ Linked with ${who}. Keeping this Mac reachable…\n`);
+        process.stdout.write(`✓ Linked with ${who}. Keeping this computer reachable…\n`);
         break;
       }
       // still pending — the code may expire; the backend returns 403 once the row is gone.
@@ -369,9 +387,14 @@ interface ConnectorArgs {
 
 /** Port of the portal connector: one daemon socket per phone (cid), transparent JSON-RPC pipe, with
  *  the loopback cookie injected into `initialize`. The host ticket is re-minted from the backend (via
- *  hostSecret) on every reconnect, so it stays short-lived and this Mac never signs its own.
+ *  hostSecret) on every reconnect, so it stays short-lived and this computer never signs its own.
  *  Fire-and-forget: starts the relay connection + reconnect loop and returns immediately. */
 function startBridge(args: ConnectorArgs): void {
+  activeLegacyBridges.get(args.context.home.path)?.();
+  const activationMarker = stopMarker(args.context);
+  let stopped = false;
+  const controller = new AbortController();
+  let reconnect: ReturnType<typeof setTimeout> | null = null;
   const { relayUrl, pairingId, hostSecret, backend, machineName, authToken } = args;
   const DAEMON = daemonUrl(args.context);
   const out = (msg: string) => { if (!args.quiet) process.stdout.write(msg); };
@@ -382,8 +405,32 @@ function startBridge(args: ConnectorArgs): void {
   }
   const peers = new Map<string, WebSocket>();
   let relay: WebSocket | null = null;
+  // Relays deployed before the subprotocol transport select no protocol, which
+  // `ws` treats as a failed handshake; fall back to the query form once.
+  let queryFallback = false;
   let keepalive: ReturnType<typeof setInterval> | null = null;
   let ticket = args.initialHostTicket;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    controller.abort();
+    watcher.close();
+    clearInterval(revocationCheck);
+    if (keepalive) clearInterval(keepalive);
+    if (reconnect) clearTimeout(reconnect);
+    for (const socket of peers.values()) socket.terminate();
+    peers.clear();
+    relay?.terminate();
+    if (activeLegacyBridges.get(args.context.home.path) === stop) activeLegacyBridges.delete(args.context.home.path);
+  };
+  const checkRevocation = () => {
+    if (activationMarker !== stopMarker(args.context) || !existsSync(pairPath(args.context))) stop();
+  };
+  const watcher = watch(remoteDir(args.context), { persistent: false }, checkRevocation);
+  watcher.on("error", stop);
+  const revocationCheck = setInterval(checkRevocation, 250);
+  revocationCheck.unref();
+  activeLegacyBridges.set(args.context.home.path, stop);
 
   function openDaemon(cid: string): WebSocket {
     const existing = peers.get(cid);
@@ -423,6 +470,13 @@ function startBridge(args: ConnectorArgs): void {
   }
 
   function toDaemon(cid: string, payloadStr: string): void {
+    checkRevocation();
+    if (stopped) return;
+    try {
+      const request = JSON.parse(payloadStr) as { method?: unknown };
+      // Remote-device management is exclusively host-local, including for legacy phones.
+      if (typeof request.method === "string" && (request.method.startsWith("remote.") || request.method.startsWith("telegram."))) return;
+    } catch { return; }
     const ws = openDaemon(cid);
     let out = payloadStr;
     try {
@@ -436,9 +490,10 @@ function startBridge(args: ConnectorArgs): void {
       /* not JSON — forward verbatim */
     }
     const queue = (ws as unknown as { _queue: string[] })._queue;
-    dbg(`[dbg] ->daemon cid=${cid} rs=${ws.readyState} (OPEN=${WebSocket.OPEN}) ${out.slice(0, 40)}\n`);
+    dbg(`[dbg] ->daemon cid=${cid} rs=${ws.readyState} bytes=${out.length}\n`);
     if (ws.readyState === WebSocket.OPEN) ws.send(out);
-    else queue.push(out);
+    else if (queue.length < 32 && payloadStr.length < 512 * 1024) queue.push(out);
+    else ws.terminate();
   }
 
   async function freshTicket(): Promise<string | null> {
@@ -446,7 +501,7 @@ function startBridge(args: ConnectorArgs): void {
       const { status, json } = await postJson(`${backend}/v1/pair/host-poll`, {
         pairingId,
         hostSecret,
-      }, authToken);
+      }, authToken, controller.signal);
       if (status === 410) return null; // unlinked
       if (status === 200 && typeof json.hostTicket === "string") return json.hostTicket;
     } catch {
@@ -456,8 +511,15 @@ function startBridge(args: ConnectorArgs): void {
   }
 
   function connect(): void {
-    relay = new WebSocket(`${relayUrl}/v1/host?ticket=${encodeURIComponent(ticket)}`);
+    checkRevocation();
+    if (stopped) return;
+    const handshake = legacyHostHandshake(relayUrl, ticket, queryFallback);
+    relay = new WebSocket(handshake.url, handshake.protocols);
+    let opened = false;
+    let subprotocolRefused = false;
     relay.on("open", () => {
+      opened = true;
+      if (stopped) { relay?.terminate(); return; }
       out(`● Remote access ON — “${machineName}” reachable from your phone (pairing ${pairingId}).\n`);
       if (keepalive) clearInterval(keepalive);
       keepalive = setInterval(() => {
@@ -469,6 +531,8 @@ function startBridge(args: ConnectorArgs): void {
       }, 25000);
     });
     relay.on("message", (data: WebSocket.RawData) => {
+      checkRevocation();
+      if (stopped || data.toString().length > 512 * 1024) return;
       let m: { t?: string; event?: string; cid?: string; payload?: string };
       try {
         m = JSON.parse(data.toString());
@@ -489,7 +553,7 @@ function startBridge(args: ConnectorArgs): void {
           peers.delete(m.cid);
         }
       } else if (m.t === "data" && m.cid && typeof m.payload === "string") {
-        dbg(`[dbg] relay->data cid=${m.cid} ${m.payload.slice(0, 40)}\n`);
+        dbg(`[dbg] relay->data cid=${m.cid} bytes=${m.payload.length}\n`);
         toDaemon(m.cid, m.payload);
       } else {
         dbg(`[dbg] relay-msg t=${m.t} event=${m.event ?? ""}\n`);
@@ -505,22 +569,56 @@ function startBridge(args: ConnectorArgs): void {
         }
       }
       peers.clear();
+      if (stopped) return;
+      if (!opened && subprotocolRefused && !queryFallback) {
+        queryFallback = true;
+        reconnect = setTimeout(connect, 500);
+        return;
+      }
       void freshTicket().then((t) => {
+        checkRevocation();
+        if (stopped) return;
         if (t === null) {
-          out("This Mac was unlinked from the phone. Run `agenc remote on` to re-pair.\n");
+          out("This computer was unlinked from the phone. Run `agenc remote on` to re-pair.\n");
           if (!args.quiet) process.exit(0);
           return; // quiet (TUI): stop reconnecting, but keep the agent session alive
         }
         ticket = t;
-        setTimeout(connect, 2000);
+        reconnect = setTimeout(connect, 2000);
       });
     });
-    relay.on("error", () => {
-      /* close handler drives the reconnect */
+    relay.on("error", (error: Error) => {
+      // `ws` aborts the handshake when the server selects no subprotocol; the
+      // close handler then retries once with the query form.
+      if (!opened && /subprotocol/i.test(error.message)) subprotocolRefused = true;
     });
   }
 
   connect();
+}
+
+/** Subprotocol name under which a legacy host offers its relay ticket. */
+export const LEGACY_HOST_PROTOCOL = "agenc-relay-v1";
+
+/**
+ * How a legacy host presents its ticket to the relay. The ticket rides in the
+ * `Sec-WebSocket-Protocol` header, base64url-encoded because `s1` tickets
+ * contain ":" which is not a valid subprotocol token character, so it never
+ * appears in a request URL that edge observability logs record. `fallback`
+ * selects the old query form for relays that predate the subprotocol.
+ */
+export function legacyHostHandshake(
+  relayUrl: string,
+  ticket: string,
+  fallback: boolean,
+): { readonly url: string; readonly protocols: string[] } {
+  if (fallback) {
+    return { url: `${relayUrl}/v1/host?ticket=${encodeURIComponent(ticket)}`, protocols: [] };
+  }
+  return {
+    url: `${relayUrl}/v1/host`,
+    protocols: [LEGACY_HOST_PROTOCOL, Buffer.from(ticket, "utf8").toString("base64url")],
+  };
 }
 
 /** Blocking wrapper for the foreground CLI: start the bridge, then never resolve (Ctrl-C exits). */
@@ -548,16 +646,17 @@ export async function runRemoteSlash(
   }
   if (sub === "off") {
     if (existsSync(pairPath(context))) {
-      rmSync(pairPath(context), { force: true });
-      return "Forgot this Mac's pairing. (A bridge started this session keeps running until the session ends.)";
+      stopLegacyRemote(context);
+      return "Remote access stopped and the local pairing was removed.";
     }
-    return "This Mac is not linked.";
+    stopLegacyRemote(context);
+    return "This computer is not linked.";
   }
 
   // "on" — delegate to the shared starter.
   const started = await startRemoteOn(context);
   if ("message" in started) return started.message;
-  return `${started.box}\n  This Mac is now reachable for this session — pair, then talk to this agent from your phone.`;
+  return `${started.box}\n  This computer is now reachable for this session — pair, then talk to this agent from your phone.`;
 }
 
 export interface RemoteOnStarted {
@@ -575,6 +674,7 @@ export interface RemoteOnStarted {
 export async function startRemoteOn(
   context: RemoteCliRuntimeContext,
 ): Promise<RemoteOnStarted | { message: string }> {
+  const activationMarker = stopMarker(context);
   const backend = backendUrl(context);
   const authToken = remoteAuthSessionTokenSync(context);
   if (authToken === undefined) {
@@ -588,6 +688,7 @@ export async function startRemoteOn(
       hostSecret: existing.hostSecret,
     }, authToken);
     if (status === 200 && typeof json.hostTicket === "string") {
+      if (activationMarker !== stopMarker(context)) return { message: "Remote access stopped." };
       startBridge({
         context,
         relayUrl: (json.relayUrl as string) ?? existing.relayUrl,
@@ -599,12 +700,12 @@ export async function startRemoteOn(
         authToken,
         quiet: true,
       });
-      return { message: `● Remote access ON — already linked to “${existing.machineName}”. Drive this Mac from your phone.` };
+      return { message: `● Remote access ON — already linked to “${existing.machineName}”. Drive this computer from your phone.` };
     }
     if (status === 410) rmSync(pairPath(context), { force: true }); // revoked — fall through to re-pair
   }
 
-  const name = hostname() || "A Mac";
+  const name = hostname() || "A computer";
   const { status, json } = await postJson(`${backend}/v1/pair/start`, { machineName: name }, authToken);
   if (status !== 200 || typeof json.pairingId !== "string") {
     return { message: `Could not start pairing (${status}). Check your connection.` };
@@ -613,6 +714,7 @@ export async function startRemoteOn(
   const hostSecret = json.hostSecret as string;
   const relayUrl = json.relayUrl as string;
   const hostTicket = json.hostTicket as string;
+  if (activationMarker !== stopMarker(context)) return { message: "Remote access stopped." };
   writePairFile(context, {
     pairingId,
     hostSecret,
@@ -633,6 +735,7 @@ export async function startRemoteOn(
     // A transient network error must NOT reject — that would leave the QR surface hanging.
     for (let i = 0; i < 90; i += 1) {
       await sleep(2000);
+      if (activationMarker !== stopMarker(context)) return "";
       try {
         const poll = await postJson(`${backend}/v1/pair/host-poll`, { pairingId, hostSecret }, authToken);
         if (poll.status === 200 && poll.json.status === "active") {

@@ -5,7 +5,7 @@ your local daemon. It is a **daemon client**: it talks to the daemon only
 through the embedding SDK (`@tetsuo-ai/agenc-sdk`), never runtime internals.
 Channels are a client-side addition, not a runtime change.
 
-**Shipped channels (0.17.0):** Telegram, Discord, Slack, WebChat, and stdio.
+**Shipped channels (0.18.0):** Telegram, Discord, Slack, WebChat, and stdio.
 Signal, WhatsApp, and email **channels** are **not** shipped. (The LIVE
 **Browser** tool is a coding-agent capability, not a gateway channel — see
 [browser.md](browser.md).)
@@ -71,6 +71,30 @@ AGENC_TELEGRAM_BOT_TOKEN=123:ABC agenc gateway run
 agenc onboard channel
 agenc gateway install-service
 ```
+
+`install-service` records the selected canonical `AGENC_HOME` in the systemd
+unit or launchd plist. The service uses that home's config, pairing store,
+daemon socket and native credential namespace even when the service manager
+has a different environment. Reinstall the service after selecting a different
+home, or to update an older definition that did not record one.
+
+Only `AGENC_HOME` is added to the service environment. Provider keys, channel
+tokens and unrelated shell exports are not copied into the definition. Home
+paths containing control characters, unpaired Unicode surrogates or Unicode
+noncharacters are rejected before a service file is written or a service
+manager is called.
+
+Executable and entrypoint paths are recorded as literal arguments, including
+spaces, quotes, backslashes, percent signs, dollar signs and XML characters.
+The Linux unit uses `/usr/bin/env --` to execute Node because systemd rejects
+quotes and backslashes in the executable field itself. The unit disables
+environment expansion for that command and escapes percent specifiers.
+`/usr/bin/env` must be available. No shell parses the command.
+
+Both paths must be absolute file paths without control characters or invalid
+Unicode. A missing entrypoint or rejected path leaves an existing definition
+unchanged and does not invoke the service manager. Reinstall older service
+definitions to apply the corrected argument quoting.
 
 ## Channels
 
@@ -267,6 +291,15 @@ is up (`startCronDelivery`), not from a daemon restart alone. Isolated session
 key `cron|default|<id>`. Permissions denied. Scan cap 5 minutes. Spend rides the same
 budget envelope as other autonomous surfaces.
 
+The gateway persists completed model results and per-destination retry state
+in the task file before delivery. Failed destinations retry with bounded
+backoff without repeating the model turn or a destination already marked
+delivered. One-shots are removed and recurring tasks advance only after all
+destinations acknowledge delivery. Exhausted failures remain visible in the
+outbox for operator action. External delivery is at-least-once across the
+acknowledgment/local-commit crash window unless the receiver deduplicates the
+stable delivery key.
+
 Webhook POST is **address-pinned**: the gateway resolves the host once, dials
 that exact IP, and keeps the original hostname on `Host` / TLS SNI. http(s)
 only; URL credentials, `localhost` / `*.localhost`, loopback, private,
@@ -341,6 +374,32 @@ Use the coding-agent `ImagineImage` / `ImagineVideo` tools in a grok session
 instead ([imagine.md](imagine.md)). Helius on-chain reads still install when
 configured.
 
+#### Quotas for directly constructed media helpers
+
+Embedders that construct `XaiMemeFeature` or `XaiVoiceFeature` directly use a
+durable reservation ledger at `usageFile`. A slot is committed before the
+initial progress reply and provider call. Instances and processes using the
+same ledger share its limit, including image and voice helpers configured
+with the same path. Independent ledgers retain independent limits.
+
+The ledger keeps the existing `{day, count}` format. The UTC day is sampled
+under the runtime's Node.js SQLite lock, and publication uses a synced
+temporary file, atomic rename, and directory sync. Clock rollback does not
+reopen an earlier day's quota. Invalid limits and malformed or inaccessible
+ledgers block provider calls rather than resetting the count.
+
+Empty or unrecognized requests do not reserve quota. Once committed, a slot
+is never refunded, including after provider errors, timeouts, invalid media,
+reply failures, or a process crash. A crash before provider entry can consume
+an unused slot. Keeping that reservation prevents an uncertain paid outcome
+from being counted as free. A provider finishing after midnight cannot
+overwrite the new day's usage.
+
+Stop older gateway processes before adopting this reservation protocol;
+older writers do not take the quota lock. Existing counts are preserved,
+but historical undercounts cannot be reconstructed from this ledger. This
+change does not install media routes in `startGateway`.
+
 ### Read-only Solana (Helius)
 
 ```bash
@@ -404,9 +463,20 @@ agenc gateway pairing revoke telegram 123456789
 | `config.toml` `[gateway]` | 0600 | policies, bindings, hooks flag |
 | Native secure storage | OS-managed | bot tokens and gateway bearer tokens |
 | `gateway/pairing.json` | 0600 | paired senders |
+| `gateway/pairing.json.lock.sqlite` | 0600 | cross-process pairing transaction lock |
 | `gateway/sessions.json` | 0600 | channel → daemon session map |
 | `gateway/control.json` | 0600 | Telegram owner/public state |
 | `gateway/conversation-recovery.json` | 0600 | bounded recovery journal |
+
+Pairing mutations hold a cross-process lock from reload through persistence.
+Writes use a unique temporary file, file sync, atomic rename, and directory sync
+where supported. Gateway and CLI processes therefore share one ordered sequence
+of approvals, revocations, and single-use challenges.
+
+Runtime callers must await `PairingStore.approve`, `revoke`, `challenge`, `redeem`,
+`listPending`, and `evaluateDmAccess`. Read-only `isPaired` and `listPaired`
+queries remain synchronous. The pairing JSON format stays at version 1.
+Restart existing gateway processes after upgrading so every writer uses the lock.
 
 Session mappings reattach conversations after gateway restart; the daemon
 session remains the source of truth for history. The recovery journal
@@ -423,3 +493,11 @@ inbound callback), `stop`, and `send` (return the channel-native message id;
 `StdioChannelAdapter`, `TelegramChannelAdapter`, `DiscordChannelAdapter`,
 `SlackChannelAdapter`, `WebChatChannelAdapter`. Register in `startGateway`
 (`runtime/src/gateway/run.ts`).
+
+The session router observes a rejected `send` immediately, including a failed
+streaming edit. It stops queued sends and ignores later text chunks for that
+turn. The first delivery error is returned after the active prompt settles,
+and the conversation lock is then released. `GatewaySession` has no prompt
+cancellation operation, so a delivery failure does not cancel model execution
+or allow another turn to overlap it. Adapter failures never trigger the
+missing-daemon-agent retry, even when their error fields resemble that error.

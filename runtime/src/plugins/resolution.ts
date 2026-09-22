@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { GIT_CHECKOUT_BYTES_ARGS } from "./gitAcquisitionArgs.js";
 import {
   access,
   cp,
@@ -18,12 +19,14 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 
 import {
   createHash,
   createPublicKey,
+  type KeyObject,
   verify as verifySignatureBytes,
 } from "node:crypto";
 import { redactSecrets } from "../secrets/index.js";
 import { isRecord } from "../utils/record.js";
 import { findPluginManifestPath, loadPluginManifest } from "./manifest.js";
 import { pluginCacheDirPath, sanitizePluginId } from "./directories.js";
+import { builtInPluginPublisherPublicKeys } from "./publisher-trust.js";
 import {
   buildPluginIdentifier,
   isCanonicalPluginIdentity,
@@ -137,18 +140,26 @@ interface SignatureFile {
 }
 
 interface PublisherKeyring {
-  readonly publishers?: Readonly<Record<string, string | { readonly publicKey?: string }>>;
+  readonly publishers?: Readonly<Record<string, unknown>>;
 }
+
+const MAX_PUBLISHER_PUBLIC_KEYS = 16;
 
 const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
 const DEFAULT_PROCESS_MAX_OUTPUT_BYTES = 1_048_576;
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 120_000;
-const DEFAULT_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024;
+export const PLUGIN_ARCHIVE_FETCH_POLICY = Object.freeze({
+  downloadTimeoutMs: 120_000,
+  maxDownloadBytes: 50 * 1024 * 1024,
+  maxRedirectHops: 5,
+  redirectStatuses: Object.freeze([301, 302, 303, 307, 308]),
+  allowedRedirectProtocols: Object.freeze(["http:", "https:"]),
+  requireSameOrigin: true,
+  allowUrlCredentials: false,
+});
 const DEFAULT_MAX_EXTRACTED_BYTES = 200 * 1024 * 1024;
 const DEFAULT_MAX_EXTRACTED_FILES = 4096;
 const DEFAULT_MAX_EXTRACT_DEPTH = 32;
 const DEFAULT_CACHE_LOCK_TIMEOUT_MS = 60_000;
-const DEFAULT_MAX_ARCHIVE_REDIRECTS = 5;
 const PLUGIN_INSTALL_METADATA_RELATIVE_PATH = ".agenc-plugin/agenc-install.json";
 const KNOWN_GIT_HOSTS = new Set([
   "github.com",
@@ -760,18 +771,26 @@ export async function verifyResolvedPluginSignature(
   const publishersPath = options.publishersPath ?? defaultPublishersPath(
     options.agencHome,
   );
-  const publicKey = await readPublisherPublicKey(publishersPath, signature.publisher);
+  const publicKeys = await readPublisherPublicKeys(
+    publishersPath,
+    signature.publisher,
+    // An explicit path is an authoritative caller-supplied trust store. The
+    // built-in AgenC root is only the fallback for the normal profile keyring.
+    options.publishersPath === undefined
+      ? builtInPluginPublisherPublicKeys(signature.publisher)
+      : undefined,
+  );
   const manifestPath = await findPluginManifestPath(pluginRoot);
   if (!manifestPath) throw new Error("cannot verify plugin signature without plugin.json");
   const manifestBytes = await readFile(manifestPath);
   const actualFiles = await collectPluginPayloadDigests(pluginRoot, manifestPath, signaturePath, options);
   assertSignedPayloadMatches(signature.files, actualFiles);
   const payload = pluginSignaturePayloadBytes(manifestBytes, signature.files);
-  const verified = verifyEd25519Signature({
+  const verified = publicKeys.some((publicKey) => verifyEd25519Signature({
     publicKey,
     payload,
     signature: signature.signature,
-  });
+  }));
   if (!verified) throw new Error(`plugin signature verification failed for publisher ${signature.publisher}`);
   return {
     required: options.requireSignature === true,
@@ -798,19 +817,14 @@ export function pluginSignaturePayloadBytes(
 }
 
 function verifyEd25519Signature(input: {
-  readonly publicKey: string;
+  readonly publicKey: KeyObject;
   readonly payload: Uint8Array;
   readonly signature: string;
 }): boolean {
-  const key = createPublicKey({
-    key: Buffer.from(input.publicKey, "base64"),
-    format: "der",
-    type: "spki",
-  });
   return verifySignatureBytes(
     null,
     Buffer.from(input.payload),
-    key,
+    input.publicKey,
     Buffer.from(input.signature, "base64"),
   );
 }
@@ -868,6 +882,9 @@ async function materializeNpmPackage(
   return extractTarball(tarballPath, join(tempRoot, "npm-extract"), options);
 }
 
+/** Hooks off and repository bytes verbatim for plugin git sources: see gitAcquisitionArgs.ts. */
+const GIT_ACQUISITION_ARGS = ["-c", "core.hooksPath=/dev/null", ...GIT_CHECKOUT_BYTES_ARGS] as const;
+
 async function materializeGitSource(
   source: string | StructuredGitPluginSource,
   tempRoot: string,
@@ -877,6 +894,7 @@ async function materializeGitSource(
   if (typeof source === "string") {
     assertSafeGitSource(source);
     await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "clone",
       "--depth",
       "1",
@@ -891,6 +909,7 @@ async function materializeGitSource(
   const revision = source.ref ?? source.sha;
   if (revision === undefined) {
     await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "clone",
       "--depth",
       "1",
@@ -900,6 +919,7 @@ async function materializeGitSource(
     ]);
   } else {
     await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "clone",
       "--depth",
       "1",
@@ -909,6 +929,7 @@ async function materializeGitSource(
       target,
     ]);
     await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "-C",
       target,
       "fetch",
@@ -918,6 +939,7 @@ async function materializeGitSource(
       revision,
     ]);
     await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "-C",
       target,
       "checkout",
@@ -928,6 +950,7 @@ async function materializeGitSource(
 
   if (source.sha !== undefined) {
     const actualSha = (await runProcess(options, "git", [
+      ...GIT_ACQUISITION_ARGS,
       "-C",
       target,
       "rev-parse",
@@ -1367,7 +1390,7 @@ async function fetchBytes(
   source: string,
   options: PluginResolverOptions,
 ): Promise<Uint8Array> {
-  const maxBytes = options.maxDownloadBytes ?? DEFAULT_MAX_DOWNLOAD_BYTES;
+  const maxBytes = options.maxDownloadBytes ?? PLUGIN_ARCHIVE_FETCH_POLICY.maxDownloadBytes;
   try {
     if (options.fetchBytes) {
       const data = await options.fetchBytes(source);
@@ -1388,7 +1411,7 @@ async function fetchBytesWithRedirectPolicy(
   maxBytes: number,
 ): Promise<Uint8Array> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.downloadTimeoutMs ?? DEFAULT_DOWNLOAD_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), options.downloadTimeoutMs ?? PLUGIN_ARCHIVE_FETCH_POLICY.downloadTimeoutMs);
   timeout.unref();
   try {
     let current = new URL(source);
@@ -1398,8 +1421,8 @@ async function fetchBytesWithRedirectPolicy(
         redirect: "manual",
       });
       if (isRedirectStatus(response.status)) {
-        if (redirects >= DEFAULT_MAX_ARCHIVE_REDIRECTS) {
-          throw new Error(`plugin archive redirect limit exceeded: ${DEFAULT_MAX_ARCHIVE_REDIRECTS}`);
+        if (redirects >= PLUGIN_ARCHIVE_FETCH_POLICY.maxRedirectHops) {
+          throw new Error(`plugin archive redirect limit exceeded: ${PLUGIN_ARCHIVE_FETCH_POLICY.maxRedirectHops}`);
         }
         current = nextPluginArchiveRedirectUrl(current, response);
         continue;
@@ -1444,20 +1467,20 @@ async function fetchBytesWithRedirectPolicy(
 }
 
 function isRedirectStatus(status: number): boolean {
-  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+  return PLUGIN_ARCHIVE_FETCH_POLICY.redirectStatuses.includes(status);
 }
 
 function nextPluginArchiveRedirectUrl(current: URL, response: Response): URL {
   const location = response.headers.get("location");
   if (!location) throw new Error("plugin archive redirect is missing a location header");
   const next = new URL(location, current);
-  if (!["http:", "https:"].includes(next.protocol)) {
+  if (!PLUGIN_ARCHIVE_FETCH_POLICY.allowedRedirectProtocols.includes(next.protocol)) {
     throw new Error(`plugin archive redirect uses an unsupported protocol: ${next.protocol}`);
   }
-  if (next.username || next.password) {
+  if (!PLUGIN_ARCHIVE_FETCH_POLICY.allowUrlCredentials && (next.username || next.password)) {
     throw new Error("plugin archive redirects with URL credentials are not allowed");
   }
-  if (next.origin !== current.origin) {
+  if (PLUGIN_ARCHIVE_FETCH_POLICY.requireSameOrigin && next.origin !== current.origin) {
     throw new Error(
       `plugin archive redirects must stay on ${current.origin}: ${redactPluginSource(next.toString())}`,
     );
@@ -1633,12 +1656,82 @@ function redactPluginResolutionError(error: unknown): Error {
   return new Error(redactPluginSource(String(error)));
 }
 
-async function readPublisherPublicKey(path: string, publisher: string): Promise<string> {
-  const parsed = JSON.parse(await readFile(path, "utf8")) as PublisherKeyring;
-  const entry = parsed.publishers?.[publisher];
-  const publicKey = typeof entry === "string" ? entry : entry?.publicKey;
-  if (!publicKey) throw new Error(`plugin publisher is not trusted: ${publisher}`);
-  return publicKey;
+/** Validate the entire entry before trying any key, including legacy fields. */
+function parsePublisherPublicKeys(entry: unknown, publisher: string): readonly KeyObject[] {
+  const invalid = () => new Error(`plugin publisher is not trusted: ${publisher}`);
+  const candidates: unknown[] = [];
+  if (typeof entry === "string") {
+    candidates.push(entry);
+  } else if (isRecord(entry)) {
+    if (Object.hasOwn(entry, "publicKey")) candidates.push(entry.publicKey);
+    if (Object.hasOwn(entry, "publicKeys")) {
+      if (
+        !Array.isArray(entry.publicKeys) ||
+        entry.publicKeys.length === 0 ||
+        entry.publicKeys.length > MAX_PUBLISHER_PUBLIC_KEYS
+      ) throw invalid();
+      candidates.push(...entry.publicKeys);
+    }
+  } else {
+    throw invalid();
+  }
+  if (candidates.length === 0) throw invalid();
+  const keys = new Map<string, KeyObject>();
+  for (const candidate of candidates) {
+    // Ed25519 DER-SPKI is exactly 44 bytes, encoded as 60 canonical base64
+    // characters. Reject permissive decoder inputs and oversized key material.
+    if (typeof candidate !== "string" || candidate.length !== 60) throw invalid();
+    const der = Buffer.from(candidate, "base64");
+    if (der.toString("base64") !== candidate) throw invalid();
+    let key: KeyObject;
+    try {
+      key = createPublicKey({ key: der, format: "der", type: "spki" });
+      if (
+        key.asymmetricKeyType !== "ed25519" ||
+        !Buffer.from(key.export({ format: "der", type: "spki" })).equals(der)
+      ) throw invalid();
+    } catch {
+      throw invalid();
+    }
+    keys.set(candidate, key);
+  }
+  if (keys.size > MAX_PUBLISHER_PUBLIC_KEYS) throw invalid();
+  return [...keys.values()];
+}
+
+async function readPublisherPublicKeys(
+  path: string,
+  publisher: string,
+  builtInPublicKeys?: readonly string[],
+): Promise<readonly KeyObject[]> {
+  let parsed: PublisherKeyring;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8")) as PublisherKeyring;
+  } catch (error) {
+    if (
+      (error as NodeJS.ErrnoException).code === "ENOENT" &&
+      builtInPublicKeys !== undefined
+    ) {
+      return parsePublisherPublicKeys({ publicKeys: builtInPublicKeys }, publisher);
+    }
+    throw error;
+  }
+  if (!isRecord(parsed) || (parsed.publishers !== undefined && !isRecord(parsed.publishers))) {
+    throw new Error("plugin publisher keyring must contain a publishers object");
+  }
+  const publishers = parsed.publishers;
+  const hasExplicitEntry =
+    publishers !== undefined &&
+    Object.prototype.hasOwnProperty.call(publishers, publisher);
+  // An entry with an empty or malformed value is still an explicit operator
+  // decision. Never mask it with the shipped root.
+  if (hasExplicitEntry) {
+    return parsePublisherPublicKeys(publishers![publisher], publisher);
+  }
+  if (builtInPublicKeys !== undefined) {
+    return parsePublisherPublicKeys({ publicKeys: builtInPublicKeys }, publisher);
+  }
+  throw new Error(`plugin publisher is not trusted: ${publisher}`);
 }
 
 function defaultPublishersPath(agencHome: string): string {

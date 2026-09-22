@@ -15,7 +15,11 @@ import {
   LLMAuthenticationError,
   LLMContextWindowExceededError,
   LLMInvalidResponseError,
+  LLMRequestRebuiltError,
+  LLMStreamTruncatedError,
   LLMMessageValidationError,
+  LLMManagedAdmissionError,
+  LLMManagedUsagePendingError,
   LLMProviderError,
 } from "../llm/errors.js";
 import {
@@ -173,6 +177,24 @@ export function isWithheld413Message(msg: AssistantMessage): boolean {
     isPromptTooLongMessage(msg) ||
     msg.apiError === "context_window_exceeded" ||
     msg.apiError === "prompt_too_long"
+  );
+}
+
+/**
+ * A provider refused the sample as too long for the context window, and the
+ * refusal reached the turn as a typed stream error instead of a withheld
+ * assistant message. It takes the same bounded 413 collapse, but only while no
+ * tool call from that sample has streamed: once one has, the executor may
+ * already be running it, and a collapse plus resample could issue it again.
+ */
+export function isRecoverableContextOverflowStreamError(
+  state: Pick<TurnState, "toolUseBlocks">,
+  streamError: unknown,
+): boolean {
+  return (
+    streamError instanceof LLMContextWindowExceededError &&
+    !isPartialProviderResponseError(streamError) &&
+    state.toolUseBlocks.length === 0
   );
 }
 
@@ -339,13 +361,37 @@ const TRANSIENT_PROVIDER_MESSAGE_PARTS = [
   "connection reset",
   "socket connection was closed unexpectedly",
   "socket closed",
+  // The OpenAI-compatible SDK raises APIConnectionError with the fixed text
+  // "Connection error." and no status or code of its own; mapLLMError keeps
+  // that text in the provider error it returns.
+  "connection error",
+  // undici ends a response body whose connection dropped mid-stream with a
+  // bare TypeError("terminated"); a goal's plan child died on exactly that
+  // right after its "Connection error." retry had succeeded.
+  "terminated",
 ];
+
+/**
+ * A stream that a transport fault cut before any tool call had streamed can
+ * be sampled again by the turn's reconnect ladder: nothing executed, and the
+ * text emitted so far is discarded with the failed attempt. Once a tool call
+ * has streamed, the executor may already have dispatched it, so the adapter
+ * must surface a partial response instead.
+ */
+export function isResampleableStreamInterruption(
+  err: unknown,
+  streamedToolCalls: number,
+): boolean {
+  return streamedToolCalls === 0 && isTransientProviderError(err);
+}
 
 function isExplicitNonTransientProviderError(err: unknown): boolean {
   return (
     err instanceof LLMAuthenticationError ||
     err instanceof LLMContextWindowExceededError ||
     err instanceof LLMMessageValidationError ||
+    err instanceof LLMManagedAdmissionError ||
+    err instanceof LLMManagedUsagePendingError ||
     err instanceof LLMCaptivePortalError ||
     err instanceof LLMCertificateError ||
     err instanceof LLMInvalidResponseError
@@ -359,6 +405,8 @@ function isTransientProviderErrorInner(
 ): boolean {
   if (depth > 4) return false;
   if (isExplicitNonTransientProviderError(err)) return false;
+  if (err instanceof LLMStreamTruncatedError) return true;
+  if (err instanceof LLMRequestRebuiltError) return true;
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
     if (TRANSIENT_PROVIDER_MESSAGE_PARTS.some((part) => msg.includes(part))) {

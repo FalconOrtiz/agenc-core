@@ -42,6 +42,9 @@ import {
   createSessionTranscriptStateForTesting,
 } from "../tui/session-transcript.js";
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from "../prompts/system-prompt-boundary.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../contracts/additional-working-directories.js";
 
 function jsonResponse(value: unknown): Response {
   return new Response(JSON.stringify(value), {
@@ -54,6 +57,63 @@ function offlineFetchFixture(): typeof fetch {
   return vi
     .fn<typeof fetch>()
     .mockRejectedValue(new Error("offline bootstrap fixture"));
+}
+
+async function installBootstrapProviderStub() {
+  const providerModule = await import("../llm/provider.js");
+  const chat = vi.fn().mockResolvedValue({
+    content: "ok",
+    toolCalls: [],
+    usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+  });
+  return vi.spyOn(providerModule, "createProvider").mockReturnValue({
+    name: "stub",
+    chat,
+  } as never);
+}
+
+async function captureQwenProviderExtra(
+  fetchImpl?: typeof fetch,
+): Promise<Record<string, unknown>> {
+  const [home, workspace] = await Promise.all([
+    mkdtemp(join(tmpdir(), "agenc-bootstrap-home-")),
+    mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-")),
+  ]);
+  const createProviderSpy = await installBootstrapProviderStub();
+  vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+  let shutdown: (() => Promise<void>) | null = null;
+  try {
+    const boot = await bootstrapLocalRuntimeSession({
+      ...(fetchImpl === undefined ? {} : { fetchImpl }),
+      env: {
+        ...process.env,
+        AGENC_HOME: home,
+        AGENC_MODEL: "qwen3.8-max",
+        AGENC_PROVIDER: "qwen",
+        AGENC_WORKSPACE: workspace,
+        HOME: home,
+        QWEN_API_KEY: "qwen-test-key",
+      },
+      argv: ["node", "agenc", "--provider", "qwen"],
+    });
+    shutdown = boot.shutdown;
+
+    const qwenCall = createProviderSpy.mock.calls.find(
+      ([providerName]) => providerName === "qwen",
+    );
+    expect(qwenCall).toBeDefined();
+    return (
+      (qwenCall?.[1] as { extra?: Record<string, unknown> } | undefined)
+        ?.extra ?? {}
+    );
+  } finally {
+    await shutdown?.().catch(() => undefined);
+    await Promise.all([
+      rm(home, { recursive: true, force: true }),
+      rm(workspace, { recursive: true, force: true }),
+    ]);
+  }
 }
 
 function clearProcessEnv(keys: readonly string[]): () => void {
@@ -129,6 +189,46 @@ describe("readStartupCliFlags", () => {
     });
   });
 
+  it("preserves spaced, equals, and repeated additional-directory flags", () => {
+    expect(
+      readStartupCliFlags([
+        "node",
+        "agenc",
+        "--add-dir",
+        "../shared workspace",
+        "--add-dir=/tmp/shared",
+        "--add-dir=/tmp/shared",
+        "--add-dir=-third",
+        "build",
+        "the app",
+      ]),
+    ).toMatchObject({
+      addDirs: ["../shared workspace", "/tmp/shared", "-third"],
+    });
+  });
+
+  it("rejects raw additional-directory overflow before duplicate collapse and bootstrap work", async () => {
+    const addDirArgs = Array.from(
+      { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+      () => "--add-dir=/tmp/repeated",
+    );
+
+    expect(() =>
+      readStartupCliFlags(["node", "agenc", ...addDirArgs]),
+    ).toThrow(
+      `agenc --add-dir accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+    );
+    await expect(
+      bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: process.cwd(),
+        argv: ["node", "agenc", ...addDirArgs],
+      }),
+    ).rejects.toThrow(
+      `agenc --add-dir accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+    );
+  });
+
   it("rejects internal modes at the startup permission surface", () => {
     expect(() =>
       readStartupCliFlags([
@@ -145,6 +245,162 @@ describe("bootstrapLocalRuntimeSession", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     _resetAgentRolesForTesting();
+  });
+
+  it("projects CLI additional directories into permissions and the sandbox authority", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-add-dir-home-"));
+    const workspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-ws-"),
+    );
+    const firstAdditional = join(workspace, "shared workspace");
+    const secondAdditional = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-external-"),
+    );
+    const regularFile = join(workspace, "not-a-directory.txt");
+    await mkdir(join(workspace, ".git"));
+    await mkdir(firstAdditional);
+    await writeFile(regularFile, "not a directory", "utf8");
+    trustWorkspaceForTest(home, workspace);
+
+    await installBootstrapProviderStub();
+    vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+    let shutdown: (() => Promise<void>) | null = null;
+    try {
+      const boot = await bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: workspace,
+        argv: [
+          "node",
+          "agenc",
+          "--add-dir",
+          "shared workspace",
+          "--add-dir=shared workspace",
+          `--add-dir=${secondAdditional}`,
+          "--add-dir",
+          regularFile,
+        ],
+        env: {
+          ...process.env,
+          AGENC_HOME: home,
+          HOME: home,
+        },
+      });
+      shutdown = boot.shutdown;
+      const additionalDirectories = [
+        ...boot.session.permissionModeRegistry
+          .current()
+          .additionalWorkingDirectories.values(),
+      ];
+      expect(additionalDirectories).toEqual([
+        { path: firstAdditional, source: "cliArg" },
+        { path: secondAdditional, source: "cliArg" },
+      ]);
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).toEqual([workspace, firstAdditional, secondAdditional]);
+      expect(
+        boot.session.permissionModeRegistry
+          .current()
+          .additionalWorkingDirectories.has(regularFile),
+      ).toBe(false);
+      expect(
+        boot.session.services.sandboxExecutionBroker?.mode,
+      ).toBe("workspace_write");
+    } finally {
+      await shutdown?.().catch(() => {});
+      await rm(home, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+      await rm(secondAdditional, { recursive: true, force: true });
+    }
+  });
+
+  it("commits and rolls back CLI directory authority from the staged permission context", async () => {
+    const home = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-home-"),
+    );
+    const workspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-ws-"),
+    );
+    const rebasedWorkspace = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-rebased-"),
+    );
+    const additionalDirectory = await mkdtemp(
+      join(tmpdir(), "agenc-bootstrap-add-dir-reload-extra-"),
+    );
+    await mkdir(join(workspace, ".git"));
+    await mkdir(join(rebasedWorkspace, ".git"));
+    trustWorkspaceForTest(home, workspace);
+    trustWorkspaceForTest(home, rebasedWorkspace);
+
+    await installBootstrapProviderStub();
+    vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+    let shutdown: (() => Promise<void>) | null = null;
+    try {
+      const boot = await bootstrapLocalRuntimeSession({
+        apiKey: "test-key",
+        cwd: workspace,
+        argv: ["node", "agenc", "--add-dir", additionalDirectory],
+        env: {
+          ...process.env,
+          AGENC_HOME: home,
+          HOME: home,
+        },
+      });
+      shutdown = boot.shutdown;
+      const withoutCliDirectories = {
+        additionalWorkingDirectories: new Map(),
+      };
+      const config = boot.configStore.current();
+
+      const rolledBack = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      expect(
+        rolledBack.authority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      rolledBack.commit();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      rolledBack.rollback();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).toContain(additionalDirectory);
+
+      const revoked = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      revoked.commit();
+      await transitionSandboxExecutionBroker(
+        boot.session.services.sandboxExecutionBroker!,
+        rebasedWorkspace,
+      );
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+
+      const laterReload = boot.prepareConfiguredExecutionAuthority(
+        config,
+        withoutCliDirectories,
+      );
+      expect(
+        laterReload.authority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+      laterReload.commit();
+      expect(
+        boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
+      ).not.toContain(additionalDirectory);
+    } finally {
+      await shutdown?.().catch(() => {});
+      await rm(home, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+      await rm(rebasedWorkspace, { recursive: true, force: true });
+      await rm(additionalDirectory, { recursive: true, force: true });
+    }
   });
 
   it("resolves mode, trust, and reloaded-config authority from the live broker cwd after rebase", async () => {
@@ -211,16 +467,19 @@ describe("bootstrapLocalRuntimeSession", () => {
         boot.configuredExecutionAuthority.fileSystemSandboxPolicy.allowWrite,
       ).toEqual([rebasedWorkspace]);
 
-      const prepared = boot.prepareConfiguredExecutionAuthority({
-        ...boot.configStore.current(),
-        sandbox_mode: "workspace-write",
-        sandbox: {
-          ...boot.configStore.current().sandbox,
-          filesystem: {
-            allowWrite: ["./relative-grant"],
+      const prepared = boot.prepareConfiguredExecutionAuthority(
+        {
+          ...boot.configStore.current(),
+          sandbox_mode: "workspace-write",
+          sandbox: {
+            ...boot.configStore.current().sandbox,
+            filesystem: {
+              allowWrite: ["./relative-grant"],
+            },
           },
         },
-      });
+        boot.session.permissionModeRegistry.current(),
+      );
       expect(prepared.authority.fileSystemSandboxPolicy.allowWrite).toEqual([
         rebasedWorkspace,
         join(rebasedWorkspace, "relative-grant"),
@@ -404,6 +663,8 @@ describe("bootstrapLocalRuntimeSession", () => {
       shutdown = boot.shutdown;
 
       expect(boot.agencHome).toBe(home);
+      expect(boot.initialState.sessionConfiguration.permissionInstructionsDeferred).toBe(true);
+      expect(boot.initialState.sessionConfiguration.baseInstructions).not.toContain("# Permission Mode:");
       expect(
         boot.initialState.sessionConfiguration.baseInstructions,
       ).toContain(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
@@ -581,6 +842,18 @@ describe("bootstrapLocalRuntimeSession", () => {
           { turnId: "turn-1", lastAgentMessage: "done" },
           firstEventSequence + 5,
         ),
+        rolloutEvent(
+          "failed-turn-start",
+          "turn_started",
+          { turnId: "turn-2" },
+          firstEventSequence + 6,
+        ),
+        rolloutEvent(
+          "failed-turn-end",
+          "turn_failed",
+          { turnId: "turn-2", code: "provider_error", message: "provider failed" },
+          firstEventSequence + 7,
+        ),
       ]) {
         first.rolloutStore.appendRollout(event);
       }
@@ -621,11 +894,14 @@ describe("bootstrapLocalRuntimeSession", () => {
           "assistant_thinking_block_stop",
           "agent_thinking",
           "turn_complete",
+          "turn_failed",
         ]),
       );
       const transcript = adaptTranscriptEvents(
         initialTranscriptEvents as Parameters<typeof adaptTranscriptEvents>[0],
       );
+      expect(transcript.isStreaming).toBe(false);
+      expect(JSON.stringify(transcript.messages)).toContain("provider failed");
       expect(
         transcript.messages.some(
           (message) =>
@@ -1902,6 +2178,17 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
+  it("does not promote ambient fetch into a provider transport override", async () => {
+    expect(await captureQwenProviderExtra()).not.toHaveProperty("fetchImpl");
+  });
+
+  it("preserves a caller-provided provider transport override", async () => {
+    const fetchImpl = offlineFetchFixture();
+    expect((await captureQwenProviderExtra(fetchImpl)).fetchImpl).toBe(
+      fetchImpl,
+    );
+  });
+
   it("keeps Gemini environment keys out of explicit factory precedence", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -2064,7 +2351,6 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
-  // branding-scan: allow real provider identifier in test title
   it("classifies no-key generic OpenAI-compatible startup as local no-auth", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -2202,7 +2488,6 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
-  // branding-scan: allow real provider identifier in test title
   it("uses an explicit OpenAI-compatible key without probing native BYOK secure storage", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -4038,8 +4323,7 @@ required = true
 
   it("enforces the runtime bootstrap step ordering invariant", async () => {
     // Asserts the concrete step order the bin bootstrap is required to
-    // follow, mirroring upstream agenc runtime
-    // `core/src/session/session.rs:814-908, 931-942`:
+    // follow:
     //
     //   1. Session construction (Session instance exists).
     //   2. Rollout store mounted on the session.
@@ -4058,9 +4342,9 @@ required = true
     //      `runStartupPrewarm`).
     //
     // Steps 5 (SessionConfigured) and 6/7 (sidecar start + MCP start)
-    // specifically follow the upstream rule "Dispatch the
-    // SessionConfiguredEvent first and then report any errors"
-    // (session.rs:814) — the emit must precede the real MCP manager
+    // specifically follow the rule "Dispatch the
+    // SessionConfiguredEvent first and then report any errors":
+    // the emit must precede the real MCP manager
     // wiring.
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -4162,7 +4446,7 @@ required = true
 
       const idx = (label: string): number => ordering.indexOf(label);
 
-      // The recorded step order must match the upstream agenc runtime
+      // The recorded step order must match the bootstrap
       // contract: each step happens strictly before the next. Every
       // label must have been recorded (index >= 0).
       const mountIdx = idx("rollout_store_mounted");

@@ -25,6 +25,9 @@
 
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
+import { runWithCanonicalSettingsAuthority } from "../utils/settings/canonicalAuthority.js";
+
+export { isBridgeSafeCommand } from "./bridge-policy.js";
 
 import type {
   CommandRegistry,
@@ -146,6 +149,20 @@ export interface DispatchOutcome {
  *     `{ kind: "error" }` — the command contract forbids throwing.
  */
 export async function dispatchSlashCommand(
+  parsed: ParsedSlashCommand,
+  ctx: SlashCommandContext,
+  registry: CommandRegistry,
+): Promise<DispatchOutcome> {
+  // Terminal input callbacks do not inherit the bootstrap async context.
+  // Bind the invocation's store for command reads, writes, and async work;
+  // never borrow another session's ambient settings authority.
+  const dispatch = () => dispatchScopedSlashCommand(parsed, ctx, registry);
+  return ctx.configStore === undefined
+    ? dispatch()
+    : runWithCanonicalSettingsAuthority(ctx.configStore, dispatch);
+}
+
+async function dispatchScopedSlashCommand(
   parsed: ParsedSlashCommand,
   ctx: SlashCommandContext,
   registry: CommandRegistry,
@@ -286,39 +303,4 @@ async function buildMistypedPathHint(
   } catch {
     return null;
   }
-}
-
-/**
- * Bridge-safe allowlist for remote-origin / daemon-bridged CLI
- * invocations. A "bridge-safe" command is one the daemon can run on
- * behalf of a CLI client without requiring human confirmation: it does
- * not mutate shell state, rewrite config, fork the turn, or exit the
- * process.
- *
- * Commands NOT on this list MUST prompt the user before the bridge
- * forwards them (e.g. `/exit`, `/compact`, `/permissions`, `/config`).
- */
-const BRIDGE_SAFE: ReadonlySet<string> = new Set([
-  "status",
-  "help",
-  "hello",
-  "model",
-  "provider",
-  "clear",
-  "diff",
-]);
-
-/**
- * Bridge-unsafe commands (listed explicitly to make the contract
- * readable; not consulted at runtime — anything outside BRIDGE_SAFE is
- * treated as unsafe).
- */
-// Kept alongside BRIDGE_SAFE to document the contract. Do not export as
-// a negation — checks MUST go through `isBridgeSafeCommand`.
-// (status / help / hello / model / provider / clear / diff) are safe;
-// everything else in the minimal surface requires user confirmation at
-// the bridge.
-
-export function isBridgeSafeCommand(name: string): boolean {
-  return BRIDGE_SAFE.has(name);
 }

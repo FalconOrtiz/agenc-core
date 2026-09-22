@@ -26,7 +26,6 @@ import { transitionPermissionMode } from '../../permissions/permission-mode.js'
 import type { ToolPermissionContext as CanonicalToolPermissionContext } from '../../permissions/types.js'
 import { createSessionMcpSamplingHandlers } from '../../session/mcp-startup.js'
 import { runTurnCompat } from '../../session/turn-compat.js'
-import { getDumpPromptsPath } from '../../services/api/dumpPrompts.js'
 import {
   connectToServer,
   fetchToolsForClient,
@@ -58,7 +57,6 @@ import type {
 } from '../../types/message.js'
 import { createAttachmentMessage } from '../../utils/attachments.js'
 import { AbortError } from '../../utils/errors.js'
-import { getDisplayPath } from '../../utils/file.js'
 import {
   cloneFileStateCache,
   createFileStateCacheWithSizeLimit,
@@ -477,13 +475,6 @@ export async function* runAgent({
     spawnAdmission.commit()
   }
 
-  // Log API calls path for subagents (internal-only)
-  if (process.env.USER_TYPE === 'ant') {
-    logForDebugging(
-      `[Subagent ${agentDefinition.agentType}] API calls: ${getDisplayPath(getDumpPromptsPath(agentId))}`,
-    )
-  }
-
   // Handle message forking for context sharing
   // Filter out incomplete tool calls from parent messages to avoid API errors
   const contextMessages: Message[] = forkContextMessages
@@ -507,7 +498,7 @@ export async function* runAgent({
   // would duplicate it and would leak a parent-workspace rendering into a
   // worktree child. Explicit overrides may add other user context, but cannot
   // bypass the single live-request resolver.
-  const { agencMd: _omittedAgenCMd, ...userContextNoAgenCMd } = baseUserContext // branding-scan: allow upstream user-context field name pending context absorb
+  const { agencMd: _omittedAgenCMd, ...userContextNoAgenCMd } = baseUserContext
   const resolvedUserContext = userContextNoAgenCMd
 
   // scanner / Plan are read-only search agents — the

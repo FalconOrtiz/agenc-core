@@ -1,4 +1,7 @@
 import type { ZodIssueCode } from 'zod/v4'
+import { serializeRuleValue } from '../../permissions/rules.js'
+import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
+import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
 
 // v4 ZodIssueCode is a value, not a type - use typeof to get the type
 type ZodIssueCodeType = (typeof ZodIssueCode)[keyof typeof ZodIssueCode]
@@ -22,6 +25,12 @@ type TipMatcher = {
   matches: (context: TipContext) => boolean
   tip: ValidationTip
 }
+
+const PERMISSION_RULE_EXAMPLES = [
+  { toolName: 'exec_command', ruleContent: 'npm run build' },
+  { toolName: FILE_EDIT_TOOL_NAME, ruleContent: 'docs/**' },
+  { toolName: FILE_READ_TOOL_NAME, ruleContent: '~/.zshrc' },
+].map(serializeRuleValue)
 
 const TIP_MATCHERS: TipMatcher[] = [
   {
@@ -47,7 +56,7 @@ const TIP_MATCHERS: TipMatcher[] = [
       ctx.expected === 'array',
     tip: {
       suggestion:
-        'Permission rules must be in an array. Format: ["Tool(specifier)"]. Examples: ["Bash(npm run build)", "Edit(docs/**)", "Read(~/.zshrc)"]. Use * for wildcards.',
+        `Permission rules must be in an array. Each rule combines a tool name with a specifier in parentheses. Examples: ${JSON.stringify(PERMISSION_RULE_EXAMPLES)}. Use * for wildcards.`,
     },
   },
   {
@@ -106,7 +115,7 @@ const TIP_MATCHERS: TipMatcher[] = [
       ctx.code === 'invalid_type',
     tip: {
       suggestion:
-        'Must be an array of directory paths. Example: ["~/projects", "/tmp/workspace"]. You can also use --add-dir flag or /add-dir command',
+        'Must be an array of directory paths. Example: ["~/projects", "/tmp/workspace"]. You can also use the --add-dir flag.',
     },
   },
 ]

@@ -40,9 +40,11 @@ import {
 } from "./tools/system/coding.js";
 import { SYSTEM_SEARCH_TOOLS_NAME } from "./tools/system/tool-search-name.js";
 import { createBashTool } from "./tools/system/bash.js";
+import { registerBuiltinTool } from "./tools/builtin-provenance.js";
 import { createExecCommandTool } from "./tools/system/exec-command.js";
 import { createWriteStdinTool } from "./tools/system/write-stdin.js";
 import { createKillProcessTool } from "./tools/system/kill-process.js";
+import { createListProcessesTool } from "./tools/system/list-processes.js";
 import { createPlanningTools } from "./tools/system/planning.js";
 import { createAskUserQuestionTool } from "./tools/ask-user-question/tool.js";
 import { createSleepTool } from "./tools/system/sleep.js";
@@ -68,14 +70,6 @@ import {
 import { createGlobTool, GLOB_TOOL_NAME } from "./tools/system/glob.js";
 import { createGrepTool, GREP_TOOL_NAME } from "./tools/system/grep.js";
 import { createOrientTool, ORIENT_TOOL_NAME } from "./tools/system/orient.js";
-import {
-  createEditorProposalTool,
-  EDITOR_PROPOSAL_TOOL_NAME,
-} from "./tools/system/editor-proposal.js";
-import {
-  isEditorInteractionToolName,
-  type EditorInteractionToolName,
-} from "./tools/system/editor-interaction-surface.js";
 import { createBrowserTool } from "./tools/BrowserTool/tool.js";
 import type { BashExecObserver } from "./tools/system/types.js";
 import type { WorkflowToolController } from "./tools/system/planning.js";
@@ -108,6 +102,11 @@ import { getAttachmentTrackingState } from "./session/attachment-state.js";
 import { runAdmittedToolCall } from "./budget/admitted-tool-call.js";
 import { AdmissionDeniedError } from "./budget/admission-client.js";
 import type { ToolEffectDispositionEvidence } from "./contracts/run-contracts.js";
+import { freshDenialTracking } from "./permissions/denial-tracking.js";
+import {
+  attachContextDefaults,
+  hasPermissionsToUseTool,
+} from "./permissions/evaluator.js";
 
 export interface ToolDispatchResult {
   readonly content: string;
@@ -133,16 +132,15 @@ export interface CodeModeNestedToolDispatch {
   readonly abortSignal?: AbortSignal;
 }
 
+export interface ToolRegistryDispatchOptions {
+  /** Request-scoped discovery metadata; does not grant execution permission. */
+  readonly advertisedToolNames?: readonly string[];
+}
+
 export interface ToolRegistry {
   readonly tools: readonly Tool[];
   toLLMTools(): LLMTool[];
-  dispatch(toolCall: LLMToolCall): Promise<ToolDispatchResult>;
-  /**
-   * Returns the exact runtime-owned built-in authorized for an Editor
-   * interaction. Callers must compare object identity; tool metadata is
-   * declarative and cannot establish provenance.
-   */
-  getTrustedEditorInteractionTool?(toolName: string): Tool | undefined;
+  dispatch(toolCall: LLMToolCall, options?: ToolRegistryDispatchOptions): Promise<ToolDispatchResult>;
   dispatchCodeModeNestedTool?(
     toolCall: CodeModeNestedToolDispatch,
   ): Promise<ToolDispatchResult>;
@@ -595,9 +593,9 @@ export interface BuildToolRegistryOptions {
    * LIVE tools (XSearch) so Pattern A one-shots can gate on config.
    */
   readonly grokCapabilities?: import("./config/schema.js").GrokCapabilityConfig;
-  /** Session provider slug for catalog-gating xAI-only LIVE tools. */
+  /** @deprecated Tool availability is independent of the reasoning provider. */
   readonly sessionProvider?: string;
-  /** Session inference base URL for direct-xAI host checks. */
+  /** @deprecated Tool backends resolve their own endpoint authority. */
   readonly sessionBaseURL?: string;
   /**
    * Runtime integration seam: extra tools to register beyond the default
@@ -682,6 +680,10 @@ export function buildToolRegistry(
       unifiedExecManager,
     }),
     createKillProcessTool({
+      cwd: options.workspaceRoot,
+      unifiedExecManager,
+    }),
+    createListProcessesTool({
       cwd: options.workspaceRoot,
       unifiedExecManager,
     }),
@@ -777,19 +779,7 @@ export function buildToolRegistry(
     }),
   ] as const;
   const requestedModelFacingTools = readToolList(options.modelFacingTools);
-  const registryModelFacingTools = [
-    ...requestedModelFacingTools.filter(
-      (tool) => !isEditorInteractionToolName(tool.name),
-    ),
-    // EditorProposal is a security terminal, not an extension point. Build it
-    // inside the registry so a caller-supplied model-facing spec cannot become
-    // the object later authenticated by an Editor turn.
-    ...(requestedModelFacingTools.some(
-      (tool) => tool.name === EDITOR_PROPOSAL_TOOL_NAME,
-    )
-      ? [createEditorProposalTool()]
-      : []),
-  ];
+  const registryModelFacingTools = requestedModelFacingTools;
   const modelFacingProviderNativeSurface = {
     webFetch: "web_fetch",
     webSearch: "WebSearch",
@@ -861,6 +851,7 @@ export function buildToolRegistry(
         shellToolSurface.execCommand,
         shellToolSurface.writeStdin,
         "kill_process",
+        "list_processes",
       ],
       stringArgumentFields: {
         [shellToolSurface.execCommand]: "cmd",
@@ -920,6 +911,9 @@ export function buildToolRegistry(
       stringArgumentFields: modelFacingStringArgumentFields,
     },
   ];
+  for (const group of baseBuiltinSurfaceGroups) {
+    if (group.id !== "model-facing") group.tools.forEach(registerBuiltinTool);
+  }
   const baseBuiltinSurface = buildBuiltinToolSurface(baseBuiltinSurfaceGroups);
   const rawDefaultBuiltinTools = baseBuiltinSurface.tools;
   const configuredRawDefaultBuiltinTools = configuredTools(
@@ -947,11 +941,6 @@ export function buildToolRegistry(
     },
   ]);
   function applyConfiguredTool(tool: Tool): Tool | null {
-    // EditorProposal is a protocol terminal for proposal-only Editor turns,
-    // not an optional Agent capability. Once the internally constructed
-    // canonical tool is present, per-tool visibility configuration must not
-    // make the Editor contract impossible to complete.
-    if (tool.name === EDITOR_PROPOSAL_TOOL_NAME) return tool;
     if (!toolConfigAllowsTool(options.toolsConfig, tool.name)) return null;
     const config = resolvePerToolConfig(options.toolsConfig, tool.name);
     if (config.defaultPermissionMode === undefined) return tool;
@@ -974,19 +963,12 @@ export function buildToolRegistry(
       ),
     ),
   );
-  const trustedEditorInteractionTools = new Map<
-    EditorInteractionToolName,
-    Tool
-  >();
   // Direct shell RPCs select one daemon-owned builtin by name. Reserve both
   // names even when the canonical tool is disabled or unavailable so an
   // extension cannot become the physical execution target by collision.
   const reservedDirectShellToolNames = new Set(["system.bash", "PowerShell"]);
   const trustedDirectShellTools = new Map<string, Tool>();
   for (const tool of defaultBuiltinTools) {
-    if (isEditorInteractionToolName(tool.name)) {
-      trustedEditorInteractionTools.set(tool.name, tool);
-    }
     if (reservedDirectShellToolNames.has(tool.name)) {
       trustedDirectShellTools.set(tool.name, tool);
     }
@@ -996,9 +978,6 @@ export function buildToolRegistry(
     tools: readonly Tool[],
   ): Tool[] =>
     tools.filter((tool) => {
-      if (isEditorInteractionToolName(tool.name)) {
-        return trustedEditorInteractionTools.get(tool.name) === tool;
-      }
       if (reservedDirectShellToolNames.has(tool.name)) {
         return trustedDirectShellTools.get(tool.name) === tool;
       }
@@ -1066,9 +1045,18 @@ export function buildToolRegistry(
   }
 
   function buildRouter(): ToolRouter {
-    const baseSpecs =
-      preserveTrustedRuntimeOwnedTools(staticTools).map(specForTool);
     const mcpTools = preserveTrustedRuntimeOwnedTools(currentMcpTools());
+    // A live manager owns its qualified MCP names. ToolRouter intentionally
+    // allows later dynamic/discoverable entries to override ordinary names,
+    // but allowing that for MCP would let a plugin borrow a real server's
+    // discovery/authentication while supplying its own schema and executor.
+    // Apply the ownership boundary once here so catalog and dispatch agree.
+    const managedMcpNames = new Set(
+      mcpTools.filter(tool => tool.name.startsWith("mcp.")).map(tool => tool.name),
+    );
+    const withoutManagedMcpCollisions = (tools: readonly Tool[]): Tool[] =>
+      preserveTrustedRuntimeOwnedTools(tools).filter(tool => !managedMcpNames.has(tool.name));
+    const baseSpecs = withoutManagedMcpCollisions(staticTools).map(specForTool);
     const directMcpTools = mcpTools.filter(
       (tool) => tool.metadata?.deferred !== true,
     );
@@ -1079,10 +1067,10 @@ export function buildToolRegistry(
       baseSpecs,
       mcpTools: toolMap(directMcpTools),
       deferredMcpTools: toolMap(deferredMcpTools),
-      discoverableTools: preserveTrustedRuntimeOwnedTools(
+      discoverableTools: withoutManagedMcpCollisions(
         currentDiscoverableTools(),
       ),
-      dynamicTools: preserveTrustedRuntimeOwnedTools([
+      dynamicTools: withoutManagedMcpCollisions([
         ...currentDynamicTools(),
         ...currentDeferredTools(),
       ]),
@@ -1108,7 +1096,7 @@ export function buildToolRegistry(
     spec: ConfiguredToolSpec,
     callId: string,
     args: Record<string, unknown>,
-    opts: { readonly abortSignal?: AbortSignal } = {},
+    opts: ToolRegistryDispatchOptions & { readonly abortSignal?: AbortSignal } = {},
   ): Promise<ToolDispatchResult> {
     Object.defineProperty(args, "__callId", {
       value: callId,
@@ -1124,7 +1112,7 @@ export function buildToolRegistry(
     }
     if (spec.tool.name === SYSTEM_SEARCH_TOOLS_NAME) {
       Object.defineProperty(args, SESSION_ADVERTISED_TOOL_NAMES_ARG, {
-        value: visibleSpecs().map((visible) => visible.tool.name),
+        value: Object.freeze([...(opts.advertisedToolNames ?? visibleSpecs().map((visible) => visible.tool.name))]),
         enumerable: false,
         configurable: true,
       });
@@ -1184,11 +1172,6 @@ export function buildToolRegistry(
     get tools(): readonly Tool[] {
       return allSpecs().map((spec) => spec.tool);
     },
-    getTrustedEditorInteractionTool(toolName: string): Tool | undefined {
-      return isEditorInteractionToolName(toolName)
-        ? trustedEditorInteractionTools.get(toolName)
-        : undefined;
-    },
     toLLMTools(): LLMTool[] {
       return visibleSpecs().map((spec) => toolToLLMTool(spec.tool));
     },
@@ -1198,7 +1181,7 @@ export function buildToolRegistry(
     discoverToolNames(toolNames: readonly string[]): void {
       markDiscovered(toolNames);
     },
-    async dispatch(toolCall: LLMToolCall): Promise<ToolDispatchResult> {
+    async dispatch(toolCall: LLMToolCall, dispatchOptions?: ToolRegistryDispatchOptions): Promise<ToolDispatchResult> {
       const router = buildRouter();
       const spec = router.findSpec(toolCall.name);
       if (!spec) {
@@ -1228,7 +1211,7 @@ export function buildToolRegistry(
             isError: true,
           };
         }
-        return await executeConfiguredTool(spec, toolCall.id, parseResult.args);
+        return await executeConfiguredTool(spec, toolCall.id, parseResult.args, dispatchOptions);
       } catch (error) {
         return {
           content: safeStringify({
@@ -1270,11 +1253,79 @@ export function buildToolRegistry(
         };
       }
       try {
-        const args = parseCodeModeNestedToolArguments(
+        let args = parseCodeModeNestedToolArguments(
           toolCall.name,
           toolCall.input,
           builtinSurface.stringArgumentFields,
         );
+        const session = options.getSession?.() ?? null;
+        const permissionRegistry = session?.services.permissionModeRegistry;
+        if (session !== null && permissionRegistry !== undefined) {
+          const denialTracking = session.denialTracking ?? freshDenialTracking();
+          const checkPermissions = spec.tool.checkPermissions;
+          const permissionTool: Tool = checkPermissions === undefined
+            ? spec.tool
+            : {
+                ...spec.tool,
+                async checkPermissions(input, context) {
+                  try {
+                    return await checkPermissions.call(spec.tool, input, context);
+                  } catch (error) {
+                    context.signal?.throwIfAborted();
+                    return {
+                      behavior: "deny",
+                      message: `Permission check failed: ${error instanceof Error ? error.message : String(error)}`,
+                      decisionReason: {
+                        type: "other",
+                        reason: "tool-specific permission check failed",
+                      },
+                    };
+                  }
+                },
+              };
+          const decision = await hasPermissionsToUseTool(
+            permissionTool,
+            args,
+            attachContextDefaults({
+              session,
+              denialTracking,
+              ...(toolCall.abortSignal !== undefined
+                ? { signal: toolCall.abortSignal }
+                : {}),
+              getAppState() {
+                const toolPermissionContext = permissionRegistry.current();
+                return {
+                  toolPermissionContext,
+                  denialTracking,
+                  autoModeActive: toolPermissionContext.autoModeActive === true,
+                };
+              },
+            }),
+          );
+          if (decision.behavior !== "allow") {
+            return {
+              content: safeStringify({
+                error: decision.message,
+              }),
+              isError: true,
+            };
+          }
+          if (decision.updatedInput !== undefined) {
+            args = parseCodeModeNestedToolArguments(
+              toolCall.name,
+              decision.updatedInput,
+              builtinSurface.stringArgumentFields,
+            );
+          }
+        } else if (spec.tool.checkPermissions !== undefined) {
+          return {
+            content: safeStringify({
+              error: `code-mode nested tool \`${toolCall.name}\` requires permission-aware dispatch with a live session permission registry`,
+            }),
+            isError: true,
+          };
+        }
+        toolCall.abortSignal?.throwIfAborted();
         return await executeConfiguredTool(spec, toolCall.id, args, {
           abortSignal: toolCall.abortSignal,
         });

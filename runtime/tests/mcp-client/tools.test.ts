@@ -152,7 +152,7 @@ describe("createToolBridge — T6 gap #119 observer wiring", () => {
     });
   });
 
-  test("skips MCP tools whose model-facing names violate provider constraints", async () => {
+  test("skips unsafe raw names but aliases names that only exceed the wire limit", async () => {
     const logger = {
       debug: vi.fn(),
       info: vi.fn(),
@@ -179,8 +179,9 @@ describe("createToolBridge — T6 gap #119 observer wiring", () => {
 
     expect(bridge.tools.map((tool) => tool.name)).toEqual([
       "mcp.srv.safe_tool",
+      `mcp.srv.${"x".repeat(60)}`,
     ]);
-    expect(logger.warn).toHaveBeenCalledTimes(4);
+    expect(logger.warn).toHaveBeenCalledTimes(3);
     const warnings = logger.warn.mock.calls.map(([message]) => String(message));
     expect(warnings.every((message) => message.includes("provider-unsafe")))
       .toBe(true);
@@ -199,7 +200,8 @@ describe("createToolBridge — T6 gap #119 observer wiring", () => {
     const wireNames = toChatCompletionsTools(llmTools).map(
       (tool) => tool.function.name,
     );
-    expect(wireNames).toEqual(["mcp__srv__safe_tool"]);
+    expect(wireNames[0]).toBe("mcp__srv__safe_tool");
+    expect(wireNames[1]).toMatch(/^toolh__[a-zA-Z0-9_-]{43}$/);
     expect(wireNames.every((name) => /^[a-zA-Z0-9_-]{1,64}$/.test(name)))
       .toBe(true);
   });
@@ -1096,6 +1098,46 @@ describe("createToolBridge — T6 gap #119 observer wiring", () => {
       .toBe("on-request");
     expect(bridge.tools.find((tool) => tool.name === "mcp.srv.write")?.defaultPermissionMode)
       .toBe("never");
+  });
+
+  test("marks only explicitly audited raw MCP tools as virtual non-filesystem writers", async () => {
+    const fakeClient = {
+      listTools: async () => ({
+        tools: [
+          {
+            name: "browser_navigate",
+            inputSchema: { type: "object", properties: {} },
+          },
+          {
+            name: "terminal_run",
+            inputSchema: { type: "object", properties: {} },
+          },
+        ],
+      }),
+      callTool: async () => ({
+        content: [{ type: "text", text: "ok" }],
+        isError: false,
+      }),
+      close: async () => {},
+    };
+
+    const bridge = await createToolBridge(fakeClient, "agenc-desktop", undefined, {
+      serverConfig: {
+        virtualNoFsWriteTools: ["browser_navigate"],
+      },
+    });
+
+    const browserNavigate = bridge.tools.find(
+      (tool) => tool.name === "mcp.agenc-desktop.browser_navigate",
+    );
+    const terminalRun = bridge.tools.find(
+      (tool) => tool.name === "mcp.agenc-desktop.terminal_run",
+    );
+    expect(browserNavigate?.metadata).toEqual({
+      mutating: true,
+      virtualNoFsWrites: true,
+    });
+    expect(terminalRun?.metadata?.virtualNoFsWrites).not.toBe(true);
   });
 
   test("treats an empty server allowlist as exposing zero tools", async () => {

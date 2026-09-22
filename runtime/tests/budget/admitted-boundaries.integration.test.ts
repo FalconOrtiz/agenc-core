@@ -393,8 +393,19 @@ describe("admitted execution boundaries with the durable kernel", () => {
     expect(kernel.activeCount).toBe(0);
   });
 
-  it("makes a provider overrun explicit and locks future descendants", async () => {
-    const client = admission("overrun-parent");
+  it.each([
+    { maxTokens: 10_000 },
+    { maxCostUsd: 0.01 },
+  ])("makes a provider overrun explicit under %j and locks future descendants", async (limits) => {
+    const client = kernel.bindClient({
+      cwd,
+      scope: {
+        runId: "overrun-parent",
+        sessionId: "overrun-parent",
+        autonomous: false,
+        ...limits,
+      },
+    });
     const session = sessionFor(client);
 
     await expect(
@@ -442,6 +453,60 @@ describe("admitted execution boundaries with the durable kernel", () => {
       "provider_overrun",
     ]);
     expect(session.abortTerminal).toHaveBeenCalledWith("provider_overrun");
+  });
+
+  it("charges an underestimated uncapped response and admits future descendants", async () => {
+    const client = admission("uncapped-parent");
+    const session = sessionFor(client);
+    const response = modelResponse({
+      promptTokens: 100_000,
+      completionTokens: 10_000,
+      totalTokens: 110_000,
+    });
+
+    await expect(
+      runAdmittedModelCall({
+        session,
+        provider,
+        messages: [{ role: "user", content: "hello" }],
+        options: { maxOutputTokens: 1 },
+        stepId: "model:underestimated",
+        model: "grok-4.5",
+        providerName: "grok",
+        invoke: async () => response,
+      }),
+    ).resolves.toBe(response);
+
+    expect(client.getUsageSummary?.()).toMatchObject({
+      inputTokens: 100_000,
+      outputTokens: 10_000,
+      totalTokens: 110_000,
+      hasUnknownCost: false,
+    });
+    expect(client.getUsageSummary?.().costUsd).toBeGreaterThan(0.01);
+    expect(session.abortTerminal).not.toHaveBeenCalled();
+    expect(session.services.agentControl.shutdownAgentTree).not.toHaveBeenCalled();
+    expect(
+      kernel
+        .listJournal({ cwd, runId: client.scope.runId })
+        .map((event) => event.event),
+    ).toEqual(["queued", "allowed", "dispatched", "reconciled"]);
+
+    const child = client.forSession({
+      runId: "uncapped-child",
+      sessionId: "uncapped-child",
+    });
+    const lease = await child.acquire({
+      stepId: "future-child",
+      kind: "tool_exec",
+      maxInputTokens: 0,
+      maxOutputTokens: 0,
+      maxCostUsd: 0,
+    });
+    expect(lease.signal.aborted).toBe(false);
+    child.void(lease.reservation.reservationId, "test_cleanup");
+    child.acknowledgeCompletion(lease.reservation.reservationId);
+    expect(kernel.activeCount).toBe(0);
   });
 
   it("atomically holds an unpriced hard-cap response and survives a crash before live shutdown", async () => {

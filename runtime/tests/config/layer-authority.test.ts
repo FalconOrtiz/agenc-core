@@ -2,6 +2,7 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -12,6 +13,7 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import {
   assertConfigPatchAuthority,
+  assertUserConfigDocumentAuthority,
   configAuthorityClass,
   MANAGED_ONLY_CONFIG_KEYS,
   OPERATOR_ONLY_CONFIG_KEYS,
@@ -32,7 +34,9 @@ import { ConfigStore } from "../../src/config/store.js";
 const temporaryDirectories: string[] = [];
 
 function temporaryRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "agenc-layer-authority-"));
+  const root = mkdtempSync(
+    join(realpathSync(tmpdir()), "agenc-layer-authority-"),
+  );
   temporaryDirectories.push(root);
   return root;
 }
@@ -446,148 +450,37 @@ describe("canonical config layer authority", () => {
     );
   });
 
-  test("trusted repository declarations survive while embedded grants are removed without values", async () => {
-    const root = temporaryRoot();
-    writeConfig(join(root, "project", ".agenc", "config.toml"), {
-      permissions: {
-        allow: ["system.bash(*)"],
-        deny: ["system.bash(rm:*)"],
-        ask: ["system.bash(git push:*)"],
-        bypassPermissionsMode: "allow",
-      },
-      tools_config: {
-        WebSearch: { default_permission_mode: "never" },
-        enabled_tools: ["WebSearch"],
-        disabled_tools: ["DangerousTool"],
-        web_search_endpoint: "https://project.invalid/search",
-      },
-      mcp_servers: {
-        docs: {
-          command: "trusted-mcp-command",
-          args: ["--stdio"],
-          default_tools_approval_mode: "never",
-          enabled_tools: ["read"],
-          disabled_tools: ["write"],
-          tools: {
-            read: { default_permission_mode: "never" },
-          },
-        },
-      },
-      hooks: {
-        PreToolUse: [{
-          matcher: "system.bash",
-          hooks: [{ type: "command", command: "trusted-hook-command" }],
-        }],
-      },
-      lsp_servers: {
-        typescript: {
-          command: "trusted-lsp-command",
-          extensionToLanguage: { ".ts": "typescript" },
-        },
-      },
-      attachments: { allowedRoots: ["/sensitive-root"] },
-      providers: {
-        grok: {
-          base_url: "https://project.invalid/provider",
-          remote_mcp: {
-            enabled: true,
-            servers: [{
-              server_url: "https://project.invalid/mcp",
-              server_label: "project",
-            }],
-          },
-        },
-      },
-      auth: { backend: "remote" },
-      profiles: { project: { approval_policy: "never" } },
-      browser: {
-        executable_path: "/sensitive-browser",
-        profile_dir: "/sensitive-profile",
-        allow_private_network: true,
-        no_sandbox: true,
-        headless: true,
-      },
-      protocol: { enabled: true, adapter: "marketplace-cli", cli_path: "/sensitive-cli" },
-      daemon: { autostart: true },
-      xaa_idp: { issuer: "https://project.invalid/idp", client_id: "sensitive-client" },
-      autonomous_mode: true,
-      coordinator_mode: true,
-      disableAllHooks: false,
-      autoMode: { allow: ["system.bash"] },
-      shell_environment_policy: {
-        set: { PROJECT_MARKER: "repository-value" },
-      },
-      statusLine: { type: "command", command: "sensitive-status-command" },
-      fileSuggestion: { type: "command", command: "sensitive-suggestion-command" },
-      autoFix: { enabled: true, lint: "sensitive-lint-command" },
-      buffer: {
-        neovim: { executable: "/sensitive-nvim" },
-        prediction: { enabled: "on", provider: "grok", model: "grok-4.6" },
-      },
-    });
+  test("lists rejected keys in code-unit order without mutating the caller's objects", () => {
+    const registries = {
+      managed: [...MANAGED_ONLY_CONFIG_KEYS],
+      operator: [...OPERATOR_ONLY_CONFIG_KEYS],
+    };
+    const userDocument = {
+      pluginTrustMessage: "Approved sources only.",
+      availableModels: ["grok-4.6"],
+    };
+    const projectPatch = {
+      minimumVersion: "99.0.0",
+      gateway: { defaultAgent: "project" },
+    };
 
-    const loaded = await loadLayeredConfig(repositoryOptions(root));
-    const project = loaded.sources.find((layer) => layer.scope === "project")?.config;
-    expect(project?.permissions).toMatchObject({
-      deny: ["system.bash(rm:*)"],
-      ask: ["system.bash(git push:*)"],
-    });
-    expect(project?.permissions?.allow).toBeUndefined();
-    expect(project?.permissions?.bypassPermissionsMode).toBeUndefined();
-    expect(project?.tools_config?.disabled_tools).toEqual(["DangerousTool"]);
-    expect(project?.tools_config?.WebSearch?.default_permission_mode).toBeUndefined();
-    expect(project?.mcp_servers?.docs?.command).toBe("trusted-mcp-command");
-    expect(project?.mcp_servers?.docs?.disabled_tools).toEqual(["write"]);
-    expect(project?.mcp_servers?.docs?.default_tools_approval_mode).toBeUndefined();
-    expect(project?.hooks?.PreToolUse).toHaveLength(1);
-    expect(project?.lsp_servers?.typescript?.command).toBe("trusted-lsp-command");
-    expect(project?.providers).toBeUndefined();
-    expect(project?.auth).toBeUndefined();
-    expect(project?.profiles).toBeUndefined();
-    expect(project?.attachments).toBeUndefined();
-    expect(project?.protocol).toBeUndefined();
-    expect(project?.daemon).toBeUndefined();
-    expect(project?.xaa_idp).toBeUndefined();
-    expect(project?.autonomous_mode).toBeUndefined();
-    expect(project?.coordinator_mode).toBeUndefined();
-    expect(project?.disableAllHooks).toBeUndefined();
-    expect(project?.autoMode).toBeUndefined();
-    expect(project?.browser).toEqual({ headless: true });
-    expect(project?.shell_environment_policy?.set).toBeUndefined();
-    expect(project?.statusLine).toBeUndefined();
-    expect(project?.fileSuggestion).toBeUndefined();
-    expect(project?.autoFix).toBeUndefined();
-    expect(project?.buffer?.neovim?.executable).toBeUndefined();
-    expect(project?.buffer?.prediction).toBeUndefined();
+    expect(() => assertUserConfigDocumentAuthority(userDocument)).toThrow(
+      /managed-only keys availableModels, pluginTrustMessage.*managed config\.toml/u,
+    );
+    expect(() => assertConfigPatchAuthority("user", {
+      pluginTrustMessage: "x",
+      availableModels: ["grok-4.6"],
+    })).toThrow(/managed-only keys availableModels, pluginTrustMessage/u);
+    expect(() => assertConfigPatchAuthority("project", projectPatch)).toThrow(
+      /operator-only keys gateway, minimumVersion/u,
+    );
 
-    const ignored = loaded.ignored.map(({ key }) => key);
-    expect(ignored).toEqual(expect.arrayContaining([
-      "permissions.allow",
-      "permissions.bypassPermissionsMode",
-      "tools_config.WebSearch.default_permission_mode",
-      "tools_config.enabled_tools",
-      "mcp_servers.docs.default_tools_approval_mode",
-      "mcp_servers.docs.tools.read.default_permission_mode",
-      "attachments",
-      "providers",
-      "auth",
-      "profiles",
-      "browser.executable_path",
-      "browser.allow_private_network",
-      "protocol",
-      "daemon",
-      "xaa_idp",
-      "autonomous_mode",
-      "disableAllHooks",
-      "autoMode",
-      "shell_environment_policy.set",
-      "statusLine",
-      "fileSuggestion",
-      "autoFix",
-      "buffer.neovim.executable",
-      "buffer.prediction",
-    ]));
-    expect(JSON.stringify(loaded.ignored)).not.toContain("secret-value");
-    expect(JSON.stringify(project)).not.toContain("sensitive-");
+    expect(Object.keys(userDocument)).toEqual([
+      "pluginTrustMessage",
+      "availableModels",
+    ]);
+    expect(Object.keys(projectPatch)).toEqual(["minimumVersion", "gateway"]);
+    expect([...MANAGED_ONLY_CONFIG_KEYS]).toEqual(registries.managed);
+    expect([...OPERATOR_ONLY_CONFIG_KEYS]).toEqual(registries.operator);
   });
 });

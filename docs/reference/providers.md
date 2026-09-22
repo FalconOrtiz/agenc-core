@@ -1,6 +1,6 @@
 # Providers reference
 
-Built-in model providers for AgenC **0.17.0**. Source of truth:
+Built-in model providers for AgenC **0.18.0**. Source of truth:
 `runtime/src/llm/registry/provider-info.ts`
 (`BUILT_IN_PROVIDER_DEFINITIONS`). Each row owns the display name, defaults,
 ordered credential and endpoint environment ingress names, and first-run
@@ -25,6 +25,41 @@ Bare interactive startup with a fresh install uses the **config** default
 (`grok-4.6`). When only the direct `grok` provider slug is resolved without an
 explicit model, the registry also uses **`grok-4.6`**. Managed OpenRouter is a
 separate provider route and its paid default remains **`x-ai/grok-4.5`**.
+
+## Gemini reasoning effort
+
+The native Gemini adapter sends an explicit effort as
+`generationConfig.thinkingConfig.thinkingLevel`. The model catalog, `/effort`,
+child-agent and role overrides, and provider/model switch checks use the same
+supported-level metadata.
+
+| Model | Explicit levels | Provider default when omitted |
+| --- | --- | --- |
+| `gemini-3.1-pro-preview` | `low`, `medium`, `high` | `high` |
+| `gemini-3.7-flash` | `low`, `medium`, `high` | `medium` |
+| `gemini-3.5-flash` | `minimal`, `low`, `medium`, `high` | `medium` |
+| `gemini-3-flash-preview` | `minimal`, `low`, `medium`, `high` | `high` |
+| `gemini-3-pro-preview` | `low`, `high` | `high` |
+
+An unconfigured Gemini session leaves thinking controls out of the request.
+An explicit `reasoning_effort = "none"` also omits the control, even when
+another configured effort would otherwise apply. Neither case disables the
+model's thinking. `/effort default` removes the saved override. A compatible
+effort already stamped on a session remains in effect after a provider switch.
+
+Unsupported explicit levels fail before a request is sent. AgenC does not
+translate `minimal`, `xhigh`, or `max` into a different Gemini level. Unknown
+model variants do not inherit levels from a name prefix. Gemini 2.5 Pro,
+Flash, and Flash-Lite use `thinkingBudget` on the native `generateContent`
+API, so AgenC does not accept named effort levels for those models or invent
+a token-budget conversion.
+
+Sources checked on 2026-09-08: Google's
+[native ThinkingConfig reference](https://ai.google.dev/api/generate-content#ThinkingConfig),
+[thinking guide](https://ai.google.dev/gemini-api/docs/thinking), and
+[Gemini 3 guide](https://ai.google.dev/gemini-api/docs/gemini-3).
+The Interactions API's level abstraction for Gemini 2.5 does not apply to
+AgenC's native `generateContent` requests.
 
 ## Single provider authority
 
@@ -71,11 +106,18 @@ catalog for Grok 4.6 exposes:
 | Reasoning effort | `low`, `medium`, `high`, `xhigh`; model default `high` |
 | Standard token rates below 200k prompt tokens | $2.00 / 1M input, $0.50 / 1M cached input, $6.00 / 1M output |
 
+| Selectable model | Context | Input | Reasoning effort | Base rates per 1M input / cached / output |
+| --- | --- | --- | --- | --- |
+| `grok-4.7` | 500,000 | text and image | `low`, `medium`, `high`, `xhigh`; default `high` | $2 / $0.50 / $6 |
+
+Grok 4.7 preserves encrypted reasoning on Responses resends and durable history.
+The session default remains `grok-4.6`.
+
 `grok-4.5` remains a selectable 500k-context catalog entry with the same input
 modalities and runtime features. Its short-context cached-input rate is
 $0.30 / 1M, versus $0.50 / 1M for Grok 4.6; it supports
 `low`/`medium`/`high` reasoning and is still the managed OpenRouter paid
-default. The xAI reasoning gate is fail-closed: Grok 4.3, Grok 4.5, Grok 4.6,
+default. The xAI reasoning gate is fail-closed: Grok 4.3, Grok 4.5, Grok 4.6, Grok 4.7,
 and the documented 4.20 multi-agent family may receive the provider parameter;
 unknown variants have it stripped instead of inheriting support from a name
 prefix. Grok 4.3's catalog default effort is `low`; Grok 4.5 and Grok 4.6
@@ -93,7 +135,7 @@ the Grok 4.6 default and capability change.
 they run only through the Grok Build CLI ACP path. See
 [grok-oauth.md](../grok-oauth.md#composer-models-acp).
 
-## Built-in providers (16)
+## Built-in providers (24)
 
 | Slug | Display name | Default model | Default base URL | Ordered credential env aliases | Ordered endpoint env aliases | Onboarding access |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -106,7 +148,15 @@ they run only through the Grok Build CLI ACP path. See
 | `openrouter` | OpenRouter | `x-ai/grok-4.5` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `OPENROUTER_BASE_URL` | `api-key` |
 | `groq` | Groq | `llama-3.3-70b-versatile` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `GROQ_BASE_URL` | `api-key` |
 | `deepseek` | DeepSeek | `deepseek-v4-flash` | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | `api-key` |
+| `meta` | Meta | `muse-spark-1.3` | `https://api.meta.ai/v1` | `MODEL_API_KEY` | `META_BASE_URL` | `api-key` |
+| `qwen` | QwenCloud Pay-As-You-Go | `qwen3.8-max` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` | `DASHSCOPE_BASE_URL`, `QWEN_BASE_URL` | `api-key` |
+| `qwen-token-plan` | QwenCloud Token Plan | `qwen3.8-max` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `QWEN_TOKEN_PLAN_API_KEY`, `DASHSCOPE_TOKEN_PLAN_API_KEY` | `QWEN_TOKEN_PLAN_BASE_URL`, `DASHSCOPE_TOKEN_PLAN_BASE_URL` | `api-key` |
+| `ollama-cloud` | Ollama Cloud | `deepseek-v4.1-flash` | `https://ollama.com/v1` | `OLLAMA_API_KEY` | None (fixed Cloud endpoint) | `api-key` |
+| `cerebras` | Cerebras | `gpt-oss-120b` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | `CEREBRAS_BASE_URL` | `api-key` |
+| `zai` | Z.AI | `glm-5.3` | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` | `ZAI_BASE_URL` | `api-key` |
+| `zai-coding-plan` | Z.AI Coding Plan | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | `ZAI_CODING_PLAN_API_KEY` | `ZAI_CODING_PLAN_BASE_URL` | `api-key` |
 | `gemini` | Gemini | `gemini-3.1-pro-preview` | `https://generativelanguage.googleapis.com/v1beta` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `GEMINI_BASE_URL` | `api-key` |
+| `kimi` | Kimi (Moonshot) | `kimi-k3` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` | _(fixed global endpoint)_ | `api-key` |
 | `mistral` | Mistral | `mistral-medium-latest` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL` | `api-key` |
 | `nvidia-nim` | NVIDIA NIM | `nvidia/llama-3.1-nemotron-70b-instruct` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | `api-key` |
 | `minimax` | MiniMax | `MiniMax-M2.5` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` | `api-key` |
@@ -150,6 +200,12 @@ stores credential values.
   retired native `agenc` credential field are explicit one-way migration
   inputs only. Reads, refreshes, and clears stay bound to the client's captured
   `HomeContext`, and refresh compare-and-swap preserves a newer login.
+  Within an OpenAI provider instance, concurrent 401 failures share one
+  refresh for the credentials used by those requests. Delayed failures from
+  older credentials cannot invalidate a refreshed session. Cancelling a chat
+  or stream stops that caller's wait without cancelling the shared refresh.
+  Genuine refresh exhaustion stays in effect until the provider is recreated
+  after login. Single-wire requests never refresh or mark refresh exhausted.
   List reachable models with `agenc openai-models --json`
   (`{ok, models, authMode}`; tokens never in the output). See
   [cli.md](cli.md#openai-models).
@@ -202,6 +258,188 @@ consumed by this direct SigV4 provider. Bedrock model discovery and token
 counting receive the same captured credentials explicitly; they do not invoke
 the AWS SDK profile, shared-file, instance-metadata, or web-identity chains.
 
+Meta Model API uses `MODEL_API_KEY` and the OpenAI-compatible
+`/chat/completions` transport. Its LLM catalog includes `muse-spark-1.3`,
+`muse-spark-1.3-contributor`, `muse-spark-1.2`,
+`muse-spark-1.2-contributor`, and `muse-spark-1.1`. The `/models` entries
+`muse-image-1.0` and `muse-voice-transcribe-1.0` are media APIs, so they remain
+excluded from the chat/session model picker. `muse-image-1.0` is instead the
+native Meta backend for the model-facing `ImagineImage` tool. Muse Spark (and
+any other tool-capable reasoning provider) can invoke that tool when
+`MODEL_API_KEY` is configured; tool availability is not restricted by the
+reasoning provider slug.
+
+Muse Spark is registered with a 1,048,576-token context window and a
+131,072-token maximum output. Its supported reasoning levels are `minimal`,
+`low`, `medium`, `high`, and `xhigh` (default `medium`); standard-tier
+`muse-spark-1.3` also accepts `max`. The API rejects `none`, and `max` is not
+available on the other registered models. See Meta's
+[reasoning guide](https://dev.meta.ai/docs/reasoning). The chat models accept image input, JSON-schema structured
+output, and parallel function calls. Meta accepts only `tool_choice: "auto"`
+and rejects `stop`, so AgenC normalizes those controls before sending a
+request. Streams must include a terminal `finish_reason`; malformed or cut
+streams fail instead of being accepted as completed answers, and tool calls
+require `finish_reason: "tool_calls"` before dispatch. This follows Meta's
+[Chat Completions contract](https://dev.meta.ai/docs/protocols/chat-completions).
+Exact per-token pricing is not published in the authoritative
+provider documentation, so AgenC reports the cost as unknown instead of
+treating its conservative fallback estimate as authoritative.
+
+Cerebras uses `CEREBRAS_API_KEY` with the OpenAI-compatible
+`https://api.cerebras.ai/v1/chat/completions` endpoint. The optional
+`CEREBRAS_BASE_URL` override supports a private/dedicated deployment without
+restricting its model name to the public catalog. The public chat catalog is:
+
+| Model | Context | Max output | Input / output per 1M tokens | Image input | Parallel tools | Reasoning effort (default) |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| `gpt-oss-120b` | 131,072 | 40,960 | $0.35 / $0.75 | no | no | `low`, `medium`, `high` (`medium`) |
+| `qwen-3.8-27b` | 65,536 | 32,768 | $0.99 / $1.49 | yes | yes | `none`, `low`, `medium`, `high` (`high`) |
+| `gemma-4-31b` | 131,072 | 40,960 | $0.99 / $1.49 | yes | yes | `none`, `low`, `medium`, `high` (`none`) |
+
+All three expose function tools and JSON-schema structured output, but
+Cerebras rejects combining those two modes in one request; AgenC blocks that
+combination before dispatch. AgenC sends
+`max_completion_tokens`, keeps Cerebras' `reasoning` response field out of
+visible assistant text, and replays that opaque field only to the same
+provider/model during a tool loop. Tool-result images are relayed as a user
+image only for the two vision models; `gpt-oss-120b` and unknown dedicated
+models strip them. Direct image history must use base64 PNG or JPEG data URIs
+on `user` messages; remote URLs, WebP, and GIF are rejected before dispatch.
+Requests are limited to ten images and a 10 MiB total HTTP request payload.
+Unsupported or excess
+tool-result media is dropped while its textual result remains available to the
+model. The adapter targets API v2, whose strict tool sequence
+requires every assistant tool call to be followed immediately by its matching
+tool result. Explicit `service_tier` values remain available to callers of
+configured dedicated endpoints, but the shared model catalog advertises no
+selectable speed tiers because `flex` is private preview and `priority` is
+dedicated-only. Structured schemas outside Cerebras' strict subset (including
+array-size constraints such as `maxItems`) automatically use `strict: false`
+on the wire without erasing the original application constraint. These
+capabilities were verified against the public Cerebras model catalog and
+inference documentation on 2026-09-04. The listed shared-API rates use the
+official model/pricing pages from that date; dedicated endpoint rates remain
+deployment-specific. Sources: [public model catalog](https://inference-docs.cerebras.ai/api-reference/models/public-models),
+[Qwen 3.8 27B](https://inference-docs.cerebras.ai/models/qwen-3.8-27b),
+[Chat Completions](https://inference-docs.cerebras.ai/api-reference/chat-completions),
+[reasoning](https://inference-docs.cerebras.ai/capabilities/reasoning),
+[image inputs](https://inference-docs.cerebras.ai/capabilities/image-inputs),
+[structured outputs](https://inference-docs.cerebras.ai/capabilities/structured-outputs),
+and [service tiers](https://inference-docs.cerebras.ai/capabilities/service-tiers).
+
+Z.AI Pay-As-You-Go uses `ZAI_API_KEY` with the OpenAI-compatible
+`https://api.z.ai/api/paas/v4/chat/completions` endpoint. The separate
+`zai-coding-plan` provider uses `ZAI_CODING_PLAN_API_KEY` with
+`https://api.z.ai/api/coding/paas/v4/chat/completions`. `ZAI_BASE_URL` and
+`ZAI_CODING_PLAN_BASE_URL` override only their matching route. Credentials and
+endpoints never cross between the two billing modes. Both curated chat
+catalogs are intentionally fixed rather than derived from `/models`:
+
+| Model | Context | Max output | Input / cached input / output per 1M tokens | Image input | Reasoning effort (default) |
+| --- | ---: | ---: | ---: | --- | --- |
+| `glm-5.3` | 1,000,000 | 131,072 | $1.40 / $0.26 / $4.40 | no | `low`, `high`, `max` (`max`) |
+| `glm-5.3-flash` | 1,000,000 | 131,072 | $0.15 / $0.03 / $0.50 | yes | `low`, `high`, `max` (`max`) |
+
+Both models are documented for Pay-As-You-Go and Coding Plan and use
+always-enabled thinking. Coding Plan access is subscription-based, so AgenC
+does not apply Pay-As-You-Go token prices to its cost accounting. AgenC sends
+the provider's nested `thinking` object with `clear_thinking=true` for ordinary
+turns. It switches that field to `false` only for a complete, immediately
+adjacent tool/result continuation from the exact same provider and model, and
+then replays every reasoning block in that intact multi-round chain in its
+original order. Compacted, incomplete, or older reasoning is cleared as a
+unit and remains outside the visible answer. Z.AI receives the
+full normal AgenC tool catalog up to its documented
+128-function limit. If a request would exceed that limit, AgenC fails before
+HTTP with an actionable error instead of silently dropping tools.
+`tool_choice` is normalized to `auto`, parallel-tool and undocumented
+stream-usage controls are omitted, streamed tool arguments use `tool_stream`,
+and `max_tokens` is the output field. Tool-call arguments may arrive as either
+a JSON string or an object; both forms are normalized before dispatch. JSON
+structured output uses Z.AI's `json_object` response format, includes the
+requested schema as a system constraint, and validates the result locally with
+full JSON Schema semantics. Structured output remains available through
+function-tool loops: intermediate `tool_calls` turns skip final-output parsing,
+then the terminal `stop` answer is schema-validated. The Z.AI-specific
+`sensitive`, `network_error`, and
+`model_context_window_exceeded` finish reasons map to AgenC's content-filter,
+error, and context-overflow states. Code `1113` is surfaced as a non-retryable
+billing/endpoint configuration error rather than a transient rate limit.
+Streamed tool calls require an explicit `finish_reason=tool_calls`; malformed
+or conflicting terminal frames fail closed. Only `glm-5.3-flash` admits image history; tool-result
+images are relayed as a user image for Flash and stripped for the text-only
+model. Flash validates inline input as JPEG/PNG under 5 MiB and no larger than
+6000x6000; unsupported tool-result images are omitted without losing their
+text result.
+
+`ZAI_API_KEY` also enables the provider-independent `ImagineImage` tool. A
+Z.AI Pay-As-You-Go session prefers its native synchronous
+`/images/generations` route over unrelated media credentials; another
+reasoning provider can use it only as an explicitly configured, independent
+media backend. The default image model is `glm-image`; the official
+`cogview-4-250304` model is also accepted. The tool sends one image per
+request and reserves the official $0.015 / $0.01 per-image cost respectively.
+It validates the documented `hd` / `standard` quality and size choices,
+downloads the returned temporary URL through a 20 MiB limit, and revalidates
+every HTTPS redirect against the Z.AI image-host allowlist. Image models are
+rejected by the chat provider before network dispatch. Coding Plan credentials
+never authorize this general image route: a `zai-coding-plan` session needs a
+separate `ZAI_API_KEY` (or another independent media backend) to expose
+`ImagineImage`. Sources:
+[GLM-5.3](https://docs.z.ai/guides/llm/glm-5.3),
+[GLM-5.3 Flash](https://docs.z.ai/guides/vlm/glm-5.3-flash),
+[Chat Completions](https://docs.z.ai/api-reference/llm/chat-completion),
+[Generate Image](https://docs.z.ai/api-reference/image/generate-image), and
+[pricing](https://docs.z.ai/guides/overview/pricing).
+
+Kimi uses `MOONSHOT_API_KEY` only with Moonshot's fixed global
+`https://api.moonshot.ai/v1` authority. The native `kimi` slug has no base-URL
+environment override and never borrows another provider's key; regional or
+custom OpenAI-compatible deployments belong under `openai-compatible`. Its
+curated global catalog is:
+
+| Model | Context | Default / maximum output | Cached input / input / output per 1M tokens | Reasoning effort (default) |
+| --- | ---: | ---: | ---: | --- |
+| `kimi-k3` | 1,048,576 | 131,072 / 1,048,576 | $0.30 / $3.00 / $15.00 | `low`, `high`, `max` (`max`) |
+| `kimi-k2.7-code` | 262,144 | 32,768 harness default / not published | $0.19 / $0.95 / $4.00 | provider-controlled |
+| `kimi-k2.7-code-highspeed` | 262,144 | 32,768 harness default / not published | $0.38 / $1.90 / $8.00 | provider-controlled |
+| `kimi-k2.6` | 262,144 | 32,768 harness default / not published | $0.16 / $0.95 / $4.00 | provider-controlled |
+
+All four models receive the normal AgenC function-tool catalog and vision
+history. Requests above Moonshot's 128-tool limit fail locally rather than
+silently clipping tools. K3 accepts `required`; K2.7 and K2.6 normalize that
+unsupported mode to `auto`. Named function choices are incompatible with
+thinking and are normalized for all four. Parallel-tool and fixed sampling
+controls are omitted, and every model uses
+`max_completion_tokens`.
+The K2.x 64,000-token configurable ceiling is an AgenC safety guard, not a
+published Moonshot model maximum.
+
+K3 and K2.7 always think; AgenC omits the optional `thinking` request field for
+both. K2.6 receives `thinking: { type: "enabled", keep: "all" }`. AgenC keeps
+`reasoning_content` outside visible assistant text and replays every historical
+block only to the exact same Kimi provider/model when the history is intact.
+Authenticated compaction markers describe an already-authoritative projected
+history and do not permanently disable replay. A boundary dropped during wire
+normalization or orphan-tool repair still invalidates the whole replay set;
+benign adjacent user-context merging does not. Kimi streams
+fail closed on malformed JSON, missing/conflicting terminal reasons, or a
+partial tool call not finalized with `finish_reason=tool_calls`.
+
+Vision input must be inline base64 or an already-uploaded `ms://` reference;
+public HTTP image URLs and SVG are rejected before network dispatch. Supported
+formats are JPG, PNG, WebP, GIF, BMP, HEIC, and HEIF, and the final request is
+bounded to 100 MB. JSON Schema response format is available on all four
+models. Combining it with tools is enabled only for `kimi-k2.7-code`, whose
+complete tool-call/result/final-JSON loop has been verified; the other three
+remain fail-closed until their combined loop is verified. Kimi supplies no
+native image-generation route, so `ImagineImage` continues to use a separately
+authorized media backend. Sources: [model overview](https://platform.kimi.ai/docs/api/models-overview.md),
+[thinking models](https://platform.kimi.ai/docs/guide/use-thinking-models.md),
+[vision models](https://platform.kimi.ai/docs/guide/use-kimi-vision-model.md),
+[Chat Completions](https://platform.kimi.ai/docs/api/chat.md), and
+[pricing](https://platform.kimi.ai/docs/pricing/chat-k3.md).
+
 ## Local context windows
 
 How AgenC learns the token budget for a local or OpenAI-compatible model.
@@ -250,9 +488,20 @@ explicit config, the built-in heuristic, or 128k. The admitted session window
 can therefore be smaller than the picker after the live probe returns.
 
 Live metadata providers: `grok`, `openai`, `ollama`, `lmstudio`,
-`openai-compatible`, `groq`, `deepseek`. Grok / OpenAI / Groq / DeepSeek
+`openai-compatible`, `groq`, `deepseek`, `meta`, `qwen`,
+`qwen-token-plan`, and `cerebras`. Hosted providers
 are probed only when `providers.<slug>.base_url` or that provider's endpoint
 env is set.
+
+Z.AI and Z.AI Coding Plan are deliberately not live-metadata providers: their curated GLM catalogs
+supplies context and output limits even with a custom base URL. Provider health
+checks still authenticate with `GET {base}/models`; a rejected or expired key
+therefore does not appear usable, but that response never overrides the
+curated limits.
+
+Kimi likewise uses its curated native catalog for the limits documented above;
+`GET /models` remains a credential-health check rather than model-metadata
+authority.
 
 ### Local probes (recorded against live servers)
 
@@ -381,8 +630,10 @@ provider-neutral HTTP client:
 
 - request max retries: **4**
 - stream max retries: **5**
-- stream idle timeout: **unset** (0). Silence does not end a turn unless you
-  set `stream_watchdog_timeout_ms` or `AGENC_STREAM_IDLE_TIMEOUT_MS`
+- stream idle timeout: **unset** (0) at the transport level. The session
+  watchdog owns the idle deadline: `stream_watchdog_timeout_ms` defaults to
+  `600000` (warning at half, retryable `stream_idle` abort at the deadline);
+  set it or `AGENC_STREAM_IDLE_TIMEOUT_MS` to `0` to allow unbounded silence
 
 Model-provider streaming uses HTTP/SSE. The daemon, realtime connector, MCP,
 and gateway have separate WebSocket transports; they are not provider
@@ -392,10 +643,40 @@ Its retry behavior is:
 
 - **429 is not retried** (`retry429: false`). 5xx and transport (network/timeout)
   are. Caller abort is not. One extra TLS-cert retry on attempt 0 only.
+- A stream that ends before its terminal event (`response.completed` or
+  `response.failed`) surfaces as `LLMStreamTruncatedError`, which the turn's
+  reconnect ladder retries like `stream_idle`; the transport saw a clean end,
+  so only the typed error identifies it.
+- A transport fault that cuts a stream after text but before any tool call
+  (undici's bare `terminated`, `ECONNRESET`, a 5xx mid-stream) is re-thrown
+  instead of surfacing a partial response, so the same reconnect ladder
+  samples again; nothing executed, and the text already streamed is discarded
+  with the failed attempt. Once a tool call has streamed, the partial
+  response is kept: the executor may have dispatched it. The Anthropic
+  adapter applies the same rule.
+- xAI answers "Response is too large to store" when a response exceeds its
+  server-side storage limit. Stored responses are only the speed default
+  (`AGENC_XAI_STORE`), so the grok provider sends the same request once more
+  with `store: false` (warning `xai_store_too_large`) instead of failing the
+  turn; a request that was already unstored is not retried. The refusal is
+  latched for the session: every later request is unstored with full history
+  (an unstored response cannot be continued). Under an admitted single wire
+  attempt, where the adapter must not retry in band, it throws
+  `LLMRequestRebuiltError`, which the turn's reconnect ladder treats as
+  transient, so the next admitted attempt carries the unstored plan.
 - **Retry-After > 300s** aborts the retry.
 - Session backoff base is **200 ms**.
 - After budget admission, model calls set `singleWireAttempt: true`: **no HTTP
   retry** on that lease. A retry needs a new reservation.
+
+Request deadlines and caller cancellation stay active through JSON, text,
+and non-2xx body consumption. A body-read failure after a successful HTTP
+status does not trigger a transport retry. An aborted or timed-out error body
+is not retried either.
+Body failures cancel the reader without waiting for a stalled cancellation
+callback. Completed reads release the reader, timers and abort listeners.
+Successful streams keep their separate streaming lifecycle and idle watchdog.
+
 Grok uses an SDK transport with a distinct retry contract: its default budget
 is **2**, `maxRetries` can override it, and the SDK owns retry eligibility and
 backoff. A `singleWireAttempt` still forces that SDK budget to **0**. Those are
@@ -424,7 +705,7 @@ Source: `runtime/src/llm/wire/think-tags.ts`, `capability-gating.ts`,
 `chat-completions.ts`; streaming split in
 `runtime/src/llm/providers/openai/adapter.ts`.
 
-### Think tags and `reasoning_content`
+### Think tags and provider reasoning fields
 
 Reasoning models disagree about where chain-of-thought goes.
 
@@ -432,6 +713,9 @@ Reasoning models disagree about where chain-of-thought goes.
 | --- | --- |
 | Streaming `delta.reasoning_content` | Emits hidden thinking events and stays out of visible assistant text. |
 | Non-streaming `message.reasoning_content` | Becomes visible assistant content only when `message.content` is absent, null, or otherwise not text/content blocks. A string `content`, including an empty string, takes precedence. |
+| Cerebras `delta.reasoning` / `message.reasoning` | Emits/stores hidden thinking separately from `content`; opaque state is replayed as `reasoning` only to the exact same Cerebras model. |
+| Z.AI `delta.reasoning_content` / `message.reasoning_content` | Emits/stores hidden thinking separately from `content`; all blocks are replayed in order only for a complete, immediately adjacent multi-round tool chain on the exact same Z.AI model. Other turns clear the whole stale chain. |
+| Kimi `delta.reasoning_content` / `message.reasoning_content` | Emits/stores hidden thinking separately from `content`; intact historical blocks are replayed in order only to the exact same native Kimi model, and any compaction/boundary repair clears the complete replay set. |
 | Leading `<think>...</think>` or `◁think▷...◁/think▷` in `content` | First leading block (whitespace before the opener allowed) moves to thinking. Text after the closer is the answer. |
 | Literal `<think>` later in the answer | Left visible. Only a marker that opens at the start of the assistant message starts a block. |
 | Opener with no closer | Remainder is thinking. The generation died mid-thought; it is not an answer. |
@@ -452,9 +736,11 @@ rejects or silently ignores. An undefined `acceptsX` flag still means
 
 | Field | Who gets it |
 | --- | --- |
-| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
-| `service_tier` | `openai` and `azure-openai` only |
-| `stream_options.include_usage` | Default **on**. `STREAM_USAGE_INCOMPATIBLE_PROVIDERS` is currently empty, and no operator or per-instance override is wired. |
+| `reasoning_effort` | OpenAI reasoning-family slugs (`gpt-5`, `o1`, `o3`, `o4`, `codex`, `chatgpt-5`). Grok 4.3 / 4.5 / 4.6, `grok-4-20-multi-agent` / `grok-4.20-multi-agent`, and `grok-build-latest`. Meta Muse Spark models for `minimal`, `low`, `medium`, `high`, and `xhigh` only. Z.AI GLM-5.3 models and native Kimi K3 for `low`, `high`, and `max` only. Cerebras `gpt-oss-120b` for `low`, `medium`, `high`; Cerebras `qwen-3.8-27b` and `gemma-4-31b` for `none`, `low`, `medium`, `high`. NVIDIA NIM families below, and only values in that family's enum. Everyone else: stripped. `/effort` on a local model is a no-op on the wire. |
+| `tool_choice` | Meta and Z.AI accept only `auto`. `required` and named choices are normalized to `auto`; `none` omits both the tools and choice fields. Native Kimi K3 additionally accepts `required`; Kimi K2.7/K2.6 normalize it to `auto`, and all native Kimi models normalize named choices because they are incompatible with thinking. Requests above the Z.AI or Kimi 128-function limit fail locally rather than dropping tools. Cerebras omits tool-choice/parallel controls whenever no tool definitions are attached, as required by API v2. Other compatible providers keep the requested value. |
+| `stop` | Meta rejects stop sequences, so its adapter strips them. Z.AI receives only the first sequence from a caller list. Other compatible providers keep caller-supplied sequences. |
+| `service_tier` | `openai` and `azure-openai`; explicit Cerebras pass-through remains for configured dedicated endpoints, while its shared catalog advertises no selectable tier |
+| `stream_options.include_usage` | Default **on**. Z.AI omits this undocumented control. `STREAM_USAGE_INCOMPATIBLE_PROVIDERS` is otherwise empty, and no operator or per-instance override is wired. |
 
 NVIDIA NIM `reasoning_effort` enums (hosted schemas, 2026-08):
 
@@ -479,8 +765,9 @@ For `lmstudio` and `openai-compatible` only
   `maxOutputTokens` option and `max_output_tokens` setting supply the requested
   value. Non-local OpenAI chat-completions requests use
   `max_completion_tokens`. The runtime default remains
-  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); this ceiling applies only to the
-  two grammar-constrained slugs.
+  `DEFAULT_MAX_OUTPUT_TOKENS` (**32_000**); Meta, QwenCloud, Cerebras, and Kimi also
+  use `max_completion_tokens`, while Z.AI explicitly uses `max_tokens`. This ceiling applies only to the two
+  grammar-constrained slugs.
 - **`/no_think` system suffix** when the model slug matches `qwen3` /
   `qwen-3`. Qwen3 hybrid thinking honors that line. LM Studio ignores
   `chat_template_kwargs.enable_thinking`, so this path uses the prompt
@@ -508,3 +795,71 @@ Grammar-safe tool schemas and the reduced local catalog:
 - Token admission invariant: [`../design/provider-aware-token-accounting.md`](../design/provider-aware-token-accounting.md)
 - Managed OpenRouter path: [`../managed-openrouter.md`](../managed-openrouter.md)
 - Onboarding: `agenc onboard`
+
+## Fast mode and service tiers
+
+`service_tier = "priority"` (config, profile, or the desktop Speed row) is the
+single "Fast" dial. What it does depends on the provider:
+
+| Provider | Wire | Models | Price | Notes |
+| --- | --- | --- | --- | --- |
+| OpenAI | `service_tier: "priority"` on chat completions and Responses (OpenAI also accepts `"fast"`, its new name for the same tier) | GPT-6 Astra, GPT-5.6 Sol/Terra/Luna, GPT-5.5, 5.4, 5.4 Mini, 5.3 Codex, 5.2, 5, plus the GPT-4.1/4o/o3/o4-mini rows on the pricing page | 2x standard on GPT-5.6 and later; see the pricing page per model | The response reports the served tier; requests over the fast-mode rate limit fall back per OpenAI's rules. |
+| Anthropic | `speed: "fast"` plus the `anthropic-beta: fast-mode-2026-02-01` header | Claude Opus 5, Claude Opus 4.8 only | $10 input / $50 output per MTok (2x) | Research preview: the organization needs access from Anthropic; without it the API returns an error. `usage.speed` reports `fast` or `standard`; AgenC warns when a request asked for fast and was served standard. Switching speeds invalidates the prompt cache. Not sent to other Claude models, which reject the field. |
+| Cerebras, Azure OpenAI | `service_tier` passthrough | per provider | per provider | Documented `service_tier` support; other chat-completions providers have the field stripped. |
+
+`flex` is OpenAI's lower-priority tier and is only sent to providers that
+document `service_tier`.
+
+## Zero data retention
+
+Only one built-in provider takes a request-level zero-data-retention control:
+`[providers.openrouter] zero_data_retention = true` adds `provider.zdr = true`
+to every request (OR-ed with the account setting on OpenRouter's side), so
+routing is restricted to endpoints with a zero-data-retention policy and a
+model without one is refused. The desktop shows this as a switch on the
+OpenRouter card. Everywhere else retention is an account, project or team
+setting, so the config field is rejected and the desktop card states the
+provider's policy instead. Verified 2026-09-12 against each provider's
+documentation:
+
+| Provider | Default retention | Zero data retention | AgenC |
+| --- | --- | --- | --- |
+| OpenRouter | Depends on the upstream endpoint | Per request (`provider.zdr`) and per account (privacy settings) | `zero_data_retention` switch |
+| OpenAI | 30 days for abuse monitoring; Responses state 30 days when `store` is true | Per organization or project, on request and approval; `store` is then forced false | Requests already send `store: false`; ZDR itself is granted by OpenAI |
+| Anthropic | Per the commercial retention policy | Organization-level agreement | Account level |
+| xAI Grok | 30 days encrypted, no training | Team-level in the xAI Console (enterprise); every response carries `x-zero-data-retention: true/false` and ZDR disables the stateful Responses, Files, Collections and Batch APIs | Account level |
+| Google Gemini | Prompts logged for abuse monitoring (paid: 55 days) | Per project, on request | Account level |
+| Groq | No retention of inputs and outputs by default; temporary logs up to 30 days for troubleshooting or abuse | Self-serve in the console Data Controls, globally or per feature | Account level |
+| Mistral | 30-day abuse monitoring window | Organization setting on paid plans, after approval; stateless endpoints only | Account level |
+| Cerebras | Does not retain prompts, requests or responses | Standard policy, nothing to enable | Always on |
+| Ollama Cloud | "Prompt or response data is never logged or trained on"; partners must run zero-data-retention policies | Standard policy, nothing to enable | Always on |
+| DeepSeek | Retained on servers in China while the account exists | None offered | Not available |
+| MiniMax | Purpose- and law-based retention | None documented | Not available |
+| AgenC managed | Requests are routed through the gateway to zero-data-retention endpoints only (`zdr: true`, `data_collection: "deny"`) | Built in | Always on |
+| Local servers (Ollama, LM Studio, OpenAI-compatible) | Nothing leaves the machine unless the endpoint is remote | Not applicable | Local |
+
+Kimi, Qwen, Z.AI, Meta, NVIDIA NIM and GitHub Copilot publish no
+zero-data-retention control for their APIs; treat them as retaining data per
+their terms.
+
+## Ollama Cloud
+
+Select `ollama-cloud` and provide `OLLAMA_API_KEY` for direct hosted inference at
+`https://ollama.com/v1`. The existing `ollama` provider remains a local daemon
+connection; `OLLAMA_BASE_URL` never reroutes the Cloud key. No local Ollama
+installation is required.
+
+The checked-in Cloud metadata comes from Ollama's `/api/tags` and `/api/show`
+on 2026-09-11. Desktop refreshes model IDs from `/v1/models`; an empty successful
+listing stays empty. Unknown additions can use text/tools and native context
+metadata, but do not inherit unverified image or effort settings from another
+provider. Cloud model IDs retain their tags (for example `gpt-oss:120b`).
+
+DeepSeek V4.1 Flash defaults to Low and supports image input. Reasoning controls
+are model specific; binary thinking models expose None/High, GPT OSS uses
+Low/Medium/High, and non-thinking models have no effort control. The 16k default
+and 32k recovery budget are AgenC output budgets, not advertised Cloud limits.
+Cloud quota and model availability depend on the Ollama account.
+
+Sources: https://docs.ollama.com/cloud and
+https://docs.ollama.com/api/openai-compatibility.

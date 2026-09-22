@@ -75,7 +75,7 @@ class PromptTransport implements AgencTransport {
     readonly response: Deferred<AgencDaemonResponse<"message.send">>;
   }> = [];
   client?: AgencClient;
-  initializeVersion = "1.9.0";
+  initializeVersion = "1.15.0";
   initializeFailures = 0;
   attachRuntimeOptions: unknown;
   attachRuntimeSettings: unknown = VALID_ATTACH_RUNTIME_SETTINGS;
@@ -118,7 +118,10 @@ class PromptTransport implements AgencTransport {
               this.initializeVersion === "1.6.0" ||
               this.initializeVersion === "1.7.0" ||
               this.initializeVersion === "1.8.0" ||
-              this.initializeVersion === "1.9.0",
+              this.initializeVersion === "1.9.0" ||
+              this.initializeVersion === "1.10.0" ||
+              this.initializeVersion === "1.11.0" ||
+              this.initializeVersion === "1.15.0",
           },
         },
       });
@@ -230,7 +233,7 @@ async function initializedClient(
   return client;
 }
 
-function userMessage(clientMessageId: string): JsonObject {
+function userMessage(clientMessageId: string, content: string): JsonObject {
   return {
     jsonrpc: "2.0",
     method: "event.session_event",
@@ -240,7 +243,7 @@ function userMessage(clientMessageId: string): JsonObject {
       event: {
         id: `user_${clientMessageId}`,
         type: "user_message",
-        payload: { message: clientMessageId, messageId: clientMessageId },
+        payload: { message: content, messageId: clientMessageId },
       },
     },
   };
@@ -336,6 +339,89 @@ function resolveSend(
 }
 
 describe("agenc-sdk prompt race safety", () => {
+  it("settles both prompt handles when closing a client with a pending transport request", async () => {
+    const transport = new PromptTransport();
+    const client = await initializedClient(transport);
+    const run = client.runPrompt("session_1", "pending", {
+      clientMessageId: "pending_close",
+      includeUsage: false,
+    });
+    await waitForSend(transport, 0);
+    await client.close();
+
+    await expect(run.accepted).rejects.toThrow("AgenC SDK client is closed");
+    await expect(run.result()).rejects.toThrow("AgenC SDK client is closed");
+    await expect(run[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "AgenC SDK client is closed",
+    );
+    expect(transport.requests.some((request) => request.method === "session.cancelTurn")).toBe(false);
+  });
+
+  it("settles notification-driven prompt results when closing after acceptance", async () => {
+    const transport = new PromptTransport();
+    const client = await initializedClient(transport);
+    const run = client.runPrompt("session_1", "legacy", {
+      clientMessageId: "accepted_close",
+      includeUsage: false,
+    });
+    const send = await waitForSend(transport, 0);
+    send.response.resolve(success(send.request, {
+      messageId: "accepted_close",
+      acceptedAt: "2026-08-17T00:00:00.000Z",
+      turnId: "accepted_turn",
+    }));
+    await run.accepted;
+    await client.close();
+
+    await expect(run.result()).rejects.toThrow("AgenC SDK client is closed");
+  });
+
+  it.each(["permission", "elicitation"] as const)(
+    "does not dispatch a delayed %s response after its prompt terminates",
+    async (kind) => {
+      const transport = new PromptTransport();
+      const client = await initializedClient(transport);
+      const decision = deferred<{ behavior: "allow"; action: "accept" }>();
+      let callbackStarted = false;
+      const respond = () => {
+        callbackStarted = true;
+        return decision.promise;
+      };
+      const run = client.runPrompt("session_1", "interactive", {
+        clientMessageId: "interactive_message",
+        includeUsage: false,
+        onPermissionRequest: respond,
+        onElicitationRequest: respond,
+      });
+      const send = await waitForSend(transport, 0);
+      transport.emit(userMessage("interactive_message", "interactive"));
+      transport.emit(turnStarted("interactive_turn"));
+      transport.emit({
+        jsonrpc: "2.0",
+        method: kind === "permission" ? "event.permission_request" : "event.user_input_request",
+        params: {
+          sessionId: "session_1",
+          turnId: "interactive_turn",
+          requestId: "interactive_request",
+          permissions: [],
+          questions: [],
+        },
+      });
+      expect(callbackStarted).toBe(true);
+      transport.emit(terminal("interactive_turn"));
+      resolveSend(send, "interactive_turn");
+      await run.result();
+      decision.resolve({ behavior: "allow", action: "accept" });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(transport.requests.filter((request) =>
+        request.method === "tool.approve" || request.method === "elicitation.respond",
+      )).toEqual([]);
+      await client.close();
+    },
+  );
+
   it.each([
     "1.0.0",
     "1.1.0",
@@ -346,6 +432,9 @@ describe("agenc-sdk prompt race safety", () => {
     "1.6.0",
     "1.7.0",
     "1.8.0",
+    "1.9.0",
+    "1.10.0",
+    "1.11.0",
   ])(
     "downgrades capability discovery to an older %s daemon",
     async (version) => {
@@ -359,7 +448,7 @@ describe("agenc-sdk prompt race safety", () => {
       );
       expect(initializes).toHaveLength(2);
       expect(initializes.map((request) => request.params)).toEqual([
-        expect.objectContaining({ protocol: { version: "1.9.0" } }),
+        expect.objectContaining({ protocol: { version: "1.15.0" } }),
         expect.objectContaining({ protocol: { version } }),
       ]);
       expect(client.negotiatedProtocolVersion).toBe(version);
@@ -677,7 +766,7 @@ describe("agenc-sdk prompt race safety", () => {
     ).toThrow(AgencPromptRunInProgressError);
 
     const sendA = await waitForSend(transport, 0);
-    transport.emit(userMessage("message_A"));
+    transport.emit(userMessage("message_A", "A"));
     transport.emit(turnStarted("turn_A"));
     transport.emit(terminal("turn_A", "answer A"));
     resolveSend(sendA, "turn_A");
@@ -702,7 +791,7 @@ describe("agenc-sdk prompt race safety", () => {
     ]);
     expect(stillPending).toBe(true);
 
-    transport.emit(userMessage("message_B"));
+    transport.emit(userMessage("message_B", "B"));
     transport.emit(turnStarted("turn_B"));
     transport.emit(text("turn_B", "ha"));
     transport.emit(text("turn_B", "ha"));
@@ -725,6 +814,34 @@ describe("agenc-sdk prompt race safety", () => {
     expect(
       events.filter((event) => event.type === "message_committed"),
     ).toEqual([expect.objectContaining({ text: "haha" })]);
+  });
+
+  it("keeps diagnostics and stale failures open, then returns the explicit failure", async () => {
+    const transport = new PromptTransport();
+    const client = await initializedClient(transport);
+    const run = client.runPrompt("session_1", "work", { clientMessageId: "failure-message", includeUsage: false });
+    const send = await waitForSend(transport, 0);
+    transport.emit(userMessage("failure-message", "work"));
+    transport.emit(turnStarted("turn-failure"));
+    const emit = (id: string, type: string, payload: JsonObject, turnId = "turn-failure") => transport.emit({
+      jsonrpc: "2.0", method: "event.session_event",
+      params: { sessionId: "session_1", turnId, eventId: id, event: { id, type, payload } },
+    });
+    emit("stale", "turn_failed", { turnId: "old-turn", code: "provider_error", message: "stale failure" });
+    emit("consistent-stale", "turn_failed", { turnId: "old-turn", code: "provider_error", message: "stale failure" }, "old-turn");
+    emit("diagnostic", "error", { turnId: "turn-failure", cause: "stop_hook_threw", message: "diagnostic" });
+    transport.emit(text("turn-failure", "partial answer"));
+    emit("failed", "turn_failed", { turnId: "turn-failure", code: "provider_error", message: "provider failed" });
+    resolveSend(send, "turn-failure");
+    await expect(run.result()).resolves.toMatchObject({ stopReason: "errored", exitCode: 1, finalMessage: "provider failed" });
+    const events: AgencPromptEvent[] = [];
+    for await (const event of run) events.push(event);
+    expect(events).toContainEqual(expect.objectContaining({ type: "text", delta: "partial answer" }));
+    const next = client.runPrompt("session_1", "next", { clientMessageId: "next-message", includeUsage: false });
+    const nextSend = await waitForSend(transport, 1);
+    resolveSend(nextSend, "next-turn");
+    await expect(next.result()).resolves.toMatchObject({ exitCode: 0 });
+    await client.close();
   });
 
   it("never sends or cancels when an AbortSignal is already aborted", async () => {
@@ -765,7 +882,7 @@ describe("agenc-sdk prompt race safety", () => {
       ),
     ).toEqual([]);
 
-    transport.emit(userMessage("message_cancel"));
+    transport.emit(userMessage("message_cancel", "cancel me"));
     expect(
       transport.requests.filter(
         (request) => request.method === "session.cancelTurn",
@@ -807,7 +924,7 @@ describe("agenc-sdk prompt race safety", () => {
         (request) => request.method === "session.cancelTurn",
       ),
     ).toHaveLength(0);
-    transport.emit(userMessage("message_legacy_cancel"));
+    transport.emit(userMessage("message_legacy_cancel", "legacy cancel"));
     transport.emit(turnStarted("turn_legacy_cancel"));
     await Promise.resolve();
     expect(
@@ -872,7 +989,7 @@ describe("agenc-sdk prompt race safety", () => {
     });
     const send = await waitForSend(transport, 0);
 
-    transport.emit(userMessage("message_terminal_fallback"));
+    transport.emit(userMessage("message_terminal_fallback", "finish from result"));
     transport.emit(turnStarted("turn_terminal_fallback"));
     transport.emit(text("turn_terminal_fallback", "answer"));
     transport.emit(committed("turn_terminal_fallback", "answer"));

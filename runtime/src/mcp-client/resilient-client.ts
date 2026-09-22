@@ -56,17 +56,33 @@ export function toToolCatalogPolicyConfig(
   )
     ? config.default_tools_approval_mode
     : undefined;
+  // This flag bypasses filesystem target inference, so only authorities that
+  // cannot be supplied by a checked-out project, a plugin, or a session may
+  // grant it. Desktop persists its audited loopback bridge at user scope.
+  const virtualNoFsWriteTools =
+    config.origin?.scope === "default" ||
+      config.origin?.scope === "managed" ||
+      config.origin?.scope === "user"
+      ? config.virtual_no_fs_write_tools
+      : undefined;
   if (
     !config.supplyChain &&
     !config.pinnedCatalogSha256 &&
     allowedTools === undefined &&
     deniedTools === undefined &&
     defaultToolsApprovalMode === undefined &&
-    config.tools === undefined
+    virtualNoFsWriteTools === undefined &&
+    config.tools === undefined &&
+    config.localOnly !== true &&
+    !(config.origin?.scope === "session" && config.headers !== undefined)
   ) {
     return undefined;
   }
   return {
+    ...(config.localOnly === true ? { localOnly: true } : {}),
+    ...(config.desktopAuthorityGrant ? { desktopAuthorityGrant: config.desktopAuthorityGrant } : {}),
+    ...(config.origin?.scope === "session" && config.headers !== undefined
+      ? { sensitiveHeaders: config.headers } : {}),
     ...(allowedTools !== undefined ? { allowedTools } : {}),
     ...(deniedTools !== undefined ? { deniedTools } : {}),
     ...(config.pinnedCatalogSha256 !== undefined
@@ -74,6 +90,9 @@ export function toToolCatalogPolicyConfig(
       : {}),
     ...(defaultToolsApprovalMode !== undefined
       ? { defaultToolsApprovalMode }
+      : {}),
+    ...(virtualNoFsWriteTools !== undefined
+      ? { virtualNoFsWriteTools }
       : {}),
     ...(config.tools !== undefined ? { tools: config.tools } : {}),
     supplyChain: config.supplyChain,
@@ -275,6 +294,7 @@ export class ResilientMCPBridge implements MCPToolBridge {
 
   private createProxyTool(namespacedName: string, templateTool: Tool): Tool {
     return {
+      ...templateTool,
       name: namespacedName,
       description: templateTool.description,
       inputSchema: templateTool.inputSchema,
@@ -309,7 +329,9 @@ export class ResilientMCPBridge implements MCPToolBridge {
 
         const result = await innerTool.execute(args);
 
-        if (result.isError && isConnectionError(result.content)) {
+        // A bound provider receipt describes a known terminal tool outcome,
+        // not a transport loss inferred from arbitrary result text/URLs.
+        if (result.isError && result.effectDisposition === undefined && isConnectionError(result.content)) {
           this.scheduleReconnect();
           return { content: `MCP server "${this.serverName}" lost connection — reconnecting...`, isError: true };
         }

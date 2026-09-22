@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, test, vi } from "vitest";
 
 import calibrationCorpus from "./fixtures/token-accounting-calibration.v1.json" with {
@@ -14,7 +16,10 @@ import {
   TOKEN_COUNT_CACHE_MAX_ENTRIES,
   TOKEN_COUNT_CACHE_TTL_MS,
   TOKEN_COUNT_PROVIDER_TIMEOUT_MS,
+  TOKEN_ACCOUNTING_CALIBRATION_HEADROOM,
+  TOKEN_ACCOUNTING_CALIBRATION_MAX_FACTOR,
   TOKEN_ACCOUNTING_METRICS_MAX_PARTITIONS,
+  TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS,
   TOKEN_FALLBACK_MARGIN_RATIO,
   TOKEN_FALLBACK_MARGIN_TOKENS,
   TokenAccountingError,
@@ -22,6 +27,7 @@ import {
   assertTokenAccountingWithinContext,
   canonicalTokenEndpointIdentity,
   createTokenAccountingRequest,
+  estimateInlineImageTokenUnits,
   estimateTokenAccountingRequest,
   estimateUtf8TokenUnits,
   requireAdmissibleTokenAccounting,
@@ -29,7 +35,7 @@ import {
   type ProviderTokenCountCapability,
   type TokenAccountingRequest,
 } from "./token-accounting.js";
-import type { LLMContentPart, LLMTool } from "./types.js";
+import type { LLMContentPart, LLMMessage, LLMTool } from "./types.js";
 
 const COMPLETE_COMPONENTS = [
   "system",
@@ -73,6 +79,42 @@ function accountingRequest(
     ...overrides,
     options,
   });
+}
+
+const VALID_ONE_PIXEL_PNG = Buffer.from(
+  "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082",
+  "hex",
+);
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const typeBytes = Buffer.from(type, "ascii");
+  const chunk = Buffer.allocUnsafe(12 + data.length);
+  chunk.writeUInt32BE(data.length, 0);
+  typeBytes.copy(chunk, 4);
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(testCrc32(Buffer.concat([typeBytes, data])), 8 + data.length);
+  return chunk;
+}
+
+function testCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function validPngWithLargeTextChunk(size: number): Buffer {
+  const text = Buffer.alloc(size, 0x61);
+  Buffer.from("Comment\0", "latin1").copy(text);
+  return Buffer.concat([
+    VALID_ONE_PIXEL_PNG.subarray(0, VALID_ONE_PIXEL_PNG.length - 12),
+    pngChunk("tEXt", text),
+    VALID_ONE_PIXEL_PNG.subarray(VALID_ONE_PIXEL_PNG.length - 12),
+  ]);
 }
 
 function capability(
@@ -309,6 +351,257 @@ describe("conservative complete-request fallback", () => {
     expect(native.admissible).toBe(true);
     expect(native.coverage.complete).toBe(true);
     expect(native.coverage.contentTypes).toContain("image_remote");
+  });
+
+  test("accounts a large inline PNG as visual patches instead of Base64 text", () => {
+    const png = validPngWithLargeTextChunk(2_400_000);
+    const dataUrl = `data:image/png;base64,${png.toString("base64")}`;
+    const request = accountingRequest(
+      [
+        { type: "text", text: "inspect this image" },
+        {
+          type: "image_url",
+          image_url: {
+            url: dataUrl,
+          },
+        },
+      ],
+      {
+        provider: "qwen",
+        model: "qwen3.8-flash",
+        contextWindowTokens: 1_000_000,
+        reservedOutputTokens: 131_072,
+      },
+    );
+
+    const result = estimateTokenAccountingRequest(request);
+
+    expect(estimateInlineImageTokenUnits(dataUrl)).toBe(66);
+    expect(result.coverage.contentTypes).toContain("image_inline");
+    expect(result.coverage.countedComponents).toContain("images");
+    expect(result.inputTokens).toBeLessThan(20_000);
+    expect(result.totalTokens).toBeLessThan(1_000_000);
+    expect(() =>
+      assertTokenAccountingWithinContext(result, 1_000_000),
+    ).not.toThrow();
+  });
+
+  test("fails closed when a PNG signature is not followed by a valid IHDR", () => {
+    const malformed = Buffer.alloc(64);
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(malformed, 0);
+    malformed.writeUInt32BE(1, 16);
+    malformed.writeUInt32BE(1, 20);
+
+    expect(
+      estimateInlineImageTokenUnits(
+        `data:image/png;base64,${malformed.toString("base64")}`,
+      ),
+    ).toBe(TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS);
+  });
+
+  test("keeps unknown inline-image formats bounded without charging Base64 as text", () => {
+    const result = estimateTokenAccountingRequest(
+      accountingRequest([
+        {
+          type: "image_url",
+          image_url: {
+            url: `data:image/gif;base64,${"A".repeat(3_200_000)}`,
+          },
+        },
+      ]),
+    );
+
+    expect(result.inputTokens).toBeGreaterThanOrEqual(
+      TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS,
+    );
+    expect(result.inputTokens).toBeLessThan(30_000);
+  });
+
+  test("rejects an oversized inline-image source before decoding it", () => {
+    const oversized = "A".repeat(MAX_TOKEN_ACCOUNTING_REQUEST_BYTES);
+    const request = accountingRequest([
+      {
+        type: "image_url",
+        image_url: { url: `data:image/png;base64,${oversized}` },
+      },
+    ]);
+
+    expect(() => estimateTokenAccountingRequest(request)).toThrow(
+      expect.objectContaining({ code: "request_too_large" }),
+    );
+  });
+
+  test("preserves the aggregate request-byte bound across inline images", async () => {
+    const byteBounded = new TokenAccountingService({ maxRequestBytes: 10_000 });
+    const image = (payload: string): LLMContentPart => ({
+      type: "image_url",
+      image_url: { url: `data:image/gif;base64,${payload}` },
+    });
+
+    await expect(
+      byteBounded.count(accountingRequest([image("A".repeat(6_000))])),
+    ).resolves.toBeDefined();
+    await expect(
+      byteBounded.count(
+        accountingRequest([
+          image("A".repeat(6_000)),
+          image("B".repeat(6_000)),
+        ]),
+      ),
+    ).rejects.toMatchObject({ code: "request_too_large" });
+  });
+
+  test("does not share cache entries between different inline image bytes", async () => {
+    const service = new TokenAccountingService();
+    const counter = vi.fn(async () => completeCount(77));
+    const native = capability(counter);
+    const imageRequest = (payload: string) =>
+      accountingRequest([
+        {
+          type: "image_url" as const,
+          image_url: { url: `data:image/png;base64,${payload}` },
+        },
+      ]);
+
+    await service.count(imageRequest("aGVsbG8="), { capability: native });
+    await service.count(imageRequest("d29ybGQ="), { capability: native });
+
+    expect(counter).toHaveBeenCalledTimes(2);
+  });
+
+  test("domain-separates inline image identity from a literal remote URL", async () => {
+    const service = new TokenAccountingService();
+    const counter = vi.fn(async () => completeCount(77));
+    const native = capability(counter);
+    const dataUrl = "data:image/png;base64,aGVsbG8=";
+    const legacyDigest = createHash("sha256").update(dataUrl).digest("hex");
+    const legacyMarker =
+      `agenc-inline-image-v1:image/png;sha256=${legacyDigest}` +
+      ";decodedBytes=5";
+
+    await service.count(
+      accountingRequest([
+        { type: "image_url", image_url: { url: dataUrl } },
+      ]),
+      { capability: native },
+    );
+    await service.count(
+      accountingRequest([
+        { type: "image_url", image_url: { url: legacyMarker } },
+      ]),
+      { capability: native },
+    );
+
+    expect(counter).toHaveBeenCalledTimes(2);
+  });
+
+  test("counts only images that survive provider-wire normalization", () => {
+    const clean = estimateTokenAccountingRequest(accountingRequest("hello"));
+    const withDroppedOrphanImage = estimateTokenAccountingRequest(
+      accountingRequest("ignored", {
+        messages: [
+          { role: "user", content: "hello" },
+          {
+            role: "tool",
+            toolCallId: "orphan",
+            toolName: "unused",
+            content: [
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/gif;base64,${"A".repeat(3_200_000)}`,
+                },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(withDroppedOrphanImage.inputTokens).toBe(clean.inputTokens);
+    expect(withDroppedOrphanImage.coverage.contentTypes).not.toContain(
+      "image_inline",
+    );
+    expect(withDroppedOrphanImage.coverage.countedComponents).not.toContain(
+      "images",
+    );
+  });
+
+  test("does not charge stripped tool-result images to text-only Qwen", () => {
+    const messages: LLMMessage[] = [{ role: "user", content: "inspect files" }];
+    for (let index = 0; index < 54; index += 1) {
+      const id = `call-${index}`;
+      messages.push(
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id, name: "FileRead", arguments: "{}" }],
+        },
+        {
+          role: "tool",
+          toolCallId: id,
+          toolName: "FileRead",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,AA==" },
+            },
+          ],
+        },
+      );
+    }
+    const result = estimateTokenAccountingRequest(
+      accountingRequest("ignored", {
+        provider: "qwen",
+        model: "qwen3.7-max",
+        messages,
+        options: { maxOutputTokens: 131_072 },
+        contextWindowTokens: 1_000_000,
+        reservedOutputTokens: 131_072,
+      }),
+    );
+
+    expect(result.coverage.contentTypes).not.toContain("image_inline");
+    expect(result.coverage.countedComponents).not.toContain("images");
+    expect(result.inputTokens).toBeLessThan(50_000);
+    expect(result.totalTokens).toBeLessThan(1_000_000);
+    expect(() =>
+      assertTokenAccountingWithinContext(result, 1_000_000),
+    ).not.toThrow();
+  });
+
+  test("charges relayed tool-result images to vision-capable Qwen", () => {
+    const result = estimateTokenAccountingRequest(
+      accountingRequest("ignored", {
+        provider: "qwen",
+        model: "qwen3.8-flash",
+        messages: [
+          { role: "user", content: "inspect files" },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "call-1", name: "FileRead", arguments: "{}" }],
+          },
+          {
+            role: "tool",
+            toolCallId: "call-1",
+            toolName: "FileRead",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AA==" },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(result.coverage.contentTypes).toContain("image_inline");
+    expect(result.coverage.countedComponents).toContain("images");
+    expect(result.inputTokens).toBeGreaterThan(
+      TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS,
+    );
   });
 
   test("rejects provider-specific blocks when no complete native count exists", () => {
@@ -954,5 +1247,116 @@ describe("validation, context enforcement, and telemetry", () => {
     expect(snapshot).toContainEqual(
       expect.objectContaining({ provider: "other", model: "other" }),
     );
+  });
+});
+
+// Terminal-Bench 4.0, 2026-09-14: DeepSeek reported 660,625 prompt tokens against a 519,792-token fallback estimate, so
+// the next request kept a 384,000-token output reservation and overflowed the 1,048,576-token window.
+describe("provider-usage calibration of the conservative fallback", () => {
+  const scoped = (
+    scope: string | undefined,
+    overrides: Partial<Parameters<typeof createTokenAccountingRequest>[0]> = {},
+  ) => accountingRequest("calibration probe ".repeat(40), {
+    ...(scope !== undefined ? { calibrationScope: scope } : {}),
+    ...overrides,
+  });
+
+  async function learn(service: TokenAccountingService, scope: string, ratio: number) {
+    const first = await service.count(scoped(scope));
+    service.recordProviderUsage(first, Math.ceil(first.inputTokens * ratio));
+    return first;
+  }
+
+  test("a scoped undercount raises later fallback estimates in that scope only", async () => {
+    const service = new TokenAccountingService();
+    const first = await learn(service, "conversation-a", 1.271);
+    expect(first.calibration).toBeUndefined();
+    const factor = Math.ceil(first.inputTokens * 1.271) / first.inputTokens;
+
+    const next = await service.count(scoped("conversation-a"));
+
+    expect(next.source).toBe("conservative_fallback");
+    expect(next.confidence).toBe(first.confidence);
+    expect(next.calibration).toEqual({
+      factor,
+      basisInputTokens: first.inputTokens,
+      headroom: TOKEN_ACCOUNTING_CALIBRATION_HEADROOM,
+    });
+    expect(next.inputTokens).toBe(
+      Math.ceil(first.inputTokens * factor * TOKEN_ACCOUNTING_CALIBRATION_HEADROOM),
+    );
+    expect(next.reservedOutputTokens).toBe(first.reservedOutputTokens);
+    expect(next.totalTokens).toBe(next.inputTokens + next.reservedOutputTokens);
+    for (const other of [
+      scoped("conversation-b"),
+      scoped(undefined),
+      scoped("conversation-a", { model: "other-model" }),
+      scoped("conversation-a", { provider: "other-provider" }),
+      scoped("conversation-a", { endpointIdentity: "https://other.example/v1" }),
+    ]) {
+      expect((await service.count(other)).calibration).toBeUndefined();
+    }
+  });
+
+  test("native counts, and the cache they fill, are never scaled", async () => {
+    const service = new TokenAccountingService();
+    await learn(service, "conversation-a", 2);
+    const countTokens = vi.fn(async () => completeCount(321));
+    const native = capability(countTokens);
+
+    const inA = await service.count(scoped("conversation-a"), { capability: native });
+    const inB = await service.count(scoped("conversation-b"), { capability: native });
+
+    expect(inA).toMatchObject({ source: "provider_native", inputTokens: 321 });
+    expect(inA.calibration).toBeUndefined();
+    expect(inB).toMatchObject({ source: "provider_native", inputTokens: 321, cacheStatus: "hit" });
+    expect(inB.calibration).toBeUndefined();
+    expect(countTokens).toHaveBeenCalledOnce();
+  });
+
+  test("the factor is measured against the basis, never falls, and stops at the cap", async () => {
+    const service = new TokenAccountingService();
+    const first = await learn(service, "conversation-a", 1.5);
+    const factorAt = (ratio: number) => Math.ceil(first.inputTokens * ratio) / first.inputTokens;
+
+    // Usage reported against a scaled estimate is still divided by the unscaled basis, so factors do not compound.
+    const scaled = await service.count(scoped("conversation-a"));
+    service.recordProviderUsage(scaled, Math.ceil(first.inputTokens * 1.6));
+    expect((await service.count(scoped("conversation-a"))).calibration?.factor).toBe(factorAt(1.6));
+
+    const overcounted = await service.count(scoped("conversation-a"));
+    service.recordProviderUsage(overcounted, first.inputTokens);
+    expect((await service.count(scoped("conversation-a"))).calibration?.factor).toBe(factorAt(1.6));
+
+    const wild = await service.count(scoped("conversation-a"));
+    service.recordProviderUsage(wild, first.inputTokens * 10);
+    expect((await service.count(scoped("conversation-a"))).calibration?.factor)
+      .toBe(TOKEN_ACCOUNTING_CALIBRATION_MAX_FACTOR);
+  });
+
+  test("zero, negative, fractional, unbounded or unscoped usage teaches nothing", async () => {
+    const service = new TokenAccountingService();
+    for (const reported of [0, -5, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      service.recordProviderUsage(await service.count(scoped("conversation-a")), reported);
+    }
+    const unscoped = await service.count(scoped(undefined));
+    service.recordProviderUsage(unscoped, unscoped.inputTokens * 3);
+
+    expect((await service.count(scoped("conversation-a"))).calibration).toBeUndefined();
+    expect((await service.count(scoped(undefined))).calibration).toBeUndefined();
+  });
+
+  test("an evicted scope, a restarted service or a cleared one falls back to the plain estimate", async () => {
+    const service = new TokenAccountingService({ calibrationMaxScopes: 2 });
+    await learn(service, "conversation-a", 1.5);
+    await learn(service, "conversation-b", 1.5);
+    await learn(service, "conversation-c", 1.5);
+
+    expect((await service.count(scoped("conversation-a"))).calibration).toBeUndefined();
+    expect((await service.count(scoped("conversation-c"))).calibration).toBeDefined();
+    expect((await new TokenAccountingService().count(scoped("conversation-c"))).calibration)
+      .toBeUndefined();
+    service.clear();
+    expect((await service.count(scoped("conversation-c"))).calibration).toBeUndefined();
   });
 });

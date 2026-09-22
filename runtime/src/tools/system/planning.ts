@@ -230,7 +230,13 @@ function inputPlan(args: Record<string, unknown>): string | undefined {
 
 async function updatePermissionMode(params: {
   readonly controller: WorkflowToolController | undefined;
-  readonly target: "plan" | "default" | PermissionMode;
+  /**
+   * `restore` leaves plan mode for whatever mode the session was in before
+   * it entered; a `PermissionMode` is an explicit choice (the plan-approval
+   * overlay's "manually approve edits" is `default` even when the session
+   * entered plan mode from acceptEdits).
+   */
+  readonly target: "plan" | "restore" | PermissionMode;
   readonly permissionUpdates?: readonly PermissionUpdate[];
 }): Promise<
   | {
@@ -288,7 +294,7 @@ async function updatePermissionMode(params: {
       };
     }
     const requestedTarget =
-      params.target === "default"
+      params.target === "restore"
         ? current.prePlanMode && current.prePlanMode !== "plan"
           ? current.prePlanMode
           : "default"
@@ -372,15 +378,13 @@ export function createPlanningTools(options: PlanningToolOptions = {}): readonly
    *
    * Tool result content is AgenC
    * `mapToolResultToToolResultBlockParam`'s `base` sentence
-   * (`TodoWriteTool.ts`). When the AgenC verification-agent
-   * contract is enabled, the close-out nudge below mirrors the donor:
-   * finishing 3+ tasks without a verification item reminds the model
-   * to spawn the verification agent before final response.
+   * (`TodoWriteTool.ts`). Finishing 3+ tasks without a verification
+   * item adds a reminder to verify within the user's task constraints.
    */
   const todoWriteTool: Tool = {
     name: "TodoWrite",
     description:
-      "Update the todo list for the current session. To be used proactively and often to track progress and pending tasks. Make sure that at least one task is in_progress at all times. Always provide both content (imperative) and activeForm (present continuous) for each task.",
+      "Update the todo list for the current session. Always provide both content (imperative) and activeForm (present continuous) for each task.",
     metadata: metadata("TodoWrite", { virtualNoFsWrites: true }),
     recoveryCategory: "side-effecting",
     inputSchema: {
@@ -431,9 +435,9 @@ export function createPlanningTools(options: PlanningToolOptions = {}): readonly
       await persistTodosToTaskBoard(nextTodos);
       const verificationNudgeNeeded = allDone &&
         todos.length >= 3 &&
-        !todos.some((todo) => /verif/i.test(todo.content));
+        !todos.some((todo) => /\b(?:verif\w*|tests?|testing|checks?|checking|reviews?|reviewing)\b/i.test(todo.content));
       const nudge = verificationNudgeNeeded
-        ? '\n\nNOTE: You just closed out 3+ tasks and none of them was a verification step. Before writing your final summary, spawn the sentinel agent (agent_type="sentinel"). You cannot self-assign PARTIAL by listing caveats in your summary; only the sentinel issues a verdict.'
+        ? "\n\nVerify the changes with the checks allowed by the user's instructions, then report the actual results and any checks you could not perform."
         : "";
       return textResult(`${TODO_WRITE_RESULT_MESSAGE}${nudge}`, {
         verificationNudgeNeeded,
@@ -481,6 +485,22 @@ Remember: DO NOT write or edit any files except the plan file.`,
     },
   };
 
+  const preflightExitPlan: NonNullable<Tool["preflight"]> = () => {
+    const registry = options.workflowController?.getPermissionModeRegistry?.() ?? null;
+    if (registry === null) {
+      return {
+        code: "registry-unavailable",
+        message: "permission mode registry is not available for workflow tools",
+      };
+    }
+    if (registry.current().mode !== "plan") {
+      return {
+        code: "not-in-plan-mode",
+        message: "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.",
+      };
+    }
+    return null;
+  };
   const exitPlanTool: Tool = {
     name: "ExitPlanMode",
     description:
@@ -488,6 +508,7 @@ Remember: DO NOT write or edit any files except the plan file.`,
     metadata: metadata("ExitPlanMode", { mutating: true, virtualNoFsWrites: true }),
     requiresApproval: true,
     recoveryCategory: "interactive",
+    preflight: preflightExitPlan,
     inputSchema: {
       type: "object",
       properties: {
@@ -517,17 +538,11 @@ Remember: DO NOT write or edit any files except the plan file.`,
       additionalProperties: true,
     },
     async execute(args) {
-      const registry = options.workflowController?.getPermissionModeRegistry?.() ?? null;
-      if (!registry) {
+      const preflight = preflightExitPlan(args);
+      if (preflight !== null) {
         return validationErrorToolResult(
-          "tool:system.exit-plan-mode:registry-unavailable",
-          "permission mode registry is not available for workflow tools",
-        );
-      }
-      if (registry.current().mode !== "plan") {
-        return validationErrorToolResult(
-          "tool:system.exit-plan-mode:not-in-plan-mode",
-          "You are not in plan mode. This tool is only for exiting plan mode after writing a plan. If your plan was already approved, continue with implementation.",
+          `tool:system.exit-plan-mode:${preflight.code}`,
+          preflight.message,
         );
       }
       const approval = consumeExitPlanModeApproval(args);
@@ -562,10 +577,13 @@ Remember: DO NOT write or edit any files except the plan file.`,
         : [];
       const result = await updatePermissionMode({
         controller: options.workflowController,
+        // An approval that names a mode is the user's explicit choice; one
+        // that does not (or a model-initiated exit) goes back to the mode the
+        // session entered plan mode from.
         target:
-          approval?.action === "approve"
-            ? (approval.mode ?? "default")
-            : "default",
+          approval?.action === "approve" && approval.mode !== undefined
+            ? approval.mode
+            : "restore",
         permissionUpdates,
       });
       if ("error" in result) return errorResult(result.error);

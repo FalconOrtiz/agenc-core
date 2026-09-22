@@ -1,5 +1,12 @@
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { basename, resolve } from "node:path";
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { closeSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import { assertReadOnlyInspectionInvocation } from "../permissions/readonly-inspection.js";
+import { basename, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import treeKill from "tree-kill";
 
@@ -10,11 +17,17 @@ import {
   truncateHeadTail,
 } from "./head-tail-buffer.js";
 import {
+  type DetachedProcessRequest,
   type ExecCommandRequest,
   type ExecCommandToolOutput,
+  type ListOwnedProcessesRequest,
+  type OwnedProcessView,
+  type TerminateOwnedProcessesOutcome,
+  type TerminateOwnedProcessesRequest,
   type TerminateProcessRequest,
   type UnifiedExecManagerOptions,
   type UnifiedExecProcessManagerLike,
+  type UnifiedExecBackgroundProcess,
   type UnifiedExecRuntimeSandbox,
   type UnifiedExecSandboxManager,
   type UnifiedExecProgressEvent,
@@ -22,7 +35,10 @@ import {
   type WriteStdinRequest,
   UnifiedExecError,
 } from "./types.js";
-import { assertProcessOwnerAccess } from "./process-ownership.js";
+import {
+  assertProcessOwnerAccess,
+  isProcessOwnedBy,
+} from "./process-ownership.js";
 import { buildScrubbedSpawnEnv } from "./scrub-env.js";
 import {
   loadPty as loadRequiredPty,
@@ -36,7 +52,7 @@ import {
 import {
   signalProcessTree,
   spawnContainedProcess,
-  terminateProcessTreeAndWait,
+  terminateProcessTreeAndReport,
 } from "../utils/supervisedProcess.js";
 import {
   commandShellArgs,
@@ -46,6 +62,14 @@ import { withChildTempAuthority } from "../utils/subprocessEnv.js";
 import { resolveSessionTempRoot } from "../session/runtime-options.js";
 
 const DEFAULT_EXEC_YIELD_TIME_MS = 10_000;
+/**
+ * How long a detached service gets to fail before the tool returns with it
+ * running. Long enough for a daemon to bind its port or reject its config,
+ * short enough that a service which simply runs does not hold the turn.
+ */
+const DEFAULT_DETACHED_YIELD_TIME_MS = 2_000;
+/** How much of a detached service's log the early result may carry. */
+const DETACHED_LOG_READ_LIMIT_BYTES = 256 * 1024;
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250;
 const MIN_YIELD_TIME_MS = 250;
 const MIN_EMPTY_YIELD_TIME_MS = 5_000;
@@ -53,6 +77,8 @@ const MAX_YIELD_TIME_MS = 30_000;
 const MAX_EMPTY_WRITE_YIELD_TIME_MS = 300_000;
 const DEFAULT_MAX_PROCESSES = 64;
 const DEFAULT_OUTPUT_BUFFER_CHARS = 1024 * 1024;
+const TASK_OUTPUT_TAIL_CHARS = 8192;
+const MAX_COMPLETED_BACKGROUND_PROCESSES = 64;
 const SANDBOX_AUTHORITY_QUIESCE_TIMEOUT_MS = 5_000;
 const PTY_ARGV0_EXECVE_SCRIPT =
   "const [program, argv0, ...args] = process.argv.slice(1);" +
@@ -89,6 +115,8 @@ export class ProcessOutputBuffer {
   private readonly chunks: OutputChunk[] = [];
   private consumedIndex = 0;
   private totalChars = 0;
+  private outputTail = "";
+  private outputBytes = 0;
   /**
    * Test-only counter of expensive pending-collapse passes, so a perf test can
    * assert the O(pending) work is amortized rather than run on every append.
@@ -99,6 +127,10 @@ export class ProcessOutputBuffer {
 
   append(stream: UnifiedExecStream, chunk: string): void {
     if (chunk.length === 0) return;
+    this.outputBytes += Buffer.byteLength(chunk);
+    this.outputTail = chunk.length >= TASK_OUTPUT_TAIL_CHARS
+      ? chunk.slice(-TASK_OUTPUT_TAIL_CHARS)
+      : (this.outputTail + chunk).slice(-TASK_OUTPUT_TAIL_CHARS);
     this.chunks.push({ stream, chunk });
     this.totalChars += chunk.length;
     // Evicting already-consumed chunks is cheap and safe on every append. The
@@ -126,6 +158,11 @@ export class ProcessOutputBuffer {
     const drained = this.chunks.slice(this.consumedIndex);
     this.consumedIndex = this.chunks.length;
     return drained;
+  }
+
+  /** Reading task details must never consume the model's pending output. */
+  snapshot(): { outputTail: string; outputBytes: number } {
+    return { outputTail: this.outputTail, outputBytes: this.outputBytes };
   }
 
   private evictConsumed(): void {
@@ -293,6 +330,7 @@ function commandForPtyArgv0(
 
 interface ProcessEntry {
   readonly processId: number;
+  readonly taskId: string;
   readonly command: string;
   readonly cwd: string;
   readonly tty: boolean;
@@ -307,8 +345,19 @@ interface ProcessEntry {
   readonly exitPromise: Promise<ExitState>;
   resolveExit: (state: ExitState) => void;
   exitState: ExitState | null;
+  backgrounded: boolean;
+  stopRequested: boolean;
+  endedAt?: number;
+  stopPromise?: Promise<void>;
   cleanupFailure?: Error;
   hardTimeout?: NodeJS.Timeout;
+  hardTimeoutExpired?: boolean;
+  /**
+   * Set when the tree still had live members after the leader exited and the
+   * supervisor stopped them; surfaced to the model so a `nginx` or `nohup
+   * server &` that vanished is explained and pointed at `detach: true`.
+   */
+  residualProcessesTerminated?: boolean;
   // gaphunt3 #44: removes the upstream-abort listener attached to the (long-lived,
   // session-scoped) source signal so it is cleaned up on normal exit, not only on abort.
   detachUpstreamAbort?: () => void;
@@ -333,6 +382,26 @@ function enforceOwnerAccess(
   if (!decision.ok) {
     throw new UnifiedExecError("owner_denied", decision.reason);
   }
+}
+
+function backgroundProcessStatus(
+  entry: ProcessEntry,
+): UnifiedExecBackgroundProcess["status"] {
+  if (entry.exitState === null) return "running";
+  if (entry.stopRequested) return "killed";
+  return entry.exitState.exitCode === 0 ? "completed" : "failed";
+}
+
+function ownedProcessStatus(entry: ProcessEntry): OwnedProcessView["status"] {
+  if (entry.exitState === null) {
+    return entry.stopRequested ? "stopping" : "running";
+  }
+  return backgroundProcessStatus(entry);
+}
+
+function normalizeOwnerId(ownerId: string | undefined): string | undefined {
+  const trimmed = ownerId?.trim() ?? "";
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function makeDeferredExit(): {
@@ -397,6 +466,11 @@ function createResult(params: {
   readonly durationMs: number;
   readonly timedOut: boolean;
   readonly maxOutputTokens?: number;
+  readonly residualProcessesTerminated?: boolean;
+  readonly detached?: {
+    readonly pid?: number;
+    readonly logPath: string;
+  };
 }): ExecCommandToolOutput {
   const maxChars = maxCharsForTokens(params.maxOutputTokens);
   const stdout = truncateHeadTail(params.stdout, maxChars);
@@ -419,7 +493,35 @@ function createResult(params: {
     timedOut: params.timedOut,
     truncated: stdout.truncated || stderr.truncated,
     original_token_count: approximateTokenCount(originalText),
+    ...(params.residualProcessesTerminated === true
+      ? { residual_processes_terminated: true }
+      : {}),
+    ...(params.detached !== undefined
+      ? {
+          detached: true,
+          log_path: params.detached.logPath,
+          ...(params.detached.pid !== undefined ? { pid: params.detached.pid } : {}),
+        }
+      : {}),
   };
+}
+
+/** The first bytes of a file, bounded; what a detached service wrote so far. */
+function readFileHead(path: string, limitBytes: number): string {
+  let fd: number | undefined;
+  try {
+    const size = statSync(path).size;
+    if (size === 0) return "";
+    fd = openSync(path, "r");
+    const buffer = Buffer.alloc(Math.min(size, limitBytes));
+    const read = readSync(fd, buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, read).toString("utf8");
+    return size > limitBytes ? `${text}\n[log truncated; see ${path}]` : text;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike {
@@ -435,6 +537,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
   private readonly sandboxAuthorityQuiesceTimeoutMs: number;
   private nextProcessId = 1;
   private readonly processes = new Map<number, ProcessEntry>();
+  private readonly completedBackgroundProcesses = new Map<string, UnifiedExecBackgroundProcess>();
   private sandboxAuthorityGeneration = 0;
   private sandboxAuthorityQuiesced = false;
   private sandboxAuthorityCleanupFailure: Error | undefined;
@@ -559,7 +662,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     if (tty && hasCurrentWorkspaceOperationLifetime()) {
       throw new UnifiedExecError(
         "create_process",
-        "tty=true execution is blocked while an Editor workspace fence is active because PTY descendants cannot be contained safely",
+        "tty=true execution is blocked inside a contained tool operation because PTY descendants cannot be contained safely",
       );
     }
 
@@ -572,11 +675,15 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       request.cmd,
     );
     const args = commandShellArgs(shell, command, request.login === true);
+    const direct = request.directInvocation;
+    if (direct !== undefined && (request.tty === true || request.login === true || request.shell !== undefined || request.runtimeSandbox !== direct.runtimeSandbox)) {
+      throw new UnifiedExecError("create_process", "Read-only direct execution cannot use shell options or a different sandbox");
+    }
     const spawnCommand = this.buildSpawnCommand({
-      program: shell,
-      args,
-      cwd,
-      env: buildEnv(this.baseEnv, this.env),
+      program: direct?.program ?? shell,
+      args: direct?.args ?? args,
+      cwd: direct?.cwd ?? cwd,
+      env: direct?.env ?? buildEnv(this.baseEnv, this.env),
       ...(request.runtimeSandbox !== undefined
         ? { runtimeSandbox: request.runtimeSandbox }
         : {}),
@@ -587,6 +694,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       typeof request.ownerId === "string" && request.ownerId.trim().length > 0
         ? request.ownerId.trim()
         : undefined;
+    if (direct !== undefined) assertReadOnlyInspectionInvocation(direct);
     const entry = await this.spawnProcess({
       processId,
       callId,
@@ -629,6 +737,8 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
         : null;
     if (explicitTimeoutMs !== null) {
       entry.hardTimeout = setTimeout(() => {
+        if (entry.exitState !== null) return;
+        entry.hardTimeoutExpired = true;
         this.forceTerminate(entry);
       }, explicitTimeoutMs);
       entry.hardTimeout.unref?.();
@@ -654,11 +764,136 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       this.releaseProcessId(processId);
       return collected;
     }
+    entry.backgrounded = true;
     return {
       ...collected,
       process_id: processId,
       session_id: processId,
     };
+  }
+
+  /**
+   * Start a service the model asked to keep running (`detach: true`). The
+   * child gets its own session and a log file for stdout/stderr, so nothing
+   * AgenC does later (command settlement, `closeAll` at session end) reaches
+   * it, and a closed pipe cannot kill it with SIGPIPE. The manager waits at
+   * most `yield_time_ms` for an early exit so a daemon that rejects its config
+   * still reports its error, then returns pid and log path. It never tracks
+   * the process: there is no session_id, `kill_process` does not know it, and
+   * the caller must have established that no sandbox applies.
+   */
+  async startDetachedProcess(
+    request: DetachedProcessRequest,
+  ): Promise<ExecCommandToolOutput> {
+    this.assertSandboxAuthorityAdmission();
+    if (request.cmd.trim().length === 0) {
+      throw new UnifiedExecError(
+        "missing_command",
+        "missing command line for unified exec request",
+      );
+    }
+    // The operation lifetime (`retainCurrentWorkspaceOperation`) keeps a
+    // tool call's process containment open until every contained process
+    // settles. A detached service never settles and is, by the user's
+    // choice of the full-access sandbox, outside containment, so it neither
+    // retains the lifetime nor is refused by it: the dispatcher runs every
+    // tool call inside one, and refusing here would refuse detach everywhere
+    // (observed in the first Terminal-Bench rerun).
+    const cwd = resolve(request.workdir ?? this.cwd);
+    const shell = resolveShell(request.shell, this.shellPath);
+    const command = wrapCommandForShell(
+      shell,
+      this.commandWrapperArgv,
+      request.cmd,
+    );
+    const args = commandShellArgs(shell, command, request.login === true);
+    // No session temp authority here: the service outlives the session and
+    // the temp root that would be handed to it.
+    const env = buildEnv(this.baseEnv, this.env);
+    const logDir = join(this.sessionTempRoot, "detached");
+    mkdirSync(logDir, { recursive: true, mode: 0o700 });
+    const logPath = join(logDir, `${randomUUID()}.log`);
+    const logFd = openSync(logPath, "a", 0o600);
+    const startedAt = Date.now();
+    const processId = this.allocateProcessId();
+    const callId = request.callId ?? `exec-detached-${processId}`;
+    let child: ChildProcess;
+    try {
+      child = spawn(shell, args, {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["ignore", logFd, logFd],
+        windowsHide: true,
+      });
+    } catch (error) {
+      this.releaseProcessId(processId);
+      throw new UnifiedExecError(
+        "create_process",
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      // The child holds its own copies of the log descriptor.
+      closeSync(logFd);
+    }
+    request.observer?.onBegin?.({
+      callId,
+      command: request.cmd,
+      cwd,
+      processId,
+      tty: false,
+    });
+    let settled: (ExitState & { readonly error?: Error }) | null = null;
+    const exit = new Promise<void>((resolveExit) => {
+      child.once("exit", (code, signal) => {
+        settled = { exitCode: code, signal };
+        resolveExit();
+      });
+      child.once("error", (error) => {
+        settled = { exitCode: 1, signal: null, error };
+        resolveExit();
+      });
+    });
+    const yieldMs = clampExecYield(
+      request.yield_time_ms ?? DEFAULT_DETACHED_YIELD_TIME_MS,
+    );
+    try {
+      await Promise.race([
+        delay(yieldMs, undefined, { signal: request.__abortSignal }),
+        exit,
+      ]);
+    } catch (error) {
+      // An aborted turn stops waiting; the service was asked for and stays.
+      if (!isAbortError(error)) throw error;
+    }
+    child.unref();
+    const outcome = settled as (ExitState & { readonly error?: Error }) | null;
+    const output = readFileHead(logPath, DETACHED_LOG_READ_LIMIT_BYTES);
+    const durationMs = Date.now() - startedAt;
+    const result = createResult({
+      stdout: output,
+      stderr: outcome?.error === undefined ? "" : outcome.error.message,
+      exitCode: outcome?.exitCode ?? null,
+      durationMs,
+      timedOut: false,
+      maxOutputTokens: request.max_output_tokens,
+      detached: {
+        logPath,
+        ...(outcome === null && child.pid !== undefined ? { pid: child.pid } : {}),
+      },
+    });
+    request.observer?.onEnd?.({
+      callId,
+      exitCode: result.exitCode,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      durationMs,
+      processId,
+      sessionId: processId,
+      tty: false,
+    });
+    this.releaseProcessId(processId);
+    return result;
   }
 
   async writeStdin(request: WriteStdinRequest): Promise<ExecCommandToolOutput> {
@@ -678,7 +913,9 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     ) {
       throw new UnifiedExecError(
         "write_stdin",
-        "write_stdin requires an existing session with a compatible sandbox profile",
+        "write_stdin requires an existing session with a compatible sandbox profile; " +
+          "a session started with sandbox_permissions (an escalated or widened sandbox) " +
+          "is reached by passing the same sandbox_permissions, and justification, to write_stdin",
       );
     }
     if (input.length > 0) {
@@ -710,7 +947,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
         }
         throw error instanceof UnifiedExecError
           ? error
-          : new UnifiedExecError("write_stdin", "failed to write to stdin");
+          : new UnifiedExecError("stdin_write_failed", "failed to write to stdin");
       }
     }
 
@@ -756,6 +993,133 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     enforceOwnerAccess(entry, ownerId);
     this.forceTerminate(entry);
     return { terminated: true };
+  }
+
+  /**
+   * The yielded sessions one owner started (#2477): live ones, plus exited
+   * ones whose final output has not been collected yet. This is the
+   * model-facing recovery inventory. It answers "what of mine is still
+   * running?" from manager-owned identity, so an agent never has to match
+   * task filenames against `/proc/*\/cmdline` — a predicate that also selects
+   * the AgenC CLI and the process brokers, which is how a Terminal-Bench run
+   * killed itself. Another owner's sessions are not listed; a stale or
+   * foreign id is simply absent.
+   */
+  listOwnedProcesses(request: ListOwnedProcessesRequest = {}): OwnedProcessView[] {
+    const ownerId = normalizeOwnerId(request.ownerId);
+    return [...this.processes.values()]
+      .filter(
+        (entry) =>
+          entry.backgrounded &&
+          isProcessOwnedBy({ entryOwnerId: entry.ownerId, requestOwnerId: ownerId }),
+      )
+      .sort((left, right) => left.startedAt - right.startedAt)
+      .map((entry) => this.ownedProcessView(entry));
+  }
+
+  /**
+   * Bulk stop through manager-owned identities (#2477). With `processIds`,
+   * every named live session is ownership-checked *before* any signal is
+   * sent, so a batch that names another owner's session is refused whole
+   * (`owner_denied`) and has no effect; unknown or exited ids report
+   * `terminated: false` like `terminateProcess`. Without `processIds`, only
+   * the owner's own live yielded sessions are stopped — never another
+   * owner's, never an unowned legacy entry, never anything found by scanning
+   * the process table.
+   */
+  terminateOwnedProcesses(
+    request: TerminateOwnedProcessesRequest,
+  ): TerminateOwnedProcessesOutcome {
+    const ownerId = normalizeOwnerId(request.ownerId);
+    if (request.processIds !== undefined) {
+      const results: { sessionId: number; terminated: boolean }[] = [];
+      const targets: ProcessEntry[] = [];
+      for (const processId of new Set(request.processIds)) {
+        const entry = this.processes.get(processId);
+        if (!entry || entry.exitState !== null) {
+          results.push({ sessionId: processId, terminated: false });
+          continue;
+        }
+        enforceOwnerAccess(entry, ownerId);
+        targets.push(entry);
+        results.push({ sessionId: processId, terminated: true });
+      }
+      for (const entry of targets) this.forceTerminate(entry);
+      return { results };
+    }
+    const targets = [...this.processes.values()]
+      .filter(
+        (entry) =>
+          entry.backgrounded &&
+          entry.exitState === null &&
+          isProcessOwnedBy({ entryOwnerId: entry.ownerId, requestOwnerId: ownerId }),
+      )
+      .sort((left, right) => left.startedAt - right.startedAt);
+    for (const entry of targets) this.forceTerminate(entry);
+    return {
+      results: targets.map((entry) => ({
+        sessionId: entry.processId,
+        terminated: true,
+      })),
+    };
+  }
+
+  private ownedProcessView(entry: ProcessEntry): OwnedProcessView {
+    return {
+      sessionId: entry.processId,
+      command: entry.command,
+      cwd: entry.cwd,
+      tty: entry.tty,
+      status: ownedProcessStatus(entry),
+      startedAt: entry.startedAt,
+      ...(entry.endedAt !== undefined ? { endedAt: entry.endedAt } : {}),
+      ...(entry.exitState?.exitCode != null ? { exitCode: entry.exitState.exitCode } : {}),
+    };
+  }
+
+  /** The owning session's control plane may inspect its root and child work. */
+  listBackgroundProcesses(): UnifiedExecBackgroundProcess[] {
+    const snapshots = [...this.completedBackgroundProcesses.values()].map(
+      (snapshot) => ({ ...snapshot }),
+    );
+    for (const entry of this.processes.values()) {
+      if (entry.backgrounded) snapshots.push(this.backgroundProcessSnapshot(entry));
+    }
+    return snapshots.sort((left, right) => left.startedAt - right.startedAt);
+  }
+
+  /**
+   * Operator control only. Model tools still use numeric IDs and owner checks.
+   * An old task ID cannot address a process in another session or daemon.
+   */
+  async stopBackgroundProcess(taskId: string): Promise<{ stopped: boolean }> {
+    const entry = [...this.processes.values()].find(
+      (candidate) => candidate.backgrounded && candidate.taskId === taskId,
+    );
+    if (entry?.exitState !== null) return { stopped: false };
+    entry.stopRequested = true;
+    entry.stopPromise ??= this.closeProcessStrict(entry).finally(() => {
+      entry.stopPromise = undefined;
+    });
+    await entry.stopPromise;
+    // Retain the entry until write_stdin retrieves its final output or pruning
+    // needs the slot; stopping from the UI must not destroy pending tool output.
+    return { stopped: true };
+  }
+
+  private backgroundProcessSnapshot(entry: ProcessEntry): UnifiedExecBackgroundProcess {
+    return {
+      taskId: entry.taskId,
+      command: entry.command,
+      cwd: entry.cwd,
+      tty: entry.tty,
+      ...(entry.ownerId !== undefined ? { ownerId: entry.ownerId } : {}),
+      startedAt: entry.startedAt,
+      ...(entry.endedAt !== undefined ? { endedAt: entry.endedAt } : {}),
+      status: backgroundProcessStatus(entry),
+      ...(entry.exitState?.exitCode != null ? { exitCode: entry.exitState.exitCode } : {}),
+      ...entry.output.snapshot(),
+    };
   }
 
   async closeAll(_reason = "session_shutdown"): Promise<void> {
@@ -873,6 +1237,13 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
 
   private releaseProcessId(processId: number): void {
     const entry = this.processes.get(processId);
+    if (entry?.backgrounded && entry.exitState !== null) {
+      this.completedBackgroundProcesses.set(entry.taskId, this.backgroundProcessSnapshot(entry));
+      while (this.completedBackgroundProcesses.size > MAX_COMPLETED_BACKGROUND_PROCESSES) {
+        const oldest = this.completedBackgroundProcesses.keys().next().value;
+        if (oldest !== undefined) this.completedBackgroundProcesses.delete(oldest);
+      }
+    }
     if (entry?.hardTimeout) clearTimeout(entry.hardTimeout);
     // gaphunt3 #44: ensure the upstream-abort listener is removed when a slot is
     // released, even if the entry never reached complete() (idempotent).
@@ -936,6 +1307,9 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     };
     const entryBase = {
       processId: params.processId,
+      taskId: randomUUID(),
+      backgrounded: false,
+      stopRequested: false,
       command: params.command,
       cwd: params.cwd,
       tty: params.tty,
@@ -954,6 +1328,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     const complete = (entry: ProcessEntry, state: ExitState): void => {
       if (entry.exitState !== null) return;
       entry.exitState = state;
+      entry.endedAt = Date.now();
       // gaphunt3 #44: the process settled — drop the upstream-abort listener so
       // it does not survive (the normal-exit path the `{ once: true }` never covered).
       entry.detachUpstreamAbort?.();
@@ -1053,10 +1428,14 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       if (settlementStarted) return;
       settlementStarted = true;
       setTimeout(() => {
-        void terminateProcessTreeAndWait(child, {
+        void terminateProcessTreeAndReport(child, {
           label: `exec_command process ${params.processId}`,
         }).then(
-          () => {
+          (outcome) => {
+            // Optional chaining: test doubles of the supervisor resolve void.
+            if (outcome?.residualProcessesTerminated === true) {
+              entry.residualProcessesTerminated = true;
+            }
             if (spawnError !== undefined) {
               notifyData("stderr", spawnError.message);
             }
@@ -1259,13 +1638,17 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       stderr,
       exitCode: entry.exitState?.exitCode ?? null,
       processId: entry.exitState === null ? entry.processId : undefined,
-      durationMs: Date.now() - entry.startedAt,
-      timedOut,
+      durationMs: (entry.endedAt ?? Date.now()) - entry.startedAt,
+      timedOut: entry.hardTimeoutExpired === true || timedOut,
       maxOutputTokens: options.maxOutputTokens,
+      ...(entry.residualProcessesTerminated === true
+        ? { residualProcessesTerminated: true }
+        : {}),
     });
   }
 
   private forceTerminate(entry: ProcessEntry): void {
+    if (entry.exitState === null) entry.stopRequested = true;
     this.terminate(entry, "SIGTERM");
     setTimeout(() => {
       if (entry.exitState === null) {

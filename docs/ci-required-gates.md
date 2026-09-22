@@ -7,13 +7,13 @@ Operating policy update: 2026-08-31
 Ordinary pull requests use `.github/workflows/pr-fast.yml`. One Ubuntu job
 classifies the changed paths, runs runtime typecheck, and selects exact changed
 tests or tests related to changed runtime inputs. Launcher, SDK, and gate policy
-tests run only when a PR changes those paths. Changes limited to `docs/**`,
-`README.md`, `memory_todo.md`, and `todo.txt` do not start GitHub Actions. The
+tests run only when a PR changes those paths. Changes limited to `docs/**`
+and `README.md` do not start GitHub Actions. The
 classifier, command plan, and local pitfalls are in
 [Fast `test:fast` checks](#fast-testfast-checks).
 
 `.github/workflows/platform-tests.yml` is manual. It retains the four full-suite
-shards and the Linux kernel, PowerShell, Neovim, macOS, and Windows jobs for
+shards and the Linux kernel, PowerShell, macOS, and Windows jobs for
 release candidates and changes that depend on those platforms. A normal PR does
 not need a full-suite receipt, a GitHub App check, or a platform-matrix run.
 
@@ -38,7 +38,10 @@ npm run test:fast
 
 `test:fast` is [`scripts/run-fast-checks.mjs`](../scripts/run-fast-checks.mjs).
 It prints a JSON classification plan, then runs only the commands that plan
-selects. Run the exact test file while developing a bug fix. Use a subsystem
+selects. Plans that run runtime Vitest first check that the shared resolver can
+start system ripgrep or the installed `@vscode/ripgrep` platform binary. A missing
+or unusable binary fails this preflight before typecheck and test discovery.
+Run the exact test file while developing a bug fix. Use a subsystem
 smoke only when the changed behavior needs it. Examples include the PTY startup
 check for startup or terminal work and a native platform job for
 platform-specific code.
@@ -86,8 +89,7 @@ Before classification the script also runs `git diff --check` on
 
 ### Classification
 
-If every changed path is `docs/**`, `README.md`, `memory_todo.md`, or
-`todo.txt`, or if the change set is empty, the script prints the plan and
+If every changed path is `docs/**` or `README.md`, or if the change set is empty, the script prints the plan and
 exits without typecheck or tests. A mix of those files and any other path
 still runs.
 
@@ -127,7 +129,7 @@ These paths select no Vitest, launcher, SDK, or policy command:
 | --- | --- |
 | `runtime/native/agenc-landlock-run.c`, `agenc-process-broker.c`, `agenc-process-job-broker.cs`, `agenc-keychain-helper.c`, `agenc-secret-service-helper.c` | typecheck only |
 | `runtime/bin/agenc`, `runtime/bin/agenc-linux-sandbox` | typecheck only |
-| `.npmrc`, `packaging/**` gate units, `parity/agent-surface-contract.json` | typecheck only |
+| `.npmrc`, `packaging/**` gate units | typecheck only |
 | other non-JS/TS runtime files (assets, JSON fixtures, `runtime/scripts/hermetic-network-boundary.c`) | typecheck only |
 
 Related mode only accepts `.[cm]?[jt]sx?` under `src`, `tests`, `scripts`,
@@ -384,6 +386,23 @@ implementation, Linux subreaper broker source, and Windows Job Object broker
 source. Contract tests remove each member in turn and require the policy-closure
 check to fail, so containment or handoff code cannot silently fall outside the
 approved digest.
+
+Red-probe failures include the last authenticated startup phase and separate
+spawn, heartbeat, terminal-record, and physical-settlement observations. The
+bootstrap signs an ordered stderr transcript for handoff acceptance, bootstrap
+initialization, dependency import, readiness, and the terminal record. The
+parent verifies each record's identity, sequence, and domain-separated HMAC
+before advancing the reported phase. Partial, forged, replayed, or unrelated
+records cannot advance that phase. Heartbeat observations remain separate from
+authenticated phase evidence.
+
+The assertion reporter stays in the bootstrap closure. One real child checks
+both direct and Function-constructor global lookups, records both observations
+for the parent, and must exit without expected-red evidence. Controlled-clock
+tests simulate stalls at the supervisor boundary. A separate real pre-ready
+stall verifies that the supervisor kills a resistant descendant and settles
+the process tree. Probe deadlines, heartbeat silence bounds, termination grace,
+and settlement backstops are unchanged.
 
 ## Inactive optional worker and publisher trust boundaries
 
@@ -1032,25 +1051,11 @@ default suite, and runs an exact three-file allowlist. The Node tripwire remains
 active, while the native PowerShell subprocess is restricted to local
 fixtures, fixed telemetry/update opt-outs, and an asserted no-process-leak
 postcondition; this narrow lane is not an OS egress boundary.
-The `neovim` matrix is five runners (`linux-x64`, `linux-arm64`, `darwin-x64`,
-`darwin-arm64`, `win-x64`) with digest-pinned Neovim. Lifecycle requires **18**
-tests in one file (`buffer-neovim-lifecycle.real-neovim.test.ts`). Provider and
-observed-descendant require **65** tests in three files on all five runners.
-Linux and Darwin also run the two hosted PTY scenarios with
-`node runtime/scripts/check-tui-e2e/runner.mjs --platform "$AGENC_NEOVIM_SLUG"`
-and expect `2/2 passed`. Do not add those scenarios back to `win-x64`.
-GitHub's hosted Windows ConPTY path has produced nondeterministic synthetic-input
-failures on unrelated changes. The registry
-(`runtime/scripts/check-tui-e2e/platform-scenarios.mjs`) and
-`selectPlatformScenarios()` reject `win-x64`. Reproduce the Unix pair locally
-with `--platform linux-x64` (or `linux-arm64` / `darwin-x64` /
-`darwin-arm64`). `--platform win-x64` fails closed. The full local BUFFER
-PTY set remains
-`npm --workspace=@tetsuo-ai/runtime run check:tui-workbench-buffer-neovim`.
-Windows still runs the 18-test lifecycle suite, the 65-test
-provider/observed-descendant set (including Job Object tree cleanup), and
-post-job leak assertions.
-The `macos-native` job first runs the 66-test red-probe runner contract.
+Windows also runs post-job leak assertions.
+The `macos-native` job first runs the 79-test red-probe runner contract in a
+separate invocation capped at one worker. A failed invocation preserves its
+console log and JSON report, including phase diagnostics, for one day. This
+workflow remains disabled until an operator explicitly enables it.
 Never add deadline-only descendant-marker coverage back to that contract. Its
 hard deadline begins before probe readiness, so it races cold bootstrap on
 hosted runners. The native process test covers descendant timeout containment
@@ -1351,7 +1356,7 @@ General GitHub-hosted suite execution remains rejected because it spends remote
 runner time without strengthening the local hermetic boundary. Narrow
 exceptions cover capabilities Linux cannot otherwise prove: untagged candidate
 builders and PR lanes run exact macOS and Windows native probes, while the PR
-`powershell` and `neovim` lanes run exact pinned-runtime allowlists. None repeat
+`powershell` lane runs an exact pinned-runtime allowlist. None repeat
 the complete local plan. The current policy keeps broad merge verification local
 and records evidence in the PR. The optional App design would add authenticated
 exact-SHA enforcement without moving that complete plan to GitHub, but that

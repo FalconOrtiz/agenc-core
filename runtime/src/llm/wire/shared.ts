@@ -8,11 +8,13 @@ import type {
   LLMChatOptions,
   LLMContentPart,
   LLMMessage,
+  LLMResponse,
   LLMTool,
   LLMToolCall,
   LLMToolChoice,
   LLMUsage,
 } from "../types.js";
+import { LLMInvalidResponseError } from "../errors.js";
 import { normalizeMessagesForAPI } from "../messages.js";
 import { validateToolCall, validateToolCallDetailed } from "../types.js";
 import { encodeMcpToolNameForWire } from "./mcp-tool-naming.js";
@@ -302,24 +304,56 @@ export function coerceUsage(usage: {
   };
 }
 
-export function normalizeFinishReason(
+type LLMFinishReason = LLMResponse["finishReason"];
+
+type ProviderStopOutcome =
+  | { readonly kind: "mapped"; readonly finishReason: LLMFinishReason }
+  | { readonly kind: "unsupported" };
+
+const PROVIDER_STOP_REASON_OUTCOME: {
+  readonly [reason: string]: ProviderStopOutcome;
+} = {
+  tool_calls: { kind: "mapped", finishReason: "tool_calls" },
+  tool_use: { kind: "mapped", finishReason: "tool_calls" },
+  length: { kind: "mapped", finishReason: "length" },
+  max_tokens: { kind: "mapped", finishReason: "length" },
+  model_context_window_exceeded: { kind: "mapped", finishReason: "length" },
+  content_filter: { kind: "mapped", finishReason: "content_filter" },
+  refusal: { kind: "mapped", finishReason: "content_filter" },
+  sensitive: { kind: "mapped", finishReason: "content_filter" },
+  error: { kind: "mapped", finishReason: "error" },
+  network_error: { kind: "mapped", finishReason: "error" },
+  pause_turn: { kind: "unsupported" },
+};
+
+function providerStopReasonKey(reason: unknown): string {
+  return typeof reason === "string" ? reason : "";
+}
+
+function outcomeForProviderStopReason(reason: unknown): ProviderStopOutcome {
+  return PROVIDER_STOP_REASON_OUTCOME[providerStopReasonKey(reason)] ?? {
+    kind: "mapped",
+    finishReason: "stop",
+  };
+}
+
+export function normalizeFinishReason(reason: unknown): LLMFinishReason {
+  const outcome = outcomeForProviderStopReason(reason);
+  return outcome.kind === "mapped" ? outcome.finishReason : "error";
+}
+
+export function requireMappedFinishReason(
+  providerName: string,
   reason: unknown,
-): "stop" | "tool_calls" | "length" | "content_filter" | "error" {
-  switch (String(reason ?? "")) {
-    case "tool_calls":
-    case "tool_use":
-      return "tool_calls";
-    case "length":
-    case "max_tokens":
-      return "length";
-    case "content_filter":
-    case "refusal":
-      return "content_filter";
-    case "error":
-      return "error";
-    default:
-      return "stop";
+): LLMFinishReason {
+  const outcome = outcomeForProviderStopReason(reason);
+  if (outcome.kind === "unsupported") {
+    throw new LLMInvalidResponseError(
+      providerName,
+      `Unsupported provider state ${JSON.stringify(providerStopReasonKey(reason))}`,
+    );
   }
+  return outcome.finishReason;
 }
 
 export function messageTextContent(
@@ -624,12 +658,105 @@ export function prepareMessagesForWire(
   });
 }
 
+/**
+ * Apply the OpenAI-compatible tool-result image policy before serialization.
+ * Keeping this projection shared lets admission accounting inspect the exact
+ * image set that the provider will receive instead of over-counting images a
+ * text-only destination strips from tool results.
+ */
+export function applyToolResultImagePolicyForWire(
+  messages: readonly LLMMessage[],
+  policy: "relay_as_user" | "strip" | undefined,
+): readonly LLMMessage[] {
+  if (policy === undefined) return messages;
+
+  const projected: LLMMessage[] = [];
+  const pendingRelays: Array<{
+    readonly toolCallId?: string;
+    readonly toolName?: string;
+    readonly imageParts: LLMContentPart[];
+  }> = [];
+  const flushRelays = (): void => {
+    if (pendingRelays.length === 0) return;
+    const content: LLMContentPart[] = [];
+    for (const relay of pendingRelays) {
+      const identity = relay.toolName?.trim() || relay.toolCallId?.trim();
+      content.push({
+        type: "text",
+        text: identity
+          ? `Image returned by tool ${identity}.`
+          : "Image returned by the preceding tool call.",
+      });
+      content.push(...relay.imageParts);
+    }
+    projected.push({ role: "user", content });
+    pendingRelays.length = 0;
+  };
+
+  for (const message of messages) {
+    if (message.role !== "tool") {
+      flushRelays();
+      projected.push(message);
+      continue;
+    }
+    if (!Array.isArray(message.content)) {
+      projected.push(message);
+      continue;
+    }
+
+    const imageParts: LLMContentPart[] = message.content.flatMap((part) =>
+      part.type === "image_url" && part.image_url.url.trim().length > 0
+        ? [
+            {
+              type: "image_url" as const,
+              image_url: { url: part.image_url.url },
+            },
+          ]
+        : [],
+    );
+    const textContent = message.content
+      .filter((part) => part.type !== "image_url")
+      .map((part) => messageTextContent([part]))
+      .filter((text) => text.length > 0)
+      .join("\n");
+    projected.push({
+      ...message,
+      content:
+        textContent ||
+        (imageParts.length > 0
+          ? policy === "relay_as_user"
+            ? "[Tool returned image content; image follows in the next message.]"
+            : "[Tool returned image content; this model does not accept image input.]"
+          : "[Tool returned no textual content.]"),
+    });
+    if (policy === "relay_as_user" && imageParts.length > 0) {
+      pendingRelays.push({
+        ...(message.toolCallId !== undefined
+          ? { toolCallId: message.toolCallId }
+          : {}),
+        ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
+        imageParts,
+      });
+    }
+  }
+  flushRelays();
+  return projected;
+}
+
 export function normalizeToolCalls(
   toolCalls: readonly LLMToolCall[],
 ): LLMToolCall[] {
   return toolCalls
     .map((toolCall) => validateToolCall(toolCall))
     .filter((toolCall): toolCall is LLMToolCall => toolCall !== null);
+}
+
+/** Normalize compatible APIs that return tool arguments as JSON or an object. */
+export function serializeProviderToolArguments(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "{}";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 export function normalizeToolCallsStrict(

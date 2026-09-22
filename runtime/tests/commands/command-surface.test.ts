@@ -47,6 +47,7 @@ const MINIMAL_NAMES = [
   "help",
   "hello",
   "status",
+  "goal",
   "login",
   "logout",
   "whoami",
@@ -221,6 +222,19 @@ describe("AgenC command surface compatibility", () => {
     expect(BRIDGE_SAFE_COMMANDS.has(byName.get("diff")!)).toBe(true);
     expect(isBridgeSafeCommand(byName.get("diff")!)).toBe(true);
     expect(isBridgeSafeCommand(byName.get("compact")!)).toBe(false);
+  });
+
+  it.each([
+    { aliases: ["help"] },
+    { userFacingName: () => "help" },
+  ])("does not grant bridge safety from display or alias metadata %j", (metadata) => {
+    const unsafe = getCommandsSync().find((command) => command.name === "compact")!;
+    expect(isBridgeSafeCommand({ ...unsafe, ...metadata })).toBe(false);
+  });
+
+  it("keeps prompt forwarding separate from the bridge-safe command allowlist", () => {
+    expect(isBridgeSafeCommand(promptCommand({ name: "project-skill" }))).toBe(false);
+    expect(isBridgeSafeCommand(promptCommand({ name: "help" }))).toBe(false);
   });
 
   it("keeps custom command providers model-facing without adding TUI slash commands", async () => {

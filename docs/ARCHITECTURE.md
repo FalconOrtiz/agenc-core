@@ -1,6 +1,6 @@
 # AgenC Architecture
 
-A current map of how `agenc` is put together (runtime **0.17.0**). For the
+A current map of how `agenc` is put together (runtime **0.18.0**). For the
 user-facing CLI, quick start, and install paths see [`../README.md`](../README.md)
 and [`quickstart.md`](quickstart.md). Reference docs for operators and embedders:
 
@@ -88,7 +88,7 @@ Everything past the launcher lives in the single runtime workspace
 | `elicitation/`                                                           | Structured user-input / MCP elicitation request-response                                                                                                                                                                                       |
 | `memory/` / `memdir/`                                                    | Project/session memory extraction, storage, aging, retrieval; full-corpus FTS index (`derived-indexes/memory-v1.sqlite`); team memory paths. See [memory.md](reference/memory.md).                                                             |
 | `config/`                                                                | Config schema, loader, migrations, profiles, model/provider resolution                                                                                                                                                                         |
-| `state/`                                                                 | On-disk SQLite project state, migrations, rebuildable run/effect/journal projections, recovery, pruning, agent-runs, health stats                                                                                                              |
+| `state/`                                                                 | On-disk SQLite project state, migrations, rebuildable run/effect/journal projections, recovery, pruning (including [session rollout retention](reference/daemon.md#session-rollout-retention)), agent-runs, health stats                                                                                                              |
 | `durability/`                                                            | Crash failpoints and immutable, atomic artifact publication                                                                                                                                                                                    |
 | `secrets/`                                                               | Secret redaction / sanitizer                                                                                                                                                                                                                   |
 | `transaction-guard/`                                                     | Opt-in local SLM guard for Solana-like mutating tool calls                                                                                                                                                                                     |
@@ -103,9 +103,9 @@ Everything past the launcher lives in the single runtime workspace
 | `tasks/`                                                                 | Task UI / task store surface for agent work items                                                                                                                                                                                              |
 | `file-watcher/`                                                          | Workspace file-watch helpers                                                                                                                                                                                                                   |
 | `transport/`                                                             | Transport fallback ladder                                                                                                                                                                                                                      |
-| `services/`                                                              | Wire-layer helpers the turn loop and daemon call: LLM API adapters (`api/`), compaction (`compact/`), LSP, Ledger wallet CLI, code prediction, MCP transport glue, memory extraction, autoFix post-tool hook, heap watchdog. [CP-0006](design/critical-path/0006-compaction-transaction.md#operator-contract-current-main) documents compact thresholds, disable flags, admitted summary calls, and [compact-skip session survival](design/critical-path/0006-compaction-transaction.md#compact-skip-and-session-survival). Most of these are not separate CLIs.                                                                                                                                                                                |
+| `services/`                                                              | Wire-layer helpers the turn loop and daemon call: LLM API adapters (`api/`), compaction (`compact/`), LSP, Ledger wallet CLI, code prediction, MCP transport glue, memory extraction, autoFix post-tool hook, heap watchdog. [CP-0006](design/critical-path/0006-compaction-transaction.md#operator-contract-current-main) documents compact thresholds, disable flags, admitted summary calls, the [900 s transaction wall budget](design/critical-path/0006-compaction-transaction.md#compaction-transaction-wall-budget), and [compact-skip session survival](design/critical-path/0006-compaction-transaction.md#compact-skip-and-session-survival). Most of these are not separate CLIs.                                                                                                                                                                                |
 | `search/`                                                                | Persistent fuzzy file index used by `fs.fuzzy_search`                                                                                                                                                                                          |
-| `workspace/`                                                             | Editor mutation leases and topology fences for BUFFER (`workspace.editor.*`)                                                                                                                                                                   |
+| `workspace/`                                                             | Verified file-mutation transactions (rollback boundary, no-effect evidence) and the per-tool-call operation lifetime that keeps shell descendants contained                                                                                    |
 | `contracts/`                                                             | Frozen run/admission/CSV/invocation types shared by daemon, SDK, and tests                                                                                                                                                                     |
 | `recovery/`                                                              | Crash/recovery helpers for in-flight work                                                                                                                                                                                                      |
 | `onboarding/`                                                            | Guided `agenc onboard` wizard UI                                                                                                                                                                                                               |
@@ -118,7 +118,7 @@ Everything past the launcher lives in the single runtime workspace
 | `bootstrap/` / `lifecycle/` / `conversation/`                            | Bootstrap state, shutdown/signals, conversation token-budget and realtime                                                                                                                                                                      |
 | `constants/` / `types/` / `errors/` / `utils/` / `context/` / `schemas/` | Shared constants, pure types, error shaping, utilities                                                                                                                                                                                         |
 | `browser/`                                                               | Isolated Chromium CDP driver + SSRF proxy for the LIVE `Browser` tool                                                                                                                                                                          |
-| `build/` / `version.ts` / `index.ts`                                     | Feature flags, version stamp (`0.17.0`), public barrel                                                                                                                                                                                         |
+| `build/` / `version.ts` / `index.ts`                                     | Feature flags, version stamp (`0.18.0`), public barrel                                                                                                                                                                                         |
 
 ## State on disk (`AGENC_HOME`, default `~/.agenc`)
 
@@ -139,7 +139,7 @@ The daemon and runtime persist under one home. Relocate with an absolute
 | `gateway/`                                                         | Gateway sessions map, pairing, webchat token, heartbeat session id, control plane                                                    |
 | `projects/<slug>/`                                                 | Per-project SQLite state (including execution admission, run/effect projections, and schema-v18 bounded recovery evidence) + canonical `sessions/<id>/` rollouts |
 | `projects/<slug>/agenc-state_1.pre-v15.sqlite`                     | Automatic verified rollback snapshot created before upgrading an existing project database to schema v15                             |
-| `sessions/` (project-scoped)                                       | Canonical append-only JSONL rollouts + advisory `index.json` (atomic tmp+fsync+rename)                                               |
+| `sessions/` (project-scoped)                                       | Canonical append-only JSONL rollouts + advisory `index.json` (atomic tmp+fsync+rename). The daemon sweep deletes idle session dirs after `agent.retention.rollout_days` (default 30; 0 keeps every session): [session rollout retention](reference/daemon.md#session-rollout-retention). |
 | `derived-indexes/memory-v1.sqlite`                                 | Rebuildable full-corpus memory FTS cache (not source authority). See [memory.md](reference/memory.md).                               |
 | logs / state DBs                                                   | SQLite state + logs databases under project/home layout                                                                              |
 
@@ -367,6 +367,7 @@ phase machine. Module files under `runtime/src/phases/` own the heavy steps;
 | 2   | `streamModel`        | `phases/stream-model.ts`         | Admit one physical sample; stream the provider response; capture assistant + tool-use blocks (may start streaming tool dispatch) |
 | 3   | `postSampleRecovery` | `phases/post-sample-recovery.ts` | Run recovery ladder on stream outcome / withheld errors                                           |
 | 4   | `continuationNudge`  | `phases/continuation-nudge.ts`   | Nudge re-entry when the model stopped without required follow-up                                  |
+| 4b  | `completionGate`     | `phases/completion-gate.ts`      | Non-interactive sessions only: hold the first tool-free final answer, inject a durable verification request, accept once each checked item has associated tool evidence, settle `partial` for evidenced unavailable checks, or `exhausted` at the round cap |
 | 5   | `executeTools`       | `phases/execute-tools.ts`        | Drain / finalize tool dispatch → tool results                                                     |
 | 6   | `commit`             | `phases/commit.ts`               | Terminal commit for the iteration; may re-enter via stop-hooks                                    |
 
@@ -447,7 +448,7 @@ output, low/medium/high/xhigh effort with high default); `grok-4.5` remains a
 selectable entry. Model metadata
 and cost assumptions: [`reference/providers.md`](reference/providers.md).
 
-There are **16 built-in provider slugs**. Full table, env vars, base URLs,
+There are **17 built-in provider slugs**. Full table, env vars, base URLs,
 and how local servers publish a context window:
 [`reference/providers.md`](reference/providers.md).
 `session.snapshot.contextBreakdown` gives a rough category estimate for the
@@ -484,18 +485,7 @@ Heartbeat: **disabled by default**, interval **1800s**, env
 The TUI is a **custom `react-reconciler` Ink fork** under
 `runtime/src/tui/ink` (own renderer, double-buffered frame diffing, event
 dispatch, bidi/ANSI) — not the upstream `ink` package. On top: app shell,
-prompt input, transcript, and the **workbench** (project explorer, preview,
-and editable `BUFFER`).
-
-BUFFER prefers a supervised `nvim --embed` workspace session. Neovim owns
-editing, modes, command-line UI, messages, popups, buffers, and plugins; AgenC
-attaches a line-grid UI, renders that native grid into the measured center
-pane, routes terminal input, and owns process and file-safety boundaries.
-Loaded and hidden Neovim buffers form one safety unit: navigation reuses the
-session, dirty state is aggregated across the buffer manifest, and a workbench
-transition cannot abandon edits in a non-active buffer. Request-scoped
-Editor turns cap sampling, tool calls, and query tokens; see
-[editor request bounds](embedded-neovim-buffer.md#editor-request-bounds).
+prompt input, and transcript.
 
 A throwing frame is contained; the next frame full-repaints rather than
 crashing the process.
@@ -521,7 +511,7 @@ crashing the process.
   [ci-required-gates.md](ci-required-gates.md#fast-testfast-checks).
 - Releases use the complete local suite and the manual hosted matrix from
   exact current `main`. The matrix covers Linux kernel
-  sandboxing, PowerShell, Neovim, macOS, and Windows. The optional GitHub App
+  sandboxing, PowerShell, macOS, and Windows. The optional GitHub App
   and ruleset design remains inactive. See
   [`ci-required-gates.md`](ci-required-gates.md).
 
@@ -548,7 +538,7 @@ compression, and timestamp policy, validates the descriptor graph, compares
 every compressed blob, then starts the bound image under read-only-root,
 capability-free, no-network hardening and verifies native socket credentials.
 
-## Current status (0.17.0)
+## Current status (0.18.0)
 
 Daemon-backed process model, multi-provider LLM layer, permissions/sandbox,
 gateway multi-channel surface, heartbeat + cron delivery + hooks with

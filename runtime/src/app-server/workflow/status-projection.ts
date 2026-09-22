@@ -17,12 +17,14 @@ import {
   type WorkflowStepId,
   type WorkflowStepStatus,
   type WorkflowStopReason,
+  type WorkflowSpec,
 } from "../../contracts/run-contracts.js";
 import type {
   DurableRunEffect,
   DurableRunTerminalRecord,
 } from "../../state/run-durability.js";
-import { deriveAllStageProjections } from "./steps.js";
+import { deriveAllStageProjections, readWorkflowStepEvidence } from "./steps.js";
+import type { PermissionMode } from "../../permissions/types.js";
 
 export interface WorkflowStatusStep {
   readonly stepId: string;
@@ -35,6 +37,9 @@ export interface WorkflowStatusStep {
 
 export interface WorkflowRunStatus {
   readonly runId: string;
+  readonly requestedPermissionMode?: WorkflowSpec["permissionMode"];
+  /** Only a live, owned Session can supply this field; durable projection cannot. */
+  readonly effectivePermissionMode?: PermissionMode;
   readonly steps: readonly WorkflowStatusStep[];
   readonly terminal?: {
     readonly status: RunTerminalStatus;
@@ -109,8 +114,16 @@ export function projectWorkflowStatus(input: {
     )
       ? (input.terminal.stopReason as WorkflowStopReason)
       : undefined;
+  const intake = input.effects.find((effect) => effect.stepId === "workflow.intake");
+  const spec = intake === undefined ? undefined : readWorkflowStepEvidence(intake).spec;
+  const permissionMode = spec !== null && typeof spec === "object"
+    ? (spec as Record<string, unknown>).permissionMode
+    : undefined;
   return {
     runId: input.runId,
+    ...(permissionMode === "default" || permissionMode === "plan" || permissionMode === "acceptEdits" || permissionMode === "bypassPermissions"
+      ? { requestedPermissionMode: permissionMode }
+      : {}),
     steps,
     ...(input.terminal !== undefined
       ? {

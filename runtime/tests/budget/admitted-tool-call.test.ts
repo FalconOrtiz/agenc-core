@@ -1,3 +1,7 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
 import type {
@@ -7,6 +11,8 @@ import type {
 import { AdmissionDeniedError } from "../../src/budget/admission-client.js";
 import type { AdmissionLease } from "../../src/budget/admission-types.js";
 import { runAdmittedToolCall } from "../../src/budget/admitted-tool-call.js";
+import { createModelFacingTools } from "../../src/bin/model-facing-tools.js";
+import { WEB_FETCH_TOOL_NAME } from "../../src/tools/WebFetchTool/prompt.js";
 import {
   effectSettlementMetrics,
   resolveLiveEffectPoison,
@@ -16,6 +22,17 @@ import { EventLog, type Event } from "../../src/session/event-log.js";
 import type { Session } from "../../src/session/session.js";
 import type { Tool } from "../../src/tools/types.js";
 import { attachPendingPhysicalSettlement } from "../../src/tools/physical-settlement.js";
+import { createFileEditTool } from "../../src/tools/system/file-edit.js";
+import { createExecCommandTool } from "../../src/tools/system/exec-command.js";
+import { createWriteStdinTool } from "../../src/tools/system/write-stdin.js";
+import { UnifiedExecProcessManager } from "../../src/unified-exec/process-manager.js";
+import { bindExplicitDangerBoundary } from "../helpers/explicit-danger-boundary.js";
+
+const zeroAdmissionEstimate = () => ({
+  maxInputTokens: 0,
+  maxOutputTokens: 0,
+  maxCostUsd: 0,
+});
 
 function toolHarness() {
   const leaseController = new AbortController();
@@ -95,6 +112,51 @@ function toolHarness() {
 }
 
 describe("runAdmittedToolCall", () => {
+  it.each(["timeout", "nonzero", "signal"] as const)(
+    "a real background process %s stays an error without locking subsequent commands",
+    async (termination) => {
+      const root = await mkdtemp(join(tmpdir(), "agenc-process-settlement-"));
+      const manager = new UnifiedExecProcessManager({ cwd: root });
+      const state = toolHarness();
+      const exec = bindExplicitDangerBoundary(createExecCommandTool({ cwd: root, unifiedExecManager: manager }));
+      const poll = bindExplicitDangerBoundary(createWriteStdinTool({ cwd: root, unifiedExecManager: manager }));
+      const invoke = (tool: Tool, callId: string, args: Record<string, unknown>) => runAdmittedToolCall({
+        session: state.session, turnId: "turn-1", callId, tool, args,
+        invoke: async ({ crossEffectBoundary }) => {
+          crossEffectBoundary();
+          return tool.execute(args);
+        },
+      });
+      try {
+        await mkdir(join(root, "tmp"));
+        // A failed command can already have made changes. The poll receipt
+        // confirms observation, never that the workspace is unchanged.
+        const started = await invoke(exec, "start-background", {
+          cmd: termination === "nonzero"
+            ? "printf partial > tmp/partial.txt; sleep 0.6; exit 7"
+            : "printf partial > tmp/partial.txt; sleep 30",
+          yield_time_ms: 250,
+          ...(termination === "timeout" ? { timeoutMs: 600 } : {}),
+        });
+        const sessionId = started.metadata?.sessionId as number;
+        expect(sessionId, started.content).toEqual(expect.any(Number));
+        if (termination === "signal") manager.terminateProcess(sessionId);
+        const result = await invoke(poll, "poll-background", { session_id: sessionId, chars: "" });
+        expect(result.isError).toBe(true);
+        expect(result.effectDisposition).toMatchObject({ disposition: "confirmed_committed", evidenceKind: "provider_receipt" });
+        expect(result.content).toContain(termination === "timeout" ? "timed_out=true" : termination === "nonzero" ? "exit_code=7" : "signal_terminated=true");
+        expect(await readFile(join(root, "tmp/partial.txt"), "utf8")).toBe("partial");
+        const followUp = await invoke(exec, "follow-up", { cmd: "printf recovered > tmp/recovered.txt" });
+        expect(followUp.isError).not.toBe(true);
+        expect(await readFile(join(root, "tmp/recovered.txt"), "utf8")).toBe("recovered");
+        expect(state.effectEvents.some((event) => event.msg.type === "effect_unknown_outcome")).toBe(false);
+      } finally {
+        await manager.closeAll("test_cleanup");
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("fails closed before tool dispatch when the canonical effect journal is detached", async () => {
     const state = toolHarness();
     Object.assign(state.session, { rolloutStore: null });
@@ -373,6 +435,49 @@ describe("runAdmittedToolCall", () => {
     });
     expect(state.holdUnknown).not.toHaveBeenCalled();
     expect(state.acknowledgeCompletion).toHaveBeenCalledOnce();
+  });
+
+  it("settles a successful web_fetch at zero instead of holding it as missing usage", async () => {
+    // Foodstuff-beta-activity (DeepSeek, 2026-09-15): the nested extraction call reconciled at the
+    // model boundary, then the fetch's own reservation was held as missing_tool_usage because the
+    // tool declared no estimate, and the whole session's cost turned unknown. The real tool
+    // definition is used here; only the network fetch is stubbed.
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-web-fetch-admission-"));
+    try {
+      const webFetch = createModelFacingTools({
+        workspaceRoot,
+        agencHome: workspaceRoot,
+        env: {},
+        getSession: () => null,
+      }).find((candidate) => candidate.name === WEB_FETCH_TOOL_NAME);
+      expect(webFetch).toBeDefined();
+      const state = toolHarness();
+
+      await runAdmittedToolCall({
+        session: state.session,
+        turnId: "turn-1",
+        callId: "call-web-fetch",
+        tool: webFetch!,
+        args: { url: "https://example.com/data.json", prompt: "list the fields" },
+        invoke: async ({ crossEffectBoundary }) => {
+          crossEffectBoundary();
+          return { content: "page text" };
+        },
+      });
+
+      expect(state.acquire).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "tool_exec", maxCostUsd: 0 }),
+        undefined,
+      );
+      expect(state.holdUnknown).not.toHaveBeenCalled();
+      expect(state.reconcile).toHaveBeenCalledWith("tool-reservation", {
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   it("holds the full bound when a charged tool omits usage", async () => {
@@ -670,6 +775,75 @@ describe("runAdmittedToolCall", () => {
       throw new Error("missing unknown outcome");
     }
     expect(acknowledgement.msg.payload.outcome).toBe("unknown_outcome");
+  });
+
+  it("settles an Edit whose old_string is not found as a determinate failure, not unknown", async () => {
+    // Regression for the poisoned-session rollout: a stale `old_string`
+    // returned a bare error result, the supervisor recorded
+    // `effect_unknown_outcome`, and every later Write / exec_command in
+    // the session was refused with a `/resolve` instruction the model
+    // cannot execute. The file is untouched before the write boundary, so
+    // the Edit tool must settle this as a confirmed no-effect failure.
+    const root = await mkdtemp(join(tmpdir(), "agenc-admitted-edit-"));
+    try {
+      const file = join(root, "target.txt");
+      await writeFile(file, "current text\n", "utf8");
+      const editTool = createFileEditTool({ allowedPaths: [root] });
+      const state = toolHarness();
+
+      const result = await runAdmittedToolCall({
+        session: state.session,
+        turnId: "turn-1",
+        callId: "call-edit-miss",
+        tool: {
+          ...editTool,
+          admissionEstimate: zeroAdmissionEstimate,
+        } as unknown as Tool,
+        args: {},
+        invoke: async ({ crossEffectBoundary }) => {
+          crossEffectBoundary();
+          return editTool.execute({
+            file_path: file,
+            old_string: "text that is not there",
+            new_string: "replacement",
+            __testBypassSessionGuard: true,
+          });
+        },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("String to replace not found in file.");
+      expect(
+        state.effectEvents.some(
+          (event) => event.msg.type === "effect_unknown_outcome",
+        ),
+      ).toBe(false);
+      expect(state.effectEvents.at(-1)?.msg).toMatchObject({
+        type: "effect_result",
+        payload: { outcome: "failed", effectBoundary: "crossed" },
+      });
+
+      // The session is not poisoned: a later side-effecting call still runs.
+      await expect(
+        runAdmittedToolCall({
+          session: state.session,
+          turnId: "turn-1",
+          callId: "call-write-after-edit-miss",
+          tool: {
+            name: "write.follow-up",
+            recoveryCategory: "side-effecting",
+            admissionEstimate: zeroAdmissionEstimate,
+          } as unknown as Tool,
+          args: {},
+          invoke: async ({ crossEffectBoundary }) => {
+            crossEffectBoundary();
+            return { content: "ok" };
+          },
+        }),
+      ).resolves.toMatchObject({ content: "ok" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("accepts typed adapter evidence that a crossed attempt made no effect", async () => {

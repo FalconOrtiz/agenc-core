@@ -2,8 +2,10 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -51,6 +53,9 @@ import {
   loadBypassPermissionsConsent,
   recordBypassPermissionsConsent,
 } from "../../src/permissions/bypass-consent-state.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../../src/contracts/additional-working-directories.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -413,6 +418,52 @@ describe("canonical permission persistence", () => {
 });
 
 describe("permission CLI/mode helpers", () => {
+  test("persists exact-cwd bypass consent when a trusted session starts in bypass mode", async () => {
+    // A desktop session created with permissionMode "bypassPermissions" was
+    // authorized in memory only; after a daemon restart its resume was
+    // refused with "restored bypass permission mode requires persisted
+    // exact-cwd consent". Explicit startup bypass now records the consent.
+    let env = await canonicalEnv({ diskState: true });
+    const canonicalCwd = canonicalizeBypassPermissionsCwd(env.cwd!);
+    const { toolPermissionContext } = await initializeToolPermissionContext({
+      env,
+      projectTrust: "trusted",
+      permissionMode: "bypassPermissions",
+    });
+    expect(toolPermissionContext).toMatchObject({
+      mode: "bypassPermissions",
+      bypassPermissionsAcceptedIn: [canonicalCwd],
+    });
+    env = await restartCanonicalEnv(env);
+    expect(
+      loadBypassPermissionsConsent(
+        env.configStore.stateRepository,
+        env.cwd!,
+        { reload: true },
+      ),
+    ).toEqual([canonicalCwd]);
+    env.configStore.stateRepository.close();
+  });
+
+  test("does not persist bypass consent for an untrusted project", async () => {
+    let env = await canonicalEnv({ diskState: true });
+    await initializeToolPermissionContext({
+      env,
+      projectTrust: "untrusted",
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+    });
+    env = await restartCanonicalEnv(env);
+    expect(
+      loadBypassPermissionsConsent(
+        env.configStore.stateRepository,
+        env.cwd!,
+        { reload: true },
+      ),
+    ).toEqual([]);
+    env.configStore.stateRepository.close();
+  });
+
   test("restores exact-cwd bypass consent on trusted restart before a later mode switch", async () => {
     let env = await canonicalEnv({ diskState: true });
     const canonicalCwd = canonicalizeBypassPermissionsCwd(env.cwd!);
@@ -662,6 +713,51 @@ describe("permission CLI/mode helpers", () => {
       .toEqual([{ path: "/managed-extra", source: "policySettings" }]);
     expect(warnings).toContain(
       "Ignored --add-dir because managed policy allows only managed permission rules",
+    );
+  });
+
+  test("admits only canonical directories and deduplicates aliases", async () => {
+    const env = await canonicalEnv();
+    const directory = join(env.cwd!, "shared");
+    const directoryLink = join(env.cwd!, "shared-link");
+    const regularFile = join(env.cwd!, "regular.txt");
+    mkdirSync(directory);
+    writeFileSync(regularFile, "not a directory", "utf8");
+    symlinkSync(
+      directory,
+      directoryLink,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    const { toolPermissionContext, warnings } =
+      await initializeToolPermissionContext({
+        env,
+        addDirs: [
+          "shared",
+          "shared",
+          directory,
+          directoryLink,
+          regularFile,
+        ],
+      });
+
+    expect([...toolPermissionContext.additionalWorkingDirectories.values()])
+      .toEqual([{ path: realpathSync(directory), source: "cliArg" }]);
+    expect(warnings).toContain(
+      `--add-dir path is not a directory: ${regularFile}`,
+    );
+  });
+
+  test("rejects too many additional directories before path resolution", async () => {
+    const addDirs = Array.from(
+      { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+      (_, index) => `/not-probed/additional-${index}`,
+    );
+
+    await expect(
+      initializeToolPermissionContext({ addDirs }),
+    ).rejects.toThrow(
+      `initializeToolPermissionContext addDirs accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
     );
   });
 

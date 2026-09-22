@@ -106,10 +106,11 @@ const OPENAI_CONTEXT_WINDOWS: Record<string, number> = {
   'o3-mini':                  200_000,
   'o4-mini':                  200_000,
 
-  // DeepSeek V4 coding-agent models. DeepSeek's official coding-agent guide
-  // publishes V4 Pro at 1,048,576 context / 262,144 output; Flash is treated
-  // as the same family for local budgeting until a dedicated public model card
-  // lands.
+  // DeepSeek V4 Flash and Pro: 1,048,576 context and 384,000 output ceiling.
+  // The native adapter's default response budget is registered separately.
+  'deepseek-flash':         1_048_576,
+  'deepseek-v4.1-flash':     1_048_576,
+  'deepseek-v4-flash-vision-exp': 1_048_576,
   'deepseek-v4-flash':      1_048_576,
   'deepseek-v4-pro':        1_048_576,
   // Groq (fast inference)
@@ -173,7 +174,9 @@ const OPENAI_CONTEXT_WINDOWS: Record<string, number> = {
   // Yi via NVIDIA NIM
   '01-ai/yi-large': 32_768,
 
-  // MiniMax (all M2.x variants share 204,800 context, 131,072 max output)
+  // MiniMax (M3 has a 1,000,000 window; all M2.x variants share 204,800)
+  'MiniMax-M3':               1_000_000,
+  'minimax-m3':               1_000_000,
   'MiniMax-M2.7':             204_800,
   'MiniMax-M2.7-highspeed':   204_800,
   'MiniMax-M2.5':             204_800,
@@ -187,11 +190,8 @@ const OPENAI_CONTEXT_WINDOWS: Record<string, number> = {
   'minimax-m2.1':             204_800,
   'minimax-m2.1-highspeed':   204_800,
 
-  // MiniMax new models
+  // MiniMax ids no longer in the documented lineup that still answer
   'MiniMax-Text-01':          524_288,
-  'MiniMax-Text-01-Preview':  262_144,
-  'MiniMax-Vision-01':        32_768,
-  'MiniMax-Vision-01-Fast':   16_384,
   'MiniMax-M2':               204_800,
 
   // Google (via OpenRouter)
@@ -346,8 +346,11 @@ const OPENAI_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'o4-mini':                  100_000,
 
   // DeepSeek V4 coding-agent models. See context-window note above.
-  'deepseek-v4-flash':        262_144,
-  'deepseek-v4-pro':          262_144,
+  'deepseek-flash':           384_000,
+  'deepseek-v4.1-flash':       384_000,
+  'deepseek-v4-flash-vision-exp': 384_000,
+  'deepseek-v4-flash':        384_000,
+  'deepseek-v4-pro':          384_000,
   // Compatibility DeepSeek API aliases documented in the public pricing/model pages.
 
   // Groq
@@ -359,7 +362,9 @@ const OPENAI_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'mistral-large-latest':     32_768,
   'mistral-small-latest':     32_768,
 
-  // MiniMax (all M2.x variants share 131,072 max output)
+  // MiniMax (M3 and all M2.x variants share 131,072 max output)
+  'MiniMax-M3':              131_072,
+  'minimax-m3':              131_072,
   'MiniMax-M2.7':            131_072,
   'MiniMax-M2.7-highspeed':  131_072,
   'MiniMax-M2.5':            131_072,

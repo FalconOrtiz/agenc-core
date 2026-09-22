@@ -47,6 +47,7 @@ const MAX_PLUGIN_REGISTRATION_MARKDOWN_FILES = 512;
 const MAX_PLUGIN_REGISTRATION_SCAN_DEPTH = 8;
 
 export interface PluginRuntimeLoadOptions {
+  readonly readOnly?: boolean;
   readonly cwd?: string;
   readonly workspaceRoot?: string;
   readonly pluginStorageRoot: string;
@@ -88,6 +89,7 @@ export function toPluginLoaderOptions(
   return {
     pluginStorageRoot,
     workspaceRoot,
+    ...(options.readOnly === undefined ? {} : { readOnly: options.readOnly }),
     ...(options.config !== undefined ? { config: options.config } : {}),
     ...(options.extraPluginDirs !== undefined ? { extraPluginDirs: options.extraPluginDirs } : {}),
   };
@@ -101,7 +103,7 @@ export async function loadRuntimePlugins(
     options.errors?.push(...result.errors);
     return result.enabled;
   };
-  if (options.fresh === true || hasExplicitPluginDiscoveryInput(options)) {
+  if (options.readOnly === true || options.fresh === true || hasExplicitPluginDiscoveryInput(options)) {
     const result = await loadPlugins(loaderOptions);
     return projectResult(result);
   }

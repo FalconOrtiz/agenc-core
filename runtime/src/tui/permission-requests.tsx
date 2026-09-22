@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ApprovalCtx } from "../tools/orchestrator.js";
 import type { ReviewDecision } from "../permissions/review-decision.js";
@@ -16,14 +16,15 @@ import {
   type AskUserQuestionInput,
   type AskUserQuestionPlanInterviewAction,
 } from "../tools/ask-user-question/tool.js";
-import { makeToolUseMessage } from "./session-transcript.js";
+import { makeToolUseMessage } from "./synthetic-assistant-message.js";
 import type { AgenCBridgeSession } from "./session-types.js";
 import { createSessionAppStateBridge } from "./session-app-state.js";
 import type { AppState } from "./state/AppState.js";
 import { approvalInputText } from "./approval-input-text.js";
-import { Box, useInput } from "./ink.js";
+import { Box, useInput, type Key } from "./ink.js";
+import type { InputEvent } from "./ink/events/input-event.js";
 import { useRegisterKeybindingContext } from "./keybindings/KeybindingContext.js";
-import { useKeybindings } from "./keybindings/useKeybinding.js";
+import { useInputCapture, useKeybindings } from "./keybindings/useKeybinding.js";
 import { useRegisterOverlay } from "./context/overlayContext.js";
 import { ApprovalCard, type ApprovalDiffPreview } from "./components/v2/primitives.js";
 import { buildEditDiffPreview } from "./edit-diff-preview.js";
@@ -44,6 +45,17 @@ export interface PendingRequest {
   readonly input: Record<string, unknown>;
   readonly description: string;
   resolve(decision: ReviewDecision): void;
+}
+
+export function collectPermissionToolNames(
+  transcriptToolNames: Iterable<string>,
+  requests: readonly PendingRequest[],
+): ReadonlySet<string> {
+  const names = new Set(transcriptToolNames);
+  // Child tools need not appear in the parent's transcript. Every queued
+  // request is projected, so include every identity before building cards.
+  for (const request of requests) names.add(request.ctx.toolName);
+  return names;
 }
 
 function parseJsonObject(raw: string | undefined): Record<string, unknown> {
@@ -290,12 +302,14 @@ export function usePermissionRequests(
 export function AgenCPermissionOverlay({
   request,
   tools,
+  onDismiss,
 }: {
   readonly request: PendingRequest | undefined;
   readonly tools: readonly any[];
   readonly mcpClients?: readonly unknown[];
   readonly isNonInteractiveSession?: boolean;
   readonly debug?: boolean;
+  readonly onDismiss?: () => void;
 }) {
   // Register the whole approval family as a modal overlay: without this the
   // GLOBAL turn-cancel (useCancelRequest) treats esc as "cancel the turn"
@@ -333,7 +347,7 @@ export function AgenCPermissionOverlay({
   }, [request]);
 
   if (request !== undefined && isExitPlanMode) {
-    return <PlanApprovalContainer key={request.id} request={request} />;
+    return <PlanApprovalContainer key={request.id} request={request} onDismiss={onDismiss} />;
   }
 
   if (
@@ -346,7 +360,7 @@ export function AgenCPermissionOverlay({
         key={request.id}
         input={askUserQuestionInput}
         onSubmit={(updatedInput) => toolUseConfirm.onAllow(updatedInput, [])}
-        onSkip={() =>
+        onSkip={onDismiss ?? (() =>
           // esc is a deliberate skip, not a denial: approve with an empty
           // answer set flagged skipped — the tool then tells the model to
           // proceed with best judgment instead of erroring into a re-ask loop.
@@ -361,7 +375,7 @@ export function AgenCPermissionOverlay({
             },
             [],
           )
-        }
+        )}
       />
     );
   }
@@ -374,6 +388,7 @@ export function AgenCPermissionOverlay({
       key={request.id}
       request={request}
       toolUseConfirm={toolUseConfirm}
+      onDismiss={onDismiss}
     />
   );
 }
@@ -412,10 +427,13 @@ function AskUserQuestionApprovalContainer({
 
 function PlanApprovalContainer({
   request,
+  onDismiss,
 }: {
   readonly request: PendingRequest;
+  readonly onDismiss?: () => void;
 }) {
   useRegisterKeybindingContext("Confirmation");
+  const settled = useRef(false);
 
   const planContent =
     request.ctx.planContent ??
@@ -428,6 +446,8 @@ function PlanApprovalContainer({
 
   const onApprove = useCallback(
     (mode: "acceptEdits" | "default") => {
+      if (settled.current) return;
+      settled.current = true;
       setPlanApprovalChoice(request.id, {
         action: "approve",
         mode,
@@ -439,6 +459,8 @@ function PlanApprovalContainer({
   );
 
   const onKeepPlanning = useCallback(() => {
+    if (settled.current) return;
+    settled.current = true;
     setPlanApprovalChoice(request.id, { action: "revise" });
     request.resolve(APPROVED);
   }, [request]);
@@ -446,6 +468,8 @@ function PlanApprovalContainer({
   useKeybindings(
     {
       "app:interrupt": () => {
+        if (settled.current) return;
+        settled.current = true;
         request.resolve(ABORT);
       },
     },
@@ -459,6 +483,7 @@ function PlanApprovalContainer({
         {...(planFilePath !== undefined ? { planFilePath } : {})}
         onApprove={onApprove}
         onKeepPlanning={onKeepPlanning}
+        onDismiss={onDismiss}
       />
     </Box>
   );
@@ -502,26 +527,36 @@ function approvalCommandIsShell(
 function AgenCApprovalOverlay({
   request,
   toolUseConfirm,
+  onDismiss,
 }: {
   readonly request: PendingRequest;
   readonly toolUseConfirm: ProjectedToolUseConfirm;
+  readonly onDismiss?: () => void;
 }) {
   const command = approvalInputText(toolUseConfirm.input, { prettyJson: true });
-  // Build a bounded diff/content preview so a Write/Edit is not approved blind.
-  // Reuses the same diff engine + helper the post-approval DIFF card uses; it
-  // returns null for non-file-write tools (e.g. Bash), so those show no diff.
+  const fileWritePreview = request.ctx.fileWritePreview;
+  const writePreviewUnavailable = toolUseConfirm.tool.name === "Write" &&
+    (fileWritePreview === undefined || fileWritePreview.kind === "unavailable");
   const diffPreview = useMemo<ApprovalDiffPreview | undefined>(() => {
     try {
+      if (writePreviewUnavailable) return undefined;
+      const writeInput = toolUseConfirm.tool.name === "Write" &&
+        fileWritePreview?.kind === "existing" &&
+        toolUseConfirm.input !== null && typeof toolUseConfirm.input === "object"
+        ? {
+            ...toolUseConfirm.input,
+            old_string: fileWritePreview.content,
+            new_string: (toolUseConfirm.input as Record<string, unknown>).content,
+          }
+        : undefined;
       const built = buildEditDiffPreview(
-        toolUseConfirm.tool.name,
-        toolUseConfirm.input,
+        writeInput === undefined ? toolUseConfirm.tool.name : "Edit",
+        writeInput ?? toolUseConfirm.input,
       );
       if (built === null) return undefined;
-      // Label the inline diff the same way the post-approval TRANSCRIPT card
-      // does: a Write produces a brand-new file → CREATE; Edit/MultiEdit change
-      // an existing one → EDIT. Keeps the approval preview and the transcript in
-      // sync instead of showing a neutral DIFF here.
-      const op = toolUseConfirm.tool.name === "Write" ? "CREATE" : "EDIT";
+      const op = toolUseConfirm.tool.name === "Write" && fileWritePreview?.kind === "missing"
+        ? "CREATE"
+        : "EDIT";
       return {
         file: built.file,
         stats: built.stats,
@@ -534,35 +569,49 @@ function AgenCApprovalOverlay({
       // command-only card rather than throwing inside render.
       return undefined;
     }
-  }, [toolUseConfirm.tool.name, toolUseConfirm.input]);
+  }, [toolUseConfirm.tool.name, toolUseConfirm.input, fileWritePreview, writePreviewUnavailable]);
   const risk = classifyApprovalRisk({
     request,
     toolName: toolUseConfirm.tool.name,
     description: toolUseConfirm.description,
     command,
+    toolInput: toolUseConfirm.input,
   });
   const destructive = risk === "destructive";
   const requiredWord = typedConfirmationWordForRisk({
     risk,
     command,
     description: toolUseConfirm.description,
+    toolName: toolUseConfirm.tool.name,
+    toolInput: toolUseConfirm.input,
   });
   const [typed, setTyped] = useState("");
+  const typedRef = useRef("");
   const [selectedIndex, setSelectedIndex] = useState(0);
+  const selectedIndexRef = useRef(0);
+  const settled = useRef(false);
   useRegisterKeybindingContext("Confirmation");
+  const settle = useCallback((decision: () => void) => {
+    if (settled.current || request.ctx.signal?.aborted === true) return;
+    settled.current = true;
+    decision();
+  }, [request]);
   const approve = useCallback(() => {
-    toolUseConfirm.onAllow(toolUseConfirm.input, []);
-  }, [toolUseConfirm]);
+    settle(() => toolUseConfirm.onAllow(toolUseConfirm.input, []));
+  }, [settle, toolUseConfirm]);
   const approveForSession = useCallback(() => {
     if (destructive) return;
-    toolUseConfirm.onAllowForSession(toolUseConfirm.input);
-  }, [destructive, toolUseConfirm]);
+    settle(() => toolUseConfirm.onAllowForSession(toolUseConfirm.input));
+  }, [destructive, settle, toolUseConfirm]);
   const reject = useCallback(() => {
-    toolUseConfirm.onReject();
-  }, [toolUseConfirm]);
+    settle(() => toolUseConfirm.onReject());
+  }, [settle, toolUseConfirm]);
   const abort = useCallback(() => {
-    toolUseConfirm.onAbort();
-  }, [toolUseConfirm]);
+    settle(() => {
+      if (onDismiss !== undefined) onDismiss();
+      else toolUseConfirm.onAbort();
+    });
+  }, [onDismiss, settle, toolUseConfirm]);
 
   const confirmSelection = useCallback(
     (index: number) => {
@@ -579,13 +628,65 @@ function AgenCApprovalOverlay({
     [approve, approveForSession, reject],
   );
 
+  const handleSelectionInput = useCallback(
+    (input: string, key: Key, event: InputEvent): boolean => {
+      if (input === "1") {
+        event.stopImmediatePropagation();
+        selectedIndexRef.current = 0;
+        setSelectedIndex(0);
+        approve();
+        return true;
+      }
+      if (input === "2") {
+        event.stopImmediatePropagation();
+        selectedIndexRef.current = 1;
+        setSelectedIndex(1);
+        approveForSession();
+        return true;
+      }
+      if (input === "3") {
+        event.stopImmediatePropagation();
+        selectedIndexRef.current = 2;
+        setSelectedIndex(2);
+        reject();
+        return true;
+      }
+      if (key.upArrow) {
+        event.stopImmediatePropagation();
+        selectedIndexRef.current = (selectedIndexRef.current + 2) % 3;
+        setSelectedIndex(selectedIndexRef.current);
+        return true;
+      }
+      if (key.downArrow) {
+        event.stopImmediatePropagation();
+        selectedIndexRef.current = (selectedIndexRef.current + 1) % 3;
+        setSelectedIndex(selectedIndexRef.current);
+        return true;
+      }
+      if (key.return) {
+        event.stopImmediatePropagation();
+        confirmSelection(selectedIndexRef.current);
+        return true;
+      }
+      return false;
+    },
+    [approve, approveForSession, confirmSelection, reject],
+  );
+  useInputCapture(handleSelectionInput, { context: "Modal", isActive: !destructive });
+  useInput(handleSelectionInput, { isActive: !destructive });
+
   useKeybindings(
     {
       "confirm:yes": () => {
         if (destructive) return false;
         approve();
+        return undefined;
       },
-      "confirm:no": reject,
+      "confirm:no": () => {
+        if (destructive) return false;
+        reject();
+        return undefined;
+      },
       "app:interrupt": abort,
     },
     { context: "Confirmation" },
@@ -593,60 +694,25 @@ function AgenCApprovalOverlay({
 
   useInput(
     (input, key, event) => {
-      if (input === "1") {
-        event.stopImmediatePropagation();
-        setSelectedIndex(0);
-        approve();
-        return;
-      }
-      if (input === "2") {
-        event.stopImmediatePropagation();
-        setSelectedIndex(1);
-        approveForSession();
-        return;
-      }
-      if (input === "3") {
-        event.stopImmediatePropagation();
-        setSelectedIndex(2);
-        reject();
-        return;
-      }
-      if (key.upArrow) {
-        event.stopImmediatePropagation();
-        setSelectedIndex((index) => (index + 2) % 3);
-        return;
-      }
-      if (key.downArrow) {
-        event.stopImmediatePropagation();
-        setSelectedIndex((index) => (index + 1) % 3);
-        return;
-      }
-      if (key.return) {
-        event.stopImmediatePropagation();
-        confirmSelection(selectedIndex);
-      }
-    },
-    { isActive: !destructive },
-  );
-
-  useInput(
-    (input, key, event) => {
       if (!destructive) return;
       event.stopImmediatePropagation();
       if (key.return) {
-        if (typed === requiredWord) approve();
+        if (typedRef.current === requiredWord) approve();
         return;
       }
       if (key.escape) {
-        reject();
+        if (onDismiss !== undefined) abort();
+        else reject();
         return;
       }
       if (key.backspace || key.delete) {
-        setTyped((value) => value.slice(0, -1));
+        typedRef.current = typedRef.current.slice(0, -1);
+        setTyped(typedRef.current);
         return;
       }
-      if (input.length === 1 && !key.ctrl && !key.meta) {
-        setTyped((value) => (value + input).slice(0, requiredWord.length));
+      if (input.length > 0 && !key.ctrl && !key.meta && !/[\u0000-\u001f\u007f]/u.test(input)) {
+        typedRef.current = (typedRef.current + input).slice(0, requiredWord.length + 1);
+        setTyped(typedRef.current);
       }
     },
     { isActive: destructive },
@@ -666,6 +732,7 @@ function AgenCApprovalOverlay({
         title={`tool · ${name} · ${title}`}
         command={command.length > 0 ? command : toolUseConfirm.description}
         commandIsShell={approvalCommandIsShell(toolUseConfirm)}
+        confirmLabel={destructive ? `type ${requiredWord}` : "enter"}
         facts={[
           { label: "tool", value: name },
           {
@@ -683,7 +750,9 @@ function AgenCApprovalOverlay({
             value: destructive ? `type ${requiredWord}` : "enter",
           },
         ]}
-        note={toolUseConfirm.description}
+        note={writePreviewUnavailable
+          ? `Existing content unavailable; this write may overwrite a file. ${fileWritePreview?.kind === "unavailable" ? fileWritePreview.reason : ""}`.trim()
+          : toolUseConfirm.description}
         {...(diffPreview !== undefined ? { diffPreview } : {})}
         requestId={request.id}
         requireTypedConfirmation={destructive}

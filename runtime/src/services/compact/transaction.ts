@@ -7,14 +7,26 @@ import {
   createTokenAccountingRequest,
   requireAdmissibleTokenAccounting,
   assertTokenAccountingWithinContext,
+  MAX_TOKEN_ACCOUNTING_REQUEST_BYTES,
   tokenAccountingService,
   type TokenAccountingResult,
 } from "../../llm/token-accounting.js";
+import {
+  DEFAULT_CONTEXT_IMAGE_BUDGET_BYTES,
+  boundContextImageBytes,
+  resolveContextImageBudgetBytes,
+} from "../../session/query-image-budget.js";
 import {
   readProviderFactoryOptions,
   readProviderIdentity,
 } from "../../llm/provider.js";
 import type { LLMChatOptions, LLMMessage } from "../../llm/types.js";
+import type { CompactionLocalSummarizer } from "./emergency-summarizer.js";
+import {
+  CompactionTransactionFailureWithDetails,
+  describeFailureCause,
+  type CompactionFailureDetails,
+} from "./failure-details.js";
 import type { BaseHookInput } from "../../entrypoints/sdk/coreTypes.js";
 import {
   accountCompactionCall,
@@ -25,6 +37,7 @@ import {
 } from "./plan.js";
 import {
   accumulateCompactionOutputBudget,
+  conservativeOutputTokenEstimate,
   compactionOutputTokenUpperBound,
   compactionWallTimeExceeded,
 } from "./transaction-limits.js";
@@ -74,7 +87,9 @@ import {
   type CompactionTransactionLease,
   type CompactionTransactionMetadataV1,
   CompactionCannotReduceError,
+  CompactionFailurePersistenceError,
   CompactionReconstructionRequiredError,
+  CompactionSummaryRejectedError,
   CompactionTransactionError,
 } from "./transaction-types.js";
 import type { CompactContext, CompactionResult, RuntimeMessage } from "./types.js";
@@ -84,6 +99,11 @@ import {
   compactActiveHistoryEntries,
   createCompactionPayloadBundleV1,
 } from "./payload-manifest.js";
+import { redactDurableSecrets } from "../../session/provider-replay-redaction.js";
+import { redactSecretsInValue } from "../../secrets/sanitizer.js";
+import { durableRedactionDropsProviderReplay } from "../../session/message-history-conversion.js";
+import type { ProviderReasoningReplay } from "../../llm/types.js";
+import { omitAlteredBinaryCarriers } from "../../llm/content-conversion.js";
 
 const COMPACTION_BOUNDARY_MESSAGE = "Conversation compacted transactionally";
 const COMPACTION_UNKNOWN_MODEL = "unknown";
@@ -103,6 +123,12 @@ interface CompactionOutputTokenAccounting {
 
 export interface TransactionalCompactionOptions {
   readonly customInstructions: string;
+  /**
+   * Runtime-local summarizer for the emergency ladder tier (#2497). When
+   * present, no provider call is made; the plan, byte limits, body
+   * validation, provenance, shrink floor and commit are unchanged.
+   */
+  readonly summarizer?: CompactionLocalSummarizer;
   readonly direction?: "from" | "up_to";
   readonly automatic: boolean;
   readonly messagesToKeep: readonly RuntimeMessage[];
@@ -425,11 +451,21 @@ async function compactConversationTransactionBody(
   let intentCommitted = false;
   let transactionCommitted = false;
   try {
-    adapter.pinAndRecordIntent(intent, sourcePayloadBundles);
+    try {
+      adapter.pinAndRecordIntent(intent, sourcePayloadBundles);
+    } catch (error) {
+      if (error instanceof CompactionTransactionError) throw error;
+      throw new CompactionTransactionError(
+        "intent_failed",
+        "durable compaction intent failed",
+        { cause: error },
+      );
+    }
     intentCommitted = true;
     deadline.assertActive();
     const run = await deadline.wait(runSummaryTree({
       context,
+      ...(options.summarizer !== undefined ? { summarizer: options.summarizer } : {}),
       plan,
       attemptId,
       policyDigest,
@@ -497,6 +533,7 @@ async function compactConversationTransactionBody(
       providerName,
       model,
       accountingRef,
+      imageBudgetBytes: shrinkAccountingImageBudgetBytes(session),
     }));
     deadline.assertActive();
     const replacementHistory = replacementRuntime.map(toProjectionMessage);
@@ -521,9 +558,20 @@ async function compactConversationTransactionBody(
       committed = adapter.commit(commitInput);
     } catch (error) {
       if (error instanceof CompactionTransactionError) throw error;
-      throw new CompactionTransactionError(
+      // Name the cause and the commit's size facts in the message itself:
+      // the warning that reaches the rollout, the TUI, and stderr carries
+      // the message, and a disk-full write must be distinguishable from a
+      // size cap or a validation refusal after the fact (#2499).
+      const facts = commitSizeFacts(commitInput);
+      throw new CompactionTransactionFailureWithDetails(
         "commit_failed",
-        "durable compaction commit failed",
+        `durable compaction commit failed: ${describeFailureCause(error)}; ` +
+          `replacement history ${facts.replacement_history_bytes} bytes ` +
+          `(${facts.replacement_history_messages} messages), ` +
+          `payload bundles ${facts.payload_bundle_count} ` +
+          `(${facts.payload_chunk_count} chunks, ${facts.payload_canonical_bytes} canonical bytes), ` +
+          `summary ${facts.summary_bytes} bytes`,
+        facts,
         { cause: error },
       );
     }
@@ -572,8 +620,10 @@ async function compactConversationTransactionBody(
       transaction,
     };
   } catch (error) {
+    if (transactionCommitted) {
+      throw new CompactionReconstructionRequiredError(attemptId, { cause: error });
+    }
     if (
-      transactionCommitted ||
       !intentCommitted ||
       error instanceof CompactionReconstructionRequiredError
     ) {
@@ -596,11 +646,28 @@ async function compactConversationTransactionBody(
     try {
       adapter.recordFailure(failure);
     } catch (recordError) {
-      throw new CompactionTransactionError(
+      throw new CompactionFailurePersistenceError(
         reason,
-        "compaction failed and its terminal failure event could not be committed; source remains pinned for startup reconciliation",
         { cause: new AggregateError([error, recordError]) },
       );
+    }
+    // Reject invalid model output without replacing a byte of source history.
+    // Do not turn arbitrary provider, budget, storage, or cancellation errors
+    // into advisory outcomes. The failure record must succeed first.
+    if (
+      error instanceof CompactionTransactionError &&
+      [
+        "provider_non_stop",
+        "provider_empty",
+        "output_invalid_json",
+        "output_schema_invalid",
+        "output_limit_exceeded",
+        "provenance_invalid",
+        "digest_invalid",
+        "injection_marker_leakage",
+      ].includes(error.reason)
+    ) {
+      throw new CompactionSummaryRejectedError(reason, error.message, { cause: error });
     }
     throw error;
   }
@@ -739,6 +806,7 @@ function buildCompactionDisplayMessage(
 
 async function runSummaryTree(params: {
   readonly context: CompactContext;
+  readonly summarizer?: CompactionLocalSummarizer;
   readonly plan: CompactionMapReducePlan;
   readonly attemptId: string;
   readonly policyDigest: string;
@@ -793,37 +861,90 @@ async function runSummaryTree(params: {
         "compaction exceeded its wall-clock budget",
       );
     }
-    accountCompactionCall({
-      messages,
-      systemPrompt: params.policyMaterial[stage],
-      providerName: params.providerName,
-      model: params.model,
-      contextWindowTokens: params.plan.context_window_tokens,
-      outputReserveTokens: params.plan.output_reserve_tokens,
-    });
-    const invocation = await invokeCompactionProvider({
-      context: params.context,
-      messages,
-      systemPrompt: params.policyMaterial[stage],
-      providerName: params.providerName,
-      model: params.model,
-      callCount,
-      attemptId: params.attemptId,
-      contextWindowTokens: params.plan.context_window_tokens,
-      outputReserveTokens: params.plan.output_reserve_tokens,
-      remainingInputTokens: MAX_COMPACTION_TOTAL_INPUT_TOKENS - inputTokens,
-    });
-    inputTokens = safeBudgetSum(
-      inputTokens,
-      invocation.accounting.inputTokens,
-    );
-    if (inputTokens > MAX_COMPACTION_TOTAL_INPUT_TOKENS) {
-      throw new CompactionTransactionError(
-        "token_budget_exceeded",
-        "exact provider token counts exceeded the aggregate compaction budget",
+    let response: { readonly content: string; readonly finishReason: string };
+    let outputTokenUpperBound: number;
+    if (params.summarizer !== undefined) {
+      // Emergency ladder tier (#2497): the summary is produced locally and
+      // nothing reaches a provider. The step still passes through execution
+      // admission, reserved as an explicitly unpriced zero-token call and
+      // reconciled at zero, so the canonical scanner sees the same
+      // queued/allowed/dispatched/reconciled cycle it requires of every
+      // planned call. The output reserve still binds the summary.
+      const admissionSession = params.context.admissionSession;
+      const client = admissionSession?.services.executionAdmission;
+      if (admissionSession === undefined || client === undefined) {
+        throw new CompactionTransactionError(
+          "provider_unavailable",
+          "runtime-local compaction requires an execution-admission client",
+        );
+      }
+      const lease = await client.acquire(
+        {
+          stepId: `compact:${params.attemptId}:${callCount}`,
+          kind: "model_turn",
+          sessionId: admissionSession.conversationId,
+          model: params.model,
+          provider: params.providerName,
+          maxInputTokens: 0,
+          maxOutputTokens: params.plan.output_reserve_tokens,
+          maxCostUsd: null,
+        },
+        params.context.abortController?.signal,
       );
+      const reservationId = lease.reservation.reservationId;
+      let content: string;
+      try {
+        content = params.summarizer({
+          stage,
+          messages,
+          allowedSourceRefIds: sourceRefs.map((ref) => ref.ref_id),
+          maxOutputTokens: params.plan.output_reserve_tokens,
+        });
+      } catch (error) {
+        client.void(reservationId, "runtime_local_summary_failed");
+        throw error;
+      }
+      client.markDispatched(reservationId, {
+        boundary: "provider_wire",
+        details: { runtime_local_summary: true, stage },
+      });
+      client.reconcile(reservationId, { inputTokens: 0, outputTokens: 0, costUsd: 0 });
+      response = { content, finishReason: "stop" };
+      outputTokenUpperBound = conservativeOutputTokenEstimate(content);
+    } else {
+      accountCompactionCall({
+        messages,
+        systemPrompt: params.policyMaterial[stage],
+        providerName: params.providerName,
+        model: params.model,
+        contextWindowTokens: params.plan.context_window_tokens,
+        outputReserveTokens: params.plan.output_reserve_tokens,
+      });
+      const invocation = await invokeCompactionProvider({
+        context: params.context,
+        messages,
+        systemPrompt: params.policyMaterial[stage],
+        providerName: params.providerName,
+        model: params.model,
+        callCount,
+        attemptId: params.attemptId,
+        contextWindowTokens: params.plan.context_window_tokens,
+        outputReserveTokens: params.plan.output_reserve_tokens,
+        remainingInputTokens: MAX_COMPACTION_TOTAL_INPUT_TOKENS - inputTokens,
+      });
+      inputTokens = safeBudgetSum(
+        inputTokens,
+        invocation.accounting.inputTokens,
+      );
+      if (inputTokens > MAX_COMPACTION_TOTAL_INPUT_TOKENS) {
+        throw new CompactionTransactionError(
+          "token_budget_exceeded",
+          "exact provider token counts exceeded the aggregate compaction budget",
+        );
+      }
+      response = invocation.response;
+      outputTokenUpperBound = invocation.outputTokenUpperBound;
     }
-    const response = invocation.response;
     if (response.finishReason !== "stop") {
       throw new CompactionTransactionError(
         "provider_non_stop",
@@ -839,7 +960,7 @@ async function runSummaryTree(params: {
     if (
       Buffer.byteLength(response.content, "utf8") >
         MAX_COMPACTION_OUTPUT_UTF8_BYTES_PER_CALL ||
-      invocation.outputTokenUpperBound > params.plan.output_reserve_tokens
+      outputTokenUpperBound > params.plan.output_reserve_tokens
     ) {
       throw new CompactionTransactionError(
         "output_limit_exceeded",
@@ -848,7 +969,13 @@ async function runSummaryTree(params: {
     }
     const allowedIds = new Set(sourceRefs.map((ref) => ref.ref_id));
     const validated = parseCompactionBodyV1(response.content, allowedIds);
-    assertExactToolPairs(validated.body.tool_pairs, expectedToolPairs);
+    // The runtime knows every tool call/result pair of the span and pins
+    // them into the summary itself. A model that echoes them anyway must
+    // match exactly; one that leaves them out has done nothing wrong.
+    if (validated.body.tool_pairs.length > 0) {
+      assertExactToolPairs(validated.body.tool_pairs, expectedToolPairs);
+    }
+    const body = { ...validated.body, tool_pairs: expectedToolPairs };
     totals = accumulateCompactionOutputBudget(totals, validated.budget);
     const summary = createCompactionSummaryV1({
       stage,
@@ -856,7 +983,7 @@ async function runSummaryTree(params: {
       policyDigest: params.policyDigest,
       accountingRef: params.accountingRef,
       sourceRefs,
-      body: validated.body,
+      body,
     });
     const ref: CompactionSummaryRefV1 = {
       kind: "compaction_summary",
@@ -1181,7 +1308,21 @@ async function invokeCompactionProvider(params: {
         content: candidate.content,
         signal: admittedOptions.signal,
       });
-      const reported = candidate.usage?.completionTokens;
+      // `coerceUsage` normalises an ABSENT usage object AND a partial one
+      // (prompt-only or total-only) to completionTokens 0, and marks the partial
+      // case `availability: "reported"`. So neither the value nor `availability`
+      // can distinguish "the provider counted zero output tokens" from "the
+      // provider never counted the output at all". Trusting the coerced 0
+      // BYPASSED this bound whenever usage was unknown or partial; a response
+      // carrying a valid completion count was always bounded correctly. A
+      // non-empty body cannot have cost zero
+      // completion tokens, so a non-positive count against real content is not a
+      // count: fall back to the estimate, which is what this bound exists to apply.
+      const reportedCompletion = candidate.usage?.completionTokens;
+      const reported =
+        reportedCompletion !== undefined && reportedCompletion > 0
+          ? reportedCompletion
+          : undefined;
       outputTokenUpperBound = outputAccounting.source === "conservative_fallback"
         ? compactionOutputTokenUpperBound(candidate.content, reported)
         : Math.max(reported ?? 0, outputAccounting.tokens);
@@ -1247,7 +1388,7 @@ async function countCompactionProviderOutput(params: {
   const withContent = await count(params.content);
   if (withContent.source === "conservative_fallback") {
     return {
-      tokens: Buffer.byteLength(params.content, "utf8"),
+      tokens: conservativeOutputTokenEstimate(params.content),
       source: "conservative_fallback",
       exact: false,
     };
@@ -1258,7 +1399,7 @@ async function countCompactionProviderOutput(params: {
     emptyEnvelope.source !== withContent.source
   ) {
     return {
-      tokens: Buffer.byteLength(params.content, "utf8"),
+      tokens: conservativeOutputTokenEstimate(params.content),
       source: "conservative_fallback",
       exact: false,
     };
@@ -1272,6 +1413,32 @@ async function countCompactionProviderOutput(params: {
   };
 }
 
+/**
+ * Inline-image budget the shrink measurement applies to both histories.
+ *
+ * The measurement answers "what would the next sampling request cost, before
+ * and after". The sampling path never sends the raw history: it bounds inline
+ * images to `AGENC_CONTEXT_IMAGE_BUDGET_BYTES` first (`run-turn.ts`). Counting
+ * the raw history instead walked every screenshot into the accounting
+ * request, which is capped at 16 MiB, so a 30-screenshot session could not
+ * compact at all (Terminal-Bench `layout-config-recreation__Hrx5oPp`:
+ * "inline image sources exceed the 65447-byte remaining request budget" on
+ * every ladder tier). The operator's budget is the measurement budget; a
+ * disabled (`0`) or cap-sized value measures with the default so the
+ * measurement itself can never exceed the accounting cap.
+ */
+export function shrinkAccountingImageBudgetBytes(
+  session: NonNullable<CompactContext["admissionSession"]>,
+): number {
+  const configured = resolveContextImageBudgetBytes(
+    session.services.userShell?.childEnvironment ?? process.env,
+  );
+  if (configured <= 0 || configured > MAX_TOKEN_ACCOUNTING_REQUEST_BYTES / 2) {
+    return DEFAULT_CONTEXT_IMAGE_BUDGET_BYTES;
+  }
+  return configured;
+}
+
 async function validateShrink(params: {
   readonly context: CompactContext;
   readonly sourceMessages: readonly RuntimeMessage[];
@@ -1279,6 +1446,8 @@ async function validateShrink(params: {
   readonly providerName: string;
   readonly model: string;
   readonly accountingRef: string;
+  /** See {@link shrinkAccountingImageBudgetBytes}. */
+  readonly imageBudgetBytes: number;
 }): Promise<{
   readonly source: TokenAccountingResult;
   readonly candidate: TokenAccountingResult;
@@ -1302,10 +1471,16 @@ async function validateShrink(params: {
       : {}),
   };
   const count = async (messages: readonly RuntimeMessage[]) => {
+    // Measure the projection the model would be sent, not the durable
+    // history: inline images beyond the budget become placeholders on the
+    // wire, and the same bound on both sides keeps the savings comparable.
     const request = createTokenAccountingRequest({
       provider: params.providerName,
       model: params.model,
-      messages: messages.map(toLlmMessage),
+      messages: boundContextImageBytes(
+        messages.map(toLlmMessage),
+        params.imageBudgetBytes,
+      ).messages,
       options: baseOptions,
       contextWindowTokens: contextWindow,
       reservedOutputTokens: outputReserve,
@@ -1374,6 +1549,31 @@ function toProjectionMessage(message: RuntimeMessage): CompactionProjectionMessa
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
     ...(message.uuid !== undefined ? { id: message.uuid } : {}),
     ...(message.phase !== undefined ? { phase: message.phase } : {}),
+    ...(typeof message.providerReasoningContent === "string" &&
+    message.providerReasoningContent.length > 0
+      ? {
+          providerReasoning:
+            message.providerReasoningProvenance !== undefined &&
+            typeof message.providerReasoningProvenance.provider === "string" &&
+            message.providerReasoningProvenance.provider.trim().length > 0 &&
+            typeof message.providerReasoningProvenance.model === "string" &&
+            message.providerReasoningProvenance.model.trim().length > 0
+              ? {
+                  version: 2 as const,
+                  content: message.providerReasoningContent,
+                  provider: message.providerReasoningProvenance.provider
+                    .trim()
+                    .toLowerCase(),
+                  model: message.providerReasoningProvenance.model
+                    .trim()
+                    .toLowerCase(),
+                }
+              : {
+                  version: 1 as const,
+                  content: message.providerReasoningContent,
+                },
+        }
+      : {}),
     ...(message.runtimeOnly?.toolResultIntegrity !== undefined
       ? {
           toolResultIntegrity: {
@@ -1407,10 +1607,62 @@ function toLlmMessage(message: RuntimeMessage): LLMMessage {
       : {}),
     ...(projected.toolCallId !== undefined ? { toolCallId: projected.toolCallId } : {}),
     ...(projected.toolName !== undefined ? { toolName: projected.toolName } : {}),
+    ...(projected.providerReasoning !== undefined
+      ? {
+          providerReasoningContent: projected.providerReasoning.content,
+          ...(projected.providerReasoning.version === 2
+            ? {
+                providerReasoningProvenance: {
+                  provider: projected.providerReasoning.provider,
+                  model: projected.providerReasoning.model,
+                },
+              }
+            : {}),
+        }
+      : {}),
     ...(projected.compactionHistory !== undefined
       ? { runtimeOnly: { compactionHistory: projected.compactionHistory } }
       : {}),
   };
+}
+
+function describeProjectionMismatch(
+  callerComplete: readonly RuntimeMessage[],
+  callerIndex: number,
+  canonical: readonly RuntimeMessage[],
+  searchedBelow: number,
+): string {
+  const describe = (message: RuntimeMessage): string => {
+    const role = message.originalRole ?? message.role ?? message.message?.role ?? "user";
+    const content = message.content ?? message.message?.content ?? "";
+    const bytes = Buffer.byteLength(
+      typeof content === "string" ? content : JSON.stringify(content),
+      "utf8",
+    );
+    let tool = "";
+    if (message.toolName !== undefined) {
+      tool = ` tool=${message.toolName}`;
+    } else if (message.toolCalls !== undefined) {
+      tool = ` toolCalls=${message.toolCalls.length}`;
+    }
+    return `${role}${tool} ${bytes}B`;
+  };
+  const failing = callerComplete[callerIndex]!;
+  const failingRole = failing.originalRole ?? failing.role ?? failing.message?.role ?? "user";
+  const sameRoleCandidates = canonical
+    .slice(0, searchedBelow)
+    .filter((candidate) =>
+      (candidate.originalRole ?? candidate.role ?? candidate.message?.role ?? "user") ===
+        failingRole,
+    );
+  const nearest = sameRoleCandidates.at(-1);
+  return (
+    `caller message ${callerIndex + 1}/${callerComplete.length} (${describe(failing)}) ` +
+    `has no canonical match among ${searchedBelow} of ${canonical.length} canonical messages` +
+    (nearest !== undefined
+      ? `; nearest canonical ${failingRole} is ${describe(nearest)}`
+      : "")
+  );
 }
 
 function createAuthoritativeSelectionMapper(
@@ -1421,8 +1673,90 @@ function createAuthoritativeSelectionMapper(
   readonly sourceRefs: readonly Extract<CompactionSourceRefV1, { readonly kind: "rollout_span" }>[];
   readonly preparedIndexes: readonly number[];
 } {
-  const key = (message: RuntimeMessage): string =>
-    canonicalizeJson(canonicalCompactionSourceMessages([message]));
+  // A tool result's body is bounded in memory once it is persisted (the
+  // runtime keeps only the most recent few full, older ones become a
+  // marker) while the canonical rollout keeps the full body. Matching such a
+  // message by its text could therefore never succeed after a few tool calls,
+  // and every mid-turn compaction of a long session died on it. The sealed
+  // integrity record is the authenticated identity of the body on both sides,
+  // so a sealed tool result maps to its canonical record by that identity.
+  // The canonical body is what gets summarized either way; the caller only
+  // ever points at a position.
+  // Durable persistence drops an opaque replay when redaction would alter it,
+  // keeping the message. Project the caller's live message the same way, so a
+  // message whose replay was dropped on the canonical side still matches.
+  // Nothing else about the message changes, so a forged body or an altered
+  // ordinary replay is still refused.
+  // Durable persistence also omits a binary carrier whose bytes redaction would
+  // alter. The projection has to apply the identical omission or a caller
+  // message keeps an image its own canonical record no longer has.
+  const withoutMedia = (message: RuntimeMessage): RuntimeMessage => {
+    const { content, omitted } = omitAlteredBinaryCarriers(
+      message.content,
+      message.content,
+      (body) => redactSecretsInValue(body) !== body,
+    );
+    return omitted
+      ? ({ ...message, content } as RuntimeMessage)
+      : message;
+  };
+  const durablyProjected = (message: RuntimeMessage): RuntimeMessage => {
+    const content = message.providerReasoningContent;
+    // A user attachment carries no provider replay, so returning early here
+    // would skip the media omission entirely and the caller would keep an
+    // image its canonical record no longer has.
+    if (typeof content !== "string" || content.length === 0) {
+      return withoutMedia(message);
+    }
+    const provenance = message.providerReasoningProvenance;
+    const replay: ProviderReasoningReplay =
+      provenance !== undefined &&
+      typeof provenance.provider === "string" &&
+      provenance.provider.trim().length > 0 &&
+      typeof provenance.model === "string" &&
+      provenance.model.trim().length > 0
+        ? {
+            version: 2,
+            content,
+            // llmMessageToResponseItem normalizes provider and model before the
+            // durable drop decision is made, so normalize identically here or a
+            // secret-shaped provider/model would redact on one side only.
+            provider: provenance.provider.trim().toLowerCase(),
+            model: provenance.model.trim().toLowerCase(),
+          }
+        : { version: 1, content };
+    if (!durableRedactionDropsProviderReplay(replay)) return withoutMedia(message);
+    const {
+      providerReasoningContent: _droppedContent,
+      providerReasoningProvenance: _droppedProvenance,
+      ...withoutReplay
+    } = message;
+    return withoutMedia(withoutReplay as RuntimeMessage);
+  };
+  const key = (message: RuntimeMessage): string => {
+    const role =
+      message.originalRole ?? message.role ?? message.message?.role ?? "user";
+    const integrity = message.runtimeOnly?.toolResultIntegrity;
+    if (role === "tool" && integrity !== undefined && message.toolCallId !== undefined) {
+      const { persisted: _persisted, ...identity } =
+        integrity as unknown as Record<string, unknown>;
+      return canonicalizeJson({
+        role,
+        tool_call_id: message.toolCallId,
+        ...(message.toolName !== undefined ? { tool_name: message.toolName } : {}),
+        tool_result_integrity: identity,
+      });
+    }
+    // The canonical side was secret-redacted when it was written; key the
+    // caller's live message the same way so a secret in a user or assistant
+    // message does not read as "no canonical match" (redaction is idempotent).
+    return canonicalizeJson(
+      redactDurableSecrets(
+        canonicalCompactionSourceMessages([durablyProjected(message)]),
+        "source_history",
+      ),
+    );
+  };
   const preparedByKey = new Map<string, number[]>();
   prepared.messages.forEach((message, index) => {
     const messageKey = key(message);
@@ -1437,9 +1771,28 @@ function createAuthoritativeSelectionMapper(
     const positions = preparedByKey.get(key(message)) ?? [];
     const positionIndex = lastIndexLessThan(positions, nextPreparedIndex);
     if (positionIndex < 0) {
+      if (isTransientContextMessage(message)) {
+        // A per-request context message (a skill listing, a permission
+        // reminder) is rendered for the model and never written to the
+        // rollout, so it cannot have a canonical record. It carries nothing
+        // to summarize or keep: leave it out rather than refuse the whole
+        // compaction over it.
+        callerToPrepared[callerIndex] = -1;
+        continue;
+      }
+      // Name the message that broke the projection. Without this the
+      // sentence alone could not distinguish a rewritten tool result from a
+      // message the canonical rollout never saw, so a live failure could not
+      // be acted on. Shape only, never content: role, tool, sizes, position.
       throw new CompactionTransactionError(
         "pin_failed",
-        "caller history is not an ordered projection of canonical active history",
+        "caller history is not an ordered projection of canonical active history: " +
+          describeProjectionMismatch(
+            callerComplete,
+            callerIndex,
+            prepared.messages,
+            nextPreparedIndex,
+          ),
       );
     }
     nextPreparedIndex = positions[positionIndex]!;
@@ -1486,7 +1839,9 @@ function createAuthoritativeSelectionMapper(
       used.add(callerIndex);
       return callerIndex;
     });
-    const preparedIndexes = callerIndexes.map((index) => callerToPrepared[index]!);
+    const preparedIndexes = callerIndexes
+      .map((index) => callerToPrepared[index]!)
+      .filter((index) => index >= 0);
     return {
       messages: preparedIndexes.map((index) => prepared.messages[index]!),
       sourceRefs: preparedIndexes.map(
@@ -1495,6 +1850,22 @@ function createAuthoritativeSelectionMapper(
       preparedIndexes,
     };
   };
+}
+
+/**
+ * A user-channel context message the runtime renders for one request (a
+ * skill listing, a permission reminder, hook context). It is never history:
+ * `isAttachmentMessage` in session/attachment-retention.ts names the same
+ * shape. An agent-invocation channel also carries the user_context boundary
+ * but is durable, so it is excluded here.
+ */
+function isTransientContextMessage(message: RuntimeMessage): boolean {
+  const role = message.originalRole ?? message.role ?? message.message?.role ?? "user";
+  return (
+    role === "user" &&
+    message.runtimeOnly?.mergeBoundary === "user_context" &&
+    message.runtimeOnly?.agentInvocation === undefined
+  );
 }
 
 function lastIndexLessThan(values: readonly number[], threshold: number): number {
@@ -1531,6 +1902,32 @@ function classifyFailure(
     }
   }
   return "provider_error";
+}
+
+/** Byte and count facts of a commit, for the failure message and warning. */
+function commitSizeFacts(commitInput: {
+  readonly summary: CompactionSummaryV1;
+  readonly replacement_history: readonly CompactionProjectionMessageV1[];
+  readonly payload_bundles: CompactionCommitPayloadBundlesV1;
+}): CompactionFailureDetails {
+  const bundles = Object.values(commitInput.payload_bundles);
+  return {
+    replacement_history_bytes: Buffer.byteLength(
+      canonicalizeJson(commitInput.replacement_history),
+      "utf8",
+    ),
+    replacement_history_messages: commitInput.replacement_history.length,
+    summary_bytes: Buffer.byteLength(canonicalizeJson(commitInput.summary), "utf8"),
+    payload_bundle_count: bundles.length,
+    payload_chunk_count: bundles.reduce(
+      (total, bundle) => total + bundle.manifest.chunk_count,
+      0,
+    ),
+    payload_canonical_bytes: bundles.reduce(
+      (total, bundle) => total + bundle.manifest.canonical_utf8_bytes,
+      0,
+    ),
+  };
 }
 
 function errorDetail(error: unknown): string {

@@ -14,11 +14,17 @@
  */
 
 import type { Tool, ToolExecutionInjectedArgs, ToolResult } from "../types.js";
+import { validationErrorToolResult } from "../results.js";
+import {
+  createToolEffectDispositionEvidence,
+  readEffectBoundaryNotCrossed,
+} from "../effect-boundary.js";
 import type { FunctionCallOutputContentItem } from "../context.js";
 import type { PermissionResult, PermissionUpdate } from "../../permissions/types.js";
 import type { ToolEvaluatorContext } from "../../permissions/evaluator.js";
 import { getRuleByContentsForTool } from "../../permissions/rules.js";
 import { BrowserManager } from "../../browser/manager.js";
+import { readBrowserNavigationFailureReceipt } from "../../browser/page.js";
 import {
   isSandboxExecutionBrokerDisposed,
   registerSandboxExecutionLifecycleParticipant,
@@ -84,6 +90,16 @@ function str(value: unknown): string | undefined {
 
 function errorResult(message: string): ToolResult {
   return { content: message, isError: true };
+}
+
+/**
+ * A refusal made before the browser was touched. A bare error from this
+ * mutating tool is filed as an unknown outcome and gates the session behind
+ * /resolve (#2190). Only a received navigation failure has a separate,
+ * authoritative completed-command receipt; other action failures stay unknown.
+ */
+function refuse(message: string): ToolResult {
+  return validationErrorToolResult("tool:Browser:validation", message);
 }
 
 function safeAgencHome(explicit?: string): string | undefined {
@@ -235,12 +251,10 @@ export function createBrowserTool(
   ): Promise<ToolResult> {
     const action = str(input.action);
     if (action === undefined || !BROWSER_ACTIONS.includes(action as never)) {
-      return errorResult(
-        `action must be one of: ${BROWSER_ACTIONS.join(", ")}`,
-      );
+      return refuse(`action must be one of: ${BROWSER_ACTIONS.join(", ")}`);
     }
     const requiredError = validateRequired(action, input);
-    if (requiredError !== undefined) return errorResult(requiredError);
+    if (requiredError !== undefined) return refuse(requiredError);
     if (sandboxExecutionBroker === undefined) {
       throw missingSandboxExecutionBoundary("browser");
     }
@@ -358,7 +372,7 @@ export function createBrowserTool(
         return { content: `Closed tab ${tabId}.`, metadata: { action, tabId } };
       }
       default:
-        return errorResult(`unsupported action: ${action}`);
+        return refuse(`unsupported action: ${action}`);
     }
   }
 
@@ -509,7 +523,38 @@ export function createBrowserTool(
         return await dispatch(input, signal, sandboxExecutionBroker);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return errorResult(`Browser action failed: ${message}`);
+        const result = errorResult(`Browser action failed: ${message}`);
+        const noEffect = readEffectBoundaryNotCrossed(err, new Date().toISOString());
+        if (noEffect !== undefined) {
+          // The manager branded this error: no browser was launched and the
+          // attempt's proxy is stopped, so the action provably had no effect.
+          return {
+            ...result,
+            effectDisposition: {
+              disposition: "confirmed_no_effect",
+              evidenceKind: noEffect.evidenceKind,
+              evidenceRef: noEffect.evidenceRef,
+              evidenceSha256: noEffect.evidenceSha256,
+            },
+          };
+        }
+        const receipt = readBrowserNavigationFailureReceipt(err);
+        if (
+          receipt === undefined ||
+          (input.action !== "navigate" && input.action !== "new_tab") ||
+          receipt.url !== str(input.url)
+        ) return result;
+        return {
+          ...result,
+          effectDisposition: createToolEffectDispositionEvidence({
+            // Chromium completed the attempted command with an error. This
+            // is not a successful page load and must never claim no effect.
+            disposition: "confirmed_committed",
+            evidenceKind: "provider_receipt",
+            evidenceRef: "tool:Browser:cdp-navigation-response",
+            evidenceMaterial: JSON.stringify(receipt),
+          }),
+        };
       }
     },
   };

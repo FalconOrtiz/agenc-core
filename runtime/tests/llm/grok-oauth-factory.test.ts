@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 import { resolveHomeContext } from '../../src/config/home.js'
+import { SandboxExecutionBroker } from '../../src/sandbox/execution-broker.js'
 
 /**
  * Factory wiring for Sign in with X / xAI OAuth: with no API key, the grok
@@ -32,6 +33,9 @@ async function importProviderModule() {
   ])
   return {
     ...providerModule,
+    resolveProviderFactoryOptions: optionsModule.resolveProviderFactoryOptions,
+    /** The factory itself, without the option resolver's OAuth substitution. */
+    createProviderRaw: providerModule.createProvider,
     createProvider: (
       provider: 'grok',
       requested: Parameters<typeof providerModule.createProvider>[1],
@@ -235,4 +239,161 @@ test('API-key mode keeps the no-refresh default callback', async () => {
     previousError: Object.assign(new Error('401'), { status: 401 }),
   })
   expect(outcome.kind).toBe('skipped')
+})
+
+test('a stale bearer snapshot passed as apiKey does not demote the raw factory to API-key mode', async () => {
+  // Soak F76: the verified-change reviewer's provider was re-created from
+  // the parent session's recorded factory options, which held the bearer
+  // resolved at run start. The stored grant had been refreshed since, so
+  // the snapshot matched nothing and the raw factory picked API-key mode:
+  // no refresh callbacks, no pre-flight, and xAI answered 403.
+  storedAccessToken = 'oauth-bearer-2'
+  const { createProviderRaw } = await importProviderModule()
+
+  const provider = createProviderRaw('grok', {
+    apiKey: 'oauth-bearer-1',
+    model: 'grok-4.5',
+    credentialHome: CREDENTIAL_HOME,
+  })
+  expect((provider as unknown as { config: { apiKey: string } }).config.apiKey).toBe(
+    'oauth-bearer-2',
+  )
+  // OAuth mode is active: the bearer is refused for a non-xAI host.
+  expect(() =>
+    createProviderRaw('grok', {
+      apiKey: 'oauth-bearer-1',
+      model: 'grok-4.5',
+      credentialHome: CREDENTIAL_HOME,
+      baseURL: 'https://attacker.example/v1',
+    }),
+  ).toThrow(/refusing to send the xAI OAuth bearer/)
+})
+
+test('a provider re-created from recorded factory options after a refresh carries the current grant', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, readProviderFactoryOptions } = await importProviderModule()
+  const first = createProviderRaw('grok', {
+    model: 'grok-4.5',
+    credentialHome: CREDENTIAL_HOME,
+  })
+
+  storedAccessToken = 'oauth-bearer-2'
+  const second = createProviderRaw('grok', {
+    ...readProviderFactoryOptions(first),
+    model: 'grok-4.5',
+  })
+  expect((second as unknown as { config: { apiKey: string } }).config.apiKey).toBe(
+    'oauth-bearer-2',
+  )
+  expect(
+    (second as unknown as { oauthCallbacksInstalled: boolean }).oauthCallbacksInstalled,
+  ).toBe(true)
+})
+
+test('a session fork preserves configuration and refreshes only its own OAuth client', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, readProviderFactoryOptions } = await importProviderModule()
+  const parent = createProviderRaw('grok', {
+    model: 'grok-4.5',
+    credentialHome: CREDENTIAL_HOME,
+    baseURL: 'https://cli-chat-proxy.grok.com/v1',
+    timeoutMs: 12000,
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'inspect_file',
+        description: 'Inspect a file',
+        parameters: { type: 'object', properties: {} },
+      },
+    }],
+    extra: {
+      authMode: 'oauth',
+      incrementalContinuation: true,
+      parallelToolCalls: false,
+      temperature: 0.2,
+    },
+  })
+  storedAccessToken = 'oauth-bearer-2'
+  const child = parent.forkForSession!({
+    cwd: process.cwd(),
+    sandboxExecutionBroker: new SandboxExecutionBroker({
+      mode: 'danger_full_access',
+      cwd: process.cwd(),
+    }),
+  })
+  type OAuthProviderState = {
+    client: { apiKey: string }
+    config: { apiKey: string }
+    authRefreshCallbacks: {
+      refreshBearer: (ctx: unknown) => Promise<{ kind: string; bearer?: string }>
+    }
+  }
+  const parentState = parent as unknown as OAuthProviderState
+  const childState = child as unknown as OAuthProviderState
+  const parentClient = { apiKey: 'oauth-bearer-1' }
+  const childClient = { apiKey: 'oauth-bearer-2' }
+  parentState.client = parentClient
+  childState.client = childClient
+  try {
+    expect(child).not.toBe(parent)
+    expect(readProviderFactoryOptions(child)).toMatchObject({
+      credentialHome: CREDENTIAL_HOME,
+      model: 'grok-4.5',
+      baseURL: 'https://cli-chat-proxy.grok.com/v1',
+      timeoutMs: 12000,
+      tools: [{ function: { name: 'inspect_file' } }],
+      extra: {
+        authMode: 'oauth',
+        incrementalContinuation: true,
+        parallelToolCalls: false,
+        temperature: 0.2,
+      },
+    })
+    expect(readProviderFactoryOptions(child)).toEqual({
+      ...readProviderFactoryOptions(parent),
+      apiKey: 'oauth-bearer-2',
+    })
+    expect(forceRefreshMock).not.toHaveBeenCalled()
+
+    forceRefreshMock.mockResolvedValue({ accessToken: 'oauth-bearer-3' })
+    const outcome = await childState.authRefreshCallbacks.refreshBearer({
+      attempt: 1,
+      previousError: Object.assign(new Error('401'), { status: 401 }),
+    })
+
+    expect(outcome).toEqual({ kind: 'refreshed', bearer: 'oauth-bearer-3' })
+    expect(forceRefreshMock).toHaveBeenCalledExactlyOnceWith(CREDENTIAL_HOME)
+    expect(childClient.apiKey).toBe('oauth-bearer-3')
+    expect(childState.config.apiKey).toBe('oauth-bearer-3')
+    expect(parentClient.apiKey).toBe('oauth-bearer-1')
+    expect(parentState.config.apiKey).toBe('oauth-bearer-1')
+  } finally {
+    await child.dispose?.()
+    await parent.dispose?.()
+  }
+})
+
+test('explicit API-key selection survives the raw factory and recorded-option recreation', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, readProviderFactoryOptions, resolveProviderFactoryOptions } = await importProviderModule()
+  const options = resolveProviderFactoryOptions('grok', {
+    model: 'grok-4.5', credentialHome: CREDENTIAL_HOME,
+    baseURL: 'https://api-gateway.example/v1',
+  }, { GROK_AUTH_MODE: 'api-key', XAI_API_KEY: 'explicit-api-key' })
+  const first = createProviderRaw('grok', options)
+  storedAccessToken = 'oauth-bearer-2'
+  const second = createProviderRaw('grok', readProviderFactoryOptions(first)!)
+  for (const provider of [first, second]) {
+    expect((provider as unknown as { config: { apiKey: string } }).config.apiKey).toBe('explicit-api-key')
+    expect((provider as unknown as { oauthCallbacksInstalled: boolean }).oauthCallbacksInstalled).toBe(false)
+  }
+})
+
+test('explicit API-key selection without a key cannot fall back to a saved OAuth grant', async () => {
+  storedAccessToken = 'oauth-bearer-1'
+  const { createProviderRaw, resolveProviderFactoryOptions } = await importProviderModule()
+  const options = resolveProviderFactoryOptions('grok', {
+    model: 'grok-4.5', credentialHome: CREDENTIAL_HOME,
+  }, { GROK_AUTH_MODE: 'api-key' })
+  expect(() => createProviderRaw('grok', options)).toThrow(/requires apiKey/)
 })

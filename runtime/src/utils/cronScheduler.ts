@@ -35,7 +35,7 @@
 // structured telemetry is emitted on every wake/dispatch.
 
 import type { AgentId } from "../types/ids.js";
-import { getScheduledTasksEnabled } from "../bootstrap/state.js";
+import { getScheduledTasksEnabled, removeSessionCronTasks } from "../bootstrap/state.js";
 import { logForDebugging } from "./debug.js";
 import { enqueuePendingNotification } from "./messageQueueManager.js";
 import { monotonicMs } from "./monotonic.js";
@@ -43,6 +43,7 @@ import {
   DEFAULT_CRON_JITTER_CONFIG,
   jitteredNextCronRunMs,
   listAllCronTasks,
+  listSessionCronTasks,
   markCronTasksFired,
   nextCronRunMs,
   oneShotJitteredNextCronRunMs,
@@ -64,7 +65,8 @@ export type CronEnqueue = (command: {
   isMeta: true;
   queueOwner: CronSessionQueueOwner;
   agentId?: string;
-}) => void;
+}, task: Readonly<CronTask>, firedAt: number) =>
+  void | Promise<void | "accepted" | "cancelled">;
 
 /**
  * Frozen authority for one scheduler lifetime. The process-wide scheduler is
@@ -75,6 +77,8 @@ export type CronEnqueue = (command: {
 export type CronSchedulerActivation = {
   readonly queueOwner: CronSessionQueueOwner;
   readonly workspaceRoot: string;
+  /** Do not read, arm, or mutate any file-backed jobs for this activation. */
+  readonly sessionOnly?: boolean;
 };
 
 /** Injectable clocks/timer so tests can drive the driver with fake timers. */
@@ -91,6 +95,8 @@ export type CronSchedulerDeps = {
   clearTimer: (handle: ReturnType<typeof setTimeout>) => void;
   /** Load the currently-enabled tasks (file-backed + session). */
   loadTasks: (dir: string, conversationId: string) => Promise<CronTask[]>;
+  /** Visible owner diagnostics; a failed load must never look like an empty schedule. */
+  onLoadError: (error: unknown, activation: CronSchedulerActivation) => void;
   enqueue: CronEnqueue;
 };
 
@@ -100,6 +106,10 @@ const defaultDeps: CronSchedulerDeps = {
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (handle) => clearTimeout(handle),
   loadTasks: (dir, conversationId) => listAllCronTasks(dir, conversationId),
+  onLoadError: (error) => logForDebugging(
+    `[CronScheduler] durable scheduled tasks unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    { level: "warn" },
+  ),
   enqueue: () => {
     // Default stub: never invokes the model. The real call site overrides this
     // with the TUI command queue (enqueuePendingNotification). Keeping a no-op
@@ -245,11 +255,19 @@ export class CronScheduler {
     if (!getScheduledTasksEnabled()) return;
     const normalized = normalizeCronSchedulerActivation(activation);
     if (this.running) {
-      if (!sameCronSchedulerActivation(this.activation, normalized)) {
+      if (sameCronSchedulerActivation(this.activation, normalized)) return;
+      if (this.activation?.queueOwner.conversationId !== normalized.queueOwner.conversationId ||
+        this.activation.workspaceRoot !== normalized.workspaceRoot) {
         throw new Error(
           "Cron scheduler is already active for a different conversation or workspace",
         );
       }
+      // Retire stale loads/wakes without forgetting already-fired session
+      // occurrences or resetting the rate/overlap limits for this owner.
+      this.activation = normalized;
+      this.scheduleGeneration += 1;
+      this.clearTimer();
+      void this.reschedule();
       return;
     }
     this.resetActivationState();
@@ -320,7 +338,7 @@ export class CronScheduler {
     const generation = ++this.scheduleGeneration;
     this.clearTimer();
 
-    const dueAt = await this.earliestDueAt(activation);
+    const dueAt = await this.earliestDueAt(activation, generation);
     if (
       !this.isCurrentActivation(activation, generation) ||
       this.paused ||
@@ -399,11 +417,24 @@ export class CronScheduler {
    */
   private async loadRunnableTasks(
     activation: CronSchedulerActivation,
+    generation: number,
   ): Promise<CronTask[]> {
-    const tasks = await this.deps.loadTasks(
-      activation.workspaceRoot,
-      activation.queueOwner.conversationId,
-    );
+    let tasks: CronTask[];
+    try {
+      tasks = activation.sessionOnly === true
+        ? listSessionCronTasks(activation.queueOwner.conversationId)
+        : await this.deps.loadTasks(
+          activation.workspaceRoot,
+          activation.queueOwner.conversationId,
+        );
+    } catch (error) {
+      if (!this.isCurrentActivation(activation, generation)) return [];
+      this.deps.onLoadError(error, activation);
+      // Unavailable durable storage must not suppress independently owned
+      // in-memory jobs. Keep durable reads/listing failures visible and admit
+      // only this conversation's memory tasks through the normal filters.
+      tasks = listSessionCronTasks(activation.queueOwner.conversationId);
+    }
     return tasks.filter(
       (task) =>
         task.deliver === undefined &&
@@ -423,7 +454,7 @@ export class CronScheduler {
     generation: number,
   ): Promise<void> {
     const now = this.deps.now();
-    const tasks = await this.loadRunnableTasks(activation);
+    const tasks = await this.loadRunnableTasks(activation, generation);
     // loadTasks may cross a session switch. A stale wake must leave no queue
     // item, rate accounting, lease, or task-file mutation behind.
     if (!this.isCurrentActivation(activation, generation) || this.paused)
@@ -491,13 +522,43 @@ export class CronScheduler {
         this.firedThrough.delete(task.id);
         continue;
       }
-      this.deps.enqueue({
+      const completion = this.deps.enqueue({
         value: task.prompt,
         mode: "task-notification",
         isMeta: true,
         queueOwner: { ...queueOwner },
         ...(task.agentId ? { agentId: task.agentId } : {}),
-      });
+      }, task, now);
+      if (completion !== undefined) {
+        let result: void | "accepted" | "cancelled";
+        try {
+          result = await completion;
+        } catch (error) {
+          this.stop(activation);
+          throw error;
+        } finally {
+          this.inFlightUntil.delete(task.id);
+        }
+        if (result === "cancelled") continue;
+        dispatched += 1;
+        if (result === "accepted") continue;
+        if (task.recurring) {
+          if (task.durable !== false) {
+            await markCronTasksFired([task.id], now, activation.workspaceRoot);
+          }
+        } else {
+          if (task.durable === false) {
+            removeSessionCronTasks([task.id], activation.queueOwner.conversationId);
+          } else {
+            await removeCronTasks(
+              [task.id],
+              activation.workspaceRoot,
+              activation.queueOwner.conversationId,
+            );
+          }
+        }
+        continue;
+      }
       dispatched += 1;
 
       if (task.recurring) {
@@ -506,7 +567,11 @@ export class CronScheduler {
         // listAllCronTasks).
         if (task.durable !== false) firedRecurringIds.push(task.id);
       } else {
-        firedOneShotIds.push(task.id);
+        if (task.durable === false) {
+          removeSessionCronTasks([task.id], activation.queueOwner.conversationId);
+        } else {
+          firedOneShotIds.push(task.id);
+        }
       }
     }
 
@@ -587,9 +652,10 @@ export class CronScheduler {
    */
   private async earliestDueAt(
     activation: CronSchedulerActivation,
+    generation: number,
   ): Promise<number | null> {
     const now = this.deps.now();
-    const tasks = await this.loadRunnableTasks(activation);
+    const tasks = await this.loadRunnableTasks(activation, generation);
     let earliest: number | null = null;
     for (const task of tasks) {
       const due = this.nextDueForTask(task, now);
@@ -733,6 +799,7 @@ function normalizeCronSchedulerActivation(
   return {
     queueOwner: { kind: "session", conversationId },
     workspaceRoot,
+    ...(activation.sessionOnly === true ? { sessionOnly: true } : {}),
   };
 }
 
@@ -743,7 +810,8 @@ function sameCronSchedulerActivation(
   return (
     left?.queueOwner.kind === "session" &&
     left.queueOwner.conversationId === right.queueOwner.conversationId &&
-    left.workspaceRoot === right.workspaceRoot
+    left.workspaceRoot === right.workspaceRoot &&
+    (left.sessionOnly === true) === (right.sessionOnly === true)
   );
 }
 

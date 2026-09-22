@@ -103,6 +103,16 @@ A failed verification earns one bounded re-implement attempt
 `maxImplementAttempts` and remaining budget allow; otherwise the run
 terminates `failed/verification_failed`.
 
+Both retry prompts carry the previous verification forward: the
+re-implement prompt lists the verdict, the required-command results and the
+verification agent's report, and asks for every reported failure to be fixed;
+the second verification prompt carries the same report and asks the verifier
+to re-check every listed failure first, then continue its own independent
+pass. The report is read back from the committed `child.finalMessage`
+evidence, so a run resumed between the two attempts carries it too. (Soak
+F73: with only `Agent verdict: FAIL` in hand the implementer changed nothing,
+and the second verifier spent 22 minutes re-deriving the same two defects.)
+
 ## Session policy
 
 The frozen spec's `permissionMode`, unattended allow/deny lists, and the
@@ -239,14 +249,24 @@ the final prose summary.
 
 `reconstructVerifiedChange(bundleDir)`
 (`runtime/src/workflow/evidence-reconstruction.ts`) is the mechanical form of
-that claim: it re-validates the record (canonical document digest + spec
-binding), verifies the sealed hash chain via `verifyEvidenceLedger` — pinned
-by the `evidenceLedger.sealDigest` the completed record now carries and the
-bundle's local anchor material — recomputes every artifact digest from the
-exact CAS bytes, re-derives the review blockers from the
+that claim. It re-validates the record's canonical document digest and spec
+binding, then verifies the sealed hash chain via `verifyLocalEvidenceLedger`.
+Verification is pinned by the record's `evidenceLedger.sealDigest` and the
+bundle's local anchor material. Reconstruction recomputes every artifact digest
+from the exact CAS bytes, re-derives the review blockers from the
 `independent_review` artifact, and cross-checks the recorded verification
 commands against a `test_result` artifact. Any tampered byte fails loudly
 with a typed error; a summary is never produced from unverified bytes.
+
+Local v2 seals use HMAC-SHA256 and remain `integrity_only`. The exported secret
+lets a holder produce another local seal, so local verification is not an
+external authenticity claim and cannot supply externally verified score evidence.
+
+Legacy local v1 receipts labeled a different shared-secret construction as
+Ed25519. The new local policy and verifier pins reject those receipts with an
+unsupported-policy/version error. Preserve old bundles for inspection and rerun
+the workflow with a new run ID to produce v2 evidence. Do not edit old receipts,
+change their algorithm label, or overwrite their stored seal digest.
 
 ## Operator troubleshooting
 

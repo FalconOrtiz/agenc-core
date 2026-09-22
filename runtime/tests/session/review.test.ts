@@ -9,15 +9,13 @@
  *   - `session.onTaskFinished(subId)` drains the review from the
  *     registry the same way it drains a regular turn.
  *   - Review tasks are NOT steerable — `isTaskKindSteerable("review")`
- *     returns `false`, matching upstream agenc runtime behavior (Item 6
- *     steer_input gate port will consume this classifier directly).
+ *     returns `false` (the
+ *     steer_input gate consumes this classifier directly).
  *   - `ReviewManager` tracks spawned reviews by subId and shuts them
- *     down cleanly (upstream `GuardianReviewSessionManager::shutdown`).
- *   - `parseReviewOutput` mirrors upstream
- *     `parse_review_output_event`: structured JSON, substring JSON,
+ *     down cleanly.
+ *   - `parseReviewOutput` handles structured JSON, substring JSON,
  *     and plain-text fallback.
- *   - Exit templates render verbatim (upstream
- *     `render_review_exit_success` + CRLF-free
+ *   - Exit templates render verbatim (`renderReviewExitSuccess` + CRLF-free
  *     `exit_interrupted.xml`).
  *
  * Fixture reuses the `buildSession` pattern from `tasks.test.ts` so
@@ -25,7 +23,8 @@
  * across the session-kernel test suites.
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as reviewDelegate from "./agenc-delegate.js";
 
 import { AsyncQueue } from "../utils/async-queue.js";
 import { createTestConfigStore } from "../fixtures.js";
@@ -326,6 +325,28 @@ describe("isTaskKindSteerable — Item 6 gate classification", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("spawnReviewTask registry lifecycle", () => {
+  it.each(["throw", "outcome"])("writes one explicit failed review terminal (%s)", async (failurePath) => {
+    const session = mkSession();
+    const store = mountTestRollout(session);
+    const delegate = vi.spyOn(reviewDelegate, "runAgenCReviewOneShot");
+    const failure = new Error("review failed");
+    if (failurePath === "throw") delegate.mockRejectedValue(failure);
+    else delegate.mockResolvedValue({ verdict: "fail", output: emptyReviewOutput(), rawText: null, modelUsed: "test-model", error: failure });
+    try {
+      const review = await spawnReviewTask(session, { subId: "failed-review", request: mkReviewRequest() });
+      expect(await review.outcome === null).toBe(failurePath === "throw");
+      await review.done;
+      const terminals = store.readAll().flatMap((item) => item.type === "event_msg" && item.payload.msg.type === "turn_failed" ? [item.payload.msg] : []);
+      expect(terminals).toEqual([{
+        type: "turn_failed",
+        payload: { turnId: "failed-review", code: "review_task_failed", message: "review failed", completedAt: expect.any(Number), durationMs: expect.any(Number) },
+      }]);
+      expect(session.activeTurn.unsafePeek()).toBeNull();
+    } finally {
+      delegate.mockRestore();
+    }
+  });
+
   it("registers a task with kind === 'review' in the session's activeTurn", async () => {
     const session = mkSession();
     const spawned = await spawnReviewTask(session, {
@@ -759,7 +780,6 @@ describe("parseReviewOutput", () => {
 describe("review exit templates", () => {
   it("renderReviewExitSuccess substitutes {{results}} once", () => {
     const rendered = renderReviewExitSuccess("Finding A\nFinding B");
-    // Mirrors upstream tasks/review.rs::tests::render_review_exit_success_replaces_results_placeholder
     expect(rendered).toBe(
       "<user_action>\n  <context>User initiated a review task. Here's the full review output from reviewer model. User may select one or more comments to resolve.</context>\n  <action>review</action>\n  <results>\n  Finding A\nFinding B\n  </results>\n  </user_action>",
     );
@@ -926,9 +946,9 @@ describe("ReviewManager + session abort integration", () => {
     // Documents the current contract: the manager registry is separate
     // from Session's task registry. Callers who register a review with
     // a manager are responsible for calling manager.take(subId) or
-    // manager.shutdown() to release it. This matches upstream agenc runtime
-    // where `on_task_finished` does not reach into the
-    // `GuardianReviewSessionManager` state.
+    // manager.shutdown() to release it;
+    // `onTaskFinished` does not reach into the
+    // `ReviewManager` state.
     const session = mkSession();
     const manager = new ReviewManager();
     await spawnReviewTask(session, {
@@ -1083,7 +1103,7 @@ describe("renderReviewExitSuccess edge cases", () => {
   });
 
   it("escapes no characters in results (matches upstream — callers must sanitize)", () => {
-    // Upstream agenc runtime template engine substitutes literally; any escaping
+    // The template engine substitutes literally; any escaping
     // is the caller's responsibility. This test pins the behavior.
     const results = "a<b>c&d\"e'f";
     const rendered = renderReviewExitSuccess(results);

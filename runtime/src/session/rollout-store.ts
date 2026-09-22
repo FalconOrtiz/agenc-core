@@ -74,7 +74,7 @@ import { ThreadSpawnEdgeRepository } from "../state/spawn-edges.js";
 import { StateRunDurabilityRepository } from "../state/run-durability.js";
 import { recordInFlightToolCallUnknownOutcome } from "../state/tool-output-rotation.js";
 import { resolveUnknownOutcomeEffect } from "../state/unknown-outcome-gate.js";
-import { sanitizePath } from "../utils/path.js";
+import { projectStorageKey } from "../utils/project-storage-key.js";
 import { isRecord } from "../utils/record.js";
 import {
   EFFECT_EVIDENCE_FORMAT_VERSION,
@@ -141,7 +141,8 @@ import {
   CompactionTransactionError,
 } from "../services/compact/transaction-types.js";
 import {
-  canonicalizeJson,
+  canonicalizeSourceJson,
+  digestSourceWithDomain,
   digestWithDomain,
   sha256Hex,
   verifyCompactionSummaryDigest,
@@ -162,10 +163,11 @@ import {
   reconstructCompactionPayloadV1,
 } from "../services/compact/payload-manifest.js";
 import {
-  scanCanonicalRollout,
+  CanonicalRolloutScanner,
   type CanonicalCompactionAttemptScan,
   type CanonicalRolloutScan,
 } from "./canonical-rollout-scanner.js";
+import { redactDurableSecrets } from "./provider-replay-redaction.js";
 
 export interface RolloutStoreOpts extends SessionStoreOpts {
   /** Session-owned temporary root captured at request ingress. */
@@ -465,9 +467,11 @@ function requireCompactionPayloadBundle(
       { cause: error },
     );
   }
+  // The bundle holds the redacted payload; expect the redacted value too.
   if (
     params.expectedValue !== undefined &&
-    canonicalizeJson(value) !== canonicalizeJson(params.expectedValue)
+    canonicalizeSourceJson(value) !==
+      canonicalizeSourceJson(redactDurableSecrets(params.expectedValue, params.payloadKind === "replacement_history" || params.payloadKind === "source_history" ? "history" : "ordinary"))
   ) {
     throw new CompactionTransactionError(
       params.failureStage,
@@ -576,10 +580,10 @@ function compactionIntentMatchesPin(
     intent.source.source_sha256 === pin.sourceSha256 &&
     intent.source.source_bytes === pin.sourceBytes &&
     intent.source.history_digest === pin.historyDigest &&
-    canonicalizeJson(intent.source.active_history_refs) ===
-      canonicalizeJson(pin.activeHistoryRefs) &&
-    canonicalizeJson(intent.selected_history_indexes) ===
-      canonicalizeJson(pin.selectedHistoryIndexes) &&
+    canonicalizeSourceJson(intent.source.active_history_refs) ===
+      canonicalizeSourceJson(pin.activeHistoryRefs) &&
+    canonicalizeSourceJson(intent.selected_history_indexes) ===
+      canonicalizeSourceJson(pin.selectedHistoryIndexes) &&
     intent.policy_digest === pin.policyDigest &&
     intent.configuration_digest === pin.configurationDigest &&
     intent.accounting_ref === pin.accountingRef &&
@@ -597,9 +601,9 @@ function compactionCommitMatchesIntentAndPin(
   return (
     compactionIntentMatchesPin(intent, pin) &&
     commit.attempt_id === intent.attempt_id &&
-    canonicalizeJson(commit.source) === canonicalizeJson(intent.source) &&
-    canonicalizeJson(commit.selected_history_indexes) ===
-      canonicalizeJson(intent.selected_history_indexes) &&
+    canonicalizeSourceJson(commit.source) === canonicalizeSourceJson(intent.source) &&
+    canonicalizeSourceJson(commit.selected_history_indexes) ===
+      canonicalizeSourceJson(intent.selected_history_indexes) &&
     commit.policy_digest === intent.policy_digest &&
     commit.configuration_digest === intent.configuration_digest &&
     commit.accounting.accounting_ref === intent.accounting_ref &&
@@ -629,7 +633,7 @@ function compactionSourceAuthorityMatchesScan(
   }
   return (
     sourceBytes === source.source_bytes &&
-    digestWithDomain(
+    digestSourceWithDomain(
       COMPACTION_SOURCE_DIGEST_DOMAIN,
       source.active_history_refs,
     ) === source.source_sha256
@@ -694,6 +698,9 @@ function cloneProjectionMessage(
         : message.content.map((part) => ({ ...part })),
     ...(message.toolCalls !== undefined
       ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
+      : {}),
+    ...(message.providerReasoning !== undefined
+      ? { providerReasoning: { ...message.providerReasoning } }
       : {}),
     ...(message.toolResultIntegrity !== undefined
       ? { toolResultIntegrity: { ...message.toolResultIntegrity } }
@@ -761,6 +768,12 @@ export class RolloutStore {
   private readonly afterCompactionSourcePruneRewriteForTestingOnly?: () => void;
   private readonly afterCompactionRollbackAppendForTestingOnly?: () => void;
   private readonly nowMilliseconds: () => number;
+  /**
+   * One scanner for this store's rollout: compaction bookkeeping scans it
+   * several times per step, and the scanner replays only what was appended
+   * since its last scan instead of the whole session.
+   */
+  private readonly canonicalScanner = new CanonicalRolloutScanner();
   private readonly durablyCommittedCompactionsAwaitingReconstruction =
     new Set<string>();
   private readonly compactionSourcePayloadBundles = new Map<
@@ -768,6 +781,7 @@ export class RolloutStore {
     CompactionSourcePayloadBundlesV1
   >();
   private liveToolPairProjection: ToolPairProjection | undefined;
+  private liveToolPairProjectionId: string | undefined;
   private liveToolPairValidator: StreamingToolPairValidator | undefined;
   private openedAt: string | undefined;
   private openedEpoch: number | undefined;
@@ -952,6 +966,7 @@ export class RolloutStore {
       if (this.startScheduler) this.scheduler.start();
     } catch (error) {
       this.scheduler.stop();
+      this.canonicalScanner.close();
       this.store.close();
       this.stateDriver.close();
       throw error;
@@ -1014,7 +1029,7 @@ export class RolloutStore {
   ): CompactionPreparedSourceV1 {
     this.store.upgradeCanonicalSchemaHeader(ROLLOUT_SCHEMA_VERSION);
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: this.sessionId,
       expectedEpoch: this.runEpoch,
@@ -1051,7 +1066,7 @@ export class RolloutStore {
     const authoritativeMessages = activeHistory.messages.map(
       runtimeMessageFromResponseItem,
     );
-    const historyDigest = digestWithDomain(
+    const historyDigest = digestSourceWithDomain(
       COMPACTION_SOURCE_DIGEST_DOMAIN,
       canonicalCompactionSourceMessages(authoritativeMessages),
     );
@@ -1098,7 +1113,7 @@ export class RolloutStore {
     const lastSequence = Math.max(
       ...activeHistoryRefs.map((ref) => ref.last_sequence),
     );
-    const sourceSha256 = digestWithDomain(
+    const sourceSha256 = digestSourceWithDomain(
       COMPACTION_SOURCE_DIGEST_DOMAIN,
       activeHistoryRefs,
     );
@@ -1234,7 +1249,7 @@ export class RolloutStore {
     const candidates = this.compactionRetentionRepo.listActiveForSourceBinding(
       source.source_binding,
     );
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: source.session_id,
       expectedEpoch: this.runEpoch,
@@ -1359,7 +1374,7 @@ export class RolloutStore {
       replacement_history: input.replacement_history,
       cleanup_state: "pending",
     };
-    const commitSha256 = digestWithDomain(
+    const commitSha256 = digestSourceWithDomain(
       COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
       committed,
     );
@@ -1494,8 +1509,8 @@ export class RolloutStore {
     const exactCommit =
       terminalItems.length === 1 &&
       terminalItems[0]?.type === "compaction_committed" &&
-      canonicalizeJson(terminalItems[0].payload) ===
-        canonicalizeJson(expected.payload);
+      canonicalizeSourceJson(terminalItems[0].payload) ===
+        canonicalizeSourceJson(expected.payload);
     if (!exactCommit) {
       this.poisonCompactionProjection(expected.payload.attempt_id, [
         appendError,
@@ -1529,7 +1544,7 @@ export class RolloutStore {
 
   private assertCompactionCommitFresh(intent: CompactionIntentV1): void {
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: intent.source.session_id,
       expectedEpoch: this.runEpoch,
@@ -1561,8 +1576,8 @@ export class RolloutStore {
       attempt === undefined ||
       persistedIntents.length !== 1 ||
       persistedIntents[0]!.item.type !== "compaction_intent" ||
-      canonicalizeJson(persistedIntents[0]!.item.payload) !==
-        canonicalizeJson(intent) ||
+      canonicalizeSourceJson(persistedIntents[0]!.item.payload) !==
+        canonicalizeSourceJson(intent) ||
       hasTerminal ||
       !attempt.admissionValid
     ) {
@@ -1718,7 +1733,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -1766,7 +1781,7 @@ export class RolloutStore {
     const commit = commitRecord.item;
     if (
       commit.type !== "compaction_committed" ||
-      digestWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload) !==
+      digestSourceWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload) !==
         pin.commitSha256
     ) {
       throw new CompactionTransactionError(
@@ -1792,7 +1807,7 @@ export class RolloutStore {
       cloneProjectionMessage,
     );
     if (
-      digestWithDomain(
+      digestSourceWithDomain(
         COMPACTION_SOURCE_DIGEST_DOMAIN,
         canonicalCompactionSourceMessages(
           sourceHistory.map(runtimeMessageFromResponseItem),
@@ -1989,8 +2004,8 @@ export class RolloutStore {
       projected.length > rollback.source_history.length ||
       projected.some(
         (message, index) =>
-          canonicalizeJson(message) !==
-          canonicalizeJson(rollback.source_history[index]),
+          canonicalizeSourceJson(message) !==
+          canonicalizeSourceJson(rollback.source_history[index]),
       )
     ) {
       throw new CompactionTransactionError(
@@ -2026,8 +2041,8 @@ export class RolloutStore {
       .readAll()
       .flatMap((item) => (item.type === "response_item" ? [item.payload] : []));
     if (
-      canonicalizeJson(materialized) !==
-      canonicalizeJson(rollback.source_history)
+      canonicalizeSourceJson(materialized) !==
+      canonicalizeSourceJson(rollback.source_history)
     ) {
       throw new CompactionTransactionError(
         "commit_failed",
@@ -2116,7 +2131,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -2310,7 +2325,7 @@ export class RolloutStore {
       );
     }
     this.store.syncCanonicalTail();
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: pin.sessionId,
       expectedEpoch: this.runEpoch,
@@ -2348,7 +2363,7 @@ export class RolloutStore {
     if (
       commit.type !== "compaction_committed" ||
       pin.commitSha256 === undefined ||
-      digestWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload) !==
+      digestSourceWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload) !==
         pin.commitSha256
     ) {
       throw new CompactionTransactionError(
@@ -2446,7 +2461,7 @@ export class RolloutStore {
   private compactionSourcePrefixMatches(pin: CompactionPinRecord): boolean {
     try {
       this.store.syncCanonicalTail();
-      const scan = scanCanonicalRollout(this.rolloutPath, {
+      const scan = this.canonicalScanner.scan(this.rolloutPath, {
         sessionTempRoot: this.sessionTempRoot,
         expectedRunId: pin.sessionId,
         expectedEpoch: this.runEpoch,
@@ -2469,7 +2484,7 @@ export class RolloutStore {
     const existingPins = this.compactionRetentionRepo.listSession(
       this.sessionId,
     );
-    const scan = scanCanonicalRollout(this.rolloutPath, {
+    const scan = this.canonicalScanner.scan(this.rolloutPath, {
       sessionTempRoot: this.sessionTempRoot,
       expectedRunId: this.sessionId,
       ...(this.reopenTerminalRun ? {} : { expectedEpoch: this.runEpoch }),
@@ -2631,7 +2646,7 @@ export class RolloutStore {
       }
       pin = this.compactionRetentionRepo.markCommitted(
         commit.payload,
-        digestWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload),
+        digestSourceWithDomain(COMPACTION_ACCOUNTING_DIGEST_DOMAIN, commit.payload),
       );
       this.compactionRetentionRepo.markProjectionComplete(
         pin.attemptId,
@@ -2810,7 +2825,7 @@ export class RolloutStore {
           "canonical compaction admission lifecycle is incomplete or contaminated",
         );
       }
-      const commitSha256 = digestWithDomain(
+      const commitSha256 = digestSourceWithDomain(
         COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
         commit.payload,
       );
@@ -2968,13 +2983,18 @@ export class RolloutStore {
         projection === undefined
           ? this.requireRunEpoch(payload.runId)
           : { epoch: projection.epoch };
+      // The journaled child run id wins: a workflow session journals its
+      // plan/implement steps on behalf of a subordinate run, and a replay
+      // that derived the child from the session id alone rebuilt those
+      // intents without it and conflicted with the live projection.
+      const childRunId =
+        payload.childRunId ??
+        (this.sessionId !== payload.runId ? this.sessionId : undefined);
       this.runDurabilityRepo.beginEffect({
         runId: payload.runId,
         epoch: epoch.epoch,
         stepId: payload.stepId,
-        ...(this.sessionId !== payload.runId
-          ? { childRunId: this.sessionId }
-          : {}),
+        ...(childRunId !== undefined ? { childRunId } : {}),
         sessionId: this.sessionId,
         callId: payload.callId,
         toolName: payload.toolName,
@@ -3439,7 +3459,35 @@ export class RolloutStore {
       throw new Error("live tool-pair projection did not initialize");
     }
     this.liveToolPairProjection = context.projection;
+    this.liveToolPairProjectionId = context.projectionId;
     this.liveToolPairValidator = validator;
+  }
+
+  /**
+   * Why this session's live history can no longer take a response item, once
+   * the live tool-pair validator has closed on a failure; `undefined` while
+   * appends are still accepted. Callers that start turns check this before
+   * opening one, so a client hears the reason instead of watching an empty
+   * turn end.
+   */
+  liveHistoryBlockedReason(): string | undefined {
+    const failure = this.liveToolPairValidator?.terminalFailureOutcome;
+    if (failure === undefined) return undefined;
+    return new ToolPairHistoryBlockedError("live append", failure).message;
+  }
+
+  /**
+   * Whether the live history already holds a result for this tool call. A
+   * durable resume asks before it persists a synthetic result for a dangling
+   * call: the bootstrap replay may already have closed the call, and a second
+   * result for one call id is a duplicate the live validator rejects, which
+   * blocks the session's history for good.
+   */
+  liveToolCallResolved(callId: string): boolean {
+    const projection = this.liveToolPairProjection;
+    const projectionId = this.liveToolPairProjectionId;
+    if (projection === undefined || projectionId === undefined) return false;
+    return projection.find(projectionId, callId)?.resultIndex !== undefined;
   }
 
   private validateLiveResponseItem(message: ToolPairMessage): void {
@@ -3665,8 +3713,19 @@ export class RolloutStore {
     this.store.setFsyncImplForTest(impl);
   }
 
+  /**
+   * Register (or clear) a listener for successful rollout appends.
+   * `FileThreadStore` uses this to keep `thread_rollout_items` current.
+   */
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.store.setOnRolloutCommitted(listener);
+  }
+
   close(): void {
     this.scheduler.stop();
+    this.canonicalScanner.close();
     this.stateDriver.close();
     this.store.close();
   }
@@ -4314,7 +4373,7 @@ export class RolloutStore {
         resolve(
           this.store.agencHome,
           "projects",
-          sanitizePath(this.store.cwd),
+          projectStorageKey(this.store.cwd),
           this.sessionId,
           "tool-results",
         ),
@@ -4623,6 +4682,16 @@ function runtimeMessageFromResponseItem(item: ResponseItem): RuntimeMessage {
       : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
     ...(message.phase !== undefined ? { phase: message.phase } : {}),
+    ...(message.providerReasoningContent !== undefined
+      ? { providerReasoningContent: message.providerReasoningContent }
+      : {}),
+    ...(message.providerReasoningProvenance !== undefined
+      ? {
+          providerReasoningProvenance: {
+            ...message.providerReasoningProvenance,
+          },
+        }
+      : {}),
     ...(item.id !== undefined ? { uuid: item.id } : {}),
     ...(message.runtimeOnly !== undefined
       ? { runtimeOnly: message.runtimeOnly }

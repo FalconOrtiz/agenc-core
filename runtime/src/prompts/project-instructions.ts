@@ -13,9 +13,18 @@
  * @module
  */
 import { lstat } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 import {
+  MAX_SECURE_PROJECT_FILE_BYTES,
   type InstructionFileIdentity,
   readInstructionFileSnapshot,
 } from "./secure-instruction-file.js";
@@ -38,7 +47,6 @@ export {
  */
 const OVERRIDE_PROJECT_INSTRUCTION_FILE = "AGENC.override.md";
 const DOT_AGENC_PROJECT_INSTRUCTION_FILE = join(".agenc", "AGENC.md");
-const MAX_SECURE_PROJECT_FILE_BYTES = 5 * 1024 * 1024;
 
 /**
  * Default project-root markers used when config does not specify any.
@@ -102,6 +110,14 @@ export interface LoadProjectInstructionsOptions extends ProjectInstructionsConfi
   readonly cwd: string;
 }
 
+export interface ProjectRootSearchOptions {
+  /**
+   * Exclusive ancestor boundary for marker discovery. Markers at this path
+   * and above it cannot become the root of a strict descendant workspace.
+   */
+  readonly stopBefore?: string;
+}
+
 export interface ProjectInstructions {
   /** Absolute path to the file that was loaded. */
   readonly path: string;
@@ -146,6 +162,24 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+function projectRootStopBefore(
+  cwd: string,
+  requestedBoundary: string,
+): string | undefined {
+  const start = resolve(cwd);
+  const boundary = resolve(requestedBoundary);
+  const fromBoundary = relative(boundary, start);
+  if (
+    fromBoundary === "" ||
+    fromBoundary === ".." ||
+    fromBoundary.startsWith(`..${sep}`) ||
+    isAbsolute(fromBoundary)
+  ) {
+    return undefined;
+  }
+  return boundary;
+}
+
 /**
  * Returns the directory where the first configured marker exists when
  * walking from `cwd` upward. Returns `null` if no marker is found before
@@ -154,13 +188,21 @@ async function pathExists(p: string): Promise<boolean> {
 export async function findProjectRoot(
   cwd: string,
   markers: readonly string[] = DEFAULT_PROJECT_ROOT_MARKERS,
+  options: ProjectRootSearchOptions = {},
 ): Promise<{ rootDir: string; marker: string } | null> {
   if (markers.length === 0) {
     return null;
   }
 
+  const stopBefore = projectRootStopBefore(
+    cwd,
+    options.stopBefore ?? homedir(),
+  );
   let currentDir = cwd;
   while (true) {
+    if (stopBefore !== undefined && resolve(currentDir) === stopBefore) {
+      return null;
+    }
     for (const marker of markers) {
       if (await pathExists(join(currentDir, marker))) {
         return { rootDir: currentDir, marker };

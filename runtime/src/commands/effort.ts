@@ -2,7 +2,7 @@
  * /effort — show or set the reasoning effort level for the current model.
  *
  * Levels are validated against the current model's catalog capabilities
- * (grok-4.3/4.5 accept low/medium/high via xAI reasoning_effort); `default`
+ * (including the exact Meta Muse and Grok model enums); `default`
  * clears the explicit
  * choice so the level follows the model default again.
  */
@@ -40,7 +40,7 @@ function currentEffortValue(ctx: SlashCommandContext): unknown {
 
 export const effortCommand: SlashCommand = {
   name: "effort",
-  description: "Show or set reasoning effort (low/medium/high)",
+  description: "Show or set reasoning effort for the current model",
   immediate: true,
   supportsNonInteractive: true,
   execute: async (ctx) =>
@@ -146,7 +146,7 @@ export const effortCommand: SlashCommand = {
       }
 
       await updateSettingsForSource("userSettings", {
-        reasoning_effort: effortValueToReasoningEffort(level),
+        reasoning_effort: effortValueToReasoningEffort(level, available),
       });
       ctx.appState?.setAppState?.((prev: unknown) => ({
         ...(prev as Record<string, unknown>),

@@ -32,12 +32,79 @@ describe("StaticModelsManager", () => {
       truncationPolicy: "off",
       usedFallbackModelMetadata: false,
     });
+    // gpt-5's own ladder: minimal is its floor and xhigh is not accepted
+    // (Responses API, probed 2026-09-11).
     expect(info.supportedReasoningLevels).toEqual([
+      "minimal",
       "low",
       "medium",
       "high",
-      "xhigh",
     ]);
+  });
+
+  it("uses curated Z.ai metadata without probing a custom base URL", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "zai",
+        model: "glm-5.3",
+        providers: {
+          zai: {
+            default_model: "glm-5.3",
+            base_url: "https://zai-proxy.invalid/api/paas/v4",
+          },
+        },
+      }),
+      fallbackProvider: "zai",
+      metadata: {
+        fetchImpl,
+        env: { ZAI_BASE_URL: "https://zai-proxy.invalid/api/paas/v4" },
+      },
+    });
+
+    const info = await manager.getModelInfo("glm-5.3");
+
+    expect(info).toMatchObject({
+      contextWindow: 1_000_000,
+      maxOutputTokens: 131_072,
+      maxOutputTokensUpperLimit: 131_072,
+      usedFallbackModelMetadata: false,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("uses curated Coding Plan metadata without probing its base URL", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "zai-coding-plan",
+        model: "glm-5.3",
+        providers: {
+          "zai-coding-plan": {
+            default_model: "glm-5.3",
+            base_url: "https://coding-proxy.invalid/api/coding/paas/v4",
+          },
+        },
+      }),
+      fallbackProvider: "zai-coding-plan",
+      metadata: {
+        fetchImpl,
+        env: {
+          ZAI_CODING_PLAN_BASE_URL:
+            "https://coding-proxy.invalid/api/coding/paas/v4",
+        },
+      },
+    });
+
+    expect((await manager.listModels()).map((entry) => entry.slug))
+      .toEqual(expect.arrayContaining(["glm-5.3", "glm-5.3-flash"]));
+    expect(await manager.getModelInfo("glm-5.3")).toMatchObject({
+      contextWindow: 1_000_000,
+      maxOutputTokens: 131_072,
+      maxOutputTokensUpperLimit: 131_072,
+      usedFallbackModelMetadata: false,
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("lists and resolves registered bundled model catalog entries", async () => {
@@ -49,7 +116,7 @@ describe("StaticModelsManager", () => {
     const listed = await manager.listModels();
     expect(listed.map((entry) => entry.slug)).toContain("gpt-5.4");
     expect(listed.map((entry) => entry.slug)).not.toContain(
-      "codex-auto-review", // branding-scan: allow openai model identifier
+      "codex-auto-review",
     );
 
     const info = await manager.getModelInfo("gpt-5.4");
@@ -75,10 +142,10 @@ describe("StaticModelsManager", () => {
     ]);
 
     const hidden = await manager.getModelInfo(
-      "codex-auto-review", // branding-scan: allow openai model identifier
+      "codex-auto-review",
     );
     expect(hidden).toMatchObject({
-      slug: "codex-auto-review", // branding-scan: allow openai model identifier
+      slug: "codex-auto-review",
       visibility: "hide",
       showInPicker: false,
     });
@@ -89,7 +156,6 @@ describe("StaticModelsManager", () => {
       config: mergeConfigs(defaultConfig(), {
         providers: {
           openrouter: {
-            // branding-scan: allow documented routed Anthropic model identifier
             default_model: "anthropic/claude-3.7-sonnet",
           },
         },
@@ -99,7 +165,6 @@ describe("StaticModelsManager", () => {
 
     const listed = await manager.listModels();
     expect(listed.map((entry) => entry.slug)).toContain(
-      // branding-scan: allow documented routed Anthropic model identifier
       "anthropic/claude-3.7-sonnet",
     );
   });
@@ -288,6 +353,39 @@ describe("StaticModelsManager", () => {
     expect(info.maxOutputTokensUpperLimit).toBe(60_000);
     expect(info.maxOutputTokensExplicit).toBe(true);
     expect(info.maxOutputTokensCappedDefault).toBe(false);
+  });
+
+  it.each([
+    ["meta", "muse-spark-1.3", 1_048_576],
+    ["openai", "gpt-5.4-mini", 272_000],
+  ] as const)("preserves %s context when only its output cap is configured", async (
+    provider,
+    model,
+    contextWindow,
+  ) => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: provider,
+        model,
+        providers: { [provider]: { max_output_tokens: 512 } },
+      }),
+      fallbackProvider: provider,
+      metadata: { fetchImpl, env: {} },
+    });
+    const expected = {
+      contextWindow,
+      maxOutputTokens: 512,
+      maxOutputTokensUpperLimit: 512,
+      maxOutputTokensExplicit: true,
+      usedFallbackModelMetadata: false,
+    };
+
+    // Picker metadata resolves synchronously; session startup resolves async.
+    expect(manager.tryListModels()?.find((entry) => entry.slug === model))
+      .toMatchObject(expected);
+    expect(await manager.getModelInfo(model)).toMatchObject(expected);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it("reads live openai-compatible endpoint metadata for vLLM-style models", async () => {
@@ -597,6 +695,180 @@ describe("StaticModelsManager", () => {
     expect(info.maxOutputTokensUpperLimit).toBe(64_000);
     expect(info.maxOutputTokensExplicit).toBe(false);
     expect(info.maxOutputTokensCappedDefault).toBe(true);
+  });
+
+  it("uses the safe Cerebras Qwen default while retaining its output ceiling", async () => {
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+      }),
+      fallbackProvider: "cerebras",
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.maxOutputTokens).toBe(8_000);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(false);
+    expect(info.maxOutputTokensCappedDefault).toBe(true);
+  });
+
+  it("keeps the Cerebras Qwen output contract with context-only provider config", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+        providers: {
+          cerebras: {
+            default_model: "qwen-3.8-27b",
+            context_window_tokens: 60_000,
+          },
+        },
+      }),
+      fallbackProvider: "cerebras",
+      metadata: { fetchImpl, env: {} },
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.contextWindow).toBe(60_000);
+    expect(info.maxOutputTokens).toBe(8_000);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(false);
+    expect(info.maxOutputTokensCappedDefault).toBe(true);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps the Cerebras Qwen output contract with context-only live metadata", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (input) => {
+      expect(String(input)).toBe("https://cerebras.invalid/v1/models");
+      return jsonResponse({
+        data: [{ id: "qwen-3.8-27b", context_length: 60_000 }],
+      });
+    });
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+      }),
+      fallbackProvider: "cerebras",
+      metadata: {
+        fetchImpl,
+        env: { CEREBRAS_BASE_URL: "https://cerebras.invalid/v1" },
+      },
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.contextWindow).toBe(60_000);
+    expect(info.maxOutputTokens).toBe(8_000);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(false);
+    expect(info.maxOutputTokensCappedDefault).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets an explicit Cerebras Qwen output override reach its ceiling", async () => {
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+        max_output_tokens: 32_768,
+      }),
+      fallbackProvider: "cerebras",
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.maxOutputTokens).toBe(32_768);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(true);
+    expect(info.maxOutputTokensCappedDefault).toBe(false);
+  });
+
+  it("clamps provider-specific Cerebras Qwen output config to its ceiling", async () => {
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+        providers: {
+          cerebras: {
+            default_model: "qwen-3.8-27b",
+            max_output_tokens: 64_000,
+          },
+        },
+      }),
+      fallbackProvider: "cerebras",
+      metadata: { env: {} },
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.maxOutputTokens).toBe(32_768);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(true);
+    expect(info.maxOutputTokensCappedDefault).toBe(false);
+  });
+
+  it("treats live Cerebras Qwen output metadata as a ceiling", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: "qwen-3.8-27b",
+            context_length: 65_536,
+            max_output_tokens: 64_000,
+          },
+        ],
+      })
+    );
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+      }),
+      fallbackProvider: "cerebras",
+      metadata: {
+        fetchImpl,
+        env: { CEREBRAS_BASE_URL: "https://cerebras.invalid/v1" },
+      },
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.maxOutputTokens).toBe(8_000);
+    expect(info.maxOutputTokensUpperLimit).toBe(32_768);
+    expect(info.maxOutputTokensExplicit).toBe(false);
+    expect(info.maxOutputTokensCappedDefault).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("lowers the Cerebras Qwen safe default to a smaller live ceiling", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      jsonResponse({
+        data: [
+          {
+            id: "qwen-3.8-27b",
+            context_length: 65_536,
+            max_output_tokens: 4_000,
+          },
+        ],
+      })
+    );
+    const manager = new StaticModelsManager({
+      config: mergeConfigs(defaultConfig(), {
+        model_provider: "cerebras",
+        model: "qwen-3.8-27b",
+      }),
+      fallbackProvider: "cerebras",
+      metadata: {
+        fetchImpl,
+        env: { CEREBRAS_BASE_URL: "https://cerebras.invalid/v1" },
+      },
+    });
+
+    const info = await manager.getModelInfo("qwen-3.8-27b");
+    expect(info.maxOutputTokens).toBe(4_000);
+    expect(info.maxOutputTokensUpperLimit).toBe(4_000);
+    expect(info.maxOutputTokensExplicit).toBe(false);
+    expect(info.maxOutputTokensCappedDefault).toBe(true);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("lets explicit output overrides bypass the capped default", async () => {

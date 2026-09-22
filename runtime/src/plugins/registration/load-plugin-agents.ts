@@ -43,7 +43,15 @@ export interface PluginAgentRegistrationOptions extends PluginRuntimeLoadOptions
 }
 
 const VALID_MEMORY_SCOPES: readonly AgentMemoryScope[] = ["user", "project", "local"];
-const VALID_EFFORTS = new Set(["none", "low", "medium", "high", "max", "xhigh"]);
+const VALID_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "max",
+  "xhigh",
+]);
 const MEMORY_TOOLS = [
   FILE_WRITE_TOOL_NAME,
   FILE_EDIT_TOOL_NAME,

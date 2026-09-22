@@ -22,6 +22,7 @@ import {
 } from "./recovery-journal-schema.js";
 import { openStateDatabases, type StateSqliteDriver } from "./sqlite-driver.js";
 import { StateThreadRepository } from "./threads.js";
+import { RUN_RUNTIME_REASONING_EFFORTS } from "../../src/contracts/run-contracts.js";
 
 const temporaryRoots: string[] = [];
 
@@ -32,6 +33,28 @@ afterEach(() => {
 });
 
 describe("strict canonical journal contract", () => {
+  it.each(RUN_RUNTIME_REASONING_EFFORTS)("replays %s in durable settings and both turn-context carriers", (reasoningEffort) => {
+    const context = {
+      cwd: "/synthetic", approvalPolicy: "never", sandboxPolicy: "danger-full-access",
+      model: "deepseek-v4-pro", collaborationMode: {model: "deepseek-v4-pro", reasoningEffort},
+    };
+    const settings = {
+      runId: "strict-test", epoch: 1, previousSettingsEventId: null, rollbackOfSettingsEventId: null,
+      reason: "initial", changedAt: "2026-09-11T00:00:00.000Z", permissionMode: "default",
+      prePlanMode: null, autoModeActive: false, autoModeAvailable: false,
+      bypassPermissionsModeAvailable: false, bypassPermissionsWorkspace: null,
+      bypassPermissionsConsentWorkspace: null, model: "deepseek-v4-pro", provider: "deepseek",
+      profile: null, reasoningEffort, modelVerbosity: null, serviceTier: null, hooksDisabled: false,
+    };
+    const journal = validEvent(1, "run_runtime_settings_changed", settings) +
+      validEvent(2, "turn_context", context) + JSON.stringify({type:"turn_context",payload:context,eventVersion:1}) + "\n";
+    expect(validateCanonicalJournalText(journal).recordCount).toBe(3);
+    expect(isCanonicalEventPayload("run_runtime_settings_changed", {...settings,reasoningEffort:"unknown-effort"})).toBe(false);
+    const invalidContext = {...context,collaborationMode:{...context.collaborationMode,reasoningEffort:"unknown-effort"}};
+    expect(isCanonicalEventPayload("turn_context", invalidContext)).toBe(false);
+    expect(isCanonicalRolloutPayload("turn_context", invalidContext)).toBe(false);
+  });
+
   it("accepts sequenced and explicit legacy format lanes", async () => {
     const catalog = await openFndFixtureCatalog();
     const sequenced = validateCanonicalJournalBytes(
@@ -122,6 +145,49 @@ describe("strict canonical journal contract", () => {
       encodedByteLength: Buffer.byteLength(second),
     });
     expect(result.records[1]?.rollingSha256).toBe(result.sourceSha256);
+  });
+
+  it("snapshots the proof of everything pushed so far without closing", () => {
+    const lines = [1, 2, 3].map((sequence) =>
+      validEvent(sequence, "turn_started"),
+    );
+    const validator = new StrictCanonicalJournalValidator();
+    validator.push(Buffer.from(lines[0]! + lines[1]!, "utf8"));
+
+    // A reader that has validated a prefix of an append-only journal proves
+    // that prefix, then pushes only what was appended since.
+    expect(validator.snapshot()).toEqual(
+      validateCanonicalJournalText(lines[0]! + lines[1]!),
+    );
+    validator.push(Buffer.from(lines[2]!, "utf8"));
+    expect(validator.snapshot()).toEqual(
+      validateCanonicalJournalText(lines.join("")),
+    );
+    expect(validator.finish().physicalLineCount).toBe(3);
+  });
+
+  it("keeps the validator usable after a rejected snapshot, unlike finish", () => {
+    const complete = validEvent(1, "turn_started");
+    const split = complete.length - 4;
+    const validator = new StrictCanonicalJournalValidator();
+    validator.push(Buffer.from(complete.slice(0, split), "utf8"));
+
+    // A record cut in half by the prefix boundary is a legitimate state for a
+    // reader that has not reached the end of the file.
+    expect(() => validator.snapshot()).toThrow(
+      expect.objectContaining({ reasonCode: "unterminated_record" }),
+    );
+    validator.push(Buffer.from(complete.slice(split), "utf8"));
+    expect(validator.snapshot().physicalLineCount).toBe(1);
+
+    const closing = new StrictCanonicalJournalValidator();
+    closing.push(Buffer.from(complete.slice(0, split), "utf8"));
+    expect(() => closing.finish()).toThrow(
+      expect.objectContaining({ reasonCode: "unterminated_record" }),
+    );
+    expect(() => closing.push(Buffer.from(complete.slice(split), "utf8")))
+      .toThrow(/validator is closed/u);
+    expect(() => closing.snapshot()).toThrow(/validator is closed/u);
   });
 
   it("uses an existing digest as an anchor and never treats a fresh digest as proof", () => {
@@ -468,6 +534,16 @@ describe("strict canonical journal contract", () => {
     ["compacted", {}],
     ["turn_context", {}],
     ["session_state", { agentTask: 42 }],
+    [
+      "session_state",
+      {
+        memoryExtraction: {
+          memoryRoot: "/memory",
+          processedVisibleCount: -1,
+          turnsSinceLastExtraction: 0,
+        },
+      },
+    ],
   ] as const)(
     "rejects an invalid %s payload before normalization",
     (type, payload) => {
@@ -482,6 +558,29 @@ describe("strict canonical journal contract", () => {
       ).toThrow(expect.objectContaining({ reasonCode: "schema_invalid" }));
     },
   );
+
+  it("validates the optional effect_intent childRunId as a string", () => {
+    const intent = (childRunId: unknown) =>
+      validEvent(1, "effect_intent", {
+        formatVersion: 2,
+        minimumReaderRuntime: "0.14.0",
+        runId: "run-1",
+        stepId: "workflow.plan",
+        callId: "workflow.plan",
+        toolName: "workflow.plan",
+        recoveryCategory: "side-effecting",
+        intentDigest: "intent-digest",
+        attempt: 1,
+        recordedAt: "2026-08-19T00:00:00.000Z",
+        childRunId,
+      });
+    expect(() =>
+      validateCanonicalJournalText(intent("run-1:plan#1")),
+    ).not.toThrow(expect.objectContaining({ reasonCode: "schema_invalid" }));
+    expect(() => validateCanonicalJournalText(intent(7))).toThrow(
+      expect.objectContaining({ reasonCode: "schema_invalid" }),
+    );
+  });
 
   it("rejects invalid payloads for known event variants", () => {
     expect(() =>
@@ -684,6 +783,20 @@ describe("strict canonical journal contract", () => {
         startedAt: "not-a-number",
       }),
     ).toBe(false);
+    expect(
+      isCanonicalRolloutPayload("session_state", {
+        memoryExtraction: {
+          memoryRoot: "/memory",
+          processedVisibleCount: 4,
+          turnsSinceLastExtraction: 2,
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isCanonicalRolloutPayload("session_state", {
+        memoryExtraction: { memoryRoot: "/memory", processedVisibleCount: 4 },
+      }),
+    ).toBe(false);
   });
 
   it("preserves v1 response fragments while rejecting malformed user images", () => {
@@ -767,6 +880,51 @@ describe("strict canonical journal contract", () => {
     ).toBe(false);
   });
 
+  it("accepts scalar warning details and leaves older warnings valid (#2499)", () => {
+    const warning = { cause: "auto_compact_failed", message: "context_limit/in_turn: durable compaction commit failed" };
+    expect(isCanonicalEventPayload("warning", warning)).toBe(true);
+    expect(isCanonicalEventPayload("warning", {
+      ...warning,
+      details: { cause_code: "ENOSPC", cause_errno: -28, replacement_history_bytes: 4096, retried: false, cause_path: null },
+    })).toBe(true);
+    expect(isCanonicalEventPayload("warning", { ...warning, details: {} })).toBe(true);
+    // Details are flat facts a reader prints as-is: no nesting, no NaN.
+    expect(isCanonicalEventPayload("warning", { ...warning, details: { nested: { code: "ENOSPC" } } })).toBe(false);
+    expect(isCanonicalEventPayload("warning", { ...warning, details: { bytes: Number.NaN } })).toBe(false);
+    expect(isCanonicalEventPayload("warning", { ...warning, details: "ENOSPC" })).toBe(false);
+  });
+
+  it("accepts the deadline_reserve completion gate reason (#2503)", () => {
+    const gate = {
+      turnId: "turn-1",
+      round: 0,
+      maxRounds: 3,
+      outcome: "skipped",
+      toolCallsSinceInjection: 0,
+    };
+    expect(isCanonicalEventPayload("completion_gate", { ...gate, reason: "deadline_reserve" })).toBe(true);
+    expect(isCanonicalEventPayload("completion_gate", { ...gate, reason: "deadline_soon" })).toBe(false);
+  });
+
+  it("accepts partial unavailable-check completion gate outcomes (#2478)", () => {
+    const gate = {
+      turnId: "turn-1",
+      round: 2,
+      maxRounds: 3,
+      toolCallsSinceInjection: 1,
+      unmetItems: ["official oracle is unavailable"],
+    };
+    expect(isCanonicalEventPayload("completion_gate", {
+      ...gate, outcome: "partial", reason: "unavailable_checks",
+    })).toBe(true);
+    expect(isCanonicalEventPayload("completion_gate", {
+      ...gate, outcome: "injected", reason: "unavailable_unproven",
+    })).toBe(true);
+    expect(isCanonicalEventPayload("completion_gate", {
+      ...gate, outcome: "partial", reason: "deadline_soon",
+    })).toBe(false);
+  });
+
   it("keeps an exhaustive fail-closed schema for every rollout discriminant", () => {
     expect(CANONICAL_ROLLOUT_SCHEMA_TYPES).toEqual([
       "compacted",
@@ -794,10 +952,10 @@ describe("strict canonical journal contract", () => {
   });
 
   it("keeps an exhaustive fail-closed schema for every known event discriminant", () => {
-    expect(KNOWN_EVENT_TYPES.size).toBe(82);
+    expect(KNOWN_EVENT_TYPES.size).toBe(86);
     expect(CANONICAL_EVENT_SCHEMA_TYPES).toEqual([...KNOWN_EVENT_TYPES].sort());
     expect(CANONICAL_EVENT_SCHEMA_TYPES).toEqual(
-      expect.arrayContaining(["run_suspended", "run_resumed"]),
+      expect.arrayContaining(["run_suspended", "run_resumed", "session_usage"]),
     );
     const eventsWithoutRequiredFields = new Set([
       "context_compacted",

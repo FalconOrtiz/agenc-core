@@ -24,6 +24,7 @@ import {
 import type { JsonObject, JsonValue } from "../protocol/index.js";
 import { resolveHomeContext } from "../../config/home.js";
 import { AgenCStdioTransport, writeJsonLine } from "./stdio.js";
+import { drainAgenCTransportRequests, type AgenCTransportCloseOptions } from "./request-drain.js";
 import {
   loadAgenCNativePeerCredentialBinding,
   type AgenCNativePeerCredentialBinding,
@@ -71,6 +72,7 @@ export interface AgenCUnixSocketMessageContext {
   readonly privateSocketOwnerUid: number | null;
   send(message: JsonValue): Promise<void>;
   close(): void;
+  terminate(): void;
 }
 
 export interface AgenCUnixSocketServerOptions {
@@ -93,6 +95,7 @@ export interface AgenCUnixSocketServerOptions {
     context: AgenCUnixSocketMessageContext,
   ) => boolean | Promise<boolean>;
   readonly acceptAuthenticationTimeoutMs?: number;
+  readonly maxQueuedRequests?: number;
   readonly onAuthenticationFailed?: (
     message: JsonObject,
     context: AgenCUnixSocketMessageContext,
@@ -130,6 +133,9 @@ export class AgenCUnixSocketServer {
   #nativePeerCredentialBinding: AgenCNativePeerCredentialBinding | null = null;
   #boundSocketIdentity: AgenCUnixSocketPathIdentity | null = null;
   #nextConnectionId = 1;
+  #listening: Promise<string> | null = null;
+  #closing: Promise<void> | null = null;
+  #closeInProgress = false;
 
   constructor(options: AgenCUnixSocketServerOptions) {
     this.#options = options;
@@ -142,11 +148,21 @@ export class AgenCUnixSocketServer {
     );
   }
 
-  async listen(): Promise<string> {
-    if (this.#server !== null) {
-      throw new Error("AgenC Unix socket transport is already listening");
+  listen(): Promise<string> {
+    if (this.#closeInProgress) {
+      return Promise.reject(new Error("AgenC Unix socket transport is closing"));
     }
+    if (this.#server !== null || this.#listening !== null) {
+      return Promise.reject(new Error("AgenC Unix socket transport is already listening"));
+    }
+    this.#closing = null;
+    this.#listening = this.#listen().finally(() => {
+      this.#listening = null;
+    });
+    return this.#listening;
+  }
 
+  async #listen(): Promise<string> {
     if (
       this.#options.nativePeerCredentialAddonPath !== undefined &&
       this.#options.nativePeerCredentialBinding !== undefined
@@ -247,7 +263,23 @@ export class AgenCUnixSocketServer {
     return socketPath;
   }
 
-  async close(): Promise<void> {
+  close(options: AgenCTransportCloseOptions = {}): Promise<void> {
+    if (this.#closing !== null) return this.#closing;
+    this.#closeInProgress = true;
+    const listening = this.#listening;
+    this.#closing = (async () => {
+      // Startup owns its listener until bind and path identity capture finish.
+      // Keep admission fenced while joining it, then release that generation.
+      if (listening !== null) await listening.catch(() => {});
+      await this.#close(options);
+    })().finally(() => {
+      this.#closeInProgress = false;
+      this.#closing = null;
+    });
+    return this.#closing;
+  }
+
+  async #close(options: AgenCTransportCloseOptions): Promise<void> {
     const server = this.#server;
     const boundSocketIdentity = this.#boundSocketIdentity;
     this.#server = null;
@@ -255,16 +287,19 @@ export class AgenCUnixSocketServer {
     this.#nativePeerCredentialBinding = null;
     this.#boundSocketIdentity = null;
 
-    for (const { socket, transport } of this.#connections.values()) {
+    const activeConnections = [...this.#connections.values()];
+    // Fence every peer before draining handlers: a blocked handler on one
+    // connection must not leave another connection accepting more work.
+    for (const { socket } of activeConnections) {
       socket.destroy();
-      await transport.close();
     }
+    const pending = activeConnections.map(({ transport }) => transport.close());
     this.#connections.clear();
 
     if (server !== null) {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => {
-          if (error) {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
             reject(error);
             return;
           }
@@ -277,9 +312,14 @@ export class AgenCUnixSocketServer {
       await this.#options.beforeSocketPathRemoval?.();
       await removeSocketPathIfIdentity(this.socketPath, boundSocketIdentity);
     }
+    await drainAgenCTransportRequests(pending, options);
   }
 
   #acceptConnection(socket: Socket): void {
+    if (this.#server === null || this.#closeInProgress) {
+      socket.destroy();
+      return;
+    }
     const connectionId = this.#nextConnectionId;
     this.#nextConnectionId += 1;
     const peerUid = resolveAgenCUnixSocketPeerUid(
@@ -299,6 +339,7 @@ export class AgenCUnixSocketServer {
       return;
     }
     let accepted = this.#options.acceptAuthenticator === undefined;
+    let closed = false;
     let closingUnauthenticated = false;
     let authenticationTimeout: NodeJS.Timeout | undefined;
     // The transport fires onMessage for each parsed line WITHOUT awaiting
@@ -327,13 +368,23 @@ export class AgenCUnixSocketServer {
       privateSocketOwnerUid: this.#privateSocketOwnerUid,
       send: (message) => writeJsonLine(socket, message),
       close: () => {
+        closed = true;
         socket.end();
+      },
+      terminate: () => {
+        closed = true;
+        socket.destroy();
       },
     };
     const transport = new AgenCStdioTransport({
       input: socket,
       output: socket,
+      maxQueuedRequests: this.#options.maxQueuedRequests,
       onMessage: async (message) => {
+        // Parsed frames can still be queued behind an active request after
+        // disconnect. They must never recreate a daemon connection or start
+        // work after its connection-scoped authority has been removed.
+        if (closed || socket.destroyed) return;
         // Two-step gate to handle line-batched [initialize, method]
         // messages that arrive in one TCP packet and trigger parallel
         // onMessage handlers. The transport fires handlers via
@@ -361,7 +412,7 @@ export class AgenCUnixSocketServer {
           // We waited for someone else's auth. They've already set
           // accepted / closingUnauthenticated. Fall through to dispatch
           // (or short-circuit if their auth failed).
-          if (closingUnauthenticated) return;
+          if (closed || socket.destroyed || closingUnauthenticated) return;
           if (!accepted) return; // sibling rejected; we should also stop
           await this.#options.onMessage(message, context);
           return;
@@ -379,11 +430,15 @@ export class AgenCUnixSocketServer {
               (await this.#options.acceptAuthenticator?.(message, context)) ===
               true;
           } catch (error) {
+            closingUnauthenticated = true;
             clearAuthenticationTimeout();
             this.#options.onError?.(asNodeError(error), connectionId);
             socket.destroy();
             return;
           }
+          // Authentication is asynchronous; disconnect or its deadline may
+          // have revoked this connection while the decision was in flight.
+          if (closed || socket.destroyed || closingUnauthenticated) return;
           if (!authenticated) {
             closingUnauthenticated = true;
             clearAuthenticationTimeout();
@@ -402,7 +457,10 @@ export class AgenCUnixSocketServer {
         await this.#options.onMessage(message, context);
       },
       onError: (error) => this.#options.onError?.(error, connectionId),
-      onClose: () => this.#connections.delete(connectionId),
+      onClose: () => {
+        closed = true;
+        this.#connections.delete(connectionId);
+      },
     });
 
     this.#connections.set(connectionId, { socket, transport });
@@ -413,6 +471,7 @@ export class AgenCUnixSocketServer {
       }, this.#options.acceptAuthenticationTimeoutMs ?? AGENC_DAEMON_SOCKET_ACCEPT_AUTH_TIMEOUT_MS);
     }
     socket.once("close", () => {
+      closed = true;
       clearAuthenticationTimeout();
       this.#connections.delete(connectionId);
       this.#options.onConnectionClosed?.(connectionId);

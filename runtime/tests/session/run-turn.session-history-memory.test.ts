@@ -72,7 +72,10 @@ import { createTestConfigStore } from "../fixtures.js";
 
 const LARGE_TOOL_OUTPUT_BYTES = 80_000; // > 64KB, well over the clear threshold.
 const KEEP_RECENT = 5; // mirrors microcompact's keep-recent window.
-const CLEARED_MARKER = "[Old tool result content cleared]";
+import {
+  CLEARED_MARKER,
+  isClearedToolResultMarker,
+} from "./helpers/cleared-tool-result-marker.js";
 const UNTRUSTED_TOOL_RESULT_BOUNDARY =
   "===== AGENC UNTRUSTED TOOL RESULT DATA =====";
 
@@ -469,7 +472,7 @@ describe("runTurn — session-history-memory in-memory retention bound", () => {
       const clearedMarkers = history.filter(
         (m) =>
           (m.role === "tool" || m.toolCallId !== undefined) &&
-          messageText(m) === CLEARED_MARKER,
+          isClearedToolResultMarker(messageText(m)),
       );
       expect(clearedMarkers.length).toBeGreaterThan(0);
 

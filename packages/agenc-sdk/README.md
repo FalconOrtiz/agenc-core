@@ -2,7 +2,8 @@
 
 **0.3.0** — typed, zero-dependency embedding SDK for the AgenC daemon protocol.
 
-Node **>=26.5 <27** · ESM only · plain `tsc` build · no runtime dependencies.
+Node **>=26.5 <27**, ESM only, TypeScript build with generated-contract checks,
+and no external runtime dependencies.
 
 ## Surfaces
 
@@ -12,13 +13,20 @@ Node **>=26.5 <27** · ESM only · plain `tsc` build · no runtime dependencies.
 | `promptViaSubprocess()`                                                      | Same event-iterable interface over `agenc -p --output-format stream-json` with no daemon socket access from your process.                                                                                              |
 | `client.runStatus` / `runResult` / `replayRun` / `runEvidence` / `cancelRun` | Read durable run/admission state, replay or hash canonical journal evidence, or cancel a run tree.                                                                                                                     |
 | `client.reattachRun({ runId, afterSequence })`                               | Catch up from a durable cursor, suppress and report duplicate delivery, stop on any explicit replay gap, and fetch the durable terminal result after reconnect.                                                        |
-| `client.request(method, params)`                                             | Raw typed JSON-RPC for all **53** public daemon methods (mirrored in `./protocol`).                                                                                                                                    |
+| `client.request(method, params)`                                             | Raw typed JSON-RPC for all **89** public daemon methods, generated from the daemon protocol. Required wire payloads must be supplied.                                                                                   |
 | `client.listCsvJobReviews` / `showCsvJobReview` / `resolveCsvJobReview`      | Typed CSV unknown-outcome review helpers (`csvJob.review.*`).                                                                                                                                                          |
 
 Errors: `AgencRpcError`, `AgencMalformedResponseError`,
 `AgencPromptRunInProgressError`, `AgencDuplicateSubmissionIncompleteError`,
 `AgencCapabilityUnavailableError` (1.2 fail-closed), `AgencRunReplayGapError`,
 `AgencRunReplayProtocolError`. Full table: [`docs/sdk.md`](../../docs/sdk.md).
+
+The socket transport rejects every pending request and closes the connection
+when a completed line contains malformed JSON or an invalid JSON-RPC response
+or notification envelope. `onClose` receives the protocol error once, and later
+requests fail immediately. Partial lines may span chunks within the 16 MiB
+buffer limit. Valid `message.send` and `message.stream` calls remain unbounded
+by the control-request timeout.
 
 Prompt events on protocol 1.2 also include `message_committed`,
 `history_reset`, `elicitation_request`, `gap`, and `session_event`. The sample
@@ -45,6 +53,12 @@ those guarantees are unavailable.
 Protocol 1.9 adds a Core-only admitted shell method; it is not exposed by the
 SDK request union.
 
+`createSession()`, `spawnAgent()`, and the CSV review helpers supply an omitted
+`cwd`. Direct `request()` calls require the daemon's complete payload, including
+`cwd` for those methods. The SDK generation check compiles exact request and
+result parity for every public method. See [protocol generation](../../docs/sdk.md#protocol-mirror--drift-guard)
+for regeneration and compatibility adapters.
+
 ```js
 import { connect, promptViaSubprocess } from "@tetsuo-ai/agenc-sdk";
 
@@ -67,10 +81,30 @@ await client.close();
 
 ## Defaults
 
+`connect({ readyTimeoutMs, signal })` uses one monotonic deadline for the initial
+probe, CLI startup, readiness polling, socket connection, and initialize
+handshake. The default is 45,000 ms. Caller cancellation preserves
+`signal.reason`; cancellation after `connect()` returns does not close the client.
+Control RPCs keep their separate request timeout.
+
+The nested starter receives the remaining `AGENC_DAEMON_READY_TIMEOUT_MS`.
+On timeout or cancellation, the SDK sends its starter `SIGTERM`, escalates to
+`SIGKILL` after 100 ms, and waits for `close`. Cleanup can add up to 1,000 ms
+beyond the readiness deadline. Missing `close` produces an `AggregateError`
+with the original reason as its cause. The SDK does not signal an existing
+daemon or claim to terminate a daemon that the starter already detached.
+
+Custom `AgencSpawnFn` adapters must now provide `kill`, `on("error")`,
+`once("close")`, and `removeListener` for those events. A piped stderr stream
+also needs `removeListener("data")`. Update exit-only test fakes to emit `close`
+after exit and stdio closure. A Node `ChildProcess` satisfies the contract
+without an adapter. No protocol or stored-state migration is needed.
+
 - Local endpoint: `${AGENC_HOME:-~/.agenc}/daemon.sock` on Unix; a stable per-home named pipe on Windows
 - Cookie: `${AGENC_HOME:-~/.agenc}/daemon.cookie` (first message must be `initialize` with `authCookie`; `connect()` handles this)
 - Plugin storage: `createSession()` requires an exact absolute `pluginStorageRoot` of at most 4096 UTF-8 bytes, with no surrounding whitespace. `AgencClient` does not reread `AGENC_PLUGIN_CACHE_DIR`, derive a root from `AGENC_HOME`, or accept `agentId`; use `attachAgent()` for an existing agent.
-- Autostart: runs `agenc daemon start` when the socket is down (disable with `autostart: false`)
+- Autostart: runs `agenc daemon start` when the socket is down (disable with `autostart: false`); when that start fails, the error carries the CLI's exit code and its last stderr lines
+- Environment: `createSession()` forwards this process's allowlisted environment as `envOverrides` (`collectClientEnvOverrides()`: the daemon's `AGENC_DAEMON_CLIENT_ENV_KEYS` such as `DEEPSEEK_API_KEY` or `AGENC_MODEL`, plus `AGENC_CREDENTIAL_*` bearers), the same ingress `agenc -p` uses, so a provider key exported in the embedder's shell reaches the session. Pass `envOverrides: {}` to forward nothing, or your own map to forward exactly that. A daemon session never inherits the daemon process's own environment.
 - Hook authority: `createSession()` sends `allowUntrustedHooks: false`. A caller using `spawnAgent()` must send complete runtime options and may set the field to `true` only after vetting the workspace. It permits command effects only and cannot override `simpleMode` hook suppression.
 - Home authority: `AGENC_HOME` must be absolute and is canonicalized before daemon paths are derived. Explicit socket and cookie paths do not bypass home-authority validation.
 
@@ -96,12 +130,21 @@ node packages/agenc-sdk/examples/one-shot.mjs --transport subprocess "say hello"
 Protocol drift is pinned by `runtime/tests/sdk-package/protocol-drift.contract.test.ts`
 against the runtime's canonical method registry.
 `session.transcript.v2` result shapes are generated from the daemon protocol
-into `src/transcript-v2.generated.ts` and checked by
+into `src/transcript-v2.generated.ts`. Refresh the file with
+`npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types -- --write`,
+then check it with
 `npm --workspace=@tetsuo-ai/runtime run check:sdk-generated-types`
 (see [`docs/sdk.md`](../../docs/sdk.md#transcript-v2-generated-mirror)).
 Workflow-result types in `src/workflow-result.generated.ts` are marker-checked
 by the same command, not an exact file compare
 (see [`docs/sdk.md`](../../docs/sdk.md#workflow-result-generated-mirror)).
+Workflow-handoff types, constants, and structural validator data in
+`src/workflow-handoff.generated.ts` are generated from the versioned runtime
+JSON schema and checked against the runtime schema and named constants.
+The same `--write` command refreshes the complete file. SDK build and typecheck
+run the read-only generated checks. Cross-field and UTF-8 validation stays in
+`src/workflow-handoff-validation.ts`, with no runtime package dependencies
+(see [`docs/sdk.md`](../../docs/sdk.md#workflow-handoff-generated-mirror)).
 
 ## Durable reconnect
 

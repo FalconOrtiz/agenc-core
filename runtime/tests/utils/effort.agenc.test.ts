@@ -80,7 +80,6 @@ test('explicit effort context wins over ambient provider and subscription state'
     getDefaultEffortForModelForContext,
     modelSupportsEffortForContext,
   } = await importFreshEffortModule({ provider: 'xai' })
-  vi.stubEnv('USER_TYPE', 'ant')
   const context = {
     home: {},
     environment: { TEST_SUBSCRIPTION: 'pro' },
@@ -151,4 +150,122 @@ test('grok models without catalog reasoning levels do not expose effort', async 
   })
 
   expect(modelSupportsEffort('grok-composer-2.5-fast')).toBe(false)
+})
+
+test('Meta Muse models expose and apply their exact catalog effort levels', async () => {
+  const {
+    effortValueToReasoningEffort,
+    getAvailableEffortLevelsForContext,
+    getDefaultEffortForModelForContext,
+    modelSupportsEffortForContext,
+    reasoningEffortToEffortLevel,
+    resolveAppliedEffortForContext,
+  } = await importFreshEffortModule({ provider: 'xai' })
+  const context = {
+    home: {},
+    environment: {},
+    provider: 'meta',
+  } as never
+
+  expect(modelSupportsEffortForContext('muse-spark-1.3', context)).toBe(true)
+  expect(
+    getAvailableEffortLevelsForContext('muse-spark-1.3', context),
+  ).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+  expect(
+    getDefaultEffortForModelForContext('muse-spark-1.3', context),
+  ).toBe('medium')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.3', 'max', context),
+  ).toBe('max')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.3', 'xhigh', context),
+  ).toBe('xhigh')
+  expect(
+    resolveAppliedEffortForContext('muse-spark-1.2', 'max', context),
+  ).toBe('xhigh')
+  expect(getAvailableEffortLevelsForContext('muse-spark-1.3-contributor', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('muse-spark-1.3-unverified', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('meta/muse-spark-1.3-unverified', context))
+    .not.toContain('max')
+  expect(getAvailableEffortLevelsForContext('meta/muse-spark-1.3', context))
+    .toContain('max')
+  const levels = getAvailableEffortLevelsForContext('muse-spark-1.3', context)
+  expect(effortValueToReasoningEffort('max', levels)).toBe('max')
+  expect(effortValueToReasoningEffort('xhigh', levels)).toBe('xhigh')
+  expect(reasoningEffortToEffortLevel('max')).toBe('max')
+  expect(reasoningEffortToEffortLevel('xhigh')).toBe('xhigh')
+  expect(effortValueToReasoningEffort('minimal')).toBe('minimal')
+  expect(reasoningEffortToEffortLevel('minimal')).toBe('minimal')
+})
+
+test.each(['deepseek-v4-flash', 'deepseek-v4-pro'])('native %s keeps Low/High/Max and defaults to High', async (model) => {
+  const effort = await importFreshEffortModule({ provider: 'xai' })
+  const context = { home: {}, environment: {}, provider: 'deepseek' } as never
+  expect(effort.getAvailableEffortLevelsForContext(model, context)).toEqual(['low', 'high', 'max'])
+  expect(effort.getDefaultEffortForModelForContext(model, context)).toBe('high')
+  expect(effort.resolveAppliedEffortForContext(model, 'max', context)).toBe('max')
+  expect(effort.getDisplayedEffortLevelForContext(model, 'max', context)).toBe('max')
+})
+
+test('Z.ai GLM-5.3 exposes, defaults, applies, and displays literal max effort', async () => {
+  const {
+    getAvailableEffortLevelsForContext,
+    getDefaultEffortForModelForContext,
+    getDisplayedEffortLevelForContext,
+    getEffortSuffixForContext,
+    modelSupportsEffortForContext,
+    modelSupportsMaxEffortForContext,
+    resolveAppliedEffortForContext,
+  } = await importFreshEffortModule({ provider: 'xai' })
+  const context = {
+    home: {},
+    environment: {},
+    provider: 'zai',
+  } as never
+
+  expect(modelSupportsEffortForContext('glm-5.3', context)).toBe(true)
+  expect(modelSupportsMaxEffortForContext('glm-5.3', context)).toBe(true)
+  expect(getAvailableEffortLevelsForContext('glm-5.3', context)).toEqual([
+    'low',
+    'high',
+    'max',
+  ])
+  expect(getDefaultEffortForModelForContext('glm-5.3', context)).toBe('max')
+  expect(resolveAppliedEffortForContext('glm-5.3', 'max', context)).toBe(
+    'max',
+  )
+  expect(resolveAppliedEffortForContext('glm-5.3', undefined, context)).toBe(
+    'max',
+  )
+  expect(getDisplayedEffortLevelForContext('glm-5.3', undefined, context)).toBe(
+    'max',
+  )
+  expect(getEffortSuffixForContext('glm-5.3', 'max', context)).toBe(
+    ' with max effort',
+  )
+})
+
+test('Z.AI Coding Plan preserves the same literal max effort contract', async () => {
+  const {
+    getAvailableEffortLevelsForContext,
+    getDefaultEffortForModelForContext,
+    modelSupportsMaxEffortForContext,
+    resolveAppliedEffortForContext,
+  } = await importFreshEffortModule({ provider: 'xai' })
+  const context = {
+    home: {},
+    environment: {},
+    provider: 'zai-coding-plan',
+  } as never
+
+  expect(getAvailableEffortLevelsForContext('glm-5.3', context)).toEqual([
+    'low',
+    'high',
+    'max',
+  ])
+  expect(getDefaultEffortForModelForContext('glm-5.3', context)).toBe('max')
+  expect(modelSupportsMaxEffortForContext('glm-5.3', context)).toBe(true)
+  expect(resolveAppliedEffortForContext('glm-5.3', 'max', context)).toBe('max')
 })

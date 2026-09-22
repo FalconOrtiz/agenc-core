@@ -1,17 +1,32 @@
-# Imagine image and video tools
+# Image and video generation tools
 
-LIVE tools `ImagineImage` and `ImagineVideo` call xAI Grok Imagine REST
-endpoints. They are registered on the tool catalog but only run when all of
-these hold:
+LIVE tools `ImagineImage` and `ImagineVideo` use separately authenticated
+media backends. The provider that performs the reasoning turn does **not** gate
+these tools: Meta, OpenAI, Grok, and any other tool-capable model can invoke
+them when the corresponding media backend is configured.
 
-1. Session provider is `grok`
-2. Inference host is direct xAI (`api.x.ai`), not OpenRouter or another gateway
-3. Credentials: `XAI_API_KEY` / `GROK_API_KEY`, or
-   `/grok-login` subscription OAuth
+Because one registry survives in-session provider switches, bootstrap keeps
+universal `ImagineImage` and `ImagineVideo` entries deferred even before a
+session or media credential is attached. Discovering them after login or a
+provider switch re-resolves the current backend; an unconfigured or
+Coding-Plan-only session fails closed without making HTTP.
+
+| Tool | Backend availability |
+| --- | --- |
+| `ImagineImage` | Meta Muse Image (`MODEL_API_KEY`), QwenCloud image APIs (`DASHSCOPE_API_KEY` / `QWEN_API_KEY` or `QWEN_TOKEN_PLAN_API_KEY`), Z.AI GLM-Image (`ZAI_API_KEY`), or xAI Imagine (`XAI_API_KEY`, `GROK_API_KEY`, or `/grok-login` OAuth) |
+| `ImagineVideo` | xAI Imagine with `XAI_API_KEY`, `GROK_API_KEY`, or `/grok-login` OAuth |
+
+Backend authority is credential-isolated. A provider session key is reused
+only for that same provider's native media route. A direct Grok session may
+reuse its own xAI bearer; QwenCloud and Z.AI Pay-As-You-Go sessions likewise
+prefer their matching image service. A Z.AI Coding Plan credential is chat-only
+and is never reused for images. Other reasoning providers reach those services only
+through independently configured media credentials. No OpenAI, Meta,
+QwenCloud, Z.AI, xAI, or gateway key is forwarded to a different backend.
 
 Both tools require approval (`requiresApproval: true`) and run exclusive
 (no parallel sibling Imagine calls). Files land under
-`<workspace>/.agenc/imagine/` (`imagine-<uuid>.jpg`,
+`<workspace>/.agenc/imagine/` (`imagine-<uuid>.<image-extension>`,
 `imagine-video-<uuid>.mp4`). The tool result returns the path.
 
 Catalog row: [tools-permissions-sandbox.md](reference/tools-permissions-sandbox.md).
@@ -20,25 +35,45 @@ OAuth: [grok-oauth.md](grok-oauth.md).
 ## ImagineImage
 
 Source: `runtime/src/tools/system/imagine-image.ts`.
-POST `https://api.x.ai/v1/images/generations`. Tool timeout 150 s; the
-request itself uses a 120 s abort.
+
+- Meta backend: POST
+  `${META_BASE_URL:-https://api.meta.ai/v1}/images/generations` with
+  `muse-image-1.0`.
+- QwenCloud backend: the matching Pay-As-You-Go synchronous Qwen Image route,
+  or Token Plan asynchronous Wan route and task polling.
+- Z.AI backend: POST
+  `${ZAI_BASE_URL:-https://api.z.ai/api/paas/v4}/images/generations` with
+  `glm-image` (default) or `cogview-4-250304`. The separate Coding Plan base
+  does not accept or advertise this general image route; only `ZAI_API_KEY`
+  can authorize it.
+- xAI backend: POST `https://api.x.ai/v1/images/generations` with
+  `grok-imagine-image` or `grok-imagine-image-quality`.
+
+The tool timeout is 210 s; the request/polling path uses a 180 s abort.
 
 | Argument | Required | Notes |
 | --- | --- | --- |
 | `prompt` | yes | Text prompt |
-| `model` | no | `grok-imagine-image` (default) or `grok-imagine-image-quality` |
-| `n` | no | 1-10 images, default 1 |
+| `model` | no | Backend-specific allowlist. Defaults: `muse-image-1.0` on Meta, `qwen-image-3.0` or `wan2.7-image` on QwenCloud, `glm-image` on Z.AI, and `grok-imagine-image` on xAI |
+| `n` | no | Default 1. Z.AI returns exactly one. Other backend/model limits are clamped by their documented maximum |
 | `aspect_ratio` | no | `1:1`, `16:9`, `9:16`, `4:3`, `3:4`, `3:2`, `2:3`, `2:1`, `1:2`, `19.5:9`, `9:19.5`, `20:9`, `9:20`, `auto` |
-| `resolution` | no | `1k` or `2k` |
+| `resolution` | no | QwenCloud/xAI: `1k` or `2k` |
+| `quality` | no | Z.AI only: `hd` or `standard`; defaults to `hd` for `glm-image` and `standard` for CogView |
 
-Ask the agent to generate an image in a grok session, or call the tool by
-name. The model only sees the tool when the gate stack above succeeds.
+For Meta, aspect ratios map to `1024x1024`, `1536x1024`, or `1024x1536`.
+QwenCloud sizes use the provider's grid/area constraints. Z.AI aspect ratios
+map to its recommended model-specific sizes; arbitrary image models are
+rejected from both this tool and the Z.AI chat provider. URL downloads require
+credential-free HTTPS, revalidate every redirect against a provider-specific
+host allowlist, stream through a 20 MiB cap, require an image content type, and
+derive the saved extension from that content type.
 
 ## ImagineVideo
 
 Source: `runtime/src/tools/system/imagine-video.ts`.
-POST `/v1/videos/generations`, then poll `GET /v1/videos/{request_id}` until
-done. Tool timeout 300 s. Poll interval 5 s, poll budget 240 s.
+The execution backend is always direct xAI: POST `/v1/videos/generations`, then
+poll `GET /v1/videos/{request_id}` until done. The reasoning model can belong to
+any provider. Tool timeout 300 s. Poll interval 5 s, poll budget 240 s.
 
 | Argument | Required | Notes |
 | --- | --- | --- |
@@ -54,10 +89,12 @@ Saves an MP4 under the workspace.
 
 ## Failures you will actually see
 
-- Session provider is not grok
-- Base URL is not `api.x.ai` (OpenRouter is refused)
-- No bearer token (set a key or run `/grok-login`)
+- No compatible media credential is configured
+- An independently configured xAI base URL is not direct `api.x.ai`
+- `ZAI_BASE_URL` points at the chat-only Coding Plan route
+- The requested model belongs to the other image backend
 - Missing `prompt`
 - Approval denied
 
-There is no separate `agenc imagine` CLI. These are model tools.
+Changing the reasoning provider does not fix a missing media credential. There
+is no separate `agenc imagine` CLI; these are model tools.

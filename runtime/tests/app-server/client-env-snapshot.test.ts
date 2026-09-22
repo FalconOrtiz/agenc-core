@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  captureRecoverableCommandEnvironment,
   collectDaemonClientEnvOverrides,
   DAEMON_CLIENT_ENV_SNAPSHOT_KEYS,
   mergeDaemonClientEnvironment,
   normalizeDaemonClientEnvOverrides,
+  readRecoverableCommandEnvironment,
 } from "../../src/app-server/client-env-snapshot.js";
 
 describe("daemon client environment snapshots", () => {
@@ -103,7 +105,6 @@ describe("daemon client environment snapshots", () => {
       AGENC_REMOTE: "1",
       AGENC_REMOTE_SESSION_ID: "session-client-a",
       SESSION_INGRESS_URL: "https://ingress-a.example",
-      USER_TYPE: "ant",
     });
     const second = collectDaemonClientEnvOverrides({
       AGENC_REMOTE_SESSION_ID: "session-client-b",
@@ -113,12 +114,10 @@ describe("daemon client environment snapshots", () => {
     expect(first).toMatchObject({
       AGENC_REMOTE_SESSION_ID: "session-client-a",
       SESSION_INGRESS_URL: "https://ingress-a.example",
-      USER_TYPE: "ant",
     });
     expect(second).toMatchObject({
       AGENC_REMOTE_SESSION_ID: "session-client-b",
       SESSION_INGRESS_URL: "https://ingress-b.example",
-      USER_TYPE: "",
     });
     expect(first).not.toHaveProperty("AGENC_REMOTE");
     expect(second).not.toHaveProperty("AGENC_REMOTE");
@@ -216,5 +215,51 @@ describe("daemon client environment snapshots", () => {
     expect(() =>
       normalizeDaemonClientEnvOverrides({ DOCS_MCP_AUTHORIZATION: "secret" }),
     ).toThrow(/unsupported key.*DOCS_MCP_AUTHORIZATION/i);
+  });
+
+  it("accepts only well-formed AGENC_CREDENTIAL_ keys on the protocol surface", () => {
+    expect(() =>
+      normalizeDaemonClientEnvOverrides({ AGENC_CREDENTIAL_DOCS_MCP: "Bearer x" }),
+    ).not.toThrow();
+    expect(
+      normalizeDaemonClientEnvOverrides({ AGENC_CREDENTIAL_DOCS_MCP: "Bearer x" })
+        .AGENC_CREDENTIAL_DOCS_MCP,
+    ).toBe("Bearer x");
+    for (const key of [
+      "AGENC_CREDENTIAL_",
+      "AGENC_CREDENTIAL",
+      "AGENC_CREDENTIAL_docs",
+      "AGENC_CREDENTIAL_FOO-BAR",
+    ]) {
+      expect(() => normalizeDaemonClientEnvOverrides({ [key]: "secret" })).toThrow(
+        new RegExp(`unsupported key.*${key}`, "i"),
+      );
+    }
+  });
+
+  it("captures only PATH for recoverable command environment", () => {
+    expect(
+      captureRecoverableCommandEnvironment({
+        PATH: "/client/bin",
+        AGENC_PROVIDER: "gemini",
+      }),
+    ).toEqual({ PATH: "/client/bin" });
+    expect(captureRecoverableCommandEnvironment({ PATH: "   " })).toEqual({
+      PATH: "",
+    });
+    expect(captureRecoverableCommandEnvironment(undefined)).toEqual({ PATH: "" });
+  });
+
+  it("rejects malformed recoverable command environment payloads", () => {
+    expect(readRecoverableCommandEnvironment({ PATH: "/bin" })).toEqual({
+      PATH: "/bin",
+    });
+    expect(
+      readRecoverableCommandEnvironment({ PATH: "/bin", EXTRA: "x" }),
+    ).toBeUndefined();
+    expect(readRecoverableCommandEnvironment({ PATH: "/bin\0evil" })).toBeUndefined();
+    expect(readRecoverableCommandEnvironment(["PATH"])).toBeUndefined();
+    expect(readRecoverableCommandEnvironment(null)).toBeUndefined();
+    expect(readRecoverableCommandEnvironment({ path: "/bin" })).toBeUndefined();
   });
 });

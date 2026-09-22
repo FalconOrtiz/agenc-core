@@ -1,1 +1,1 @@
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max'
+export type EffortLevel = 'minimal' | 'low' | 'medium' | 'high' | 'max'

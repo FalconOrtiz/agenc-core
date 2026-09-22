@@ -1,7 +1,6 @@
 /**
  * StreamingToolExecutor — full AgenC port.
  *
- * Hand-port of the reference streaming tool executor.
  * Dispatches tools as they stream in from the model, with four-class
  * concurrency control (via the T7 `classify` analyzer) + sibling-
  * abort cascade on Bash errors + order-preserving yield of completed
@@ -66,7 +65,8 @@ import {
   type LiveToolDispatchOptions,
   type ToolRouter,
 } from "./router.js";
-import { resolveTimeoutMs } from "./execution.js";
+import { resolveTimeoutMs, parseToolArgsWithBigInt } from "./execution.js";
+import { normalizeModelToolArgs } from "./argument-validation.js";
 import type { ToolUseBlock } from "../session/turn-state.js";
 import type { Tool } from "./types.js";
 import {
@@ -113,6 +113,13 @@ export interface TrackedTool {
    * dispatch promise never settles.
    */
   executingSinceMs?: number;
+  /**
+   * Wall time from `executingSinceMs` to the terminal write, captured in
+   * `finalizeOnce`. Reported on the yielded result and on
+   * `tool_call_completed` so latency is observable without reconstructing
+   * it from admission timestamps. 0 for tools that never started executing.
+   */
+  durationMs?: number;
   /**
    * Per-tool, listener-free cancel controller created in runOne. Composed into
    * the dispatch signal via `AbortSignal.any`. The drain backstop fires THIS
@@ -608,8 +615,10 @@ export class StreamingToolExecutor {
     }
 
     const classifiable = this.resolveClassifiable(toolCall);
-    const parsedArgs = parseToolCallArguments(toolCall.arguments);
-    const classification = classify(classifiable, parsedArgs);
+    const parsedArgs = parseToolArgsWithBigInt(toolCall.arguments ?? "{}");
+    const validation = parsedArgs === null ? null : normalizeModelToolArgs(classifiable.inputSchema, parsedArgs);
+    const executionArgs = validation?.valid ? validation.args ?? parsedArgs : null;
+    const classification = executionArgs === null ? EXCLUSIVE : classify(classifiable, executionArgs);
     // AgenC tracks a per-call `isConcurrencySafe` boolean derived
     // from the tool's `isConcurrencySafe(args)` hook. We keep the T7
     // classification model but also cache the boolean so the
@@ -618,9 +627,11 @@ export class StreamingToolExecutor {
     const resolvedName = this.resolveModelToolName(toolCall.name);
     const tool = this.registry.tools.find((t) => t.name === resolvedName);
     let concurrencySafe = false;
-    if (tool?.isConcurrencySafe) {
+    if (executionArgs === null) {
+      concurrencySafe = false;
+    } else if (tool?.isConcurrencySafe) {
       try {
-        concurrencySafe = Boolean(tool.isConcurrencySafe(parsedArgs));
+        concurrencySafe = Boolean(tool.isConcurrencySafe(executionArgs));
       } catch {
         concurrencySafe = false;
       }
@@ -711,7 +722,7 @@ export class StreamingToolExecutor {
           result: tool.result,
           additionalContexts: tool.additionalContexts ?? [],
           status: tool.error ? "synthetic_error" : "completed",
-          durationMs: 0,
+          durationMs: tool.durationMs ?? 0,
         };
       } else if (tool.status === "executing" && !tool.isConcurrencySafe) {
         // Head-of-line break (AgenC :436-438). A still-running
@@ -748,7 +759,7 @@ export class StreamingToolExecutor {
             result: tool.result,
             additionalContexts: tool.additionalContexts ?? [],
             status: tool.error ? "synthetic_error" : "completed",
-            durationMs: 0,
+            durationMs: tool.durationMs ?? 0,
           },
         };
       } else if (tool.status === "executing" && !tool.isConcurrencySafe) {
@@ -779,11 +790,12 @@ export class StreamingToolExecutor {
         }
         if (this.discarded) return;
 
-        if (
-          this.hasExecutingTools() &&
-          !this.hasCompletedResults() &&
-          !this.hasPendingProgress()
-        ) {
+        // Wait unless a drain pass would yield something now. A completed
+        // result behind a still-executing exclusive tool cannot be yielded
+        // yet (the pass stops at that head to keep submission order), so
+        // counting it skipped this wait and spun the loop on microtasks,
+        // starving the head tool's own I/O and timers.
+        if (this.hasExecutingTools() && !this.hasDrainableWork()) {
           await this.waitForExecutingToolOrProgress();
         }
       }
@@ -818,11 +830,12 @@ export class StreamingToolExecutor {
         }
         if (this.discarded) return;
 
-        if (
-          this.hasExecutingTools() &&
-          !this.hasCompletedResults() &&
-          !this.hasPendingProgress()
-        ) {
+        // Wait unless a drain pass would yield something now. A completed
+        // result behind a still-executing exclusive tool cannot be yielded
+        // yet (the pass stops at that head to keep submission order), so
+        // counting it skipped this wait and spun the loop on microtasks,
+        // starving the head tool's own I/O and timers.
+        if (this.hasExecutingTools() && !this.hasDrainableWork()) {
           await this.waitForExecutingToolOrProgress();
         }
       }
@@ -940,6 +953,7 @@ export class StreamingToolExecutor {
         : defaultConcurrencyClassFor(resolvedName));
     return {
       name: resolvedName,
+      inputSchema: tool?.inputSchema as Record<string, unknown> | undefined,
       concurrencyClass: resolvedClass,
       isConcurrencySafe: (tool as Tool | undefined)?.isConcurrencySafe,
       ...(resolvedServerId !== undefined ? { serverId: resolvedServerId } : {}),
@@ -966,12 +980,21 @@ export class StreamingToolExecutor {
     return this.tools.some((t) => t.status === "executing");
   }
 
-  private hasCompletedResults(): boolean {
-    return this.tools.some((t) => t.status === "completed");
-  }
-
-  private hasPendingProgress(): boolean {
-    return this.tools.some((t) => t.pendingProgress.length > 0);
+  /**
+   * True when a drain pass (`getCompletedResults` / `getCompletedUpdates`)
+   * would flush or yield something now: pending progress on a tool the pass
+   * reaches, or a completed result ahead of the first executing exclusive
+   * tool. It walks the tools with the pass's own head-of-line rule, so a
+   * result the pass cannot yield yet never counts as work.
+   */
+  private hasDrainableWork(): boolean {
+    for (const tool of this.tools) {
+      if (tool.pendingProgress.length > 0) return true;
+      if (tool.status === "yielded") continue;
+      if (tool.status === "completed" && tool.result) return true;
+      if (tool.status === "executing" && !tool.isConcurrencySafe) return false;
+    }
+    return false;
   }
 
   /**
@@ -1068,6 +1091,10 @@ export class StreamingToolExecutor {
     if (error !== undefined) tool.error = error;
     tool.result = result;
     tool.status = "completed";
+    tool.durationMs =
+      tool.executingSinceMs === undefined
+        ? 0
+        : Math.max(0, performance.now() - tool.executingSinceMs);
     return true;
   }
 
@@ -1472,13 +1499,16 @@ export class StreamingToolExecutor {
       // no result overwrite, no status flip-back, no sibling cascade.
       const didFinalize = this.finalizeOnce(tool, result);
 
-      // Sibling-abort cascade for shell-style tools.
+      // Sibling-abort cascade for shell-style tools. Only meaningful when
+      // another tool in the batch is still pending; a lone failing shell
+      // call has nothing to cancel and the warning would be noise.
       if (
         didFinalize &&
         result.isError === true &&
         this.isSiblingAbortShellTool(tool.toolCall.name) &&
         !this.discarded &&
-        !this.hasBashErrored
+        !this.hasBashErrored &&
+        this.hasOtherPendingTools(tool)
       ) {
         this.hasBashErrored = true;
         this.onSiblingAbort?.(`bash_error:${tool.toolCall.name}`);
@@ -1500,7 +1530,8 @@ export class StreamingToolExecutor {
         didFinalize &&
         this.isSiblingAbortShellTool(tool.toolCall.name) &&
         !this.discarded &&
-        !this.hasBashErrored
+        !this.hasBashErrored &&
+        this.hasOtherPendingTools(tool)
       ) {
         this.hasBashErrored = true;
         this.onSiblingAbort?.(`bash_threw:${tool.toolCall.name}`);
@@ -1540,6 +1571,21 @@ export class StreamingToolExecutor {
 
   private isSiblingAbortShellTool(toolName: string): boolean {
     return toolName === this.bashToolName || toolName === "exec_command";
+  }
+
+  /**
+   * True when another tracked tool is still `queued` or `executing`. The
+   * shell sibling-abort cascade exists to cancel later calls in the same
+   * batch that may depend on the failed command; with nothing else in
+   * flight there is nothing to cancel, so neither the cascade nor its
+   * `sibling_tool_abort` warning should fire.
+   */
+  private hasOtherPendingTools(tool: TrackedTool): boolean {
+    return this.tools.some(
+      (other) =>
+        other !== tool &&
+        (other.status === "queued" || other.status === "executing"),
+    );
   }
 
   private buildRuntimeCallContext(

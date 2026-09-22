@@ -29,8 +29,13 @@ import type {
   ToolCallValidationFailure,
 } from "../../types.js";
 import { validateToolCallDetailed } from "../../types.js";
-import { decodeMcpToolNameFromWire } from "../../wire/mcp-tool-naming.js";
-import { LLMProviderError, mapLLMError } from "../../errors.js";
+import {
+  decodeMcpToolNameFromWire,
+  encodeMcpToolNameForWire,
+} from "../../wire/mcp-tool-naming.js";
+import { LLMProviderError, LLMServerError, LLMStreamTruncatedError, mapLLMError,
+  LLMRequestRebuiltError,
+} from "../../errors.js";
 import { ensureLazyImport } from "../../lazy-import.js";
 import {
   assertProviderStructuredOutputCompatibility,
@@ -64,6 +69,7 @@ import {
   type AuthRefreshCallbacks,
   type AuthRefreshOutcome,
 } from "./auth-refresh.js";
+import { xaiBillingRefusalError } from "./billing-refusal.js";
 import { monotonicMs } from "../../_deps/monotonic.js";
 import { resolveContextWindowProfile } from "../../_deps/context-window.js";
 import { getSelectedProviderEnvironment } from "../../../utils/model/providers.js";
@@ -86,9 +92,13 @@ import {
   type ProviderFallbackDecision,
 } from "../../api/fallback-ladder.js";
 import { getRetryDelay, sleepMs } from "../../api/retry.js";
-import { isFallbackTriggeredError } from "../../../recovery/api-errors.js";
+import {
+  isFallbackTriggeredError,
+  isResampleableStreamInterruption,
+} from "../../../recovery/api-errors.js";
 import {
   buildXaiResponsesInputItems,
+  extractXaiReasoningReplay,
   resolveXaiResponsesToolChoice,
   toXaiResponsesTools,
   XAI_ENCRYPTED_REASONING_INCLUDE,
@@ -131,6 +141,20 @@ const RAW_REASONING_SUMMARY_INDEX_OFFSET = 10_000;
  * can opt out with `AGENC_XAI_STORE=0` (or "false"/"off"), which restores
  * the old behavior at the documented speed cost.
  */
+/**
+ * xAI refuses to persist a response above its storage limit ("Response is
+ * too large to store. You can avoid this error by setting `store` to false in
+ * your request."). Storing is only the speed preference behind
+ * {@link xaiResponseStoreDefault}, so the same request goes out once more
+ * unstored instead of ending the turn (seen on Terminal-Bench 4.0: a
+ * heat-pump-warranty session died with that text as its last line).
+ */
+function isResponseTooLargeToStore(err: unknown): boolean {
+  const message =
+    err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  return /too large to store/i.test(message);
+}
+
 export function xaiResponseStoreDefault(): boolean {
   const raw = getSelectedProviderEnvironment().AGENC_XAI_STORE?.trim().toLowerCase();
   return raw !== "0" && raw !== "false" && raw !== "off";
@@ -147,6 +171,7 @@ type ProviderFallbackWaitDecision = Extract<
  * client function tools on that family (built-ins + remote MCP only).
  */
 const VISION_MODELS_WITH_TOOLS = new Set([
+  "grok-4.7",
   "grok-4.6",
   "grok-4.6-latest",
   "grok-4.5",
@@ -265,6 +290,16 @@ interface RequestTimeoutResolution {
   readonly source: RequestTimeoutSource;
 }
 
+/**
+ * Request-open (headers) deadline applied when no operator timeout exists.
+ * A stream that has not even opened after two minutes is a dead or
+ * half-open socket, not a thinking model; the abort maps to a retryable
+ * LLMTimeoutError so the reconnect ladder replaces the connection instead of
+ * the turn hanging until the user cancels. An explicit `timeout_ms`
+ * (including `0` to disable) always wins over this default.
+ */
+export const DEFAULT_REQUEST_OPEN_TIMEOUT_MS = 120_000;
+
 function normalizeConfiguredTimeoutMs(
   timeoutMs: number | undefined,
 ): number | null {
@@ -347,6 +382,7 @@ async function nextStreamChunkWithTimeout<T>(
   // gaphunt3 #21: the caller's AbortSignal must keep teeing the open stream;
   // withTimeout detaches at stream-open, so the chunk loop re-supplies it here.
   externalSignal?: AbortSignal,
+  abortStream?: (reason?: unknown) => void,
 ): Promise<IteratorResult<T>> {
   const effectiveTimeoutMs =
     typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : undefined;
@@ -357,8 +393,10 @@ async function nextStreamChunkWithTimeout<T>(
   // gaphunt3 #21: already-aborted signals must reject before awaiting the next
   // chunk so a mid-stream cancel cannot block on a slow iterator.next().
   if (externalSignal?.aborted) {
+    const error = createStreamAbortError(providerName, externalSignal);
+    abortStream?.(error);
     await closeAsyncIterator(iterator);
-    throw createStreamAbortError(providerName, externalSignal);
+    throw error;
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -377,6 +415,7 @@ async function nextStreamChunkWithTimeout<T>(
   const interrupt = (error: Error): void => {
     if (interruption.error !== undefined) return;
     interruption.error = error;
+    abortStream?.(error);
     void (async () => {
       // `return()` requests teardown, but the AsyncIterator contract does not
       // guarantee that its resolution also settles an already-pending
@@ -788,6 +827,25 @@ function errorMessageFromStreamEvent(event: unknown): string {
     : "Provider stream returned an error event";
 }
 
+/**
+ * The first field that holds an explicit numeric HTTP status, in the order given.
+ * A non-numeric value (a response status such as "failed", or a symbolic code
+ * such as "server_error") is skipped rather than ending the search, so a later
+ * explicit 4xx is never hidden behind it.
+ */
+function firstNumericStatus(...values: readonly unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed =
+      typeof value === "number"
+        ? value
+        : typeof value === "string"
+          ? Number.parseInt(value, 10)
+          : Number.NaN;
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
 function statusFromStreamEvent(event: unknown): number | undefined {
   if (!event || typeof event !== "object") return undefined;
   const record = event as Record<string, unknown>;
@@ -797,17 +855,59 @@ function statusFromStreamEvent(event: unknown): number | undefined {
     !Array.isArray(record.error)
       ? (record.error as Record<string, unknown>)
       : undefined;
-  const raw =
-    record.status ??
-    record.status_code ??
-    record.statusCode ??
-    nestedError?.status ??
-    nestedError?.status_code ??
-    nestedError?.statusCode ??
-    nestedError?.code;
-  const parsed =
-    typeof raw === "number" ? raw : Number.parseInt(String(raw ?? ""), 10);
-  return Number.isFinite(parsed) ? parsed : undefined;
+  return firstNumericStatus(
+    record.status,
+    record.status_code,
+    record.statusCode,
+    nestedError?.status,
+    nestedError?.status_code,
+    nestedError?.statusCode,
+    nestedError?.code,
+  );
+}
+
+function codeFromStreamEvent(event: unknown): unknown {
+  if (!event || typeof event !== "object") return undefined;
+  const record = event as Record<string, unknown>;
+  const nestedError =
+    record.error &&
+    typeof record.error === "object" &&
+    !Array.isArray(record.error)
+      ? (record.error as Record<string, unknown>)
+      : undefined;
+  return record.code ?? nestedError?.code;
+}
+
+const XAI_SERVER_FAILURE_CODES = new Set([
+  "server_error",
+  "internal_error",
+  "internal_server_error",
+]);
+const XAI_GENERATION_FAILURE_RE = /\binternal error during token generation\b/i;
+
+/**
+ * xAI can fail a sample on its own side inside an HTTP 200 stream, as an
+ * `error` event or `response.failed` that carries no numeric status: only a
+ * symbolic server code, or the text "Internal error during token generation".
+ * Nothing about the request was wrong, so it is typed as a server error, which
+ * the turn's bounded reconnect ladder retries. A numeric status keeps its own
+ * mapping (5xx server, 4xx terminal), and any other failure is left untyped.
+ */
+function xaiStatuslessServerFailure(
+  providerName: string,
+  message: string,
+  status: number | undefined,
+  code: unknown,
+): LLMServerError | undefined {
+  if (status !== undefined) return undefined;
+  const symbolic = typeof code === "string" ? code.trim().toLowerCase() : "";
+  if (
+    XAI_SERVER_FAILURE_CODES.has(symbolic) ||
+    XAI_GENERATION_FAILURE_RE.test(message)
+  ) {
+    return new LLMServerError(providerName, 500, message);
+  }
+  return undefined;
 }
 
 function errorFromStreamEvent(event: unknown): Error {
@@ -825,6 +925,12 @@ export class GrokProvider implements LLMProvider {
 
   private client: unknown | null = null;
   private readonly config: GrokProviderConfig;
+  /**
+   * Set once xAI refused to store a response for this session: every later
+   * plan is unstored with full history (an unstored response cannot be
+   * continued), so the refusal cannot repeat on the next admitted attempt.
+   */
+  private storeRefused = false;
   /** I-2 / I-14 tracker — zeroed by AgenC post-compact cleanup via
    *  clearAllResponseIds(); used to send delta input with
    *  previous_response_id when the request shape is unchanged. */
@@ -860,7 +966,7 @@ export class GrokProvider implements LLMProvider {
       model: config.model ?? BUILT_IN_PROVIDER_DEFAULT_MODELS.grok,
       baseURL: config.baseURL ?? BUILT_IN_PROVIDER_BASE_URLS.grok,
       timeoutMs: normalizeTimeoutMs(config.timeoutMs),
-      parallelToolCalls: config.parallelToolCalls ?? false,
+      parallelToolCalls: config.parallelToolCalls ?? true,
     };
 
     // Build client-side function tools plus provider-native tool definitions.
@@ -991,6 +1097,55 @@ export class GrokProvider implements LLMProvider {
       recordedAtMs: monotonicMs(),
     };
     this.incrementalTracker.recordResponse(snapshot);
+  }
+
+  /**
+   * One unstored retry of the same request after xAI refused to store the
+   * response: full history (an unstored response cannot be continued) and
+   * `store: false`. Shared by the non-streaming and streaming paths.
+   */
+  private unstoredRetryPlan(
+    messages: readonly LLMMessage[],
+    options: LLMChatOptions | undefined,
+  ): ReturnType<GrokProvider["buildRequestPlan"]> {
+    this.noteStoreRefusal();
+    this.emitRuntimeWarning(
+      "xai_store_too_large",
+      `${this.name} could not store the response; retrying once with store: false`,
+    );
+    const plan = this.buildRequestPlan(messages, options, {
+      disableIncremental: true,
+    });
+    (plan.params as Record<string, unknown>).store = false;
+    return plan;
+  }
+
+  /**
+   * Latch the store refusal for the session and drop the continuation the
+   * refused request may have been extending: an unstored conversation is
+   * resent in full on every later call.
+   */
+  private noteStoreRefusal(): void {
+    if (this.storeRefused) return;
+    this.storeRefused = true;
+    this.incrementalTracker.clearResponseId();
+  }
+
+  /**
+   * Under an admitted single wire attempt the adapter must not retry in
+   * band; it rebuilds its plan (unstored from now on) and hands the ladder a
+   * retryable error so the next admitted attempt carries the new plan.
+   */
+  private storeRefusalUnderAdmission(): LLMRequestRebuiltError {
+    this.noteStoreRefusal();
+    this.emitRuntimeWarning(
+      "xai_store_too_large",
+      `${this.name} could not store the response; the next admitted attempt resends the conversation with store: false`,
+    );
+    return new LLMRequestRebuiltError(
+      this.name,
+      "xAI could not store the response; the request is resent unstored on the next attempt",
+    );
   }
 
   private emitRuntimeWarning(cause: string, message: string): void {
@@ -1149,6 +1304,11 @@ export class GrokProvider implements LLMProvider {
           activePlan.requestMetrics,
           activePlan.compactionDiagnostics,
           options?.structuredOutput,
+          this.advertisedCanonicalToolNames(
+            activePlan.params,
+            options?.tools,
+          ),
+          String(activePlan.params.model),
         );
         this.emitToolCallNormalizationIssues(
           parsed.normalizationIssues,
@@ -1190,7 +1350,7 @@ export class GrokProvider implements LLMProvider {
       // (called from AgenC post-compact cleanup) zeros this on every
       // compaction.
       this.noteIncrementalRequest(
-        plan.requestMessages ?? messages,
+        plan.incrementalBaseline ?? plan.requestMessages ?? messages,
         plan.params as Record<string, unknown>,
       );
 
@@ -1232,6 +1392,20 @@ export class GrokProvider implements LLMProvider {
       return parsed;
       } catch (err: unknown) {
       if (
+        isResponseTooLargeToStore(err) &&
+        (plan.params as Record<string, unknown>).store !== false
+      ) {
+        if (options?.singleWireAttempt === true) {
+          throw this.storeRefusalUnderAdmission();
+        }
+        const retryPlan = this.unstoredRetryPlan(messages, options);
+        return await retryWithAuthRefresh(
+          String(this.config.apiKey),
+          async () => run(retryPlan),
+          this.authRefreshCallbacks,
+        );
+      }
+      if (
         options?.singleWireAttempt !== true &&
         isContinuationRetrievalFailure(err) &&
         "previous_response_id" in plan.params
@@ -1246,7 +1420,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            retryPlan.requestMessages ?? messages,
+            retryPlan.incrementalBaseline ?? retryPlan.requestMessages ?? messages,
             retryPlan.params as Record<string, unknown>,
           );
           const parsed = await retryWithAuthRefresh(
@@ -1323,7 +1497,7 @@ export class GrokProvider implements LLMProvider {
     const client = await this.ensureClient();
     let plan = this.buildRequestPlan(messages, options);
     this.noteIncrementalRequest(
-      plan.requestMessages ?? messages,
+      plan.incrementalBaseline ?? plan.requestMessages ?? messages,
       plan.params as Record<string, unknown>,
     );
     let params: Record<string, unknown> = { ...plan.params, stream: true };
@@ -1337,11 +1511,18 @@ export class GrokProvider implements LLMProvider {
       options?.timeoutMs,
     );
     const streamTimeout = resolvedStreamTimeout;
-    // There is no implicit request-open or inter-chunk deadline. A healthy
-    // xAI stream can emit zero bytes for hours while reasoning or generating
-    // one large function-call argument payload. When an operator explicitly
-    // configures timeout_ms, that value remains an inter-chunk idle timeout
-    // rather than a total-stream deadline.
+    // There is no implicit inter-chunk deadline. A healthy xAI stream can
+    // emit zero bytes for hours while reasoning or generating one large
+    // function-call argument payload, so idle policy belongs to the session
+    // watchdog. When an operator explicitly configures timeout_ms, that value
+    // remains an inter-chunk idle timeout rather than a total-stream deadline.
+    // The request-open phase is different: headers that never arrive are a
+    // dead socket, so it gets a bounded default unless the operator set a
+    // timeout (or disabled timeouts with 0) themselves.
+    const requestOpenTimeout: RequestTimeoutResolution =
+      streamTimeout.source === "provider_default"
+        ? { ...streamTimeout, timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS }
+        : streamTimeout;
 
     let consecutiveFallbackFailures = 0;
     while (true) {
@@ -1353,6 +1534,10 @@ export class GrokProvider implements LLMProvider {
       let model = this.config.model;
       let finishReason: LLMResponse["finishReason"] = "stop";
       let responseError: Error | undefined;
+      // Set when a stream failure arrives after a tool call already streamed:
+      // the executor may have dispatched it, so the failed response is marked
+      // partial and never replayed by the reconnect ladder.
+      let failedAfterStreamedToolCall = false;
       let usage: LLMUsage = coerceUsage({});
       let providerEvidence: LLMResponse["providerEvidence"];
       let encryptedReasoning: LLMResponse["encryptedReasoning"];
@@ -1365,8 +1550,14 @@ export class GrokProvider implements LLMProvider {
       // forwarded under the call_id the tool-input session events key on.
       const functionCallItemIds = new Map<string, string>();
       let streamIterator: AsyncIterator<any> | null = null;
+      let abortStream: ((reason?: unknown) => void) | undefined;
+      let streamExhausted = false;
+      let reasoningReplay: Pick<LLMResponse, "providerReasoningContent" | "providerReasoningProvenance"> = {};
       let responseTracePayload: Record<string, unknown> | undefined;
       let streamResponseMeta: ProviderResponseTraceMeta | undefined;
+      let completedResponseId: string | undefined;
+      // Deadline in force for the current phase, reported on a mapped timeout.
+      let attemptPhaseTimeoutMs = requestOpenTimeout.timeoutMs;
       try {
       // OAuth pre-flight (same as the chat path): admitted turns stream with
       // singleWireAttempt, so the in-band 401 retry never runs here — the
@@ -1375,7 +1566,7 @@ export class GrokProvider implements LLMProvider {
       // Each wire attempt gets the full resolved timeout for the open phase;
       // a configured-fallback retry must not inherit a nearly-spent budget
       // from the previous attempt.
-      const requestAttemptTimeout = streamTimeout;
+      const requestAttemptTimeout = requestOpenTimeout;
       emitProviderTraceEvent(options, {
         kind: "request",
         transport: "chat_stream",
@@ -1407,12 +1598,40 @@ export class GrokProvider implements LLMProvider {
           options?.signal,
         );
       } catch (err) {
-        if (
-          options?.singleWireAttempt !== true &&
+        if (isResponseTooLargeToStore(err) && params.store !== false) {
+          if (options?.singleWireAttempt === true) {
+            throw this.storeRefusalUnderAdmission();
+          }
+          plan = this.unstoredRetryPlan(messages, options);
+          params = { ...plan.params, stream: true };
+          result = await withTimeout(
+            async (signal) =>
+              createWithResponseMetadata<AsyncIterable<any>>(
+                client,
+                params,
+                signal,
+                options?.singleWireAttempt,
+              ),
+            requestAttemptTimeout.timeoutMs,
+            this.name,
+            options?.signal,
+          );
+        } else if (
           isContinuationRetrievalFailure(err) &&
           "previous_response_id" in params
         ) {
           this.incrementalTracker.clearResponseId();
+          if (options?.singleWireAttempt === true) {
+            // The admission boundary forbids an in-band retry. Clearing the
+            // continuation here is what lets the ladder's next admitted
+            // attempt rebuild the request with full history instead of
+            // resending the same rejected id until the ladder exhausts.
+            this.emitRuntimeWarning(
+              "previous_response_id_expired",
+              `${this.name} rejected previous_response_id; continuation state cleared, the next admitted attempt resends full history`,
+            );
+            throw err;
+          }
           this.emitRuntimeWarning(
             "previous_response_id_expired",
             `${this.name} rejected previous_response_id; clearing continuation state and retrying once with full history`,
@@ -1421,7 +1640,7 @@ export class GrokProvider implements LLMProvider {
             disableIncremental: true,
           });
           this.noteIncrementalRequest(
-            plan.requestMessages ?? messages,
+            plan.incrementalBaseline ?? plan.requestMessages ?? messages,
             plan.params as Record<string, unknown>,
           );
           params = { ...plan.params, stream: true };
@@ -1441,7 +1660,22 @@ export class GrokProvider implements LLMProvider {
           throw err;
         }
       }
+      // Resolve hashed tool aliases only against the catalog on this exact
+      // wire attempt. The continuation-expiry branch above can rebuild
+      // `params`, so compute this after that branch and before consuming the
+      // returned stream.
+      const advertisedToolNames = this.advertisedCanonicalToolNames(
+        params,
+        options?.tools,
+      );
       const stream = result.data;
+      const streamController = (stream as { controller?: AbortController }).controller;
+      if (streamController !== undefined && typeof streamController.abort === "function") {
+        abortStream = (reason) => {
+          if (!streamController.signal.aborted) streamController.abort(reason);
+        };
+      }
+      attemptPhaseTimeoutMs = streamTimeout.timeoutMs;
       streamResponseMeta = buildProviderResponseMeta({
         response: result.response,
         requestId: result.requestId,
@@ -1487,8 +1721,12 @@ export class GrokProvider implements LLMProvider {
           streamTimeout.timeoutMs,
           this.name,
           options?.signal,
+          abortStream,
         );
-        if (iterResult.done) break;
+        if (iterResult.done) {
+          streamExhausted = true;
+          break;
+        }
         const event = iterResult.value;
         streamEventIndex += 1;
         emitProviderTraceEvent(options, {
@@ -1597,7 +1835,10 @@ export class GrokProvider implements LLMProvider {
                 contentBlock: {
                   type: "tool_use",
                   id: callId,
-                  name: typeof item.name === "string" ? item.name : "",
+                  name: decodeMcpToolNameFromWire(
+                    typeof item.name === "string" ? item.name : "",
+                    advertisedToolNames,
+                  ),
                   input: {},
                 },
               },
@@ -1635,7 +1876,10 @@ export class GrokProvider implements LLMProvider {
         }
 
         if (event.type === "response.output_item.done") {
-          const { toolCall, issue } = this.toToolCall(event.item);
+          const { toolCall, issue } = this.toToolCall(
+            event.item,
+            advertisedToolNames,
+          );
           if (toolCall) {
             toolCallAccum.set(toolCall.id, toolCall);
           }
@@ -1666,16 +1910,25 @@ export class GrokProvider implements LLMProvider {
             ),
           });
           finishReason = "error";
-          responseError = this.mapError(
-            errorFromStreamEvent(event),
-            streamTimeout.timeoutMs,
-          );
+          failedAfterStreamedToolCall = toolCallAccum.size > 0;
+          responseError =
+            xaiStatuslessServerFailure(
+              this.name,
+              errorMessageFromStreamEvent(event),
+              statusFromStreamEvent(event),
+              codeFromStreamEvent(event),
+            ) ??
+            this.mapError(errorFromStreamEvent(event), streamTimeout.timeoutMs);
           break;
         }
 
         if (event.type === "response.completed") {
           receivedTerminalEvent = true;
           const response = event.response ?? {};
+          completedResponseId =
+            typeof response.id === "string" && response.id.length > 0
+              ? response.id
+              : undefined;
 
           streamResponseMeta = {
             ...(streamResponseMeta ?? {}),
@@ -1685,6 +1938,7 @@ export class GrokProvider implements LLMProvider {
             cloneProviderTracePayload(response) ??
             { error: "provider_response_trace_unavailable" };
           model = String(response.model ?? model);
+          reasoningReplay = extractXaiReasoningReplay(response.output, String(params.model));
           usage = this.parseUsage(response);
           providerEvidence = this.extractProviderEvidence(
             response as Record<string, unknown>,
@@ -1695,7 +1949,10 @@ export class GrokProvider implements LLMProvider {
           const {
             toolCalls: completedToolCalls,
             normalizationIssues,
-          } = this.extractToolCallsFromOutput(response.output);
+          } = this.extractToolCallsFromOutput(
+            response.output,
+            advertisedToolNames,
+          );
           for (const toolCall of completedToolCalls) {
             toolCallAccum.set(toolCall.id, toolCall);
           }
@@ -1747,6 +2004,7 @@ export class GrokProvider implements LLMProvider {
             ),
           });
           finishReason = "error";
+          failedAfterStreamedToolCall = toolCallAccum.size > 0;
           responseError =
             this.extractResponseError(failedResponse, "error") ??
             new LLMProviderError(this.name, "Provider returned status failed");
@@ -1764,7 +2022,7 @@ export class GrokProvider implements LLMProvider {
 
       if (!receivedTerminalEvent && finishReason === "stop") {
         finishReason = "error";
-        responseError = responseError ?? new LLMProviderError(
+        responseError = responseError ?? new LLMStreamTruncatedError(
           this.name,
           "Stream closed without a response.completed or response.failed event",
         );
@@ -1772,6 +2030,25 @@ export class GrokProvider implements LLMProvider {
 
       const toolCalls = Array.from(toolCallAccum.values());
       if (toolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
+
+      // Opt-in continuation (AGENC_XAI_INCREMENTAL): remember the completed
+      // response so the next compatible request sends previous_response_id
+      // plus the delta instead of the full history. Only stored responses can
+      // be continued, and a failed response has nothing to continue from.
+      if (
+        this.config.incrementalContinuation === true &&
+        completedResponseId !== undefined &&
+        params.store !== false &&
+        finishReason !== "error"
+      ) {
+        this.noteIncrementalResponse(completedResponseId, [
+          {
+            role: "assistant",
+            content,
+            ...(toolCalls.length > 0 ? { toolCalls } : {}),
+          },
+        ]);
+      }
 
       onChunk({ content: "", done: true, toolCalls });
 
@@ -1806,9 +2083,11 @@ export class GrokProvider implements LLMProvider {
               options.structuredOutput.schema.schema,
             ),
         encryptedReasoning,
+        ...reasoningReplay,
         finishReason,
         ...(thinking.length > 0 ? { thinking } : {}),
         ...(responseError ? { error: responseError } : {}),
+        ...(responseError && failedAfterStreamedToolCall ? { partial: true } : {}),
       };
       emitProviderTraceEvent(options, {
         kind: "response",
@@ -1856,9 +2135,15 @@ export class GrokProvider implements LLMProvider {
       }
       consecutiveFallbackFailures = 0;
       this.notifyCapabilityDrift(err);
-      const mappedError = this.mapError(err, streamTimeout.timeoutMs);
+      const mappedError = this.mapError(err, attemptPhaseTimeoutMs);
       this.logPromptOverflowDiagnostics(mappedError, params);
-      if (content.length > 0) {
+      // A transport fault before any tool call streamed is re-sampled by the
+      // turn's reconnect ladder; a partial response is surfaced only when the
+      // fault is not transient or a tool call may already have dispatched.
+      if (
+        content.length > 0 &&
+        !isResampleableStreamInterruption(mappedError, toolCallAccum.size)
+      ) {
         const partialToolCalls: LLMToolCall[] = Array.from(toolCallAccum.values());
 
         onChunk({ content: "", done: true, toolCalls: partialToolCalls });
@@ -1891,6 +2176,7 @@ export class GrokProvider implements LLMProvider {
       }
       throw mappedError;
       } finally {
+      if (!streamExhausted) abortStream?.(options?.signal?.reason);
       if (streamIterator) await closeAsyncIterator(streamIterator);
       streamIterator = null;
     }
@@ -1932,7 +2218,7 @@ export class GrokProvider implements LLMProvider {
       const response = await (client as any).responses.retrieve(trimmedResponseId);
       return this.toStoredResponse(response);
     } catch (error) {
-      throw mapLLMError(this.name, error, this.config.timeoutMs ?? 0);
+      throw this.mapError(error);
     }
   }
 
@@ -1963,7 +2249,7 @@ export class GrokProvider implements LLMProvider {
             : undefined,
       };
     } catch (error) {
-      throw mapLLMError(this.name, error, this.config.timeoutMs ?? 0);
+      throw this.mapError(error);
     }
   }
 
@@ -2005,6 +2291,7 @@ export class GrokProvider implements LLMProvider {
     toolSelection: ToolSelectionDiagnostics;
     compactionDiagnostics?: LLMCompactionDiagnostics;
     requestMessages?: readonly LLMMessage[];
+    incrementalBaseline?: readonly LLMMessage[];
   } {
     const compactionDiagnostics = undefined;
     const toolSelection = this.resolveResponseTools(
@@ -2013,7 +2300,7 @@ export class GrokProvider implements LLMProvider {
       options?.tools,
     );
     const built = this.buildParams(messages, {
-      store: xaiResponseStoreDefault(),
+      store: this.storeRefused ? false : xaiResponseStoreDefault(),
       allowedToolNames: options?.toolRouting?.allowedToolNames,
       toolChoice: options?.toolChoice,
       maxOutputTokens: options?.maxOutputTokens,
@@ -2025,7 +2312,7 @@ export class GrokProvider implements LLMProvider {
       toolSelection,
       promptCacheKey: options?.promptCacheKey?.trim() || undefined,
       systemPrompt: options?.systemPrompt?.trim() || undefined,
-      disableIncremental: overrides?.disableIncremental,
+      disableIncremental: overrides?.disableIncremental || this.storeRefused,
     });
     return {
       params: built.params,
@@ -2036,6 +2323,7 @@ export class GrokProvider implements LLMProvider {
       toolSelection: built.toolSelection,
       compactionDiagnostics,
       requestMessages: built.requestMessages,
+      incrementalBaseline: built.incrementalBaseline,
     };
   }
 
@@ -2043,7 +2331,7 @@ export class GrokProvider implements LLMProvider {
     if (this.client) return this.client;
 
     this.client = await ensureLazyImport("openai", this.name, (mod) => {
-      const ProviderSdk = (mod.default ?? mod.OpenAI ?? mod) as any; // branding-scan: allow real SDK export
+      const ProviderSdk = (mod.default ?? mod.OpenAI ?? mod) as any;
       const client = new ProviderSdk({
         apiKey: this.config.apiKey,
         baseURL: this.config.baseURL,
@@ -2077,8 +2365,10 @@ export class GrokProvider implements LLMProvider {
     params: Record<string, unknown>;
     toolSelection: ToolSelectionDiagnostics;
     requestMessages: readonly LLMMessage[];
+    incrementalBaseline: readonly LLMMessage[];
   } {
-    const visionModel = this.config.visionModel ?? DEFAULT_VISION_MODEL;
+    const visionModel = this.config.visionModel ??
+      (this.config.model === "grok-4.7" ? this.config.model : DEFAULT_VISION_MODEL);
     // Prefix-cache split: xAI caching is prefix-based ("never modify
     // earlier messages — only append"), so the volatile tail of the
     // system prompt (timestamp, git state, …) must not sit at the front
@@ -2101,9 +2391,12 @@ export class GrokProvider implements LLMProvider {
       providerName: this.name,
     });
 
-    const xaiInput = buildXaiResponsesInputItems(repairedMessages);
+    const hasImages = repairedMessages.some((message) =>
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "image_url"));
     const model =
-      options?.model ?? (xaiInput.hasImages ? visionModel : this.config.model);
+      options?.model ?? (hasImages ? visionModel : this.config.model);
+    const xaiInput = buildXaiResponsesInputItems(repairedMessages, model);
 
     const params: Record<string, unknown> = {
       model,
@@ -2222,19 +2515,42 @@ export class GrokProvider implements LLMProvider {
         currentInput: repairedMessages,
       });
       if (decision.kind === "reuse" && previousResponseId) {
-        const deltaBuilt = this.buildParams(decision.delta, {
-          ...options,
-          disableIncremental: true,
-        });
-        params.input = deltaBuilt.params.input;
+        if (this.config.incrementalContinuation === true) {
+          // The delta is a validated suffix of the full sequence: send its
+          // items as they are. Rebuilding it through buildParams would
+          // prepend the static system prompt (already part of the stored
+          // response) and re-validate a suffix that can legitimately open
+          // with tool output.
+          params.input = buildXaiResponsesInputItems(decision.delta, model).input;
+        } else {
+          const deltaBuilt = this.buildParams(decision.delta, {
+            ...options,
+            disableIncremental: true,
+          });
+          params.input = deltaBuilt.params.input;
+        }
         params.previous_response_id = previousResponseId;
       }
     }
+
+    // Baseline for the incremental tracker. The trailing dynamic system
+    // message (timestamp, git state) changes every call, so recording it
+    // would fail the next request's prefix check at that position and force
+    // a full resend; the fresh dynamic tail travels in the delta instead.
+    const trailing = repairedMessages.at(-1);
+    const incrementalBaseline =
+      this.config.incrementalContinuation === true &&
+      dynamicSystemPrompt !== undefined &&
+      trailing?.role === "system" &&
+      trailing.content === dynamicSystemPrompt
+        ? repairedMessages.slice(0, -1)
+        : repairedMessages;
 
     return {
       params,
       toolSelection: selectedTools,
       requestMessages: repairedMessages,
+      incrementalBaseline,
     };
   }
 
@@ -2455,11 +2771,14 @@ export class GrokProvider implements LLMProvider {
     requestMetrics?: LLMRequestMetrics,
     compactionDiagnostics?: LLMCompactionDiagnostics,
     structuredOutputRequest?: LLMChatOptions["structuredOutput"],
+    advertisedToolNames: readonly string[] = [],
+    requestModel: string = this.config.model,
   ): LLMResponse & {
     normalizationIssues?: readonly ToolCallNormalizationIssue[];
   } {
     const { toolCalls, normalizationIssues } = this.extractToolCallsFromOutput(
       response.output,
+      advertisedToolNames,
     );
 
     const finishReason = this.mapResponseFinishReason(response, toolCalls);
@@ -2467,6 +2786,7 @@ export class GrokProvider implements LLMProvider {
     const parsedError = this.extractResponseError(response, finishReason);
 
     return {
+      ...extractXaiReasoningReplay(response.output, requestModel),
       content: this.extractOutputText(response) ?? "",
       toolCalls,
       usage: this.parseUsage(response),
@@ -2488,7 +2808,16 @@ export class GrokProvider implements LLMProvider {
   }
 
   private toStoredResponse(response: Record<string, unknown>): LLMStoredResponse {
-    const parsed = this.parseResponse(response);
+    // A stored response does not carry its original request catalog. Short
+    // self-describing names remain decodable, while hashed aliases fail
+    // closed instead of being guessed from today's configured tool set.
+    const parsed = this.parseResponse(
+      response,
+      undefined,
+      undefined,
+      undefined,
+      [],
+    );
     const encryptedReasoning = this.extractEncryptedReasoningDiagnostics(response, {
       requested: undefined,
     });
@@ -2533,6 +2862,32 @@ export class GrokProvider implements LLMProvider {
       ...(rawOutput ? { output: rawOutput } : {}),
       raw: cloneProviderTracePayload(response),
     };
+  }
+
+  private advertisedCanonicalToolNames(
+    params: Readonly<Record<string, unknown>>,
+    requestTools: readonly LLMTool[] | undefined,
+  ): readonly string[] {
+    const wireTools = Array.isArray(params.tools) ? params.tools : [];
+    const advertisedWireNames = new Set(extractTraceToolNames(wireTools));
+    const candidates = requestTools ?? this.tools;
+    const clientToolNames = candidates
+      .map((tool) => tool.function.name)
+      .filter((name) =>
+        advertisedWireNames.has(encodeMcpToolNameForWire(name))
+      );
+    // Server-side tools use payloads such as `{type:"web_search"}` rather
+    // than function names, and remote MCP definitions can share the same
+    // `type`. The selected request retains the exact definition payload
+    // objects, so identity gives us a precise subset without guessing by
+    // category or accidentally widening an allowlist.
+    const providerNativeToolNames = this.providerNativeTools
+      .filter((definition) => wireTools.includes(definition.payload))
+      .map((definition) => definition.name);
+    return Array.from(new Set([
+      ...clientToolNames,
+      ...providerNativeToolNames,
+    ]));
   }
 
   private extractOutputText(response: Record<string, unknown>): string | undefined {
@@ -2813,7 +3168,10 @@ export class GrokProvider implements LLMProvider {
     }
   }
 
-  private toToolCall(item: unknown): {
+  private toToolCall(
+    item: unknown,
+    advertisedToolNames: readonly string[],
+  ): {
     toolCall: LLMToolCall | null;
     issue?: ToolCallNormalizationIssue;
   } {
@@ -2827,7 +3185,10 @@ export class GrokProvider implements LLMProvider {
       // Decode the strict-regex wire name back to the internal
       // `mcp.<server>.<tool>` form before dispatch. Non-MCP names
       // pass through unchanged.
-      name: decodeMcpToolNameFromWire(String(candidate.name ?? "")),
+      name: decodeMcpToolNameFromWire(
+        String(candidate.name ?? ""),
+        advertisedToolNames,
+      ),
       arguments: String(candidate.arguments ?? ""),
     });
     if (validation.toolCall) {
@@ -2858,7 +3219,10 @@ export class GrokProvider implements LLMProvider {
     };
   }
 
-  private extractToolCallsFromOutput(output: unknown): {
+  private extractToolCallsFromOutput(
+    output: unknown,
+    advertisedToolNames: readonly string[],
+  ): {
     toolCalls: LLMToolCall[];
     normalizationIssues: ToolCallNormalizationIssue[];
   } {
@@ -2868,7 +3232,10 @@ export class GrokProvider implements LLMProvider {
     const toolCalls: LLMToolCall[] = [];
     const normalizationIssues: ToolCallNormalizationIssue[] = [];
     for (const item of output) {
-      const { toolCall, issue } = this.toToolCall(item);
+      const { toolCall, issue } = this.toToolCall(
+        item,
+        advertisedToolNames,
+      );
       if (toolCall) toolCalls.push(toolCall);
       if (issue) normalizationIssues.push(issue);
     }
@@ -2938,19 +3305,32 @@ export class GrokProvider implements LLMProvider {
             ? "Provider returned failed response status"
             : "Provider returned error response")
     );
-    const codeRaw = errorObj?.code ?? errorObj?.status ?? errorObj?.statusCode;
-    const statusCode = typeof codeRaw === "number"
-      ? codeRaw
-      : Number.parseInt(String(codeRaw ?? ""), 10);
-    return new LLMProviderError(
+    // Explicit status fields take precedence over `code`: a symbolic code must
+    // never override an explicit 4xx, and a numeric code is only a fallback.
+    const statusCode = firstNumericStatus(
+      errorObj?.status,
+      errorObj?.statusCode,
+      errorObj?.status_code,
+      errorObj?.code,
+    );
+    const serverFailure = xaiStatuslessServerFailure(
       this.name,
       message,
-      Number.isFinite(statusCode) ? statusCode : undefined,
+      statusCode,
+      errorObj?.code,
     );
+    if (serverFailure) return serverFailure;
+    if (statusCode !== undefined && statusCode >= 500) {
+      return new LLMServerError(this.name, statusCode, message);
+    }
+    return new LLMProviderError(this.name, message, statusCode);
   }
 
   private mapError(err: unknown, timeoutMs?: number): Error {
-    return mapLLMError(this.name, err, timeoutMs ?? this.config.timeoutMs ?? 0);
+    return (
+      xaiBillingRefusalError(this.name, err) ??
+      mapLLMError(this.name, err, timeoutMs ?? this.config.timeoutMs ?? 0)
+    );
   }
 
   private logPromptOverflowDiagnostics(

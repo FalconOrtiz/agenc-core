@@ -35,6 +35,7 @@ import {
 import { AgenCDaemonClientMultiplexer } from "./client-multiplexer.js";
 import { AgenCDaemonJsonRpcDispatcher } from "./daemon-dispatcher.js";
 import { DAEMON_CLIENT_ENV_SNAPSHOT_KEYS } from "./client-env-snapshot.js";
+import { findAgenCDaemonAgentBySessionId } from "../../src/app-server-client/index.js";
 import {
   AGENC_DAEMON_PROTOCOL_VERSION,
   AGENC_DAEMON_METHOD_CAPABILITIES_KEY,
@@ -59,6 +60,10 @@ import {
   AgenCBackgroundAgentSuspensionShutdownError,
 } from "./background-agent-runner.js";
 import { resolveAgentRuntimeOptions } from "../session/runtime-options.js";
+import { RemoteAccessBoundary } from "../remote/access.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../contracts/additional-working-directories.js";
 
 function sequence(values: readonly string[]): () => string {
   let index = 0;
@@ -116,6 +121,54 @@ function openRollout(
     modelProvider: "grok",
   });
   return rollout;
+}
+
+type LifecycleRunner = NonNullable<
+  ConstructorParameters<typeof AgenCDaemonAgentManager>[0]["runner"]
+>;
+
+/** A runner whose live-agent transcript methods all say the agent is not running. */
+function noLiveAgentRunner(agentId: string): LifecycleRunner {
+  return {
+    startAgent: async () => ({
+      agentId: "unused",
+      startedAt: "2026-05-01T12:00:00.000Z",
+      status: "running",
+    }),
+    getAgentSessionTranscript: async () => {
+      throw new Error(`AgenC daemon agent not running: ${agentId}`);
+    },
+    getAgentSessionTranscriptV2: async () => {
+      throw new Error(`AgenC daemon agent not running: ${agentId}`);
+    },
+  };
+}
+
+/** Persist one user/assistant exchange as sequenced daemon events. */
+function appendSequencedExchange(
+  rollout: ReturnType<typeof openRollout>,
+  user: string,
+  assistant: string,
+  startSeq = 1,
+): void {
+  rollout.appendRollout({
+    type: "event_msg",
+    payload: {
+      id: `user-event-${startSeq}`,
+      eventId: `user-event-${startSeq}`,
+      seq: startSeq,
+      msg: { type: "user_message", payload: { message: user, displayText: user } },
+    },
+  });
+  rollout.appendRollout({
+    type: "event_msg",
+    payload: {
+      id: `agent-event-${startSeq + 1}`,
+      eventId: `agent-event-${startSeq + 1}`,
+      seq: startSeq + 1,
+      msg: { type: "agent_message", payload: { message: assistant } },
+    },
+  });
 }
 
 const resumeFixtureCleanups: Array<() => void> = [];
@@ -679,16 +732,7 @@ describe("AgenC background agent lifecycle", () => {
       const liveCapableRunner = new AgenCDaemonAgentManager({
         threadStore,
         sessionManager: sessions,
-        runner: {
-          startAgent: async () => ({
-            agentId: "unused",
-            startedAt: "2026-05-01T12:00:00.000Z",
-            status: "running",
-          }),
-          getAgentSessionTranscript: async () => {
-            throw new Error("AgenC daemon agent not running: agent_default");
-          },
-        },
+        runner: noLiveAgentRunner("agent_default"),
       });
       await expect(
         liveCapableRunner.getSessionTranscript({
@@ -700,6 +744,67 @@ describe("AgenC background agent lifecycle", () => {
           { role: "user", text: "build the parser" },
           { role: "assistant", text: "parser done" },
         ]),
+      });
+    } finally {
+      threadStore.close();
+      rollout.close();
+      restoreEnv();
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("serves the persisted transcript for a daemon session addressed by its session id", async () => {
+    // The desktop attaches a session and then addresses it by the daemon's
+    // session record id (session_<uuid>), while the rollout is filed under
+    // the agent id. After a daemon restart the agent row is recovered without
+    // a runtime, so the transcript must come from the persisted thread; the
+    // fallback used to look the session id up as a thread id and miss.
+    const { cwd, home, restoreEnv } = createThreadStoreTestDirs();
+    const rollout = openRollout(cwd, "conv-desktop-thread");
+    const threadStore = new FileThreadStore({ cwd, agencHome: home });
+    try {
+      threadStore.createThread({
+        threadId: "conv-desktop-thread",
+        rolloutStore: rollout,
+        source: "cli_main",
+        cwd,
+      });
+      // Sequenced events, as a daemon session writes them: the v2 snapshot
+      // reconstruction keys its messages on eventId and seq.
+      appendSequencedExchange(rollout, "sleep for a while", "starting");
+      threadStore.shutdownThread("conv-desktop-thread");
+
+      const sessions = new AgenCDaemonSessionManager({ threadStore });
+      const created = await sessions.createSession({
+        agentId: "conv-desktop-thread",
+        cwd,
+      });
+      expect(created.sessionId).not.toBe("conv-desktop-thread");
+
+      const manager = new AgenCDaemonAgentManager({
+        threadStore,
+        sessionManager: sessions,
+        runner: noLiveAgentRunner("conv-desktop-thread"),
+      });
+      await expect(
+        manager.getSessionTranscriptV2({ sessionId: created.sessionId }),
+      ).resolves.toMatchObject({
+        sessionId: created.sessionId,
+        runId: "conv-desktop-thread",
+        messages: expect.arrayContaining([
+          expect.objectContaining({ role: "user", text: "sleep for a while" }),
+          expect.objectContaining({ role: "assistant", text: "starting" }),
+        ]),
+      });
+      await expect(
+        manager.getSessionTranscript({ sessionId: created.sessionId }),
+      ).resolves.toEqual({
+        sessionId: created.sessionId,
+        messages: [
+          { role: "user", text: "sleep for a while" },
+          { role: "assistant", text: "starting" },
+        ],
       });
     } finally {
       threadStore.close();
@@ -1987,6 +2092,8 @@ describe("AgenC background agent lifecycle", () => {
       sessionId: "session-applyconfig",
       profile: "fast",
     });
+    await agents.applyConfigToSession({ sessionId: "session-applyconfig", reasoningEffort: "max" });
+    expect(applyAgentConfig).toHaveBeenLastCalledWith("agent-applyconfig", { sessionId: "session-applyconfig", reasoningEffort: "max" });
   });
 
   it("rejects session.applyConfig when no runner is available", async () => {
@@ -2506,6 +2613,7 @@ describe("AgenC background agent lifecycle", () => {
       createTestAgent(agents, {
         cwd: process.cwd(),
         objective: "  build the parser  ",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         metadata: { ticket: "F-06a" },
       }),
     ).resolves.toEqual({
@@ -2520,8 +2628,10 @@ describe("AgenC background agent lifecycle", () => {
       activeSessionIds: ["session_1"],
       metadata: {
         ticket: "F-06a",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         unattendedAllow: [],
         unattendedDeny: [],
+        commandEnvironment: { PATH: "" },
         runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
       },
       sessionId: "session_1",
@@ -2529,11 +2639,15 @@ describe("AgenC background agent lifecycle", () => {
     expect(starts).toEqual([
       {
         objective: "build the parser",
+        signal: expect.any(AbortSignal),
         cwd: process.cwd(),
+        addDirs: ["../shared workspace", "/tmp/shared"],
         metadata: {
           ticket: "F-06a",
+          addDirs: ["../shared workspace", "/tmp/shared"],
           unattendedAllow: [],
           unattendedDeny: [],
+          commandEnvironment: { PATH: "" },
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
         },
         unattendedAllow: [],
@@ -2552,10 +2666,12 @@ describe("AgenC background agent lifecycle", () => {
       cwd: process.cwd(),
       metadata: {
         ticket: "F-06a",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         objective: "build the parser",
         source: "agent.start",
         unattendedAllow: [],
         unattendedDeny: [],
+        commandEnvironment: { PATH: "" },
         runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
       },
     });
@@ -2573,8 +2689,10 @@ describe("AgenC background agent lifecycle", () => {
           activeSessionIds: ["session_1"],
           metadata: {
             ticket: "F-06a",
+            addDirs: ["../shared workspace", "/tmp/shared"],
             unattendedAllow: [],
             unattendedDeny: [],
+            commandEnvironment: { PATH: "" },
             runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
           },
         },
@@ -2602,10 +2720,12 @@ describe("AgenC background agent lifecycle", () => {
           cwd: process.cwd(),
           metadata: {
             ticket: "F-06a",
+            addDirs: ["../shared workspace", "/tmp/shared"],
             objective: "build the parser",
             source: "agent.start",
             unattendedAllow: [],
             unattendedDeny: [],
+            commandEnvironment: { PATH: "" },
             runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
           },
           activeAttachmentIds: ["attachment_1"],
@@ -2870,6 +2990,7 @@ describe("AgenC background agent lifecycle", () => {
         cwd: fixture.cwd,
         model: "grok-4.3",
         provider: "grok",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         permissionMode: "acceptEdits",
         envOverrides: { AGENC_MODEL: "grok-4.3" },
       }),
@@ -2880,11 +3001,13 @@ describe("AgenC background agent lifecycle", () => {
       activeSessionIds: ["session_resumed"],
       metadata: {
         resumedFromSessionId: "conv-retained1",
+        addDirs: ["../shared workspace", "/tmp/shared"],
       },
     });
     expect(startAgent).not.toHaveBeenCalled();
     expect(restoreAgent).toHaveBeenCalledWith({
       agentId: "conv-retained1",
+      signal: expect.any(AbortSignal),
       resumeRolloutPath: fixture.rolloutPath,
       resumeRolloutLease: expect.objectContaining({
         rolloutPath: fixture.rolloutPath,
@@ -2902,9 +3025,11 @@ describe("AgenC background agent lifecycle", () => {
         agentPath: "/root",
         model: "grok-4.3",
         provider: "grok",
+        addDirs: ["../shared workspace", "/tmp/shared"],
         permissionMode: "acceptEdits",
         unattendedAllow: [],
         unattendedDeny: [],
+        commandEnvironment: { PATH: "" },
         runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
       },
       restoreAttemptId: expect.any(String),
@@ -2912,6 +3037,7 @@ describe("AgenC background agent lifecycle", () => {
       explicitColdResume: true,
       model: "grok-4.3",
       provider: "grok",
+      addDirs: ["../shared workspace", "/tmp/shared"],
       permissionMode: "acceptEdits",
       envOverrides: { AGENC_MODEL: "grok-4.3" },
       runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
@@ -2924,6 +3050,226 @@ describe("AgenC background agent lifecycle", () => {
           objective: "retained canonical objective",
         },
       },
+    );
+  });
+
+  it.each(["/client/bin:/usr/bin", ""])("durably records fresh command authority when explicitly resuming a legacy run: %j", async (path) => {
+    const fixture = createResumeFixture("conv-legacy-command-authority");
+    const driver = openStateDatabases({ cwd: fixture.cwd, agencHome: process.env.AGENC_HOME });
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      runner: { startAgent: vi.fn(), restoreAgent },
+      recordAgentRun: (record) => { upsertAgentRun(driver, record); },
+    });
+    try {
+      await agents.restoreAgent({
+        agentId: "conv-legacy-command-authority",
+        objective: "retained canonical objective",
+        status: "idle",
+        createdAt: "2026-05-01T12:30:00.000Z",
+        startedAt: "2026-05-01T12:30:00.000Z",
+        lastActiveAt: "2026-05-01T12:31:00.000Z",
+        cwd: fixture.cwd,
+        sessionIds: [],
+        runtimeAvailable: false,
+        metadata: { agentPath: "/root", runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS },
+      });
+      await createTestAgent(agents, {
+        resumeSessionId: "conv-legacy-command-authority",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+        envOverrides: { PATH: path, XAI_API_KEY: "fresh-client-secret" },
+      });
+      const row = driver.prepareState<[], { metadata_json: string }>(
+        "SELECT metadata_json FROM agent_runs WHERE id = 'conv-legacy-command-authority'",
+      ).get();
+      expect(row).toBeDefined();
+      expect(JSON.parse(row!.metadata_json)).toMatchObject({ commandEnvironment: { PATH: path } });
+      expect(row!.metadata_json).not.toContain("fresh-client-secret");
+      expect(restoreAgent).toHaveBeenCalledWith(expect.objectContaining({
+        envOverrides: { PATH: path, XAI_API_KEY: "fresh-client-secret" },
+        metadata: expect.objectContaining({ commandEnvironment: { PATH: path } }),
+      }));
+    } finally {
+      driver.close();
+    }
+  });
+
+  it.each([
+    { recovered: true },
+    { recovery: { runtimeRestore: "unavailable", runnable: false } },
+  ])("finds a warm attachment after explicitly resuming unavailable metadata %j", async (recoveryMetadata) => {
+    const sessionId = "conv-resume-then-reattach";
+    const fixture = createResumeFixture(sessionId);
+    const agents = new AgenCDaemonAgentManager({
+      sessionManager: new AgenCDaemonSessionManager(),
+      runner: { startAgent: vi.fn(), restoreAgent: vi.fn(async () => true) },
+    });
+    await agents.restoreAgent({
+      agentId: sessionId,
+      objective: "retained canonical objective",
+      status: "idle",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      sessionIds: [],
+      runtimeAvailable: false,
+      metadata: { agentPath: "/root", runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS, ...recoveryMetadata },
+    });
+    const client = {
+      request: async () => agents.listAgents(),
+    } as Parameters<typeof findAgenCDaemonAgentBySessionId>[0];
+    await expect(findAgenCDaemonAgentBySessionId(client, sessionId)).resolves.toBeNull();
+    await createTestAgent(agents, {
+      resumeSessionId: sessionId,
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+      envOverrides: { PATH: "/resumed-client/bin:/usr/bin" },
+    });
+    await expect(findAgenCDaemonAgentBySessionId(client, sessionId)).resolves.toMatchObject({
+      agentId: sessionId,
+      status: "running",
+      metadata: { commandEnvironment: { PATH: "/resumed-client/bin:/usr/bin" } },
+    });
+    await expect(createTestAgent(agents, {
+      resumeSessionId: sessionId,
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    })).rejects.toMatchObject({ code: "CANONICAL_SESSION_ALREADY_ACTIVE" });
+  });
+
+  it("restores retained additional directories on a flagless cold resume", async () => {
+    const fixture = createResumeFixture("conv-retained-add-dirs");
+    const freshRunner: AgenCBackgroundAgentRunner = {
+      startAgent: async () => ({
+        agentId: "conv-retained-add-dirs",
+        agentPath: "/root",
+        startedAt: "2026-05-01T12:30:00.000Z",
+        status: "running",
+      }),
+    };
+    const freshAgents = new AgenCDaemonAgentManager({
+      now: () => "2026-05-01T12:30:00.000Z",
+      runner: freshRunner,
+    });
+    const fresh = await createTestAgent(freshAgents, {
+      cwd: fixture.cwd,
+      objective: "retained canonical objective",
+      addDirs: ["../shared workspace", "/tmp/shared", "/tmp/shared"],
+    });
+
+    expect(fresh.metadata).toMatchObject({
+      addDirs: ["../shared workspace", "/tmp/shared"],
+    });
+
+    const restoreAgent = vi.fn(async () => true);
+    const resumedAgents = new AgenCDaemonAgentManager({
+      runner: {
+        startAgent: async () => ({
+          agentId: "unexpected-fresh-agent",
+          startedAt: "2026-05-01T12:30:00.000Z",
+          status: "running",
+        }),
+        restoreAgent,
+      },
+    });
+    await resumedAgents.restoreAgent({
+      agentId: "conv-retained-add-dirs",
+      objective: "retained canonical objective",
+      status: "idle",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      sessionIds: [],
+      runtimeAvailable: false,
+      metadata: {
+        ...fresh.metadata,
+        agentPath: "/root",
+      },
+    });
+
+    await createTestAgent(resumedAgents, {
+      resumeSessionId: "conv-retained-add-dirs",
+      resumeRolloutPath: fixture.rolloutPath,
+      resumeSourceProof: fixture.sourceProof,
+      cwd: fixture.cwd,
+    });
+
+    expect(restoreAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "conv-retained-add-dirs",
+        addDirs: ["../shared workspace", "/tmp/shared"],
+        metadata: expect.objectContaining({
+          addDirs: ["../shared workspace", "/tmp/shared"],
+        }),
+      }),
+    );
+  });
+
+  it("reopens an interactive session whose retained label differs from the rollout", async () => {
+    // A deferred-initial-turn client (the desktop app, `agenc` itself)
+    // registers a label like "Interactive session" while the rollout's
+    // canonical objective is the user's first prompt. Comparing the two
+    // made every interactive session permanently unresumable once its
+    // agent ended.
+    const fixture = createResumeFixture("conv-interactive1", {
+      objective: "Reply with the single word: ok",
+    });
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: sequence(["session_interactive_resumed"]),
+      now: sequence(["2026-08-19T12:00:01.000Z"]),
+    });
+    const startAgent = vi.fn(async () => ({
+      agentId: "unexpected_fresh_agent",
+      startedAt: "2026-08-19T12:00:00.500Z",
+      status: "running" as const,
+    }));
+    const restoreAgent = vi.fn(async () => true);
+    const agents = new AgenCDaemonAgentManager({
+      now: sequence(["2026-08-19T12:00:00.000Z"]),
+      runner: { startAgent, restoreAgent },
+      sessionManager: sessions,
+    });
+    await agents.restoreAgent({
+      agentId: "conv-interactive1",
+      // The label a deferred-initial-turn client registers.
+      objective: "Interactive session",
+      status: "stopped",
+      createdAt: "2026-05-01T12:30:00.000Z",
+      startedAt: "2026-05-01T12:30:00.000Z",
+      lastActiveAt: "2026-05-01T12:31:00.000Z",
+      cwd: fixture.cwd,
+      metadata: { agentPath: "/root", model: "grok-4", provider: "grok" },
+      sessionIds: ["session_interactive_original"],
+    });
+
+    await expect(
+      createTestAgent(agents, {
+        resumeSessionId: "conv-interactive1",
+        resumeRolloutPath: fixture.rolloutPath,
+        resumeSourceProof: fixture.sourceProof,
+        cwd: fixture.cwd,
+      }),
+    ).resolves.toMatchObject({
+      agentId: "conv-interactive1",
+      // The disposable label is replaced by the canonical objective.
+      objective: "Reply with the single word: ok",
+      status: "running",
+      activeSessionIds: expect.arrayContaining([
+        "session_interactive_resumed",
+      ]),
+    });
+    expect(startAgent).not.toHaveBeenCalled();
+    expect(restoreAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "conv-interactive1",
+        objective: "Reply with the single word: ok",
+      }),
     );
   });
 
@@ -3405,7 +3751,15 @@ describe("AgenC background agent lifecycle", () => {
     expect(restoreAgent).toHaveBeenCalledOnce();
   });
 
-  it.each(["objective", "createdAt", "model", "provider"] as const)(
+  /*
+   * `objective` is deliberately absent: the retained objective is a
+   * client-supplied label, not session identity. Interactive clients defer
+   * the initial turn and register a label that can never equal the
+   * rollout's canonical objective, and a successful resume overwrites it
+   * with the canonical one anyway. The rollout's binding to this session is
+   * proven by its path, filename, filesystem proof and journal run id.
+   */
+  it.each(["createdAt", "model", "provider"] as const)(
     "rejects stale retained %s that disagrees with canonical rollout authority",
     async (field) => {
       const sessionId = `conv-stale-${field.toLowerCase()}1`;
@@ -3423,10 +3777,7 @@ describe("AgenC background agent lifecycle", () => {
       });
       await agents.restoreAgent({
         agentId: sessionId,
-        objective:
-          field === "objective"
-            ? "stale projected objective"
-            : "retained canonical objective",
+        objective: "retained canonical objective",
         status: "stopped",
         // Drift beyond RETAINED_CREATED_AT_TOLERANCE_MS (#1750): benign
         // millisecond skew between the daemon clock and the rollout header is
@@ -3441,7 +3792,9 @@ describe("AgenC background agent lifecycle", () => {
         metadata: {
           agentPath: "/root",
           model: field === "model" ? "stale-model" : "grok-4",
-          provider: field === "provider" ? "stale-provider" : "xai",
+          // Matches the fixture rollout's `modelProvider`; anything else
+          // would trip this very check for the unrelated rows.
+          provider: field === "provider" ? "stale-provider" : "grok",
         },
       });
 
@@ -4366,6 +4719,7 @@ describe("AgenC background agent lifecycle", () => {
       metadata: {
         unattendedAllow: [],
         unattendedDeny: [],
+        commandEnvironment: { PATH: "" },
         runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
       },
     });
@@ -4701,6 +5055,7 @@ describe("AgenC background agent lifecycle", () => {
             metadata: {
               unattendedAllow: [],
               unattendedDeny: [],
+              commandEnvironment: { PATH: "" },
               runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
             },
           },
@@ -4890,6 +5245,7 @@ describe("AgenC background agent lifecycle", () => {
           metadata: {
             unattendedAllow: [],
             unattendedDeny: [],
+            commandEnvironment: { PATH: "" },
             runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
           },
         },
@@ -4904,6 +5260,7 @@ describe("AgenC background agent lifecycle", () => {
           metadata: {
             unattendedAllow: [],
             unattendedDeny: [],
+            commandEnvironment: { PATH: "" },
             runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
           },
         },
@@ -4988,21 +5345,6 @@ describe("AgenC background agent lifecycle", () => {
       runner,
       sessionManager: sessions,
     });
-    const initialEditorInteraction = {
-      interactionId: "interaction-startup-explain",
-      kind: "explain" as const,
-      policy: "read_only" as const,
-      editorInstanceId: "editor-startup",
-      bufferHandle: 4,
-      changedtick: 9,
-      contentSha256: "b".repeat(64),
-      path: "/workspace/src/main.ts",
-      range: {
-        start: { line: 1, column: 0 },
-        end: { line: 2, column: 0 },
-      },
-      selectionMode: "line" as const,
-    };
 
     await expect(
       createTestAgent(agents, {
@@ -5016,7 +5358,6 @@ describe("AgenC background agent lifecycle", () => {
           },
         ],
         initialDisplayUserMessage: "Explain the selected code",
-        initialEditorInteraction,
       }),
     ).resolves.toMatchObject({
       agentId: "agent_image",
@@ -5034,7 +5375,6 @@ describe("AgenC background agent lifecycle", () => {
           },
         ],
         initialDisplayUserMessage: "Explain the selected code",
-        initialEditorInteraction,
       }),
     ]);
     await expect(sessions.getSession("session_image")).resolves.toMatchObject({
@@ -5703,6 +6043,43 @@ describe("AgenC background agent lifecycle", () => {
     }
   });
 
+  it("resolves legacy review rows only in the manager's captured home", async () => {
+    const { cwd, home, restoreEnv } = createThreadStoreTestDirs();
+    const otherHome = mkdtempSync(join(tmpdir(), "agenc-review-other-home-"));
+    const sessionId = "session_same_workspace_review";
+    const sessions = new AgenCDaemonSessionManager({ createSessionId: () => sessionId });
+    const ownerDriver = openStateDatabases({ cwd, agencHome: home });
+    const otherDriver = openStateDatabases({ cwd, agencHome: otherHome });
+    try {
+      await sessions.createSession({ cwd, agentId: "agent_review_owner" });
+      const agents = new AgenCDaemonAgentManager({ sessionManager: sessions, agencHome: home });
+      for (const driver of [ownerDriver, otherDriver]) {
+        recordInFlightToolCallUnknownOutcome(driver, {
+          sessionId,
+          agentId: "agent_review_owner",
+          toolCallId: "same_call_id",
+          toolName: "LegacyWrite",
+          observedAt: "2026-09-10T00:00:00.000Z",
+          recoveryCategory: "side-effecting",
+        });
+      }
+      process.env.AGENC_HOME = otherHome;
+      await expect(agents.resolveSessionToolCall({ sessionId, reviewer: "owner" }))
+        .resolves.toMatchObject({ resolved: [{ toolCallId: "same_call_id" }], remaining: 0 });
+      expect(listUnresolvedUnknownOutcomeEffects(ownerDriver, sessionId)).toHaveLength(0);
+      expect(listUnresolvedUnknownOutcomeEffects(otherDriver, sessionId)).toHaveLength(1);
+      await expect(agents.resolveSessionToolCall({ sessionId, reviewer: "owner" }))
+        .resolves.toMatchObject({ resolved: [], remaining: 0 });
+    } finally {
+      ownerDriver.close();
+      otherDriver.close();
+      restoreEnv();
+      rmSync(home, { recursive: true, force: true });
+      rmSync(otherHome, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("stops a launched agent when lifecycle session creation fails", async () => {
     const stopAgent = vi.fn(async () => {});
     const agents = new AgenCDaemonAgentManager({
@@ -5890,7 +6267,7 @@ describe("AgenC background agent lifecycle", () => {
         id: "future-protocol",
         method: "initialize",
         params: {
-          protocol: { version: "1.10.0" },
+          protocol: { version: "1.16.0" },
           clientName: "contract-test",
         },
       }),
@@ -5902,8 +6279,8 @@ describe("AgenC background agent lifecycle", () => {
         message: "Unsupported protocol version",
         data: {
           code: "PROTOCOL_VERSION_UNSUPPORTED",
-          clientVersion: "1.10.0",
-          serverVersion: "1.9.0",
+          clientVersion: "1.16.0",
+          serverVersion: "1.15.0",
         },
       },
     });
@@ -5968,16 +6345,16 @@ describe("AgenC background agent lifecycle", () => {
       id: 1,
       result: {
         type: "initialized",
-        protocolVersion: "1.9.0",
-        protocol: { version: "1.9.0" },
+        protocolVersion: "1.15.0",
+        protocol: { version: "1.15.0" },
         capabilities: {},
       },
     });
-    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.9.0");
+    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.15.0");
     expect(connection.initializeState).toMatchObject({
-      protocol: { version: "1.9.0" },
+      protocol: { version: "1.15.0" },
       clientProtocol: { version: "1.0.0" },
-      serverProtocol: { version: "1.9.0" },
+      serverProtocol: { version: "1.15.0" },
       clientCapabilities: { experimentalApi: true },
     });
     expect(
@@ -6023,6 +6400,11 @@ describe("AgenC background agent lifecycle", () => {
         params: {
           objective: "ship a daemon task",
           cwd: process.cwd(),
+          addDirs: [
+            "../shared workspace",
+            "/tmp/shared",
+            "../shared workspace",
+          ],
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
         },
       }),
@@ -6038,8 +6420,10 @@ describe("AgenC background agent lifecycle", () => {
         lastActiveAt: "2026-05-01T12:00:00.500Z",
         cwd: process.cwd(),
         metadata: {
+          addDirs: ["../shared workspace", "/tmp/shared"],
           unattendedAllow: [],
           unattendedDeny: [],
+          commandEnvironment: { PATH: "" },
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
         },
       },
@@ -6056,6 +6440,10 @@ describe("AgenC background agent lifecycle", () => {
       FIRECRAWL_API_KEY: "",
       WEB_SEARCH_PROVIDER: "",
     });
+    expect(rawCreateParams?.addDirs).toEqual([
+      "../shared workspace",
+      "/tmp/shared",
+    ]);
 
     await expect(
       connection.dispatch({
@@ -6078,12 +6466,58 @@ describe("AgenC background agent lifecycle", () => {
             lastActiveAt: "2026-05-01T12:00:00.500Z",
             cwd: process.cwd(),
             metadata: {
+              addDirs: ["../shared workspace", "/tmp/shared"],
               unattendedAllow: [],
               unattendedDeny: [],
+              commandEnvironment: { PATH: "" },
               runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
             },
           },
         ],
+      },
+    });
+    await expect(
+      connection.dispatch({
+        jsonrpc: JSON_RPC_VERSION,
+        id: "bad-add-dirs",
+        method: "agent.create",
+        params: {
+          cwd: process.cwd(),
+          objective: "ship",
+          addDirs: ["/tmp/shared", 42],
+        },
+      }),
+    ).resolves.toEqual({
+      jsonrpc: JSON_RPC_VERSION,
+      id: "bad-add-dirs",
+      error: {
+        code: -32602,
+        message: "agent.create param 'addDirs' must be an array of strings",
+        data: { code: "INVALID_ARGUMENT" },
+      },
+    });
+
+    await expect(
+      connection.dispatch({
+        jsonrpc: JSON_RPC_VERSION,
+        id: "too-many-add-dirs",
+        method: "agent.create",
+        params: {
+          cwd: process.cwd(),
+          objective: "ship",
+          addDirs: Array.from(
+            { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+            (_, index) => `/tmp/shared-${index}`,
+          ),
+        },
+      }),
+    ).resolves.toEqual({
+      jsonrpc: JSON_RPC_VERSION,
+      id: "too-many-add-dirs",
+      error: {
+        code: -32602,
+        message: `agent.create param 'addDirs' accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+        data: { code: "INVALID_ARGUMENT" },
       },
     });
 
@@ -6522,9 +6956,55 @@ describe("AgenC background agent lifecycle", () => {
           messageId: "portal-message-1",
           streamId: "portal-message-1",
           acceptedAt: "2026-05-01T12:10:02.000Z",
+          localMcpAccess: true,
         },
       },
     ]);
+  });
+
+  it("keeps actual remote portal messages non-local through the manager and runner", async () => {
+    const sessions = new AgenCDaemonSessionManager({
+      createSessionId: () => "session_remote_portal",
+      now: () => "2026-09-09T00:00:00.000Z",
+    });
+    const submitted = vi.fn(async () => {});
+    const agents = new AgenCDaemonAgentManager({
+      sessionManager: sessions,
+      runner: {
+        startAgent: async () => ({ agentId: "agent_remote_portal", startedAt: "2026-09-09T00:00:00.000Z", status: "running" }),
+        submitAgentMessage: submitted,
+      },
+    });
+    await createTestAgent(agents, { cwd: process.cwd(), objective: "remote portal provenance" });
+    const remoteAccess = new RemoteAccessBoundary({
+      workspaceId: "workspace_remote_portal",
+      workspacePath: process.cwd(),
+      sessionIds: ["session_remote_portal"],
+      role: "control",
+      allowFiles: false,
+      allowApprovals: false,
+    }, () => true, (id) => sessions.getSession(id), tmpdir());
+    const connection = new AgenCDaemonJsonRpcDispatcher({
+      agentManager: agents,
+      sessionManager: sessions,
+      now: () => "2026-09-09T00:00:01.000Z",
+    }).createConnection({ remoteAccess });
+    await expect(connection.dispatch({
+      jsonrpc: JSON_RPC_VERSION, id: "initialize", method: "initialize",
+      params: { protocol: { version: "1.0.0" }, clientName: "agenc-desktop" },
+    })).resolves.toMatchObject({ result: { type: "initialized" } });
+    const params = { sessionId: "session_remote_portal", content: "remote request", clientMessageId: "remote-message", ifBusy: "reject" };
+    await expect(connection.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "send", method: "message.send", params })).resolves.toMatchObject({ result: { messageId: "remote-message" } });
+    expect(submitted).toHaveBeenCalledExactlyOnceWith("agent_remote_portal", {
+      sessionId: "session_remote_portal", content: "remote request", originalContent: "remote request",
+      messageId: "remote-message", streamId: "remote-message", acceptedAt: "2026-09-09T00:00:01.000Z",
+      ifBusy: "reject", localMcpAccess: false,
+    });
+    // The real browser boundary is stricter than generic daemon ingress:
+    // metadata cannot spoof provenance, and streaming RPC is not admitted.
+    await expect(connection.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "forged", method: "message.send", params: { ...params, metadata: { localMcpAccess: true } } })).resolves.toMatchObject({ error: { data: { code: "REMOTE_MESSAGE_INVALID" } } });
+    await expect(connection.dispatch({ jsonrpc: JSON_RPC_VERSION, id: "stream", method: "message.stream", params })).resolves.toMatchObject({ error: { data: { code: "REMOTE_METHOD_DENIED" } } });
+    expect(submitted).toHaveBeenCalledOnce();
   });
 
   it("dispatches portal background agent dashboard list/start/stop through JSON-RPC", async () => {
@@ -6613,12 +7093,14 @@ describe("AgenC background agent lifecycle", () => {
     expect(starts).toEqual([
       {
         objective: "index queued work",
+        signal: expect.any(AbortSignal),
         cwd: process.cwd(),
         envOverrides: expect.any(Object),
         metadata: {
           source: "portal.dashboard",
           unattendedAllow: ["FileRead"],
           unattendedDeny: [],
+          commandEnvironment: { PATH: "" },
           runtimeOptions: TEST_AGENT_RUNTIME_OPTIONS,
         },
         unattendedAllow: ["FileRead"],
@@ -6829,6 +7311,7 @@ describe("AgenC background agent lifecycle", () => {
           messageId: "portal-structured",
           streamId: "portal-structured",
           acceptedAt: "2026-05-01T12:20:02.000Z",
+          localMcpAccess: true,
         },
       },
     ]);
@@ -7390,7 +7873,7 @@ describe("AgenC background agent lifecycle", () => {
         agentId: "agent_approve",
         params: {
           requestId: "call_2",
-          decision: { kind: "denied" },
+          decision: { kind: "denied", reason: "no" },
         },
       },
     ]);

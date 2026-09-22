@@ -68,6 +68,7 @@ export interface AgentThreadTaskHandle {
   readonly worktreeBranch?: string;
   readonly messages?: ReadonlyArray<LLMMessage>;
   readonly summaryMessages?: ReadonlyArray<Message>;
+  readonly summaryRevision?: number;
   readonly summaryCacheSafeParams?: CacheSafeParams;
   onSummaryCacheSafeParams?(
     listener: (params: CacheSafeParams) => void,
@@ -157,12 +158,20 @@ export function observeAgentThreadTask(
     });
     if (signature === lastSignature) return;
     lastSignature = signature;
-    onSnapshot(projected);
-    if (isTerminalTaskStatus(projected.status)) unsubscribe();
+    try {
+      onSnapshot(projected);
+    } finally {
+      if (isTerminalTaskStatus(projected.status)) unsubscribe();
+    }
   };
   unsubscribe = lifecycle.subscribe(threadId, forward);
   const current = lifecycle.get(threadId);
-  if (current !== undefined) forward(current);
+  try {
+    if (current !== undefined) forward(current);
+  } catch (error) {
+    unsubscribe();
+    throw error;
+  }
   return unsubscribe;
 }
 
@@ -471,9 +480,15 @@ export function registerAgentThreadTask(
 
 function agentTranscriptFromThread(thread: AgentThreadTaskHandle): {
   readonly messages: readonly Message[];
+  readonly revision?: number;
 } {
   if (thread.summaryMessages !== undefined) {
-    return { messages: [...thread.summaryMessages] };
+    return {
+      messages: [...thread.summaryMessages],
+      ...(thread.summaryRevision !== undefined
+        ? { revision: thread.summaryRevision }
+        : {}),
+    };
   }
   return {
     messages: (thread.messages ?? []).map(llmMessageToAgentSummaryMessage),

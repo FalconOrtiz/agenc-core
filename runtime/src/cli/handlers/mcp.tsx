@@ -21,7 +21,7 @@ import { connectToServer, getMcpServerConnectionBatchSize } from '../../services
 import { addMcpConfig, getAllMcpConfigs, getMcpConfigByName, getMcpConfigsByScope, removeMcpConfig } from '../../services/mcp/config.js';
 import { redactMcpDisplayValue } from '../../services/mcp/redaction.js';
 import { normalizeNameForMCP } from '../../services/mcp/normalization.js';
-import type { ConfigScope, ScopedMcpServerConfig } from '../../services/mcp/types.js';
+import { McpServerConfigSchema, type ConfigScope, type ScopedMcpServerConfig } from '../../services/mcp/types.js';
 import { describeMcpConfigFilePath, ensureConfigScope, getScopeLabel, projectMcpServerApprovalDigest } from '../../services/mcp/utils.js';
 import {
   approveProjectMcpServerSync,
@@ -387,19 +387,22 @@ export async function mcpAddJsonHandler(name: string, json: string, options: {
   try {
     const scope = ensureConfigScope(options.scope ?? 'user');
     const parsedJson = safeParseJSON(json);
+    const result = McpServerConfigSchema().safeParse(parsedJson);
+    if (!result.success) throw new Error('Invalid MCP server configuration.');
+    const serverConfig = result.data;
 
     // Read secret before writing config so cancellation doesn't leave partial state
-    const needsSecret = options.clientSecret && parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && (parsedJson.type === 'sse' || parsedJson.type === 'http') && 'url' in parsedJson && typeof parsedJson.url === 'string' && 'oauth' in parsedJson && parsedJson.oauth && typeof parsedJson.oauth === 'object' && 'clientId' in parsedJson.oauth;
+    const needsSecret = options.clientSecret &&
+      (serverConfig.type === 'sse' || serverConfig.type === 'http') &&
+      serverConfig.oauth?.clientId;
     const clientSecret = needsSecret
       ? await readClientSecret(options.environment)
       : undefined;
-    await addMcpConfig(name, parsedJson, scope, options.authority);
-    const transportType = parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson ? String(parsedJson.type || 'stdio') : 'stdio';
-    if (clientSecret && parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && (parsedJson.type === 'sse' || parsedJson.type === 'http') && 'url' in parsedJson && typeof parsedJson.url === 'string') {
-      saveMcpClientSecret(options.authority.homeContext, name, {
-        type: parsedJson.type,
-        url: parsedJson.url
-      }, clientSecret);
+    await addMcpConfig(name, serverConfig, scope, options.authority);
+    const transportType = serverConfig.type ?? 'stdio';
+    if (clientSecret && (serverConfig.type === 'sse' || serverConfig.type === 'http')) {
+      // Credential identity includes headers and public OAuth options, not just URL.
+      saveMcpClientSecret(options.authority.homeContext, name, serverConfig, clientSecret);
     }
     cliOk(`Added ${transportType} MCP server ${name} to ${scope} config`);
   } catch (error) {

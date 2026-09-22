@@ -65,8 +65,9 @@ Default output dirs: `eval-executor-output` (agent) and
   `OPENAI_COMPATIBLE_API_KEY`). For a static key, omit `--key-command` and
   export the env var instead. The key travels executor env → `docker exec -e`
   → agent process; it is never on an argv and patches are scanned for it.
-- Resume after an interruption by re-running the same command: tasks with an
-  existing `agent-run-report.json` are skipped.
+- Resume after an interruption by re-running the same command. Tasks with a
+  complete, validated `agent-run-report.json` for the same source-lock task
+  are skipped. Their prior outcomes still count in the new batch summary.
 - `--tasks` accepts a comma-separated list once; repeating the flag is a
   usage error. Integer options (`--seed-slot`, timeouts) are decimal digits
   only; `0x10`, `1e3`, and a blank value are rejected instead of coerced.
@@ -98,6 +99,51 @@ exit 130/143. A second signal of either kind exits immediately without a
 second sweep. Docker spawn stdout/stderr is capped at
 `EVAL_EXECUTOR_MAXIMUM_CAPTURED_OUTPUT_BYTES` (1 MiB) unless a caller raises
 the bound for a specific exec.
+
+## Invalid resume reports
+
+Source-lock `instanceId` values must be 1 to 128 ASCII characters, start with a
+letter or digit, and contain only letters, digits, periods, underscores, and
+hyphens. Trailing periods and Windows device names are rejected. IDs must also
+be unique when compared without case. These constraints keep each ID a single
+portable directory name; Windows also reserves device names with extensions.
+See [Microsoft's filename rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file).
+
+The loader validates IDs even when the source-lock self-digest is correct.
+Preflight, both agent lanes, and batch resume use the same guarded task-output
+directory helpers. They reject linked directories and check pinned directory
+identities before each operation. Reads remain bounded; writes use checked
+file descriptors and reject symlinks, hardlinks, and special files. New task
+artifacts still use exclusive creation. Batch progress appends and summary
+replacement use the same file checks.
+
+Keep output roots under operator control during a run. Directory identity
+checks detect replacements but do not provide a cross-platform directory lock
+against a malicious host. Unsafe legacy IDs must be corrected in a regenerated
+source lock, with its digest recomputed, before execution. Preserve any earlier
+reports rather than moving them into a differently identified task directory.
+
+Resume validates the full report schema, task ID, `sourceTaskDigest`, and
+`reportDigest`. The source-task digest binds every field of the locked task,
+including its base commit, image, issue text, and artifact digests. An offline
+mock-provider report cannot stand in for a real-provider result.
+
+New reports also carry the versioned `overlayManifest`. Resume checks its
+required components and execution mode, then recomputes its digest and checks
+the sidecar digest. Legacy reports without this manifest are rejected with a
+recovery message. Preserve them for inspection and rerun in a new output
+directory. Do not add a manifest to an old report or recompute its stored digest
+as a substitute for running the attested overlay.
+
+An unreadable, malformed, incomplete, oversized, or mismatched report becomes
+a `driver_error`. The executor leaves its task directory unchanged and does
+not pull an image, refresh a key, or run that task. Other tasks continue.
+Reports from older executors without `sourceTaskDigest` also require recovery
+because they cannot prove which locked task produced the result.
+
+Preserve the old evidence, then move the affected task directory aside or
+choose a new `--output` directory before rerunning. Moving only the report can
+leave patch or result files that the executor refuses to overwrite.
 
 ## Outputs
 

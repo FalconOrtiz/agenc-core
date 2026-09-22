@@ -35,4 +35,18 @@ export interface OpenAIProviderConfig extends LLMProviderConfig {
   readonly apiKeyEnvLabel?: string;
   readonly authStrategy?: OpenAIProviderAuthStrategy;
   readonly basePath?: string;
+  /** Internal managed transport marker; direct provider credentials omit it. */
+  readonly managedRequestId?: boolean;
+  /**
+   * Zero data retention as a request-level routing preference. Only
+   * subclasses whose API has such a control act on it (OpenRouter sends
+   * `provider.zdr = true`); the base adapter ignores it.
+   */
+  readonly zeroDataRetention?: boolean;
+  /**
+   * Fields merged verbatim into every chat-completions request body after
+   * shaping, for provider-specific routing preferences the shared wire
+   * layer does not model. Never carries user-controlled input.
+   */
+  readonly extraBody?: Readonly<Record<string, unknown>>;
 }

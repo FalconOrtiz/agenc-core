@@ -1,11 +1,9 @@
 /**
  * RolloutItem — the per-line wrapper written to the JSONL rollout
- * file. Port of agenc runtime `protocol/src/protocol.rs` (line 2855) + the
- * 6-variant set listed in `docs/plan/agenc runtime-inventory.md §4`.
+ * file, covering the six item variants persisted to disk.
  *
  * Serialization: JSONL with `{ "type": "snake_case", "payload": ... }`
- * discriminant (matching agenc runtime's serde `tag="type" content="payload"`
- * shape). One RolloutItem per line.
+ * discriminant. One RolloutItem per line.
  *
  * On-disk compatibility aliases accepted for backward compatibility:
  *   - `task_started`  → `turn_started`
@@ -15,11 +13,12 @@
  */
 
 import type { Event, EventMsg, SessionMetaLine } from "./event-log.js";
+import type { ProviderReasoningReplay } from "../llm/types.js";
+import { redactDurableSecrets } from "./provider-replay-redaction.js";
 import type { SessionAgentTask } from "./agent-task-lifecycle.js";
 import type { ToolResultIntegrity } from "./tool-result-integrity.js";
 import type { AgentInvocationChannelMetadata } from "../contracts/agent-invocation-envelope.js";
 import type { CompactionHistoryMarkerV1 } from "./compaction-history-marker.js";
-import { redactSecretsInValue } from "../secrets/index.js";
 import type {
   CompactionCleanupPendingV1,
   CompactionCommittedV1,
@@ -39,12 +38,80 @@ import {
 // Per-variant payloads
 // ─────────────────────────────────────────────────────────────────────
 
-/** agenc runtime `SessionStateUpdate` — session-scoped mutable slots. */
-export interface SessionStateUpdate {
-  readonly agentTask?: SessionAgentTask;
+/**
+ * Memory-extraction cadence for one memory root of a session. The extraction
+ * service paces its child by eligible turns and remembers how far into the
+ * model-visible history it has read. Both counters used to live only in the
+ * service's in-process lane map, so a daemon restart began the wait again
+ * while the conversation it paced stayed on disk. The service writes this
+ * slot after every cadence decision and the resume path seeds a new lane from
+ * the newest item per memory root.
+ */
+export interface SessionMemoryExtractionState {
+  /** Normalized memory directory the counters belong to. */
+  readonly memoryRoot: string;
+  /** Model-visible messages already offered to the extraction child. */
+  readonly processedVisibleCount: number;
+  /** Eligible turns since the last run, compared against minEligibleTurns. */
+  readonly turnsSinceLastExtraction: number;
 }
 
-/** Port of agenc runtime `ResponseItem` subset used in rollout. Every history
+/**
+ * `SessionStateUpdate`: session-scoped mutable slots.
+ *
+ * Every writer persists one slot per item. A walker restoring one slot must
+ * therefore skip the items another writer produced instead of reading its
+ * own missing key as an explicit clear; see sessionStateUpdateAddressesSlot.
+ */
+export interface SessionStateUpdate {
+  readonly agentTask?: SessionAgentTask;
+  readonly memoryExtraction?: SessionMemoryExtractionState;
+  readonly userStop?: {
+    readonly stopped: boolean;
+    readonly generation: number;
+  };
+}
+
+export type SessionStateSlot = keyof SessionStateUpdate;
+
+export function readPersistedUserStopState(item: RolloutItem): NonNullable<SessionStateUpdate["userStop"]> | undefined {
+  if (item.type !== "session_state" || !Object.hasOwn(item.payload, "userStop")) return undefined;
+  const state = item.payload.userStop;
+  if (
+    state === undefined || state === null || typeof state !== "object" ||
+    typeof state.stopped !== "boolean" || !Number.isSafeInteger(state.generation) ||
+    state.generation < 0 ||
+    Object.keys(state).some((key) => key !== "stopped" && key !== "generation")
+  ) throw new Error("Invalid persisted user-stop state");
+  return state;
+}
+
+/**
+ * Whether a persisted `session_state` payload addresses `slot`.
+ *
+ * A key that is present addresses its slot, cleared or not. An explicit clear
+ * is written as `undefined`, which JSON.stringify drops, so after a round trip
+ * a cleared agent task is a payload with no keys at all. That empty payload
+ * is still read as the agent-task clear, because the agent task is the only
+ * slot that has ever been cleared this way. A payload carrying some other
+ * slot was written by that slot's writer and says nothing about this one.
+ */
+export function sessionStateUpdateAddressesSlot(
+  payload: SessionStateUpdate,
+  slot: SessionStateSlot,
+): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  if (Object.hasOwn(payload, slot)) return true;
+  return slot === "agentTask" && Object.keys(payload).length === 0;
+}
+
+export type {
+  ProviderReasoningReplay,
+  ProviderReasoningReplayV1,
+  ProviderReasoningReplayV2,
+} from "../llm/types.js";
+
+/** The `ResponseItem` subset used in rollout. Every history
  *  message the model sent/received lives here. */
 export interface ResponseItem {
   readonly role: "system" | "developer" | "user" | "assistant" | "tool";
@@ -62,6 +129,8 @@ export interface ResponseItem {
   }>;
   readonly toolCallId?: string;
   readonly toolName?: string;
+  /** Opaque provider state; never render this as assistant text. */
+  readonly providerReasoning?: ProviderReasoningReplay;
   /** Checkpoint-v2 identity for the exact durable tool-result body. */
   readonly toolResultIntegrity?: ToolResultIntegrity;
   /** Durable authority/channel identity for a versioned agent invocation. */
@@ -78,7 +147,7 @@ export interface ToolResultIntegrityResponseItem extends ResponseItem {
   readonly toolResultIntegrity?: ToolResultIntegrity;
 }
 
-/** agenc runtime `CompactedItem` — when the conversation was compacted, this
+/** `CompactedItem`: when the conversation was compacted, this
  *  captures the summary + (optional) the replacement history that
  *  rebuilds the conversation up to the compaction boundary. The
  *  reconstruction algorithm uses `replacementHistory` as a snapshot
@@ -212,8 +281,7 @@ const KNOWN_ROLLOUT_TYPES = Object.freeze(
 
 /**
  * Compatibility-alias remapping read on deserialization so older rollouts
- * from earlier AgenC versions still parse. agenc runtime retained `task_*`
- * aliases for the same reason.
+ * from earlier AgenC versions still parse.
  */
 const ROLLOUT_LEGACY_TYPE_ALIASES: Readonly<Record<string, string>> =
   Object.freeze({
@@ -231,14 +299,85 @@ const ROLLOUT_LEGACY_TYPE_ALIASES: Readonly<Record<string, string>> =
  */
 export function serializeRolloutItem(item: RolloutItem): string {
   rejectInlineCompactionWriter(item);
+  if (
+    rolloutCarriesProviderReasoning(item) &&
+    item.eventVersion !== undefined &&
+    item.eventVersion < ROLLOUT_ITEM_VERSION
+  ) {
+    throw new Error(
+      `provider reasoning replay requires rollout eventVersion ${ROLLOUT_ITEM_VERSION}`,
+    );
+  }
   const defaultEventVersion = isCompactionRolloutType(item.type)
     ? ROLLOUT_ITEM_VERSION
-    : LEGACY_ROLLOUT_ITEM_VERSION;
+    : rolloutCarriesProviderReasoning(item)
+      ? ROLLOUT_ITEM_VERSION
+      : LEGACY_ROLLOUT_ITEM_VERSION;
   const stamped =
     item.eventVersion === undefined
       ? { ...item, eventVersion: defaultEventVersion }
       : item;
-  return `${JSON.stringify(redactSecretsInValue(stamped))}\n`;
+  // Compaction payload chunks are redacted when the bundle is created and are
+  // content-addressed (byte count and digest); redacting them again here is
+  // what the reader would reject.
+  const redacted =
+    item.type === "compaction_payload_chunk"
+      ? stamped
+      : (redactDurableSecrets(stamped, "rollout") as typeof stamped);
+  assertProviderReasoningUnchanged(stamped, redacted);
+  return `${JSON.stringify(redacted)}\n`;
+}
+
+function rolloutCarriesProviderReasoning(item: RolloutItem): boolean {
+  if (item.type === "response_item") {
+    return item.payload.providerReasoning !== undefined;
+  }
+  if (item.type === "compacted") {
+    return item.payload.replacementHistory?.some(
+      (message) => message.providerReasoning !== undefined,
+    ) === true;
+  }
+  return false;
+}
+
+function providerReasoningValues(item: RolloutItem): readonly string[] {
+  const values = (
+    reasoning: ProviderReasoningReplay | undefined,
+  ): readonly string[] =>
+    reasoning === undefined
+      ? []
+      : reasoning.version === 2
+        ? [
+            String(reasoning.version),
+            reasoning.content,
+            reasoning.provider,
+            reasoning.model,
+          ]
+        : [String(reasoning.version), reasoning.content];
+  if (item.type === "response_item") {
+    return values(item.payload.providerReasoning);
+  }
+  if (item.type === "compacted") {
+    return (item.payload.replacementHistory ?? []).flatMap((message) =>
+      values(message.providerReasoning));
+  }
+  return [];
+}
+
+function assertProviderReasoningUnchanged(
+  original: RolloutItem,
+  redacted: RolloutItem,
+): void {
+  const before = providerReasoningValues(original);
+  const after = providerReasoningValues(redacted);
+  if (
+    before.length !== after.length ||
+    before.some((value, index) => value !== after[index])
+  ) {
+    throw new Error(
+      "cannot serialize provider reasoning replay because secret redaction would change its opaque content",
+    );
+  }
 }
 
 function rejectInlineCompactionWriter(item: RolloutItem): void {

@@ -1,16 +1,15 @@
 /**
  * Session — initialized model agent context.
  *
- * Hand-port of agenc runtime `core/src/session/session.rs` (852 LOC Rust)
- * per `docs/plan/agenc runtime-inventory.md §1` Session struct mapping table.
- * Every field of agenc runtime's `Session` struct has a TypeScript equivalent.
+ * Owns the per-conversation state, the single active turn slot, the
+ * mailbox, and the service container every turn runs against.
  * Session-facing subsystem contracts (ModelsManager, RolloutRecorder,
  * McpConnectionManager, AgentControl, etc.) are structural service
  * interfaces. Concrete implementations live in their owning runtime
  * modules and are injected through `SessionServices`.
  *
- * "A session has at most 1 running task at a time, and can be
- *  interrupted by user input." — agenc runtime doc-comment, session.rs:5
+ * A session has at most one running task at a time, and can be
+ * interrupted by user input.
  *
  * Invariants enforced here:
  *   I-5  (bidirectional mailbox) — Session holds both `mailbox` (its own
@@ -34,6 +33,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { readPersistedUserStopState, type RolloutItem } from "./rollout-item.js";
+import type { ReadOnlyDelegationConstraint } from "../agents/readonly-delegation.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   AsyncLock,
@@ -59,6 +61,10 @@ import {
   validateAgentInvocationMessageSequence,
   type AgentInvocationChannelMetadata,
 } from "../contracts/agent-invocation-envelope.js";
+import {
+  projectRuntimeOnly,
+  projectToolExchangeFields,
+} from "./runtime-message-conversion.js";
 import {
   buildPostCompactMessages,
   partialCompactConversationAsync,
@@ -249,7 +255,7 @@ import {
 // behavior to the subsystem implementations injected through services.
 // ─────────────────────────────────────────────────────────────────────
 
-/** agenc runtime `ThreadId`. Conversation/thread unique identifier. */
+/** Conversation/thread unique identifier. */
 export type ThreadId = string;
 
 // Event / EventMsg / SessionConfiguredEvent are re-exported from
@@ -277,10 +283,10 @@ export {
   nonSteerableTurnKindFrom,
 } from "./tasks.js";
 
-/** agenc runtime `AgentStatus` FSM, owned by `runtime/src/agents/status.ts`. */
+/** Agent status FSM, owned by `runtime/src/agents/status.ts`. */
 export type AgentStatus = RuntimeAgentStatus;
 
-/** agenc runtime `SessionState`. Mutable state under `state` mutex. */
+/** Mutable session state held under the `state` lock. */
 export interface SessionState {
   /** Active configuration (mutable per `/model`, `/provider`, etc.). */
   sessionConfiguration: SessionConfiguration;
@@ -302,8 +308,7 @@ export interface SessionState {
   /** Resume/fork baseline turn context from rollout reconstruction. */
   referenceContextItem?: TurnContextItem;
   /**
-   * Seeded from the last persisted `token_count` event on resume/fork
-   * (agenc runtime `last_token_info_from_rollout` at session/mod.rs:1257). UIs
+   * Seeded from the last persisted `token_count` event on resume/fork. UIs
    * that need to display cumulative token usage immediately on resume
    * read this instead of waiting for the first new completion. The
    * live per-turn accounting path continues to update it via the
@@ -319,15 +324,12 @@ export interface SessionState {
     readonly webSearchRequests?: number;
   };
   /**
-   * Cross-turn cumulative token usage. Mirrors agenc runtime
-   * `TokenUsageInfo.total_token_usage` (protocol.rs:2259-2297) and is
-   * the authoritative source for the mid-turn compact gate's
-   * `total_usage_tokens >= auto_compact_limit` check. The writer in
-   * `stream-model.ts` element-wise accumulates every provider-reported
-   * `LLMUsage` under the session state lock after each stream
-   * completes, matching agenc runtime's `TokenUsageInfo::append_last_usage`
-   * (protocol.rs:2294-2297). Undefined until the first response with
-   * usage lands so an unpopulated session reports zero.
+   * Cross-turn cumulative token usage. This is the authoritative source
+   * for the mid-turn compact gate's total-usage versus auto-compact-limit
+   * check. The writer in `stream-model.ts` element-wise accumulates every
+   * provider-reported `LLMUsage` under the session state lock after each
+   * stream completes. Undefined until the first response with usage lands
+   * so an unpopulated session reports zero.
    */
   totalTokenUsage?: {
     readonly promptTokens: number;
@@ -336,19 +338,18 @@ export interface SessionState {
     readonly cachedInputTokens: number;
     readonly reasoningOutputTokens: number;
   };
-  /** Pending session-start hook source (agenc runtime line 841). */
+  /** Pending session-start hook source. */
   pendingSessionStartSource?: SessionStartSource;
 }
 
-/** agenc runtime `SessionStartSource` from the hook runtime. */
+/** Session-start source from the hook runtime. */
 export type SessionStartSource = Extract<
   HookSessionStartSource,
   "startup" | "resume" | "clear"
 >;
 
 /**
- * agenc runtime `ResponseInputItem` / `UserInput` — opaque payload the turn
- * machine consumes. Structural alias kept permissive so both text and
+ * Opaque user-input payload the turn machine consumes. Structural alias kept permissive so both text and
  * multimodal items can route through idle-input merge without the
  * session module pulling in the provider-specific shape.
  */
@@ -360,8 +361,7 @@ export type UserInput = unknown;
  * the same immutable interaction id.
  */
 export interface IdleInputOwnership {
-  readonly workspaceView: "agent" | "editor";
-  readonly editorInteractionId?: string;
+  readonly workspaceView: "agent";
 }
 
 /**
@@ -372,11 +372,11 @@ export interface IdleInputOwnership {
 export const MAILBOX_SOURCE_IDLE_INPUT = "idle";
 
 /**
- * Upstream agenc runtime `state/turn.rs::ActiveTurn`. Holds the running-task
- * registry and the per-turn lock-guarded state (`ActiveTurnState`).
+ * Active turn record. Holds the running-task registry and the per-turn
+ * lock-guarded state (`ActiveTurnState`).
  *
  * Gut originally exposed only `{turnId, startedAtMs, abortController}`
- * as a forward slot; the T5 task-dispatch port (see `session/tasks.ts`)
+ * as a forward slot; the task-dispatch layer (see `session/tasks.ts`)
  * adds the `tasks` registry and the `turnState` lock so
  * `Session.spawnTask` / `Session.onTaskFinished` can enforce the "one
  * turn in flight at a time" invariant. Existing consumers read the
@@ -387,10 +387,9 @@ export interface ActiveTurn {
   readonly turnId: string;
   readonly startedAtMs: number;
   readonly abortController: AbortController;
-  /** Upstream `tasks: IndexMap<sub_id, RunningTask>`. JS Map preserves
-   *  insertion order, matching IndexMap semantics. */
+  /** Running tasks keyed by sub-id. JS Map preserves insertion order. */
   readonly tasks: Map<string, RunningTask>;
-  /** Upstream `turn_state: Arc<Mutex<TurnState>>` per translation-conventions. */
+  /** Lock-guarded per-turn state. */
   readonly turnState: AsyncLock<ActiveTurnState>;
   /** Root human input bound to this exact turn; absent for synthetic turns. */
   readonly rootHumanTurn?: {
@@ -399,7 +398,7 @@ export interface ActiveTurn {
   };
 }
 
-/** agenc runtime `Mailbox` + `MailboxReceiver`. T9 (subagents) provides the
+/** Mailbox + receiver contract. T9 (subagents) provides the
  *  full bidirectional impl per I-5/I-16/I-31/I-64. Today we expose the
  *  shape so Session can hold its own inbox + per-child outbound
  *  mailboxes.
@@ -430,39 +429,20 @@ function idleInputOwnershipFromMessage(
   ) {
     return undefined;
   }
-  const record = candidate as {
-    readonly workspaceView?: unknown;
-    readonly editorInteractionId?: unknown;
-  };
-  if (record.workspaceView !== "agent" && record.workspaceView !== "editor") {
-    return undefined;
-  }
-  return {
-    workspaceView: record.workspaceView,
-    ...(typeof record.editorInteractionId === "string"
-      ? { editorInteractionId: record.editorInteractionId }
-      : {}),
-  };
+  const record = candidate as { readonly workspaceView?: unknown };
+  // Historical envelopes may carry the retired "editor" view; they belong to
+  // no live surface and are never drained.
+  return record.workspaceView === "agent" ? { workspaceView: "agent" } : undefined;
 }
 
 function mailboxMessageEligibleForOwnership(
   message: InterAgentCommunication,
-  ownership?: IdleInputOwnership,
 ): boolean {
   const isIdle = message.metadata?.source === MAILBOX_SOURCE_IDLE_INPUT;
-  if (ownership?.workspaceView === "editor") {
-    if (!isIdle) return false;
-    const interactionId = ownership.editorInteractionId;
-    const candidate = idleInputOwnershipFromMessage(message);
-    return (
-      typeof interactionId === "string" &&
-      interactionId.length > 0 &&
-      candidate?.workspaceView === "editor" &&
-      candidate.editorInteractionId === interactionId
-    );
-  }
   if (!isIdle) return true;
-  return idleInputOwnershipFromMessage(message)?.workspaceView !== "editor";
+  // Idle input written by a retired surface is never drained into a turn.
+  const ownership = idleInputOwnershipFromMessage(message);
+  return ownership === undefined || ownership.workspaceView === "agent";
 }
 
 export interface Mailbox<T = InterAgentCommunication> {
@@ -1038,15 +1018,15 @@ function mcpElicitationPendingKey(
   return `${serverName}\u0000${String(requestId)}`;
 }
 
-/** agenc runtime `RealtimeConversationManager`. */
+/** Realtime conversation manager. */
 export type RealtimeConversationManager = RealtimeConversation;
 
-/** agenc runtime `GuardianReviewSessionManager`. */
+/** Guardian review session manager. */
 export interface GuardianReviewSessionManager {
   readonly enabled: boolean;
 }
 
-/** agenc runtime `RolloutRecorder`. */
+/** Rollout recorder contract. */
 export interface RolloutRecorder {
   rolloutPath(): string;
   record(item: unknown): Promise<void>;
@@ -1054,7 +1034,7 @@ export interface RolloutRecorder {
   setWindowGeneration(n: number): void;
 }
 
-/** agenc runtime `ModelsManager`; runtime provider/model catalog. */
+/** Runtime provider/model catalog. */
 export interface ModelsManager {
   getModelInfo(modelSlug: string, config?: unknown): Promise<ModelInfo>;
   tryListModels(): ReadonlyArray<ModelInfo> | undefined;
@@ -1063,7 +1043,7 @@ export interface ModelsManager {
   ): Promise<ReadonlyArray<ModelInfo>>;
 }
 
-/** agenc runtime `McpManager`. */
+/** MCP manager contract. */
 export interface McpManager {
   effectiveServers(
     config: unknown,
@@ -1077,7 +1057,7 @@ export interface McpManager {
   reconnectServer?(name: string): Promise<McpServerMutationResult>;
   enableServer?(name: string): Promise<McpServerMutationResult>;
   disableServer?(name: string): Promise<McpServerMutationResult>;
-  addServer?(config: McpSessionServerConfig): Promise<McpServerMutationResult>;
+  addServer?(config: McpSessionServerConfig, options?: { readonly replace?: boolean }): Promise<McpServerMutationResult>;
   /**
    * Canonical live-manager tool boundary for callers that have already
    * acquired session effect admission. Callers must propagate that admitted
@@ -1086,6 +1066,8 @@ export interface McpManager {
   callTool?: MCPManager["callTool"];
   getTools?(): ReadonlyArray<McpSessionToolInfo>;
   getToolsByServer?(name: string): ReadonlyArray<McpSessionToolInfo>;
+  /** Live signed Desktop names, for reduced model catalogs only. Does not discover or authorize tools. */
+  getAuthenticatedDesktopToolNames?(): readonly string[];
   getConfiguredServers?(): readonly McpSessionServerConfig[];
   getConnectionState?(name: string): McpConnectionProjection | undefined;
   getConnectedConnection?(name: string): MCPServerConnection | undefined;
@@ -1172,6 +1154,9 @@ export interface McpSessionServerConfig {
   readonly endpoint?: string;
   readonly enabled?: boolean;
   readonly required?: boolean;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly localOnly?: boolean;
+  readonly desktopAuthority?: { readonly id: string; readonly signature: string };
 }
 
 export interface McpSessionToolInfo {
@@ -1186,12 +1171,12 @@ export interface McpServerInfo {
   readonly command?: string;
 }
 
-/** agenc runtime `LspManager`. */
+/** LSP manager contract. */
 export interface LspManager {
   refreshFromConfig?(config: unknown): Promise<void>;
 }
 
-/** agenc runtime `McpConnectionManager`. */
+/** MCP connection manager contract. */
 export interface McpConnectionManager {
   setApprovalPolicy(policy: unknown): void;
   setSandboxPolicy(policy: unknown): void;
@@ -1200,19 +1185,19 @@ export interface McpConnectionManager {
   ): Promise<ReadonlyArray<{ server: string; error: string }>>;
 }
 
-/** agenc runtime `AgentControl` service facade for subagents. */
+/** Agent control service facade for subagents. */
 export interface AgentControl {
   readonly maxThreads: number;
   spawnAgent(opts: unknown): Promise<unknown>;
   shutdownAgentTree(threadId: ThreadId): Promise<void>;
 }
 
-/** agenc runtime `AgentIdentityManager`; owned by the agent registry layer. */
+/** Agent identity manager; owned by the agent registry layer. */
 export interface AgentIdentityManager {
   ensureRegistered(): Promise<void>;
 }
 
-/** agenc runtime `Hooks`; implemented by `runtime/src/llm/hooks/`. */
+/** Hooks contract; implemented by `runtime/src/llm/hooks/`. */
 export interface Hooks {
   startupWarnings(): ReadonlyArray<string>;
   /**
@@ -1240,7 +1225,7 @@ export interface Hooks {
   executeStopFailure(...args: unknown[]): Promise<unknown>;
 }
 
-/** agenc runtime `SkillsManager` + `SkillsWatcher` + `PluginsManager`. */
+/** Skills manager (skills catalog, watcher, and plugin-provided skills). */
 export interface SkillsManager {
   skillsForConfig(input: unknown, fs: unknown): Promise<SkillLoadOutcome>;
   resolveSkill?(
@@ -1292,12 +1277,12 @@ export interface PluginsManager {
   ): Promise<{ effectiveSkillRoots(): unknown }>;
 }
 
-/** agenc runtime `ExecPolicyManager`. */
+/** Exec policy manager contract. */
 export interface ExecPolicyManager {
   current(): unknown;
 }
 
-/** agenc runtime `ApprovalStore`. */
+/** Approval store contract. */
 export interface ApprovalStore {
   hasApproval(key: string): boolean;
   approve(key: string): void;
@@ -1308,19 +1293,19 @@ export interface ApprovalStore {
   }): Promise<unknown>;
 }
 
-/** agenc runtime `LocalThreadStore`. */
+/** Local thread store contract. */
 export interface LocalThreadStore {
   threadName(threadId: ThreadId): Promise<string | undefined>;
   setThreadName(threadId: ThreadId, name: string): Promise<void>;
 }
 
-/** Deferred agenc runtime `ModelClient`; live provider dispatch uses `services.provider`. */
+/** Deferred model client facade; live provider dispatch uses `services.provider`. */
 export interface ModelClient {
   setWindowGeneration(n: number): void;
-  // Deferred until a caller needs the full agenc runtime ModelClient facade.
+  // Deferred until a caller needs the full ModelClient facade.
 }
 
-/** agenc runtime `NetworkApprovalService`. */
+/** Network approval service contract. */
 export interface NetworkApprovalService {
   enabled(): boolean;
   clearSessionHosts?(): void;
@@ -1328,24 +1313,25 @@ export interface NetworkApprovalService {
   requestDeferredApproval?(opts: unknown): Promise<unknown>;
 }
 
-/** agenc runtime `Shell`. */
+/** User shell contract. */
 export interface UserShell extends CommandExecutionAuthority {
   deriveExecArgs(input: string, useLoginShell: boolean): string[];
 }
 
-/** agenc runtime `UnifiedExecProcessManager`. */
+/** Unified exec process manager. */
 export type UnifiedExecProcessManager = UnifiedExecProcessManagerLike;
 
-/** agenc runtime `BehaviorSubject<unknown>` for shell snapshot tx. */
+/** Shell snapshot transmitter. */
 export type ShellSnapshotTx = BehaviorSubject<unknown | null>;
 
-/** agenc runtime `state_db_ctx`. */
+/** State database context. */
 export interface StateDbContext {
   readonly path: string;
 }
 
-/** agenc runtime `SessionServices` — DI container of all session-scoped services. */
+/** DI container of all session-scoped services. */
 export interface SessionServices {
+  readonly readOnlyDelegation?: ReadOnlyDelegationConstraint;
   /** Immutable operator policy captured for this session at creation time. */
   readonly runtimeOptions: AgentRuntimeOptions;
   readonly mcpConnectionManager: McpConnectionManager;
@@ -1358,16 +1344,15 @@ export interface SessionServices {
   readonly hooks: Hooks;
   readonly rollout: RolloutRecorder | undefined;
   /**
-   * agenc runtime `rollout_trace` (T6 diagnostics). Coexists with `rollout`:
+   * Rollout trace recorder (T6 diagnostics). Coexists with `rollout`:
    * `rollout` is the authoritative rollout item log (source of truth),
    * `rolloutTrace` is the best-effort diagnostic trace bundle recorder
    * used for replay analysis and post-mortem debugging.
    *
    * Declared optional (`?`) instead of `RolloutTraceRecorder | undefined`
    * so existing `SessionServices` construction sites in `bin/bootstrap.ts`
-   * and test fixtures do not need to be updated in this tranche. Upstream
-   * agenc runtime treats this slot as required and passes a disabled handle when
-   * tracing is off; AgenC callers can opt in by supplying
+   * and test fixtures do not need to be updated in this tranche. Callers
+   * can opt in by supplying
    * `createRolloutTraceRecorder(...)` or `RolloutTraceRecorder.disabled()`.
    */
   readonly rolloutTrace?: RolloutTraceRecorder;
@@ -1383,9 +1368,8 @@ export interface SessionServices {
   readonly toolApprovals: ApprovalStore;
   readonly guardianRejections: Map<string, unknown>;
   /**
-   * agenc runtime `GuardianRejectionCircuitBreaker` (per-turn guardian-denial
-   * counter with consecutive + total thresholds). Ported from upstream
-   * agenc runtime `core/src/guardian/mod.rs`. Optional while callers are wired up;
+   * Guardian rejection circuit breaker (per-turn guardian-denial
+   * counter with consecutive + total thresholds). Optional while callers are wired up;
    * the bootstrap default map above stays until every consumer routes
    * denials through the breaker instead.
    *
@@ -1400,7 +1384,7 @@ export interface SessionServices {
    * `guardianRejectionCircuitBreaker`.
    */
   readonly guardianApprovalReviewer?: GuardianApprovalReviewer;
-  /** T13 review-task port. agenc runtime `session/review.rs` manager analog. */
+  /** Review-task manager. */
   readonly reviewManager?: import("./review.js").ReviewManager;
   readonly skillsManager: SkillsManager;
   readonly pluginsManager: PluginsManager;
@@ -1427,12 +1411,11 @@ export interface SessionServices {
   readonly stateDb?: StateDbContext;
   readonly threadStore: LocalThreadStore;
   /**
-   * Upstream agenc runtime `services.live_thread: Option<LiveThread>`
-   * (core/src/state/service.rs:66). Optional because gut has no
+   * Optional live thread handle. Optional because gut has no
    * ThreadStore subsystem: the service is populated by callers that
    * construct a `LiveThread` against the session's `RolloutStore`, and
    * left unset in tests / ephemeral sessions. See `live-thread.ts` for
-   * the partial port's RESERVED-method list.
+   * the RESERVED-method list.
    */
   readonly liveThread?: LiveThread;
   readonly modelClient: ModelClient;
@@ -1454,9 +1437,23 @@ export interface SessionServices {
   readonly executionAdmission?: ExecutionAdmissionClient;
   /** Production sessions set this so a missing kernel is a typed hard stop. */
   readonly admissionRequired?: boolean;
+  /**
+   * Set by the one-shot review delegate on its child session. That delegate
+   * owns the review deadline (`AgenCReviewOneShotRequest.timeoutMs`, unbounded
+   * when the caller omits it) and classifies its own expiry as a `timeout`
+   * verdict. The ambient `stream_watchdog_timeout_ms` deadline would pre-empt
+   * that with an untyped `stream_idle` abort, which the guardian reviewer can
+   * only report as a review failure, so the child opts out and the delegate's
+   * deadline stays the authority over how long a review may run. The opt-out
+   * covers the *default* only: a `stream_watchdog_timeout_ms` the operator
+   * configured is still honoured in the child, as it was before this flag.
+   */
+  readonly streamIdleWatchdogDisabled?: boolean;
   readonly querySource?: QuerySource;
   readonly permissionRequestHooks?: ReadonlyArray<PermissionRequestHook>;
   readonly approvalResolver?: ApprovalResolver;
+  /** Maintenance may use existing grants but must defer new interactive approval. */
+  readonly deferInteractiveApprovals?: (toolName: string) => void;
   readonly permissionAuditLogger?: PermissionAuditLogger;
   readonly onPermissionAuditError?: PermissionAuditErrorHandler;
   requestUserInputResolver?: {
@@ -1606,11 +1603,12 @@ export type AbortReason =
   | "process_killed";
 
 // ─────────────────────────────────────────────────────────────────────
-// Session class — the field-faithful port of agenc runtime `Session` struct.
+// Session class.
 // ─────────────────────────────────────────────────────────────────────
 
 export interface SessionOpts {
   readonly conversationId: ThreadId;
+  readonly fileReadScope?: object;
   readonly initialState: SessionState;
   readonly features: ManagedFeatures;
   readonly services: SessionServices;
@@ -1807,7 +1805,138 @@ function readProviderHttpClient(
   return candidate instanceof ProviderHttpClient ? candidate : undefined;
 }
 
-function normalizeHistoryMessages(
+/**
+ * Durable metadata of a history item. The live turn stores it under
+ * `runtimeOnly` (LLMMessage shape); a rollout reconstruction restores the
+ * persisted ResponseItem shape, where the same fields sit at the top level.
+ * Both must normalize identically: a resumed session whose restored tool
+ * results lost their seal fails its first durable checkpoint with
+ * "checkpoint v2 requires every tool result to be sealed".
+ */
+function durableHistoryMetadata(candidate: {
+  readonly toolResultIntegrity?: ToolResultIntegrity;
+  readonly agentInvocation?: AgentInvocationChannelMetadata;
+  readonly compactionHistory?: CompactionHistoryMarkerV1;
+  readonly runtimeOnly?: {
+    readonly toolResultIntegrity?: ToolResultIntegrity;
+    readonly agentInvocation?: AgentInvocationChannelMetadata;
+    readonly compactionHistory?: CompactionHistoryMarkerV1;
+  };
+}): {
+  readonly toolResultIntegrity?: ToolResultIntegrity;
+  readonly agentInvocation?: AgentInvocationChannelMetadata;
+  readonly compactionHistory?: CompactionHistoryMarkerV1;
+} {
+  return {
+    toolResultIntegrity:
+      candidate.runtimeOnly?.toolResultIntegrity ?? candidate.toolResultIntegrity,
+    agentInvocation:
+      candidate.runtimeOnly?.agentInvocation ?? candidate.agentInvocation,
+    compactionHistory:
+      candidate.runtimeOnly?.compactionHistory ?? candidate.compactionHistory,
+  };
+}
+
+function normalizedReasoningProvenance(
+  value: unknown,
+): LLMMessage["providerReasoningProvenance"] | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as { readonly provider?: unknown; readonly model?: unknown };
+  if (
+    typeof record.provider !== "string" ||
+    record.provider.trim().length === 0 ||
+    typeof record.model !== "string" ||
+    record.model.trim().length === 0
+  ) {
+    return undefined;
+  }
+  return {
+    provider: record.provider.trim().toLowerCase(),
+    model: record.model.trim().toLowerCase(),
+  };
+}
+
+function normalizedProviderReasoning(candidate: {
+  readonly providerReasoningContent?: unknown;
+  readonly providerReasoningProvenance?: unknown;
+  readonly providerReasoning?: unknown;
+}): Pick<
+  LLMMessage,
+  "providerReasoningContent" | "providerReasoningProvenance"
+> {
+  const hasFlatContent = candidate.providerReasoningContent !== undefined;
+  const flatContent =
+    typeof candidate.providerReasoningContent === "string" &&
+    candidate.providerReasoningContent.length > 0
+      ? candidate.providerReasoningContent
+      : undefined;
+  const hasFlatProvenance =
+    candidate.providerReasoningProvenance !== undefined;
+  const flatProvenance = normalizedReasoningProvenance(
+    candidate.providerReasoningProvenance,
+  );
+  const hasDurable = candidate.providerReasoning !== undefined;
+  const durable =
+    candidate.providerReasoning !== null &&
+    typeof candidate.providerReasoning === "object" &&
+    !Array.isArray(candidate.providerReasoning)
+      ? (candidate.providerReasoning as Record<string, unknown>)
+      : undefined;
+  const durableContent =
+    typeof durable?.content === "string" && durable.content.length > 0
+      ? durable.content
+      : undefined;
+
+  // Treat every supplied representation as one atomic tuple. A malformed
+  // duplicate must not be ignored while another representation is accepted:
+  // doing so could bind opaque state to an identity that did not produce it.
+  if (
+    (hasFlatContent && flatContent === undefined) ||
+    (hasFlatProvenance && flatProvenance === undefined) ||
+    (hasDurable && durable === undefined)
+  ) {
+    return {};
+  }
+
+  if (durable !== undefined) {
+    if (durable.version === 2) {
+      const durableProvenance = normalizedReasoningProvenance(durable);
+      if (durableContent === undefined || durableProvenance === undefined) {
+        return {};
+      }
+      if (
+        (flatContent !== undefined && flatContent !== durableContent) ||
+        (flatProvenance !== undefined &&
+          (flatProvenance.provider !== durableProvenance.provider ||
+            flatProvenance.model !== durableProvenance.model))
+      ) {
+        return {};
+      }
+      return {
+        providerReasoningContent: durableContent,
+        providerReasoningProvenance: durableProvenance,
+      };
+    }
+    if (durable.version !== 1 || durableContent === undefined) return {};
+    if (flatContent !== undefined && flatContent !== durableContent) return {};
+    // V1 is deliberately unbound. Never upgrade it from adjacent flat fields;
+    // only a producer-written V2 record is authoritative provenance.
+    if (flatProvenance !== undefined) return {};
+    return { providerReasoningContent: durableContent };
+  }
+
+  if (flatContent === undefined) return {};
+  return {
+    providerReasoningContent: flatContent,
+    ...(flatProvenance !== undefined
+      ? { providerReasoningProvenance: flatProvenance }
+      : {}),
+  };
+}
+
+export function normalizeHistoryMessages(
   history: ReadonlyArray<unknown>,
 ): LLMMessage[] {
   const normalized: LLMMessage[] = [];
@@ -1820,6 +1949,20 @@ function normalizeHistoryMessages(
       toolCalls?: unknown;
       toolCallId?: unknown;
       toolName?: unknown;
+      providerReasoningContent?: unknown;
+      providerReasoningProvenance?: {
+        provider?: unknown;
+        model?: unknown;
+      };
+      providerReasoning?: {
+        version?: unknown;
+        content?: unknown;
+        provider?: unknown;
+        model?: unknown;
+      };
+      toolResultIntegrity?: ToolResultIntegrity;
+      agentInvocation?: AgentInvocationChannelMetadata;
+      compactionHistory?: CompactionHistoryMarkerV1;
       runtimeOnly?: {
         userMessageId?: unknown;
         toolResultIntegrity?: ToolResultIntegrity;
@@ -1827,6 +1970,7 @@ function normalizeHistoryMessages(
         compactionHistory?: CompactionHistoryMarkerV1;
       };
     };
+    const durable = durableHistoryMetadata(candidate);
     if (
       candidate.role !== "system" &&
       candidate.role !== "developer" &&
@@ -1840,6 +1984,10 @@ function normalizeHistoryMessages(
       typeof candidate.content === "string" || Array.isArray(candidate.content)
         ? candidate.content
         : "";
+    const providerReasoning =
+      candidate.role === "assistant"
+        ? normalizedProviderReasoning(candidate)
+        : {};
     normalized.push({
       role: candidate.role,
       content: content as LLMMessage["content"],
@@ -1855,34 +2003,30 @@ function normalizeHistoryMessages(
       ...(typeof candidate.toolName === "string"
         ? { toolName: candidate.toolName }
         : {}),
+      ...providerReasoning,
       // Preserve the file-history join key and durable integrity metadata.
       // The invocation merge boundary is derived from authenticated channel
       // metadata instead of accepting a transient serialized flag.
       ...(typeof candidate.runtimeOnly?.userMessageId === "string" ||
-      candidate.runtimeOnly?.toolResultIntegrity !== undefined ||
-      candidate.runtimeOnly?.agentInvocation !== undefined ||
-      candidate.runtimeOnly?.compactionHistory !== undefined
+      durable.toolResultIntegrity !== undefined ||
+      durable.agentInvocation !== undefined ||
+      durable.compactionHistory !== undefined
         ? {
             runtimeOnly: {
               ...(typeof candidate.runtimeOnly?.userMessageId === "string"
                 ? { userMessageId: candidate.runtimeOnly.userMessageId }
                 : {}),
-              ...(candidate.runtimeOnly?.toolResultIntegrity !== undefined
-                ? {
-                    toolResultIntegrity:
-                      candidate.runtimeOnly.toolResultIntegrity,
-                  }
+              ...(durable.toolResultIntegrity !== undefined
+                ? { toolResultIntegrity: durable.toolResultIntegrity }
                 : {}),
-              ...(candidate.runtimeOnly?.agentInvocation !== undefined
+              ...(durable.agentInvocation !== undefined
                 ? {
-                    agentInvocation: candidate.runtimeOnly.agentInvocation,
+                    agentInvocation: durable.agentInvocation,
                     mergeBoundary: "user_context" as const,
                   }
                 : {}),
-              ...(candidate.runtimeOnly?.compactionHistory !== undefined
-                ? {
-                    compactionHistory: candidate.runtimeOnly.compactionHistory,
-                  }
+              ...(durable.compactionHistory !== undefined
+                ? { compactionHistory: durable.compactionHistory }
                 : {}),
             },
           }
@@ -2090,40 +2234,8 @@ function fromCompactRuntimeMessage(message: RuntimeMessage): LLMMessage | null {
   return {
     role,
     content,
-    ...(message.toolCalls !== undefined
-      ? {
-          toolCalls: message.toolCalls.map((call) => ({
-            id: call.id,
-            name: call.name,
-            arguments: call.arguments ?? "",
-          })),
-        }
-      : {}),
-    ...(message.toolCallId !== undefined
-      ? { toolCallId: message.toolCallId }
-      : {}),
-    ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
-    ...(message.phase === "commentary" || message.phase === "final_answer"
-      ? { phase: message.phase }
-      : {}),
-    ...(message.runtimeOnly?.toolResultIntegrity !== undefined ||
-    message.runtimeOnly?.agentInvocation !== undefined
-      ? {
-          runtimeOnly: {
-            ...(message.runtimeOnly?.toolResultIntegrity !== undefined
-              ? {
-                  toolResultIntegrity: message.runtimeOnly.toolResultIntegrity,
-                }
-              : {}),
-            ...(message.runtimeOnly?.agentInvocation !== undefined
-              ? {
-                  agentInvocation: message.runtimeOnly.agentInvocation,
-                  mergeBoundary: "user_context" as const,
-                }
-              : {}),
-          },
-        }
-      : {}),
+    ...projectToolExchangeFields(message),
+    ...projectRuntimeOnly(message.runtimeOnly),
   };
 }
 
@@ -2275,12 +2387,12 @@ function activeAgentDefinitionsFromRoles(
 
 /**
  * Initialized model agent context.
- *
- * Mirrors agenc runtime `Session` struct (session.rs:6-29).
  */
 export class Session {
-  /** agenc runtime: `conversation_id: ThreadId` */
+  /** Conversation/thread id. */
   readonly conversationId: ThreadId;
+  readonly fileReadScope: object;
+  private readonly ownsFileReadScope: boolean;
 
   /** Immutable workspace used for all role discovery and role provenance. */
   readonly roleWorkspace: AgentRoleWorkspace;
@@ -2292,31 +2404,31 @@ export class Session {
    */
   readonly txEvent: AsyncQueue<Event>;
 
-  /** agenc runtime: `agent_status: watch::Sender<AgentStatus>` — status with replay-current. */
+  /** Agent status with replay-current semantics. */
   readonly agentStatus: BehaviorSubject<AgentStatus>;
 
-  /** agenc runtime: `out_of_band_elicitation_paused: watch::Sender<bool>` — agenc runtime realtime parity. */
+  /** Whether out-of-band elicitation is paused (realtime). */
   readonly outOfBandElicitationPaused: BehaviorSubject<boolean>;
 
-  /** agenc runtime: `state: Mutex<SessionState>` — async-locked session state. */
+  /** Async-locked session state. */
   readonly state: AsyncLock<SessionState>;
 
-  /** agenc runtime: `managed_network_proxy_refresh_lock: Mutex<()>` — serializes proxy rebuilds. */
+  /** Serializes managed network proxy rebuilds. */
   readonly managedNetworkProxyRefreshLock: AsyncLock<void>;
 
-  /** agenc runtime: `features: ManagedFeatures` — invariant for the lifetime of the session. */
+  /** Managed features; invariant for the lifetime of the session. */
   readonly features: ManagedFeatures;
 
-  /** agenc runtime: `pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>`. */
+  /** Pending MCP server refresh config, if any. */
   readonly pendingMcpServerRefreshConfig: AsyncLock<unknown | null>;
 
-  /** agenc runtime: `conversation: Arc<RealtimeConversationManager>`. T-future (realtime). */
+  /** Realtime conversation manager. T-future (realtime). */
   readonly conversation: RealtimeConversationManager;
 
-  /** agenc runtime: `active_turn: Mutex<Option<ActiveTurn>>` — at most one running task. */
+  /** Active turn slot; at most one running task. */
   readonly activeTurn: AsyncLock<ActiveTurn | null>;
 
-  /** agenc runtime: `mailbox: Mailbox` — Session's own inbox (parent or peer can send). */
+  /** Session's own inbox (parent or peer can send). */
   readonly mailbox: Mailbox;
 
   /** Concrete bounded inbox backing the public structural mailbox surface. */
@@ -2325,16 +2437,16 @@ export class Session {
   /** Sequence watcher for root mailbox delivery. */
   readonly mailboxSeqWatch: BehaviorSubject<number>;
 
-  /** agenc runtime: `mailbox_rx: Mutex<MailboxReceiver>` — drain receiver. */
+  /** Mailbox drain receiver. */
   readonly mailboxRx: AsyncLock<{ drain(): InterAgentCommunication[] }>;
 
-  /** agenc runtime: `guardian_review_session: GuardianReviewSessionManager`. */
+  /** Guardian review session manager. */
   readonly guardianReviewSession: GuardianReviewSessionManager;
 
-  /** agenc runtime: `services: SessionServices` — DI container. */
+  /** Session-scoped services (DI container). */
   readonly services: SessionServices;
 
-  /** agenc runtime: `js_repl: Arc<JsReplHandle>`. */
+  /** JS REPL handle. */
   readonly jsRepl: JsReplHandle;
 
   /** Session-root config snapshot used to build per-turn frozen configs. */
@@ -2343,17 +2455,16 @@ export class Session {
   /** Session-root model metadata used by the turn-context builder. */
   readonly modelInfo: ModelInfo;
 
-  /** agenc runtime: `next_internal_sub_id: AtomicU64` — monotonic sub-id counter. */
+  /** Monotonic internal sub-id counter. */
   private nextInternalSubIdValue: number;
 
-  /** agenc runtime: `agent_task_registration_lock: Mutex<()>` — serializes task registration. */
+  /** Serializes agent task registration. */
   readonly agentTaskRegistrationLock: AsyncLock<void>;
 
   /**
    * Serializes `spawnTask` + `abortAllTasks` so the "abort old then
    * install new" sequence is atomic w.r.t. other spawn/abort callers.
-   * Upstream agenc runtime doesn't need this because `spawn_task` is always
-   * called from the single submit dispatcher; gut exposes `spawnTask`
+   * Gut exposes `spawnTask`
    * to `runTurnKernel`, slash-command adapters, and tests, so we add a
    * dedicated mutex to keep the two-lock sequence race-free. See
    * `session/tasks.ts` for design notes.
@@ -2363,7 +2474,7 @@ export class Session {
   );
 
   // ───────────────────────────────────────────────────────────
-  // AgenC-specific additions (not in agenc runtime):
+  // Additional session fields:
   // ───────────────────────────────────────────────────────────
 
   /** I-5: per-child outbound mailboxes (parent → child Interrupt/Resume). */
@@ -2452,6 +2563,7 @@ export class Session {
 
   /** Bootstrap-owned submit hook used by the TUI contract. */
   private turnDriverHooks: SessionTurnDriverHooks | null = null;
+  private readonly turnDriverReadyListeners = new Set<() => void>();
   /**
    * SessionStart hooks may be deferred when the atomic first turn is an
    * Editor read-only/proposal-only interaction. This prevents arbitrary
@@ -2473,6 +2585,10 @@ export class Session {
 
   /** Serialize submit calls so the session keeps a single active turn. */
   private submitQueue: Promise<void> = Promise.resolve();
+  private readonly childFollowupAdmission = new AsyncLocalStorage<{
+    readonly generation: number;
+    suppressed: boolean;
+  }>();
   private hasDeferredAgentMailboxProjection = false;
   private readonly idleInputAdmissions = new Map<string, ReadonlySet<number>>();
 
@@ -2513,6 +2629,8 @@ export class Session {
    */
   constructor(opts: SessionOpts) {
     this.conversationId = opts.conversationId;
+    this.fileReadScope = opts.fileReadScope ?? Object.freeze({});
+    this.ownsFileReadScope = opts.fileReadScope === undefined;
     this.ownsMcpManager = opts.mcpManagerOwnership === "owned";
     // Keep legacy producers that were handed `session.eventLog` on the same
     // canonical persist-before-publish path as direct `session.emit` callers.
@@ -3139,6 +3257,7 @@ export class Session {
             model: prepared.provider.binding.model,
           },
           baseInstructions: prepared.baseInstructions,
+          permissionInstructionsDeferred: true,
         } as unknown as SessionConfiguration;
         (this as { modelInfo: ModelInfo }).modelInfo = prepared.modelInfo;
         (this as { config: Config }).config = {
@@ -3275,6 +3394,7 @@ export class Session {
     userMessage: string | readonly LLMContentPart[],
     opts: SessionRunTurnOptions = {},
   ): AsyncGenerator<PhaseEvent, Terminal> {
+    if (!this.canAdmitCurrentChildFollowup()) return { reason: "cancelled" };
     this.assertProviderSwitchTransactionHealthy();
     this.rolloutStore?.assertCompactionProjectionReady();
     if (
@@ -3324,6 +3444,7 @@ export class Session {
     const { runTurnKernel } = await withTurnAuthority(
       () => import("./run-turn.js"),
     );
+    if (!this.canAdmitCurrentChildFollowup()) return { reason: "cancelled" };
     const history =
       runOpts.history ??
       normalizeHistoryMessages(this.state.unsafePeek().history);
@@ -3352,6 +3473,23 @@ export class Session {
 
   installTurnDriverHooks(hooks: SessionTurnDriverHooks | null): void {
     this.turnDriverHooks = hooks;
+    if (hooks !== null && this.lifecycleState === "open") {
+      const listeners = [...this.turnDriverReadyListeners];
+      this.turnDriverReadyListeners.clear();
+      for (const listener of listeners) listener();
+    }
+  }
+
+  onTurnDriverReady(listener: () => void): () => void {
+    if (this.lifecycleState !== "open") {
+      throw new Error("cannot schedule a turn after shutdown");
+    }
+    if (this.turnDriverHooks !== null) {
+      listener();
+      return () => {};
+    }
+    this.turnDriverReadyListeners.add(listener);
+    return () => { this.turnDriverReadyListeners.delete(listener); };
   }
 
   installDeferredSessionStartHook(hook: (() => Promise<void>) | null): void {
@@ -3422,6 +3560,11 @@ export class Session {
     // replayed with duplicate side effects by a later submit.
     this.deferredOrdinarySubmitHookPromise = pending;
     await pending;
+  }
+
+  /** Whether this Session has stopped accepting new work. */
+  get isShuttingDown(): boolean {
+    return this.lifecycleState !== "open";
   }
 
   /**
@@ -3594,7 +3737,31 @@ export class Session {
     message: string | readonly LLMContentPart[],
     opts: SessionSubmitOptions = {},
   ): Promise<void> {
+    await this.enqueueSubmit(message, opts);
+  }
+
+  submitChildFollowup(generation = this.userStopGeneration): Promise<boolean> {
+    return this.enqueueSubmit("", { displayUserMessage: null }, generation);
+  }
+
+  private canAdmitCurrentChildFollowup(): boolean {
+    const admission = this.childFollowupAdmission.getStore();
+    if (admission === undefined) return true;
+    if (
+      this.lifecycleState !== "open" ||
+      this.stoppedByUserSinceLastPrompt ||
+      admission.generation !== this.userStopGeneration
+    ) admission.suppressed = true;
+    return !admission.suppressed;
+  }
+
+  private async enqueueSubmit(
+    message: string | readonly LLMContentPart[],
+    opts: SessionSubmitOptions,
+    generation?: number,
+  ): Promise<boolean> {
     if (this.lifecycleState !== "open") {
+      if (generation !== undefined) return false;
       throw new Error("session is shutting down");
     }
     const hooks = this.turnDriverHooks;
@@ -3603,30 +3770,46 @@ export class Session {
     }
     const run = this.submitQueue.then(async () => {
       if (this.lifecycleState !== "open") {
+        if (generation !== undefined) return false;
         throw new Error("session is shutting down");
       }
+      const permitted = (): boolean => generation === undefined ||
+        (!this.stoppedByUserSinceLastPrompt && generation === this.userStopGeneration);
+      if (!permitted()) return false;
       if (this.pendingCompactionCleanups.size > 0) {
         await this.repairPendingCompactionCleanups();
       }
-      if (
-        opts.editorInteraction === undefined &&
-        this.deferredSessionStartHook !== null
-      ) {
+      if (this.deferredSessionStartHook !== null) {
         await this.flushDeferredSessionStartHook();
       }
       if (
-        opts.editorInteraction === undefined &&
-        (this.deferredOrdinarySubmitHooks.length > 0 ||
-          this.deferredOrdinarySubmitHookPromise !== null)
+        this.deferredOrdinarySubmitHooks.length > 0 ||
+        this.deferredOrdinarySubmitHookPromise !== null
       ) {
         await this.flushDeferredOrdinarySubmitHooks();
       }
       if (this.lifecycleState !== "open") {
+        if (generation !== undefined) return false;
         throw new Error("session is shutting down");
       }
-      await hooks.submit(message, opts);
+      if (!permitted()) return false;
+      if (opts.onAccepted !== undefined) {
+        await opts.onAccepted();
+        if (this.lifecycleState !== "open") {
+          if (generation !== undefined) return false;
+          throw new Error("session is shutting down");
+        }
+      }
+      if (!permitted()) return false;
+      if (generation === undefined) {
+        await this.childFollowupAdmission.exit(() => hooks.submit(message, opts));
+        return true;
+      }
+      const admission = { generation, suppressed: false };
+      await this.childFollowupAdmission.run(admission, () => hooks.submit(message, opts));
+      return !admission.suppressed;
     });
-    this.submitQueue = run.catch(() => {
+    this.submitQueue = run.then(() => {}, () => {
       /* keep the queue alive for the next submit */
     });
     return run;
@@ -3661,8 +3844,18 @@ export class Session {
   }
 
   /**
-   * Mirrors agenc runtime `Session::next_internal_sub_id` — monotonic id allocation.
+   * Move the internal sub-id counter past ids that already exist durably.
+   * A resumed session starts the counter at zero; without this its first
+   * turn reused `sub-<conversation>-2` and the admission journal refused
+   * the model step ("admission step identity already exists with different
+   * request data"). Never moves the counter backwards.
    */
+  seedInternalSubId(next: number): void {
+    if (Number.isSafeInteger(next) && next > this.nextInternalSubIdValue) {
+      this.nextInternalSubIdValue = next;
+    }
+  }
+
   nextInternalSubId(): string {
     const id = this.nextInternalSubIdValue;
     this.nextInternalSubIdValue += 1;
@@ -4676,15 +4869,16 @@ export class Session {
    * the next turn. This is the only state `run-turn.ts` needs to decide
    * whether an empty submission is a no-op or should continue.
    */
-  hasPendingInput(ownership?: IdleInputOwnership): boolean {
+  hasPendingInput(_ownership?: IdleInputOwnership): boolean {
     return this.sessionMailbox.some((message) =>
-      mailboxMessageEligibleForOwnership(message, ownership),
+      mailboxMessageEligibleForOwnership(message),
     );
   }
 
   async waitForMailboxChange(
     timeoutMs: number,
     ownership?: IdleInputOwnership,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     if (this.hasPendingInput(ownership)) {
       return true;
@@ -4692,17 +4886,25 @@ export class Session {
     if (this.mailboxSeqWatch.isClosed) {
       return false;
     }
+    // A stopped turn must not sit out the deadline: the wait ends at once and
+    // reports no change, and the caller sees the aborted signal (#2201).
+    if (signal?.aborted === true) {
+      return false;
+    }
     const startSeq = this.mailboxSeqWatch.value;
     return new Promise<boolean>((resolve) => {
       let settled = false;
       let unsubscribe: (() => void) | null = null;
+      const onAbort = (): void => finish(false);
       const finish = (value: boolean): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         unsubscribe?.();
+        signal?.removeEventListener("abort", onAbort);
         resolve(value);
       };
+      signal?.addEventListener("abort", onAbort, { once: true });
       const timer = setTimeout(() => finish(false), timeoutMs);
       const subscription = this.mailboxSeqWatch.subscribe((seq) => {
         if (seq !== startSeq && this.hasPendingInput(ownership)) {
@@ -4733,9 +4935,8 @@ export class Session {
    * payload is stored on `metadata.payload` so `drainIdleInput()`
    * can round-trip the original `UserInput` back to callers.
    *
-   * AgenC behavior: matches `core/src/session/session.rs` line 23's
-   * pending-input slot, routed through the same mailbox that carries
-   * peer/agent traffic.
+   * AgenC behavior: the pending-input slot is routed through the same
+   * mailbox that carries peer/agent traffic.
    */
   enqueueIdleInput(input: UserInput, ownership?: IdleInputOwnership): number {
     return this.enqueueIdleInputBatch([input], ownership);
@@ -4776,11 +4977,6 @@ export class Session {
             ? {
                 idleInputOwnership: {
                   workspaceView: ownership.workspaceView,
-                  ...(ownership.editorInteractionId !== undefined
-                    ? {
-                        editorInteractionId: ownership.editorInteractionId,
-                      }
-                    : {}),
                 },
               }
             : {}),
@@ -4832,38 +5028,17 @@ export class Session {
    * Returns the original `UserInput` payloads in FIFO order — the
    * session-local `InterAgentCommunication` envelope is stripped.
    */
-  drainIdleInput(ownership?: IdleInputOwnership): UserInput[] {
+  drainIdleInput(_ownership?: IdleInputOwnership): UserInput[] {
     return this.sessionMailbox
       .extractWhere(
         (message) =>
           message.metadata?.source === MAILBOX_SOURCE_IDLE_INPUT &&
-          mailboxMessageEligibleForOwnership(message, ownership),
+          mailboxMessageEligibleForOwnership(message),
       )
       .map((message) => message.metadata?.payload);
   }
 
-  drainPendingInputMessages(ownership?: IdleInputOwnership): LLMMessage[] {
-    if (ownership?.workspaceView === "editor") {
-      return this.sessionMailbox
-        .extractWhere((message) =>
-          mailboxMessageEligibleForOwnership(message, ownership),
-        )
-        .flatMap((message): LLMMessage[] => {
-          const payload = message.metadata?.payload;
-          if (
-            payload !== null &&
-            typeof payload === "object" &&
-            "role" in payload &&
-            "content" in payload
-          ) {
-            return [payload as LLMMessage];
-          }
-          return typeof payload === "string" && payload.trim().length > 0
-            ? [{ role: "user", content: payload }]
-            : [];
-        });
-    }
-
+  drainPendingInputMessages(_ownership?: IdleInputOwnership): LLMMessage[] {
     const projectedEntries: Array<{
       readonly seq: number;
       readonly message: LLMMessage;
@@ -4907,14 +5082,14 @@ export class Session {
       snapshot.find(
         (candidate) =>
           candidate.seq > seq &&
-          mailboxMessageEligibleForOwnership(candidate, ownership) &&
+          mailboxMessageEligibleForOwnership(candidate) &&
           (candidate.triggerTurn ||
             candidate.metadata?.source === MAILBOX_SOURCE_IDLE_INPUT),
       );
 
     const processed = this.sessionMailbox.processPrefix((msg) => {
       if (msg.metadata?.source === MAILBOX_SOURCE_IDLE_INPUT) {
-        if (!mailboxMessageEligibleForOwnership(msg, ownership)) {
+        if (!mailboxMessageEligibleForOwnership(msg)) {
           return "retain";
         }
         const payload = msg.metadata?.payload;
@@ -5030,32 +5205,111 @@ export class Session {
     return messages;
   }
 
+  private stoppedByUserSinceLastPromptFlag = false;
+  private userStopGenerationValue = 0;
+
+  /**
+   * A user Stop holds the session quiet until the user speaks again: while
+   * this is set, a child agent's receipt does not start a parent follow-up
+   * turn (#2236). The daemon sets it on a client-initiated interrupt and
+   * clears it when the next user message is submitted; receipts that arrive
+   * meanwhile wait in the mailbox for that turn.
+   */
+  markStoppedByUser(): void {
+    this.stoppedByUserSinceLastPromptFlag = true;
+    if (this.userStopGenerationValue >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("User-stop generation is exhausted");
+    }
+    this.userStopGenerationValue += 1;
+    this.rolloutStore?.appendRollout({
+      type: "session_state",
+      payload: { userStop: { stopped: true, generation: this.userStopGenerationValue } },
+    }, { durable: true });
+  }
+
+  clearUserStop(): void {
+    if (!this.stoppedByUserSinceLastPromptFlag) return;
+    this.rolloutStore?.appendRollout({
+      type: "session_state",
+      payload: { userStop: { stopped: false, generation: this.userStopGenerationValue } },
+    }, { durable: true });
+    this.stoppedByUserSinceLastPromptFlag = false;
+  }
+
+  get stoppedByUserSinceLastPrompt(): boolean {
+    return this.stoppedByUserSinceLastPromptFlag;
+  }
+
+  get userStopGeneration(): number {
+    return this.userStopGenerationValue;
+  }
+
+  restoreUserStopFromRollout(items: readonly RolloutItem[]): void {
+    let stopped = false;
+    let generation = 0;
+    let hasExplicitUserStopState = false;
+    for (const item of items) {
+      let state;
+      try {
+        state = readPersistedUserStopState(item);
+        if (state !== undefined && state.generation < generation) throw new Error("Invalid persisted user-stop generation order");
+      } catch (error) {
+        this.stoppedByUserSinceLastPromptFlag = true;
+        throw error;
+      }
+      if (state !== undefined) {
+        hasExplicitUserStopState = true;
+        stopped = state.stopped;
+        generation = state.generation;
+        continue;
+      }
+      if (item.type !== "event_msg") continue;
+      const event = item.payload.msg;
+      if (
+        event.type === "permission_decision" &&
+        event.payload.runId === this.conversationId &&
+        event.payload.decision === "denied" &&
+        event.payload.source === "resolver"
+      ) {
+        if (!stopped) generation += 1;
+        stopped = true;
+      } else if (event.type === "turn_aborted" && event.payload.reason === "interrupted") {
+        if (!stopped) generation += 1;
+        stopped = true;
+      }
+      else if (
+        !hasExplicitUserStopState &&
+        (event.type === "user_message" || event.type === "message_submission") &&
+        typeof event.payload.messageId === "string" &&
+        typeof event.payload.acceptedAt === "string" &&
+        event.payload.streamId !== "session.shell.execute"
+      ) stopped = false;
+    }
+    if (generation < this.userStopGenerationValue) return;
+    this.stoppedByUserSinceLastPromptFlag = stopped;
+    this.userStopGenerationValue = generation;
+  }
+
   hasDeferredAgentMailboxMessages(): boolean {
     return this.hasDeferredAgentMailboxProjection;
   }
 
   /**
-   * Upstream agenc runtime `session/mod.rs::steer_input` (line 2938). Folds
+   * Steer input into the live turn. Folds
    * `items` into the live turn's mailbox/idle-input pipeline so the
    * running task picks them up at the next idle-merge boundary, and
    * sets the mailbox delivery phase back to `current_turn` so the
    * injected items stay in THIS turn rather than deferring.
    *
-   * Rejection surface mirrors upstream 1:1:
-   *   - `empty_input` when `items` is empty — matches
-   *     `SteerInputError::EmptyInput` (`session/mod.rs:2944`).
+   * Rejection surface:
+   *   - `empty_input` when `items` is empty.
    *   - `no_active_turn` when the `activeTurn` slot is `null` OR its
    *     task registry is empty. Carries `items` back to the caller
-   *     unchanged so no data is lost. Matches
-   *     `SteerInputError::NoActiveTurn(input)` (`session/mod.rs:2950`,
-   *     2954, 2978).
+   *     unchanged so no data is lost.
    *   - `sub_id_mismatch` when the caller's `subId` does not match
-   *     the live turn's first task id. Matches upstream
-   *     `SteerInputError::ExpectedTurnMismatch` (`session/mod.rs:2960`),
-   *     renamed to fit gut's `subId` naming on `RunningTask`.
+   *     the live turn's first task id.
    *   - `active_turn_not_steerable` when the live task's `kind` is
-   *     `compact` or `review`. Matches upstream's explicit arm
-   *     rejection (`session/mod.rs:2967-2979`) via the shared
+   *     `compact` or `review`, decided by the shared
    *     `isSteerable` predicate in `tasks.ts`.
    *
    * Happy path: appends each item to `Session.mailbox` via the same
@@ -5064,7 +5318,7 @@ export class Session {
    * code path), then accepts mailbox delivery for the current turn by
    * flipping `ActiveTurnState.mailboxDeliveryPhase` back to
    * `current_turn` under the per-turn lock. Returns the subId that
-   * accepted the steer, matching upstream's `Ok(active_turn_id.clone())`.
+   * accepted the steer.
    */
   async steerInput(
     subId: string,
@@ -5074,11 +5328,10 @@ export class Session {
       return { ok: false, error: { kind: "empty_input" } };
     }
 
-    // Upstream takes `active_turn.lock().await` for the whole check +
-    // update so steer state stays atomic (see the clippy `expect` at
-    // `session/mod.rs:2934-2937`). Gut's `AsyncLock.with` gives the
-    // same serialization window — the mailbox + turnState writes
-    // happen before we release the lock.
+    // Hold the active-turn lock for the whole check + update so steer
+    // state stays atomic. `AsyncLock.with` gives the serialization
+    // window: the mailbox + turnState writes happen before we release
+    // the lock.
     const result = await this.activeTurn.with(
       async (current): Promise<SteerInputResult> => {
         if (current === null) {
@@ -5131,11 +5384,9 @@ export class Session {
         }
 
         // Route the whole user steer atomically through the protected
-        // idle-input lane. Upstream calls
-        // `turn_state.push_pending_input(input.into())` which lands on
-        // `TurnState.pending_input`; gut's `pending_input` is
-        // WIRED-EXTERNAL through the mailbox per the classification in
-        // `tasks.ts`, so the equivalent gut surface is `enqueueIdleInput`.
+        // idle-input lane. Pending input is WIRED-EXTERNAL through the
+        // mailbox per the classification in `tasks.ts`, so the surface
+        // used here is `enqueueIdleInput`.
         const admitted = this.sessionMailbox.sendProtectedBatch(
           items.map((item) => ({
             author: this.conversationId,
@@ -5159,8 +5410,7 @@ export class Session {
           };
         }
 
-        // Upstream: `turn_state.accept_mailbox_delivery_for_current_turn()`
-        // (`session/mod.rs:2992`). Re-affirm `current_turn` delivery so
+        // Re-affirm `current_turn` delivery so
         // a late `defer_mailbox_delivery_to_next_turn` earlier in this
         // turn does not strand the steered items.
         await current.turnState.with((ts) => {
@@ -5200,24 +5450,22 @@ export class Session {
 
   /**
    * AgenC behavior: send_event_raw — emit with caller-supplied envelope.
-   * Used for SessionConfigured + DeprecationNotice events at startup
-   * (agenc runtime session.rs:746-748).
+   * Used for SessionConfigured + DeprecationNotice events at startup.
    */
   sendEventRaw(event: Event): void {
     this.emit(event);
   }
 
   // ───────────────────────────────────────────────────────────
-  // Task dispatch — port of upstream agenc runtime `tasks/mod.rs`.
+  // Task dispatch.
   // See `session/tasks.ts` for the rationale. These methods own the
   // `activeTurn` lock so the outer "one turn in flight at a time"
   // invariant is enforced at every spawn / finish / abort site.
   // ───────────────────────────────────────────────────────────
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::spawn_task`. Serializes the new-turn
-   * boundary: first aborts any in-flight task with `TurnAbortReason::Replaced`
-   * (matching upstream's `abort_all_tasks(TurnAbortReason::Replaced)`),
+   * Spawn a task. Serializes the new-turn
+   * boundary: first aborts any in-flight task with reason `replaced`,
    * then installs a fresh `ActiveTurn` for the new task keyed by `subId`.
    *
    * Returns the `RunningTask` so callers can pull its `.signal` for the
@@ -5228,16 +5476,16 @@ export class Session {
    */
   async spawnTask(opts: SpawnTaskOptions): Promise<RunningTask> {
     return this.taskDispatchLock.with(async () => {
-      // Upstream agenc runtime: `spawn_task` always calls
-      // `abort_all_tasks(TurnAbortReason::Replaced)` before installing
-      // the new task. This is the non-negotiable serialization point.
+      // Always abort every running task with reason `replaced` before
+      // installing the new task. This is the non-negotiable
+      // serialization point.
       await this.abortAllTasksLocked("replaced");
       return await this.startTask(opts);
     });
   }
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::start_task`. Installs the task under
+   * Installs the task under
    * `activeTurn` after the caller has serialized the abort-then-start
    * boundary.
    */
@@ -5302,13 +5550,13 @@ export class Session {
   }
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::on_task_finished`. Removes the task
+   * Normal task completion. Removes the task
    * from the `tasks` registry. When the registry empties, clears the
    * `activeTurn` slot so the next `spawnTask` sees a clean state.
    *
    * This is the normal-exit cleanup; the abort paths go through
    * `abortAllTasks` / `abortTurnIfActive` which also trigger
-   * `resolveDone` so `handle_task_abort`'s awaiter unblocks.
+   * `resolveDone` so `handleTaskAbort`'s awaiter unblocks.
    */
   async onTaskFinished(subId: string): Promise<void> {
     await this.activeTurn.update((current) => {
@@ -5329,8 +5577,8 @@ export class Session {
   }
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::abort_all_tasks`. Takes the
-   * `activeTurn` slot (upstream `take_active_turn`), drains every
+   * Abort every running task. Takes the
+   * `activeTurn` slot, drains every
    * running task by firing its cancellation token and awaiting its
    * `done` signal under the graceful-interruption budget, then
    * clears pending state and releases.
@@ -5351,7 +5599,7 @@ export class Session {
     if (taken === null) return;
     const tasks = Array.from(taken.tasks.values());
     await Promise.all(tasks.map((task) => this.handleTaskAbort(task, reason)));
-    // Upstream: `active_turn.clear_pending().await` — release any
+    // Release any
     // dangling approvals / input pre-emptively so interrupted tasks
     // don't surface stale responses. We reach into `turnState` here
     // because the `ActiveTurn` object itself is already taken out.
@@ -5366,7 +5614,7 @@ export class Session {
   }
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::abort_turn_if_active`. If the
+   * If the
    * currently-active turn's registry contains `turnId`, aborts it;
    * otherwise returns false.
    */
@@ -5395,12 +5643,11 @@ export class Session {
   }
 
   /**
-   * Upstream agenc runtime `tasks/mod.rs::handle_task_abort`. Fires the task's
+   * Fires the task's
    * cancellation signal, awaits `done` up to `GRACEFUL_INTERRUPTION_TIMEOUT_MS`,
-   * then returns even if the task did not signal done in time. We do
-   * not call `handle.abort()` like upstream does because JS has no
+   * then returns even if the task did not signal done in time. JS has no
    * force-kill primitive for a pending Promise; the bounded wait + the
-   * task's own cancellation-signal check are the gut equivalents.
+   * task's own cancellation-signal check are the equivalents.
    */
   private async handleTaskAbort(
     task: RunningTask,
@@ -5704,6 +5951,10 @@ export class Session {
    * provider_switched re-entry).
    */
   abortTerminal(reason: AbortReason): void {
+    if (reason === "provider_switched") {
+      this.abortActiveTurnForProviderSwitch();
+      return;
+    }
     if (this.abortController.signal.aborted) return;
     const activeTurnId = this.activeTurn.unsafePeek()?.turnId;
     this.abortController.abort(reason);
@@ -5715,6 +5966,34 @@ export class Session {
         payload: {
           turnId: activeTurnId,
           reason,
+        },
+      },
+    });
+  }
+
+  /**
+   * I-13: a mid-turn provider switch cancels only the turn in flight. The
+   * session-level controller is the lifetime shutdown token; tripping it for a
+   * switch left every later prompt aborting with `provider_switched` before
+   * the staged selection could apply. Phases observe the merged turn signal,
+   * so the same reason reaches them through the turn's own controller.
+   */
+  private abortActiveTurnForProviderSwitch(): void {
+    const active = this.activeTurn.unsafePeek();
+    if (active === null || active.abortController.signal.aborted) return;
+    active.abortController.abort("provider_switched");
+    for (const task of active.tasks.values()) {
+      if (!task.abortController.signal.aborted) {
+        task.abortController.abort("provider_switched");
+      }
+    }
+    this.emit({
+      id: this.nextInternalSubId(),
+      msg: {
+        type: "turn_aborted",
+        payload: {
+          turnId: active.turnId,
+          reason: "provider_switched",
         },
       },
     });
@@ -5918,14 +6197,16 @@ export class Session {
       }
     }
     try {
-      const { clearSessionReadCache, clearSessionReadState } =
-        await import("../tools/system/filesystem.js");
+      const {
+        clearSessionReadCache,
+        clearSessionReadState,
+        closeConversationReadScope,
+      } = await import("../tools/system/filesystem.js");
       const sessionTempRoot = this.services.runtimeOptions?.sessionTempRoot;
+      if (this.ownsFileReadScope) closeConversationReadScope(this.fileReadScope);
       if (sessionTempRoot !== undefined) {
         clearSessionReadState(this.conversationId, sessionTempRoot);
       } else {
-        // Test doubles may omit runtime options.
-        // Never guess a process-global temp root during session teardown.
         clearSessionReadCache(this.conversationId);
       }
     } catch {
@@ -6026,6 +6307,7 @@ function deriveMinimalSessionConfig(
       minWaitTimeoutMs: 10_000,
       defaultWaitTimeoutMs: 30_000,
       maxWaitTimeoutMs: 3_600_000,
+      maxConsecutiveWaitTimeouts: 4,
       usageHintEnabled: false,
       usageHintText: "",
       hideSpawnAgentMetadata: false,
@@ -6048,9 +6330,8 @@ function deriveMinimalSessionConfig(
  * Session without wiring a real `ModelsManager`. The runtime models manager is
  * the real owner of per-model metadata.
  *
- * `effectiveContextWindowPercent: 100` matches agenc runtime's "no reduction"
- * meaning (agenc runtime backend default is 95; 100 here is the safe fallback when
- * no authoritative per-model metadata is available). The previous `1`
+ * `effectiveContextWindowPercent: 100` means "no reduction" (100 is the
+ * safe fallback when no authoritative per-model metadata is available). The previous `1`
  * value silently truncated the live context window to 1% via
  * `modelContextWindow()` and broke compaction/budgeting math.
  */

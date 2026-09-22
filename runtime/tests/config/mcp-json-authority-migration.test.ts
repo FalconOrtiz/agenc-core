@@ -75,6 +75,11 @@ describe("retired MCP JSON authority migration", () => {
           default_tools_approval_mode: "on-request",
           tools: { inspect: { default_permission_mode: "never" } },
         },
+        oauth: {
+          type: "http",
+          url: "https://mcp.example.test/oauth",
+          oauth: { clientId: "public-client", scopes: ["read"], callbackPort: 3118 },
+        },
       },
     });
     json(nestedSource, {
@@ -122,6 +127,11 @@ describe("retired MCP JSON authority migration", () => {
           env: { MODE: "readonly" },
           default_tools_approval_mode: "on-request",
           tools: { inspect: { default_permission_mode: "never" } },
+        },
+        oauth: {
+          transport: "http",
+          endpoint: "https://mcp.example.test/oauth",
+          oauth: { clientId: "public-client", scopes: ["read"], callbackPort: 3118 },
         },
         socket: {
           transport: "websocket",
@@ -209,7 +219,7 @@ describe("retired MCP JSON authority migration", () => {
         oauth: {
           type: "http",
           url: "https://mcp.example.test/api",
-          oauth: { clientId: "client" },
+          oauth: { clientId: "client", futureAuthority: true },
         },
         internal: { type: "sdk", name: "internal" },
       },

@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -16,10 +22,6 @@ import {
   type FileHistorySnapshot,
 } from "./file-history.js";
 import type { RolloutItem } from "./rollout-item.js";
-import {
-  sha256,
-  workspaceMutationCoordinators,
-} from "../../src/workspace/mutation-coordinator.js";
 
 let previousAgencHome: string | undefined;
 
@@ -32,7 +34,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  workspaceMutationCoordinators.clearForTests();
   if (previousAgencHome === undefined) {
     delete process.env.AGENC_HOME;
   } else {
@@ -143,90 +144,6 @@ describe("FileHistory (I-28)", () => {
     // via its v1 origin backup.
     expect(restored).toContain(late);
     expect(readFileSync(late, "utf8")).toBe("late-original");
-  });
-
-  test("rewindToMessage refuses to overwrite a dirty editor buffer", async () => {
-    const file = join(project, "dirty.txt");
-    writeFileSync(file, "original", "utf8");
-    const hist = new FileHistory({ projectDir: project });
-    await hist.trackEdit(file, "msg-1");
-    await hist.makeSnapshot("msg-1");
-    writeFileSync(file, "disk-modified", "utf8");
-    await hist.makeSnapshot("msg-2");
-    const coordinator = workspaceMutationCoordinators.getOrCreate(project);
-    const lease = coordinator.acquire({
-      workspaceRoot: project,
-      editorInstanceId: "editor-a",
-    });
-    coordinator.sync({
-      workspaceRoot: project,
-      editorInstanceId: "editor-a",
-      leaseToken: lease.leaseToken,
-      epoch: lease.epoch,
-      sequence: 0,
-      buffers: [
-        {
-          path: file,
-          bufferHandle: 1,
-          changedtick: 4,
-          contentSha256: sha256("unsaved editor text"),
-          dirty: true,
-          content: "unsaved editor text",
-        },
-      ],
-    });
-
-    await expect(hist.rewindToMessage("msg-1")).rejects.toThrow(
-      /unsaved editor changes/u,
-    );
-    expect(readFileSync(file, "utf8")).toBe("disk-modified");
-  });
-
-  test("rewindToMessage blocks a clean loaded buffer until Editor unloads it", async () => {
-    const file = join(project, "clean-loaded.txt");
-    writeFileSync(file, "original", "utf8");
-    const hist = new FileHistory({ projectDir: project });
-    await hist.trackEdit(file, "msg-1");
-    await hist.makeSnapshot("msg-1");
-    writeFileSync(file, "disk-modified", "utf8");
-    await hist.makeSnapshot("msg-2");
-    const coordinator = workspaceMutationCoordinators.getOrCreate(project);
-    const lease = coordinator.acquire({
-      workspaceRoot: project,
-      editorInstanceId: "editor-a",
-    });
-    coordinator.sync({
-      workspaceRoot: project,
-      editorInstanceId: "editor-a",
-      leaseToken: lease.leaseToken,
-      epoch: lease.epoch,
-      sequence: 0,
-      buffers: [
-        {
-          path: file,
-          bufferHandle: 2,
-          changedtick: 5,
-          contentSha256: sha256("disk-modified"),
-          dirty: false,
-        },
-      ],
-    });
-
-    await expect(hist.rewindToMessage("msg-1")).rejects.toThrow(
-      /is loaded in Editor/u,
-    );
-    expect(readFileSync(file, "utf8")).toBe("disk-modified");
-
-    coordinator.sync({
-      workspaceRoot: project,
-      editorInstanceId: "editor-a",
-      leaseToken: lease.leaseToken,
-      epoch: lease.epoch,
-      sequence: 1,
-      buffers: [],
-    });
-    await expect(hist.rewindToMessage("msg-1")).resolves.toContain(file);
-    expect(readFileSync(file, "utf8")).toBe("original");
   });
 
   test("previewRewind reports changed files without touching disk", async () => {
@@ -372,6 +289,98 @@ describe("FileHistorySidecar event wiring", () => {
     writeFileSync(file, "v2-after-message", "utf8");
     await hist.rewindToMessage("user-msg-123");
     expect(readFileSync(file, "utf8")).toBe("v1");
+  });
+
+  test("backs up the workspace files an exec_command rm is about to remove", async () => {
+    const hist = new FileHistory({ projectDir: project });
+    const sidecar = new FileHistorySidecar({
+      fileHistory: hist,
+      workspaceRoot: project,
+    });
+    const doomed = join(project, "arcade15", "game.js");
+    mkdirSync(join(project, "arcade15"), { recursive: true });
+    writeFileSync(doomed, "export const game = 1;", "utf8");
+
+    sidecar.onEvent(
+      startedEvent("ev-rm", "exec_command", {
+        cmd: "rm arcade15/game.js && ls -la arcade15",
+        workdir: project,
+      }),
+    );
+    await waitForTracked(hist, doomed);
+
+    expect(hist.getState().trackedFiles.has(doomed)).toBe(true);
+    const backup =
+      hist.getState().snapshots.at(-1)?.trackedFileBackups[doomed];
+    expect(backup?.backupFileName).not.toBeNull();
+    expect(readFileSync(backup!.backupFileName!, "utf8")).toBe(
+      "export const game = 1;",
+    );
+
+    // The removal itself lands in the snapshot taken when the call completes.
+    rmSync(doomed);
+    sidecar.onEvent({
+      id: "ev-rm-done",
+      msg: {
+        type: "tool_call_completed",
+        payload: { callId: "ev-rm", toolName: "exec_command", result: "" },
+      },
+    } as Parameters<FileHistorySidecar["onEvent"]>[0]);
+    for (let i = 0; i < 50 && !hist.hasSnapshotFor("ev-rm-done"); i += 1) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+    expect(
+      hist.getState().snapshots.at(-1)?.trackedFileBackups[doomed]?.backupFileName,
+    ).toBeNull();
+  });
+
+  test("tracks both sides of a system.bash rename and skips directories", async () => {
+    const hist = new FileHistory({ projectDir: project });
+    const sidecar = new FileHistorySidecar({
+      fileHistory: hist,
+      workspaceRoot: project,
+    });
+    const from = join(project, "old.js");
+    const to = join(project, "new.js");
+    writeFileSync(from, "old", "utf8");
+    writeFileSync(to, "to be replaced", "utf8");
+    mkdirSync(join(project, "scratch"));
+
+    sidecar.onEvent(
+      startedEvent("ev-mv", "system.bash", {
+        command: "mv old.js new.js && rm -r scratch",
+        cwd: project,
+      }),
+    );
+    await waitForTracked(hist, from);
+    await waitForTracked(hist, to);
+
+    const tracked = hist.getState().trackedFiles;
+    expect(tracked.has(from)).toBe(true);
+    expect(tracked.has(to)).toBe(true);
+    expect(tracked.has(join(project, "scratch"))).toBe(false);
+  });
+
+  test("ignores shell deletions without a workspace root or outside it", async () => {
+    const hist = new FileHistory({ projectDir: project });
+    const rootless = new FileHistorySidecar({ fileHistory: hist });
+    const scoped = new FileHistorySidecar({
+      fileHistory: hist,
+      workspaceRoot: join(project, "inner"),
+    });
+    const outside = join(project, "outside.txt");
+    mkdirSync(join(project, "inner"));
+    writeFileSync(outside, "keep", "utf8");
+
+    rootless.onEvent(
+      startedEvent("ev-rootless", "exec_command", { cmd: `rm ${outside}` }),
+    );
+    scoped.onEvent(
+      startedEvent("ev-scoped", "exec_command", { cmd: "rm ../outside.txt" }),
+    );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+
+    expect(hist.getState().trackedFiles.size).toBe(0);
   });
 });
 

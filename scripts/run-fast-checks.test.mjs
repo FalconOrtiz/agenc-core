@@ -32,7 +32,7 @@ const typecheckOnlyArgs = [
 ];
 
 test("documentation paths skip code checks", () => {
-  const plan = classifyChangedFiles(["README.md", "docs/ci-required-gates.md", "todo.txt"]);
+  const plan = classifyChangedFiles(["README.md", "docs/ci-required-gates.md"]);
   assert.equal(plan.documentationOnly, true);
   assert.equal(plan.typecheck, false);
 });
@@ -84,6 +84,18 @@ test("runtime source and tests select separate Vitest modes", () => {
   const related = commandsForPlan(plan, { fileExists: () => true })
     .find((command) => command.args.includes("related"));
   assert.equal(related.args.includes("src/session/Session.ts"), true);
+});
+
+test("runtime Vitest plans check ripgrep before typecheck and test discovery", () => {
+  for (const file of ["runtime/src/utils/ripgrep.ts", "runtime/tests/utils/ripgrep.test.ts"]) {
+    const commands = commandsForPlan(classifyChangedFiles([file]), { fileExists: () => true });
+    assert.deepEqual(commands[0], {
+      executable: process.execPath,
+      args: ["runtime/scripts/check-ripgrep-available.mjs"],
+    });
+    assert.deepEqual(commands[1].args, ["run", "typecheck"]);
+  }
+  assert.deepEqual(commandsForPlan(classifyChangedFiles(["docs/README.md"])), []);
 });
 
 test("deleted runtime source selects its subsystem tests", () => {
@@ -146,6 +158,26 @@ test("deleted hermetic Vitest runner selects its discovery contract", () => {
   );
   assert.deepEqual(plan, {
     targets: ["tests/hermetic-test-discovery.test.ts"],
+    uncovered: [],
+  });
+});
+
+test("deleted slash add-dir scenario selects CLI and command contracts", () => {
+  const plan = deletedRuntimeFallbackPlan(
+    ["runtime/scripts/check-tui-e2e/scenarios/74-slash-add-dir.mjs"],
+    {
+      fileExists: (file) => new Set([
+        "runtime/tests/bin/agenc.cli-branch.test.ts",
+        "runtime/tests/commands/command-surface.test.ts",
+      ]).has(file),
+      isDirectory: () => false,
+    },
+  );
+  assert.deepEqual(plan, {
+    targets: [
+      "tests/bin/agenc.cli-branch.test.ts",
+      "tests/commands/command-surface.test.ts",
+    ],
     uncovered: [],
   });
 });
@@ -225,8 +257,6 @@ test("child command failures retain their exit status", () => {
 
 test("ci-required-gates documents the skip set and fail-closed deletion", () => {
   const docs = readFileSync(path.join(repositoryRoot, "docs/ci-required-gates.md"), "utf8");
-  assert.match(docs, /memory_todo\.md/u);
-  assert.match(docs, /todo\.txt/u);
   assert.match(docs, /deleted runtime inputs have no bounded test mapping/u);
   assert.match(docs, /--base/u);
   assert.match(docs, /packages\/agenc-sdk/u);
@@ -266,7 +296,6 @@ test("required-gate inventory outside the policy selector typechecks only", () =
   for (const file of [
     ".npmrc",
     "packaging/systemd/agenc-local-gatekeeper.config.example.json",
-    "parity/agent-surface-contract.json",
   ]) {
     const plan = classifyChangedFiles([file]);
     assert.equal(plan.policy, false, file);

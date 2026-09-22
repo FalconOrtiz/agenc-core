@@ -39,11 +39,11 @@ import {
   containsPathTraversal,
   expandPath,
   getDirectoryForPath,
-  sanitizePath,
 } from '../path.js'
-import { getPlanSlug, getPlansDirectory } from '../plans.js'
+import { matchesSessionPlanFile, sessionPlanFileAuthority } from '../../planning/session-plan-authority.js'
 import { getPlatform } from '../platform.js'
 import { getProjectDir } from '../sessionStorage.js'
+import { projectStorageKey } from '../project-storage-key.js'
 import { SETTING_SOURCES } from '../settings/constants.js'
 import {
   getSettingsFilePathForSource,
@@ -268,15 +268,7 @@ function isAgenCConfigFilePath(filePath: string): boolean {
 
 // Check if file is the plan file for the current session
 function isSessionPlanFile(absolutePath: string): boolean {
-  // Check if path is a plan file for this session (main or agent-specific)
-  // Main plan file: {plansDir}/{planSlug}.md
-  // Agent plan file: {plansDir}/{planSlug}-agent-{agentId}.md
-  const expectedPrefix = join(getPlansDirectory(), getPlanSlug())
-  // SECURITY: Normalize to prevent path traversal bypasses via .. segments
-  const normalizedPath = normalize(absolutePath)
-  return (
-    normalizedPath.startsWith(expectedPrefix) && normalizedPath.endsWith('.md')
-  )
+  return matchesSessionPlanFile(absolutePath, sessionPlanFileAuthority(peekAmbientRuntimeSession()))
 }
 
 /**
@@ -364,7 +356,7 @@ export function getAgenCTempDir(): string {
  * Path format: /tmp/agenc-{uid}/{sanitized-cwd}/
  */
 export function getProjectTempDir(): string {
-  return join(getAgenCTempDir(), sanitizePath(getOriginalCwd())) + sep
+  return join(getAgenCTempDir(), projectStorageKey(getOriginalCwd())) + sep
 }
 
 /**
@@ -660,6 +652,9 @@ export function allWorkingDirectories(
 ): Set<string> {
   const additionalDirs =
     context.additionalWorkingDirectories as unknown as ReadonlyMap<string, unknown>
+  if (context.excludeProcessWorkingDirectory === true) {
+    return new Set(additionalDirs.keys())
+  }
   return new Set([getOriginalCwd(), ...additionalDirs.keys()])
 }
 

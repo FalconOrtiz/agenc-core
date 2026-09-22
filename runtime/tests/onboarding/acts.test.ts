@@ -214,7 +214,7 @@ describe("channel act (O-3)", () => {
     const environment = Object.freeze({
       AGENC_HOME: home,
       HOME: tmpdir(),
-      USER_TYPE: "ant",
+      AGENC_OAUTH_DEV_ENDPOINTS: "1",
       USE_LOCAL_OAUTH: "1",
     });
     const credentialHome = resolveHomeContext(environment, {
@@ -265,7 +265,7 @@ describe("channel act (O-3)", () => {
 
 describe("autonomy act (O-5): guardrails before autonomy", () => {
   test("sets the budget cap, then heartbeat/cron/hooks configure", async () => {
-    mkdirSync(ws, { recursive: true });
+    mkdirSync(ws, { recursive: true, mode: 0o700 });
     markOnboardingActComplete(home, "identity", { workspace: ws });
     const { io, output } = createScriptedActIO([
       "2.5", // daily cap
@@ -438,7 +438,7 @@ describe("recap (O-6) + status funnel", () => {
   });
 
   test.each([
-    ["local", { USER_TYPE: "ant", USE_LOCAL_OAUTH: "1" }],
+    ["local", { AGENC_OAUTH_DEV_ENDPOINTS: "1", USE_LOCAL_OAUTH: "1" }],
     ["custom", { AGENC_CUSTOM_OAUTH_URL: "https://agenc.tech" }],
   ] as const)(
     "summarizes channels from the captured %s OAuth storage identity",
@@ -505,7 +505,7 @@ describe("gateway install-service (O-4)", () => {
       join(home, ".config", "systemd", "user", "agenc-gateway.service"),
       "utf8",
     );
-    expect(unit).toContain("ExecStart=/usr/bin/node /opt/agenc/bin/agenc.js gateway run");
+    expect(unit).toContain('ExecStart=:/usr/bin/env "--" "/usr/bin/node" "/opt/agenc/bin/agenc.js" "gateway" "run"');
     expect(unit).not.toContain("EnvironmentFile=");
     expect(commands).toEqual([
       ["systemctl", "--user", "daemon-reload"],

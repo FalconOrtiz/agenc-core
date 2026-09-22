@@ -35,6 +35,7 @@ import {
   type PendingAdmissionFallbackSlice,
   validatePendingAdmissionFallbackSlice,
 } from "./turn-checkpoint-slice.js";
+import { readTextToolCallCorrection, type TextToolCallCorrection } from "../recovery/rejected-text-tool-call.js";
 
 export const LEGACY_DURABLE_CHECKPOINT_VERSION = 1 as const;
 export const DURABLE_CHECKPOINT_V2 = 2 as const;
@@ -67,6 +68,7 @@ const RESPONSE_ITEM_KEYS = Object.freeze([
   "endTurn",
   "id",
   "phase",
+  "providerReasoning",
   "role",
   "toolCallId",
   "toolCalls",
@@ -74,6 +76,13 @@ const RESPONSE_ITEM_KEYS = Object.freeze([
   "toolResultIntegrity",
 ]);
 const TOOL_CALL_KEYS = Object.freeze(["arguments", "id", "name"]);
+const PROVIDER_REASONING_V1_KEYS = Object.freeze(["content", "version"]);
+const PROVIDER_REASONING_V2_KEYS = Object.freeze([
+  "content",
+  "model",
+  "provider",
+  "version",
+]);
 
 export type ReadableTurnCheckpoint =
   | {
@@ -375,6 +384,29 @@ function computeCheckpointPrefixHash(
     );
     if (message.endTurn !== undefined) {
       writer.writeString("end-turn", String(message.endTurn));
+    }
+
+    // Conditional encoding preserves existing checkpoint hashes when the
+    // optional field is absent, while authenticating every new replay value.
+    if (message.providerReasoning !== undefined) {
+      writer.writeCount(
+        "provider-reasoning-version",
+        message.providerReasoning.version,
+      );
+      writer.writeString(
+        "provider-reasoning-content",
+        message.providerReasoning.content,
+      );
+      if (message.providerReasoning.version === 2) {
+        writer.writeString(
+          "provider-reasoning-provider",
+          message.providerReasoning.provider,
+        );
+        writer.writeString(
+          "provider-reasoning-model",
+          message.providerReasoning.model,
+        );
+      }
     }
 
     writer.writeString(
@@ -831,6 +863,33 @@ function assertResponseItemShape(
   if (item.endTurn !== undefined && typeof item.endTurn !== "boolean") {
     throw malformed(`checkpoint response item ${index} has invalid endTurn`);
   }
+  if (item.providerReasoning !== undefined) {
+    if (item.role !== "assistant" || !isRecord(item.providerReasoning)) {
+      throw malformed(
+        `checkpoint response item ${index} has invalid provider reasoning replay`,
+      );
+    }
+    const providerReasoning = item.providerReasoning as Record<string, unknown>;
+    const validV1 =
+      providerReasoning.version === 1 &&
+      hasOnlyKnownKeys(providerReasoning, PROVIDER_REASONING_V1_KEYS);
+    const validV2 =
+      providerReasoning.version === 2 &&
+      hasOnlyKnownKeys(providerReasoning, PROVIDER_REASONING_V2_KEYS) &&
+      typeof providerReasoning.provider === "string" &&
+      providerReasoning.provider.trim().length > 0 &&
+      typeof providerReasoning.model === "string" &&
+      providerReasoning.model.trim().length > 0;
+    if (
+      (!validV1 && !validV2) ||
+      typeof providerReasoning.content !== "string" ||
+      providerReasoning.content.length === 0
+    ) {
+      throw malformed(
+        `checkpoint response item ${index} has invalid provider reasoning replay`,
+      );
+    }
+  }
   if (
     item.toolResultIntegrity !== undefined &&
     !isRecord(item.toolResultIntegrity)
@@ -960,6 +1019,7 @@ function parseRequiredCheckpointSlice(
 
 interface ParsedCheckpointRetryCounts {
   planToolRequiredRetryCount?: number;
+  completionGateRound?: number;
 }
 
 function parseCheckpointRetryCounts(
@@ -972,11 +1032,16 @@ function parseCheckpointRetryCounts(
       "resumableState.planToolRequiredRetryCount",
     );
   }
+  if (value.completionGateRound !== undefined) {
+    result.completionGateRound = nonNegativeInteger(
+      value.completionGateRound,
+      "resumableState.completionGateRound",
+    );
+  }
   return result;
 }
 
 interface ParsedCheckpointAdmissionState {
-  editorToolCallsAdmitted?: number;
   pendingAdmissionFallback?: PendingAdmissionFallbackSlice;
 }
 
@@ -984,12 +1049,7 @@ function parseCheckpointAdmissionState(
   value: Record<string, unknown>,
 ): ParsedCheckpointAdmissionState {
   const result: ParsedCheckpointAdmissionState = {};
-  if (value.editorToolCallsAdmitted !== undefined) {
-    result.editorToolCallsAdmitted = nonNegativeInteger(
-      value.editorToolCallsAdmitted,
-      "resumableState.editorToolCallsAdmitted",
-    );
-  }
+  // `editorToolCallsAdmitted` (retired editor quota) is accepted and ignored.
   if (value.pendingAdmissionFallback !== undefined) {
     const fallback = validatePendingAdmissionFallbackSlice(
       value.pendingAdmissionFallback,
@@ -1003,7 +1063,9 @@ function parseCheckpointAdmissionState(
 
 interface ParsedCheckpointModelSampleState {
   modelSampleOrdinal?: number;
-  modelSampleResumePrompt?: "continuation_nudge" | "empty_response";
+  modelSampleResumePrompt?: "continuation_nudge" | "empty_response" | "text_tool_call_correction";
+  textToolCallCorrectionCount?: number;
+  textToolCallCorrection?: TextToolCallCorrection;
 }
 
 function parseCheckpointModelSampleState(
@@ -1019,11 +1081,24 @@ function parseCheckpointModelSampleState(
   if (value.modelSampleResumePrompt !== undefined) {
     if (
       value.modelSampleResumePrompt !== "continuation_nudge" &&
-      value.modelSampleResumePrompt !== "empty_response"
+      value.modelSampleResumePrompt !== "empty_response" &&
+      value.modelSampleResumePrompt !== "text_tool_call_correction"
     ) {
       throw malformed("resumableState.modelSampleResumePrompt is invalid");
     }
     result.modelSampleResumePrompt = value.modelSampleResumePrompt;
+  }
+  if (value.textToolCallCorrectionCount !== undefined) {
+    result.textToolCallCorrectionCount = nonNegativeInteger(value.textToolCallCorrectionCount, "resumableState.textToolCallCorrectionCount");
+  }
+  if (value.textToolCallCorrection !== undefined) {
+    const correction = readTextToolCallCorrection(value.textToolCallCorrection);
+    if (!correction) throw malformed("resumableState.textToolCallCorrection is invalid");
+    result.textToolCallCorrection = correction;
+  }
+  if (result.modelSampleResumePrompt === "text_tool_call_correction" &&
+      (result.textToolCallCorrection === undefined || !result.textToolCallCorrectionCount)) {
+    throw malformed("resumableState tool-call correction is missing its durable counter or identity");
   }
   return result;
 }

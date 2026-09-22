@@ -7,8 +7,13 @@
 
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
-import { AgenCDaemonResponseError } from "../app-server/agent-cli.js";
-import { isTerminalDaemonErrorPayload } from "./daemon-terminal-error.js";
+import { AgenCDaemonResponseError, MAX_BUFFERED_SESSION_EVENTS_PER_SESSION } from "../app-server/agent-cli.js";
+import { DaemonEventReplay } from "./daemon-event-replay.js";
+import {
+  daemonTranscriptSnapshotCoversEvent,
+  daemonTranscriptSnapshotEvents,
+} from "./daemon-transcript-snapshot.js";
+import { classifyTurnTerminal, createTurnFailedEvent } from "../contracts/turn-terminal.js";
 import type {
   AgentAttachParams,
   AgenCDaemonMethod,
@@ -18,6 +23,7 @@ import type {
   JsonValue,
   MessageContentBlock,
   MessageStreamParams,
+  MessageStreamResult,
   RequestId,
   SessionMcpStatusResult,
   SessionMcpAddServerParams,
@@ -45,51 +51,22 @@ import type {
   SessionHooksStatusResult,
   SessionHooksSetDisabledParams,
   SessionHooksSetDisabledResult,
+  SessionStatusLinePresentation,
+  SessionStatusLineExecuteParams,
+  SessionStatusLineExecuteResult,
   SessionApplyConfigParams,
   SessionApplyConfigResult,
   SessionSnapshotResult,
+  SessionTranscriptV2Result,
   SessionShellExecuteParams,
   SessionShellExecuteResult,
+  SessionGoalParams,
+  SessionGoalResult,
+  SessionProcessesListResult,
+  SessionProcessesStopResult,
   SessionResolveToolCallResult,
-  WorkspaceEditorAcquireParams,
-  WorkspaceEditorCancelPredictionParams,
-  WorkspaceEditorCancelPredictionSessionParams,
-  WorkspaceEditorCancelPredictionResult,
-  WorkspaceEditorChangesListParams,
-  WorkspaceEditorChangesListResult,
-  WorkspaceEditorPredictParams,
-  WorkspaceEditorPredictSessionParams,
-  WorkspaceEditorPredictionFeedbackParams,
-  WorkspaceEditorPredictionFeedbackSessionParams,
-  WorkspaceEditorPredictionFeedbackResult,
-  WorkspaceEditorPredictionResult,
-  WorkspaceEditorHeartbeatParams,
-  WorkspaceEditorLeaseResult,
-  WorkspaceEditorProposalApplyParams,
-  WorkspaceEditorProposalApplyResult,
-  WorkspaceEditorProposalDiscardResult,
-  WorkspaceEditorProposalParams,
-  WorkspaceEditorProposalResult,
-  WorkspaceEditorProposalStatusParams,
-  WorkspaceEditorProposalStatusResult,
-  WorkspaceEditorReleaseParams,
-  WorkspaceEditorReleaseResult,
-  WorkspaceEditorRecoveredTopologyListParams,
-  WorkspaceEditorRecoveredTopologyListResult,
-  WorkspaceEditorRecoveredTopologyResolveParams,
-  WorkspaceEditorRecoveredTopologyResolveResult,
-  WorkspaceEditorStaleAuthorityRefreshParams,
-  WorkspaceEditorStaleAuthorityRefreshResult,
-  WorkspaceEditorSyncParams,
-  WorkspaceEditorSyncResult,
-  WorkspaceEditorTopologyCompleteParams,
-  WorkspaceEditorTopologyCompleteResult,
-  WorkspaceEditorTopologyFinalizeParams,
-  WorkspaceEditorTopologyReleaseResult,
-  WorkspaceEditorTopologyReserveParams,
-  WorkspaceEditorTopologyReserveResult,
 } from "../app-server/protocol/index.js";
-import type { ApprovalCtx, ApprovalResolver } from "../tools/orchestrator.js";
+import type { ApprovalResolver } from "../tools/orchestrator.js";
 import {
   reviewDecisionIsAllow,
   type ReviewDecision,
@@ -128,6 +105,9 @@ import type {
 } from "../session/session.js";
 import { isMcpUrlCompletionResponse } from "../elicitation/url-completion.js";
 import { takePlanApprovalChoice } from "./plan-approval-choice.js";
+import { createWorkflowApprovalControls, type WorkflowApprovalControls } from "./workflow-approval-controls.js";
+import { buildDaemonApprovalCtx, daemonFileWritePreview } from "./daemon-approval-context.js";
+import { DaemonApprovalRequests } from "./daemon-approval-requests.js";
 import { EXIT_PLAN_MODE_TOOL_NAME } from "../tools/ExitPlanModeTool/constants.js";
 import {
   createRealtimeTuiControls,
@@ -146,7 +126,7 @@ import { mcpServerNameValidationIssue } from "../mcp-client/server-name.js";
 import { isRecord } from "../utils/record.js";
 import { logForDebugging } from "../utils/debug.js";
 import type { AgentRoleWorkspace } from "../agents/role-workspace.js";
-import type { SessionEditorInteraction } from "../session/autonomous-mode.js";
+import type { SessionSubmitOptions } from "../session/autonomous-mode.js";
 import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
 import {
   applyDaemonTuiRuntimeSettingsAuthority,
@@ -155,6 +135,15 @@ import {
 
 export const AGENC_DAEMON_RECONNECTING_MESSAGE =
   "daemon disconnected, reconnecting";
+export const AGENC_DAEMON_LOST_TURN_REASON =
+  "the daemon stopped responding; the turn cannot continue here";
+/**
+ * How long a daemon may stay silent mid-turn before the TUI ends the turn.
+ * The client's own reconnect window is the 30 s RPC timeout, which is too
+ * long to sit in front of a frozen composer; a daemon that has not answered
+ * in 10 s is treated as gone, and a later reconnect resumes its events.
+ */
+export const AGENC_DAEMON_LOST_TURN_PROBE_MS = 10_000;
 
 const MAX_DAEMON_QUEUED_INPUTS = 512;
 const MAX_DAEMON_QUEUED_INPUT_BYTES = 16 * 1_024 * 1_024;
@@ -225,12 +214,6 @@ const ACTIVE_DAEMON_TRANSCRIPT_EVENTS = new Set([
   "mcp_elicitation_request",
 ]);
 
-const TERMINAL_DAEMON_TRANSCRIPT_EVENTS = new Set([
-  "turn_complete",
-  "turn_aborted",
-  "error",
-]);
-
 export type AgenCDaemonConnectionStatus =
   "connected" | "disconnected" | "reconnecting";
 
@@ -280,6 +263,12 @@ export interface AgenCTuiBridgeSession extends AgenCCompactProgressControls {
     readonly reviewer?: string;
   }): Promise<SessionResolveToolCallResult>;
   getDaemonSessionSnapshot?(): Promise<SessionSnapshotResult>;
+  listDaemonSessionProcesses?(): Promise<SessionProcessesListResult | undefined>;
+  /** `/goal`: set, inspect, pause, resume or clear the daemon session's goal. */
+  updateDaemonSessionGoal?(
+    params: Omit<SessionGoalParams, "sessionId">,
+  ): Promise<SessionGoalResult>;
+  stopDaemonSessionProcess?(taskId: string): Promise<SessionProcessesStopResult>;
   partialCompactFromMessage?(params: {
     readonly messageOrdinal: number;
     readonly direction: "from" | "up_to";
@@ -319,6 +308,10 @@ export interface AgenCTuiBridgeSession extends AgenCCompactProgressControls {
     readonly rule: string;
   }): Promise<SessionPermissionRuleMutationResult>;
   getDaemonHooksStatus?(): Promise<SessionHooksStatusResult>;
+  executeDaemonStatusLine?(
+    presentation: SessionStatusLinePresentation,
+    signal?: AbortSignal,
+  ): Promise<SessionStatusLineExecuteResult>;
   setDaemonHooksDisabled?(
     disabled: boolean,
   ): Promise<SessionHooksSetDisabledResult>;
@@ -326,60 +319,6 @@ export interface AgenCTuiBridgeSession extends AgenCCompactProgressControls {
     profile?: string;
     reload?: boolean;
   }): Promise<SessionApplyConfigResult>;
-  acquireWorkspaceEditor?(
-    params: WorkspaceEditorAcquireParams,
-  ): Promise<WorkspaceEditorLeaseResult>;
-  syncWorkspaceEditor?(
-    params: WorkspaceEditorSyncParams,
-  ): Promise<WorkspaceEditorSyncResult>;
-  refreshWorkspaceEditorStaleAuthority?(
-    params: WorkspaceEditorStaleAuthorityRefreshParams,
-  ): Promise<WorkspaceEditorStaleAuthorityRefreshResult>;
-  heartbeatWorkspaceEditor?(
-    params: WorkspaceEditorHeartbeatParams,
-  ): Promise<WorkspaceEditorLeaseResult>;
-  releaseWorkspaceEditor?(
-    params: WorkspaceEditorReleaseParams,
-  ): Promise<WorkspaceEditorReleaseResult>;
-  reserveWorkspaceEditorTopology?(
-    params: WorkspaceEditorTopologyReserveParams,
-  ): Promise<WorkspaceEditorTopologyReserveResult>;
-  completeWorkspaceEditorTopology?(
-    params: WorkspaceEditorTopologyCompleteParams,
-  ): Promise<WorkspaceEditorTopologyCompleteResult>;
-  releaseWorkspaceEditorTopology?(
-    params: WorkspaceEditorTopologyFinalizeParams,
-  ): Promise<WorkspaceEditorTopologyReleaseResult>;
-  listRecoveredWorkspaceEditorTopologies?(
-    params: WorkspaceEditorRecoveredTopologyListParams,
-  ): Promise<WorkspaceEditorRecoveredTopologyListResult>;
-  resolveRecoveredWorkspaceEditorTopology?(
-    params: WorkspaceEditorRecoveredTopologyResolveParams,
-  ): Promise<WorkspaceEditorRecoveredTopologyResolveResult>;
-  getWorkspaceEditorProposal?(
-    params: WorkspaceEditorProposalParams,
-  ): Promise<WorkspaceEditorProposalResult>;
-  getWorkspaceEditorProposalStatus?(
-    params: WorkspaceEditorProposalStatusParams,
-  ): Promise<WorkspaceEditorProposalStatusResult>;
-  applyWorkspaceEditorProposal?(
-    params: WorkspaceEditorProposalApplyParams,
-  ): Promise<WorkspaceEditorProposalApplyResult>;
-  discardWorkspaceEditorProposal?(
-    params: WorkspaceEditorProposalParams,
-  ): Promise<WorkspaceEditorProposalDiscardResult>;
-  listWorkspaceEditorChanges?(
-    params: WorkspaceEditorChangesListParams,
-  ): Promise<WorkspaceEditorChangesListResult>;
-  predictEditorCode?(
-    params: WorkspaceEditorPredictSessionParams,
-  ): Promise<WorkspaceEditorPredictionResult>;
-  cancelEditorPrediction?(
-    params: WorkspaceEditorCancelPredictionSessionParams,
-  ): Promise<WorkspaceEditorCancelPredictionResult>;
-  reportEditorPredictionFeedback?(
-    params: WorkspaceEditorPredictionFeedbackSessionParams,
-  ): Promise<WorkspaceEditorPredictionFeedbackResult>;
   readonly realtime?: AgenCRealtimeTuiControls;
   executeShellCommand?(
     params: AgenCShellExecuteParams,
@@ -389,10 +328,7 @@ export interface AgenCTuiBridgeSession extends AgenCCompactProgressControls {
   } | null;
   submit?(
     message: string,
-    opts?: {
-      readonly displayUserMessage?: string | null;
-      readonly editorInteraction?: SessionEditorInteraction;
-    },
+    opts?: SessionSubmitOptions,
   ): Promise<void>;
   enqueueIdleInput?(input: unknown, ownership?: IdleInputOwnership): number;
   enqueueIdleInputBatch?(
@@ -431,14 +367,12 @@ export type AgenCDaemonBackedTuiSession<
   | "subscribeToEvents"
 > & {
   readonly conversationId: string;
+  readonly workflowApprovalControls: WorkflowApprovalControls;
   getInitialTranscriptEvents(): readonly unknown[];
   subscribeToEvents(cb: (event: unknown) => void): () => void;
   submit(
     message: string,
-    opts?: {
-      readonly displayUserMessage?: string | null;
-      readonly editorInteraction?: SessionEditorInteraction;
-    },
+    opts?: SessionSubmitOptions,
   ): Promise<void>;
   enqueueIdleInput(input: unknown, ownership?: IdleInputOwnership): number;
   enqueueIdleInputBatch(
@@ -487,6 +421,7 @@ export type AgenCDaemonBackedTuiSession<
 };
 
 export interface AgenCDaemonTuiClient {
+  supportsMethod?(method: string): boolean;
   request(
     method: "session.shell.execute",
     params?: JsonObject,
@@ -543,6 +478,11 @@ export interface AgenCDaemonTuiClient {
     options?: { readonly signal?: AbortSignal },
   ): Promise<SessionHooksStatusResult>;
   request(
+    method: "session.statusLine.execute",
+    params?: JsonObject,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<SessionStatusLineExecuteResult>;
+  request(
     method: "session.hooks.setDisabled",
     params?: JsonObject,
     options?: { readonly signal?: AbortSignal },
@@ -583,84 +523,6 @@ export interface AgenCDaemonTuiClient {
   ): () => void;
 }
 
-interface AgenCDaemonEditorPredictionClient {
-  request(
-    method: "workspace.editor.predict",
-    params: WorkspaceEditorPredictParams,
-  ): Promise<WorkspaceEditorPredictionResult>;
-  request(
-    method: "workspace.editor.cancelPrediction",
-    params: WorkspaceEditorCancelPredictionParams,
-  ): Promise<WorkspaceEditorCancelPredictionResult>;
-  request(
-    method: "workspace.editor.predictionFeedback",
-    params: WorkspaceEditorPredictionFeedbackParams,
-  ): Promise<WorkspaceEditorPredictionFeedbackResult>;
-}
-
-interface AgenCDaemonEditorCoherenceClient {
-  request(
-    method: "workspace.editor.acquire",
-    params: WorkspaceEditorAcquireParams,
-  ): Promise<WorkspaceEditorLeaseResult>;
-  request(
-    method: "workspace.editor.sync",
-    params: WorkspaceEditorSyncParams,
-  ): Promise<WorkspaceEditorSyncResult>;
-  request(
-    method: "workspace.editor.staleAuthority.refresh",
-    params: WorkspaceEditorStaleAuthorityRefreshParams,
-  ): Promise<WorkspaceEditorStaleAuthorityRefreshResult>;
-  request(
-    method: "workspace.editor.heartbeat",
-    params: WorkspaceEditorHeartbeatParams,
-  ): Promise<WorkspaceEditorLeaseResult>;
-  request(
-    method: "workspace.editor.release",
-    params: WorkspaceEditorReleaseParams,
-  ): Promise<WorkspaceEditorReleaseResult>;
-  request(
-    method: "workspace.editor.topology.reserve",
-    params: WorkspaceEditorTopologyReserveParams,
-  ): Promise<WorkspaceEditorTopologyReserveResult>;
-  request(
-    method: "workspace.editor.topology.complete",
-    params: WorkspaceEditorTopologyCompleteParams,
-  ): Promise<WorkspaceEditorTopologyCompleteResult>;
-  request(
-    method: "workspace.editor.topology.release",
-    params: WorkspaceEditorTopologyFinalizeParams,
-  ): Promise<WorkspaceEditorTopologyReleaseResult>;
-  request(
-    method: "workspace.editor.topology.recovered.list",
-    params: WorkspaceEditorRecoveredTopologyListParams,
-  ): Promise<WorkspaceEditorRecoveredTopologyListResult>;
-  request(
-    method: "workspace.editor.topology.recovered.resolve",
-    params: WorkspaceEditorRecoveredTopologyResolveParams,
-  ): Promise<WorkspaceEditorRecoveredTopologyResolveResult>;
-  request(
-    method: "workspace.editor.proposal.get",
-    params: WorkspaceEditorProposalParams,
-  ): Promise<WorkspaceEditorProposalResult>;
-  request(
-    method: "workspace.editor.proposal.status",
-    params: WorkspaceEditorProposalStatusParams,
-  ): Promise<WorkspaceEditorProposalStatusResult>;
-  request(
-    method: "workspace.editor.proposal.apply",
-    params: WorkspaceEditorProposalApplyParams,
-  ): Promise<WorkspaceEditorProposalApplyResult>;
-  request(
-    method: "workspace.editor.proposal.discard",
-    params: WorkspaceEditorProposalParams,
-  ): Promise<WorkspaceEditorProposalDiscardResult>;
-  request(
-    method: "workspace.editor.changes.list",
-    params: WorkspaceEditorChangesListParams,
-  ): Promise<WorkspaceEditorChangesListResult>;
-}
-
 export interface AgenCDaemonTuiSessionOptions<
   Session extends AgenCTuiBridgeSession = AgenCTuiBridgeSession,
 > {
@@ -673,6 +535,9 @@ export interface AgenCDaemonTuiSessionOptions<
   readonly realtimeWebrtcSessionFactory?: CreateRealtimeTuiControlsOptions["startWebrtcSession"];
   readonly realtimeAudioCaptureFactory?: StartRealtimeAudioCapture;
   readonly realtimeAudioPlayer?: RealtimeAudioPlayer;
+  readonly transcriptSnapshot?: SessionTranscriptV2Result;
+  /** Test seam: how long a silent daemon keeps a turn alive mid-turn. */
+  readonly lostTurnProbeMs?: number;
   /** Snapshot cursor captured only after this socket's session route exists. */
   readonly runtimeSettingsCursor: {
     readonly eventId: string;
@@ -735,11 +600,16 @@ export async function attachDaemonAgentTuiSession<
     authorityCwd,
     attachment.runtimeSettings,
   );
+  const transcriptSnapshot = await options.client.request("session.transcript.v2", {
+    sessionId,
+  });
+  daemonTranscriptSnapshotEvents(transcriptSnapshot, sessionId);
   return createDaemonTuiSession({
     ...options,
     sessionId,
     conversationId: attachment.runtimeSessionId ?? options.agentId,
     realtimeThreadId: options.agentId,
+    transcriptSnapshot,
     runtimeSettingsCursor: {
       eventId: attachment.runtimeSettingsEventId,
       cwd: authorityCwd,
@@ -753,13 +623,9 @@ export function createDaemonTuiSession<
   options: AgenCDaemonTuiSessionOptions<Session>,
 ): AgenCDaemonBackedTuiSession<Session> {
   const { baseSession, client, sessionId, clientId } = options;
-  // These authenticated TUI-only methods are intentionally absent from the
-  // public daemon method union. The transport accepts known internal methods;
-  // keep the widening narrow so ordinary TUI calls remain contract-checked.
-  const editorPredictionClient =
-    client as unknown as AgenCDaemonEditorPredictionClient;
-  const editorCoherenceClient =
-    client as unknown as AgenCDaemonEditorCoherenceClient;
+  const restoredTranscriptEvents = options.transcriptSnapshot === undefined
+    ? undefined
+    : daemonTranscriptSnapshotEvents(options.transcriptSnapshot, sessionId);
   const conversationId = options.conversationId ?? sessionId;
   // Share the task board with the daemon turn: TodoWrite persists the board
   // under the conversation id (getTaskListId prefers the ambient session's
@@ -784,18 +650,26 @@ export function createDaemonTuiSession<
     readonly ownership?: IdleInputOwnership;
   };
   const queuedInputs: DaemonQueuedInput[] = [];
-  const eventSubscribers = new Set<(event: unknown) => void>();
-  // Backlog of received daemon events, replayed to subscribers that register
-  // LATE. The daemon replays the session's early events exactly once when the
-  // RPC subscription opens — a local subscriber that registers after that
-  // single replay (the transcript hook mounts after other subscriptions)
-  // would otherwise lose early events FOREVER: the user's first prompt
-  // (user_message) never reached the transcript hook and the message was
-  // invisible until ctrl+o. Replay from the same received stream — ids match,
-  // so the reducer's eventKey dedupe collapses any overlap with live events.
-  const receivedEvents: unknown[] = [];
-  const REPLAY_BACKLOG_LIMIT = 500;
-  let activeTurnSnapshot: { readonly turnId: string } | null = null;
+  const eventReplay = new DaemonEventReplay(MAX_BUFFERED_SESSION_EVENTS_PER_SESSION);
+  let activeTurnSnapshot: { readonly turnId: string } | null =
+    options.transcriptSnapshot?.activeTurn ?? null;
+  let lastObservedTurnId = options.transcriptSnapshot?.activeTurn?.turnId;
+  type PendingDaemonSubmission = {
+    readonly clientMessageId: string;
+    dispatched: boolean;
+    cancellation?: { readonly reason?: string };
+  };
+  const pendingSubmissions = new Map<string, PendingDaemonSubmission>();
+  let observedSubmission: PendingDaemonSubmission | undefined;
+  const activeDaemonTurnId = (): string | undefined => {
+    const turnId = activeTurnSnapshot?.turnId === "daemon-turn"
+      ? lastObservedTurnId
+      : activeTurnSnapshot?.turnId;
+    return turnId !== undefined && turnId !== "daemon-turn" &&
+      !pendingSubmissions.has(turnId) && turnId === lastObservedTurnId
+      ? turnId
+      : undefined;
+  };
   let daemonTurnStartGeneration = 0;
   let inFlightShellExecutionCount = 0;
   const inFlightShellCommandIds = new Set<string>();
@@ -820,6 +694,49 @@ export function createDaemonTuiSession<
   >();
   let unsubscribeDaemonEvents: (() => void) | null = null;
   let runtimeSettingsAuthorityError: Error | null = null;
+  const cancelDaemonTurn = async (expectedTurnId: string, reason?: string): Promise<void> => {
+    try {
+      await client.request("session.cancelTurn", {
+        sessionId,
+        expectedTurnId,
+        ...(reason !== undefined ? { reason } : {}),
+      }, { signal: AbortSignal.timeout(5_000) });
+    } catch (error) {
+      const timedOut = error instanceof Error &&
+        (error.name === "TimeoutError" || error.name === "AbortError");
+      if (timedOut) {
+        broadcastDaemonEvent({
+          id: `agenc-daemon-cancel-unacked-${Date.now()}`,
+          type: "warning",
+          payload: {
+            cause: "daemon_delivery_failed",
+            action: "session.cancelTurn",
+            message:
+              "interrupt not acknowledged by the daemon (it may be unresponsive) — try ESC again, or restart the daemon",
+          },
+        });
+      }
+    }
+  };
+  const flushSubmissionCancellation = (event: unknown): void => {
+    if (isJsonObject(event)) {
+      const payload = isJsonObject(event.payload) ? event.payload : {};
+      const clientMessageId = event.clientMessageId ?? payload.clientMessageId;
+      if (clientMessageId !== undefined) {
+        observedSubmission = [...pendingSubmissions.values()].find(
+          (submission) => submission.clientMessageId === clientMessageId,
+        );
+      }
+    }
+    const turnId = activeDaemonTurnId();
+    if (
+      turnId === undefined || !observedSubmission?.dispatched ||
+      observedSubmission.cancellation === undefined
+    ) return;
+    const { reason } = observedSubmission.cancellation;
+    delete observedSubmission.cancellation;
+    void cancelDaemonTurn(turnId, reason);
+  };
   const markDaemonActivityActive = (event: unknown): void => {
     if (terminalDaemonTurnObserved) return;
     const payload = (event as { readonly payload?: unknown }).payload;
@@ -830,34 +747,44 @@ export function createDaemonTuiSession<
         ? payload.turnId
         : (activeTurnSnapshot?.turnId ?? "daemon-turn");
     activeTurnSnapshot = { turnId };
+    if (turnId !== "daemon-turn" && !pendingSubmissions.has(turnId)) {
+      lastObservedTurnId = turnId;
+    }
   };
   const noteDaemonActivity = (event: unknown): void => {
     if (typeof event !== "object" || event === null) {
       return;
     }
     const eventType = (event as { readonly type?: unknown }).type;
-    // Raw session errors are diagnostic events. A terminal agent-status error
-    // carries an explicit marker added by transcriptEventFromAgentStatus.
-    if (
-      typeof eventType === "string" &&
-      TERMINAL_DAEMON_TRANSCRIPT_EVENTS.has(eventType)
-    ) {
-      if (
-        eventType === "error" &&
-        !isTerminalDaemonErrorPayload(
-          (event as { readonly payload?: unknown }).payload,
-        )
-      ) {
-        return;
-      }
+    if (eventType === "user_message") {
+      const value = event as JsonObject;
+      const payload = isJsonObject(value.payload) ? value.payload : {};
+      const clientMessageId = value.clientMessageId ?? payload.messageId;
+      observedSubmission = [...pendingSubmissions.values()].find(
+        (submission) => submission.clientMessageId === clientMessageId,
+      );
+    }
+    const terminal = typeof eventType === "string"
+      ? classifyTurnTerminal({
+          type: eventType,
+          payload: (event as { readonly payload?: unknown }).payload,
+        }, {
+          expectedTurnId: activeTurnSnapshot?.turnId === "daemon-turn"
+            ? lastObservedTurnId
+            : activeTurnSnapshot?.turnId,
+        })
+      : undefined;
+    if (terminal !== undefined) {
       activeTurnSnapshot = null;
       terminalDaemonTurnObserved = true;
+      observedSubmission = undefined;
       return;
     }
     if (eventType === "turn_start" || eventType === "turn_started") {
       daemonTurnStartGeneration += 1;
       terminalDaemonTurnObserved = false;
       markDaemonActivityActive(event);
+      flushSubmissionCancellation(event);
       return;
     }
     if (
@@ -865,6 +792,20 @@ export function createDaemonTuiSession<
       ACTIVE_DAEMON_TRANSCRIPT_EVENTS.has(eventType)
     ) {
       const payload = (event as { readonly payload?: unknown }).payload;
+      if (eventType === "request_permissions") {
+        // A child approval is displayed on the parent's connection, but its
+        // turnId belongs to the child. Approval identity must never establish
+        // or replace the parent turn used for completion and cancellation.
+        const parentTurnId = activeDaemonTurnId();
+        if (
+          parentTurnId === undefined ||
+          (isJsonObject(payload) && (
+            (typeof payload.turnId === "string" && payload.turnId !== parentTurnId) ||
+            (typeof payload.sourceConversationId === "string" &&
+              payload.sourceConversationId !== (baseSession.conversationId ?? sessionId))
+          ))
+        ) return;
+      }
       const callId =
         isJsonObject(payload) && typeof payload.callId === "string"
           ? payload.callId
@@ -883,10 +824,24 @@ export function createDaemonTuiSession<
     }
     const payload = (event as { readonly payload?: unknown }).payload;
     if (typeof payload !== "object" || payload === null) return;
+    if (
+      isJsonObject(payload) && typeof payload.agentId === "string" &&
+      payload.agentId !== realtimeThreadId
+    ) return;
     const status = (payload as { readonly status?: unknown }).status;
     const turnId = (payload as { readonly turnId?: unknown }).turnId;
     if (typeof status !== "string") return;
+    const expectedTurnId = activeDaemonTurnId();
+    if (
+      expectedTurnId !== undefined &&
+      typeof turnId === "string" && turnId !== expectedTurnId &&
+      (status === "idle" || status === "completed" || status === "failed" ||
+        status === "error" || status === "cancelled" || status === "canceled")
+    ) return;
     if (status === "idle") {
+      if (typeof turnId === "string" && !pendingSubmissions.has(turnId)) {
+        lastObservedTurnId = turnId;
+      }
       activeTurnSnapshot = null;
       return;
     }
@@ -899,24 +854,24 @@ export function createDaemonTuiSession<
     ) {
       activeTurnSnapshot = null;
       terminalDaemonTurnObserved = true;
+      observedSubmission = undefined;
       return;
     }
     if (terminalDaemonTurnObserved) return;
+    if (typeof turnId === "string" && turnId.length > 0) {
+      lastObservedTurnId = turnId;
+    }
     activeTurnSnapshot = {
       turnId:
         typeof turnId === "string" && turnId.length > 0
           ? turnId
           : "daemon-turn",
     };
+    flushSubmissionCancellation(event);
   };
   const broadcastDaemonEvent = (event: unknown): void => {
     noteDaemonActivity(event);
-    if (receivedEvents.length < REPLAY_BACKLOG_LIMIT) {
-      receivedEvents.push(event);
-    }
-    for (const subscriber of [...eventSubscribers]) {
-      subscriber(event);
-    }
+    eventReplay.publish(event);
   };
   const realtime = createRealtimeTuiControls({
     threadId: realtimeThreadId,
@@ -948,13 +903,12 @@ export function createDaemonTuiSession<
       runtimeSettingsAuthorityError = error;
       broadcastDaemonEvent({
         id: `daemon-runtime-settings-authority-failed-${Date.now()}`,
-        type: "error",
-        payload: {
-          cause: "runtime_settings_authority_gap",
+        ...createTurnFailedEvent({
+          turnId: activeTurnSnapshot?.turnId ?? "daemon-turn",
+          code: "runtime_settings_authority_gap",
           message: error.message,
-          terminal: true,
-          terminalSource: "runtime_settings_authority",
-        },
+          completedAt: Date.now(),
+        }),
       });
       const abortTerminal = (
         baseSession as AgenCTuiBridgeSession & {
@@ -984,13 +938,12 @@ export function createDaemonTuiSession<
     try {
       broadcastDaemonEvent({
         id: `daemon-runtime-settings-authority-failed-${Date.now()}`,
-        type: "error",
-        payload: {
-          cause: failureCause,
+        ...createTurnFailedEvent({
+          turnId: activeTurnSnapshot?.turnId ?? "daemon-turn",
+          code: failureCause,
           message: error.message,
-          terminal: true,
-          terminalSource: "runtime_settings_authority",
-        },
+          completedAt: Date.now(),
+        }),
       });
     } catch {
       // The authority fence and terminal abort below must survive UI listeners.
@@ -1036,6 +989,12 @@ export function createDaemonTuiSession<
       mcpProjection,
       broadcastDaemonEvent,
       runtimeSettingsReconciler,
+      () => activeTurnSnapshot?.turnId === "daemon-turn"
+        ? lastObservedTurnId
+        : activeTurnSnapshot?.turnId ?? lastObservedTurnId,
+      options.transcriptSnapshot,
+      () => activeTurnSnapshot !== null || pendingSubmissions.size > 0,
+      options.lostTurnProbeMs,
     );
     const currentConnectionState = client.getConnectionState?.();
     if (
@@ -1053,7 +1012,7 @@ export function createDaemonTuiSession<
   };
   const maybeStopDaemonEvents = (): void => {
     if (
-      eventSubscribers.size > 0 ||
+      eventReplay.size > 0 ||
       mcpProjection.hasSubscribers() ||
       runtimeSettingsReconciler !== undefined ||
       unsubscribeDaemonEvents === null
@@ -1077,14 +1036,7 @@ export function createDaemonTuiSession<
         bytes: queuedInputBlocksBytes(blocks),
         ...(ownership !== undefined
           ? {
-              ownership: {
-                workspaceView: ownership.workspaceView,
-                ...(ownership.editorInteractionId !== undefined
-                  ? {
-                      editorInteractionId: ownership.editorInteractionId,
-                    }
-                  : {}),
-              },
+              ownership: { workspaceView: ownership.workspaceView },
             }
           : {}),
       }));
@@ -1157,6 +1109,7 @@ export function createDaemonTuiSession<
   return {
     ...daemonSessionBase,
     conversationId,
+    workflowApprovalControls: createWorkflowApprovalControls(client),
     services,
     mcpSurfaceSnapshot: () => mcpProjection.snapshot(),
     refreshMcpSurface: () => mcpProjection.refresh(),
@@ -1174,23 +1127,27 @@ export function createDaemonTuiSession<
         activeTurnSnapshot ?? baseSession.activeTurn?.unsafePeek?.() ?? null,
     },
     submit: async (message, opts) => {
-      await runtimeSettingsAuthorityMutationTail;
-      await awaitRuntimeSettingsAuthority();
+      const clientMessageId = opts?.clientMessageId ?? randomUUID();
+      const streamId = `${clientId}:${randomUUID()}`;
+      const submission: PendingDaemonSubmission = { clientMessageId, dispatched: false };
+      pendingSubmissions.set(streamId, submission);
+      try {
+        await runtimeSettingsAuthorityMutationTail;
+        await awaitRuntimeSettingsAuthority();
+        if (submission.cancellation !== undefined) {
+          throw Object.assign(new Error(submission.cancellation.reason ?? "interrupted"), {
+            name: "AbortError",
+          });
+        }
+      } catch (error) {
+        pendingSubmissions.delete(streamId);
+        throw error;
+      }
       const queuedInputsBeforeSubmission = [...queuedInputs];
       const queuedEntries: DaemonQueuedInput[] = [];
       const retained: DaemonQueuedInput[] = [];
       for (const entry of queuedInputs) {
-        const selected =
-          opts?.editorInteraction !== undefined
-            ? entry.ownership?.workspaceView === "editor" &&
-              entry.ownership.editorInteractionId ===
-                opts.editorInteraction.interactionId
-            : entry.ownership?.workspaceView !== "editor";
-        if (selected) {
-          queuedEntries.push(entry);
-        } else {
-          retained.push(entry);
-        }
+        queuedEntries.push(entry);
       }
       queuedInputs.splice(0, queuedInputs.length, ...retained);
       const queued = queuedEntries.flatMap((entry) => entry.blocks);
@@ -1201,12 +1158,16 @@ export function createDaemonTuiSession<
       );
       queuedInputCount = Math.max(0, queuedInputCount - submittedInputCount);
       queuedInputBytes = Math.max(0, queuedInputBytes - submittedInputBytes);
-      if (queued.length === 0 && message.length === 0) return;
+      if (queued.length === 0 && message.length === 0) {
+        pendingSubmissions.delete(streamId);
+        return;
+      }
       inFlightInputCount += submittedInputCount;
       inFlightInputBytes += submittedInputBytes;
-      const streamId = `${clientId}:${Date.now()}`;
-      terminalDaemonTurnObserved = false;
-      activeTurnSnapshot = { turnId: streamId };
+      if (activeTurnSnapshot === null) {
+        terminalDaemonTurnObserved = false;
+        activeTurnSnapshot = { turnId: streamId };
+      }
       const content =
         queued.length === 0
           ? message
@@ -1216,49 +1177,55 @@ export function createDaemonTuiSession<
                 ? [{ type: "text", text: message } as MessageContentBlock]
                 : []),
             ];
+      let recovered: MessageStreamResult | undefined;
+      let completion: {
+        readonly turnId?: string;
+        readonly terminal: NonNullable<MessageStreamResult["terminal"]>;
+      } | undefined;
       try {
         const metadata: JsonObject = {
           ...(opts?.displayUserMessage !== undefined
             ? { displayUserMessage: opts.displayUserMessage }
             : {}),
-          ...(opts?.editorInteraction !== undefined
-            ? {
-                editorInteraction: {
-                  interactionId: opts.editorInteraction.interactionId,
-                  kind: opts.editorInteraction.kind,
-                  policy: opts.editorInteraction.policy,
-                  editorInstanceId: opts.editorInteraction.editorInstanceId,
-                  bufferHandle: opts.editorInteraction.bufferHandle,
-                  changedtick: opts.editorInteraction.changedtick,
-                  contentSha256: opts.editorInteraction.contentSha256,
-                  ...(opts.editorInteraction.path !== undefined
-                    ? { path: opts.editorInteraction.path }
-                    : {}),
-                  range: {
-                    start: {
-                      line: opts.editorInteraction.range.start.line,
-                      column: opts.editorInteraction.range.start.column,
-                    },
-                    end: {
-                      line: opts.editorInteraction.range.end.line,
-                      column: opts.editorInteraction.range.end.column,
-                    },
-                  },
-                  ...(opts.editorInteraction.selectionMode !== undefined
-                    ? {
-                        selectionMode: opts.editorInteraction.selectionMode,
-                      }
-                    : {}),
-                },
-              }
-            : {}),
         };
-        await client.request("message.stream", {
+        submission.dispatched = true;
+        const result = await client.request("message.stream", {
           sessionId,
           content,
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+          clientMessageId,
           streamId,
         } satisfies MessageStreamParams);
+        if (result.terminal !== undefined && (
+          !isJsonObject(result.terminal) ||
+          (result.terminal.code !== 0 && result.terminal.code !== 1 && result.terminal.code !== 130) ||
+          (result.terminal.message !== undefined && typeof result.terminal.message !== "string") ||
+          (result.turnId !== undefined && (
+            typeof result.turnId !== "string" || result.turnId.trim().length === 0
+          ))
+        )) {
+          throw new Error("daemon returned an invalid terminal submission result");
+        }
+        if (result.disposition === "duplicate") {
+          if (
+            result.duplicateState !== "completed" ||
+            result.terminal === undefined
+          ) {
+            throw new Error(
+              `Submission ${clientMessageId} was already admitted, but its terminal outcome is unknown. It was not run again. Inspect the session history and tool effects before starting a new submission.`,
+            );
+          }
+          recovered = result;
+          if (
+            activeTurnSnapshot?.turnId === streamId ||
+            activeTurnSnapshot?.turnId === result.turnId
+          ) {
+            activeTurnSnapshot = null;
+            terminalDaemonTurnObserved = true;
+          }
+        } else if (result.terminal !== undefined) {
+          completion = { turnId: result.turnId, terminal: result.terminal };
+        }
         const submitted = new Set(queuedEntries);
         for (const [token, admission] of idleInputAdmissions) {
           if (admission.entries.every((entry) => submitted.has(entry))) {
@@ -1272,24 +1239,30 @@ export function createDaemonTuiSession<
         // startup messages) were already drained out of `queuedInputs` above;
         // if we don't roll them back the user's content is lost permanently
         // with no transcript entry. Re-prepend the drained blocks so the next
-        // submit re-sends them, preserving at-least-once delivery.
+        // submit re-sends them.
         if (queuedEntries.length > 0) {
           const originalEntries = new Set(queuedInputsBeforeSubmission);
+          // Retained entries can be consumed or rolled back while this RPC is
+          // pending. Restore only this submission's entries, preserving the
+          // order of retained entries that still belong to the live queue.
+          const restorableEntries = new Set([...queuedInputs, ...queuedEntries]);
           const admittedAfterSubmission = queuedInputs.filter(
             (entry) => !originalEntries.has(entry),
           );
           queuedInputs.splice(
             0,
             queuedInputs.length,
-            ...queuedInputsBeforeSubmission,
+            ...queuedInputsBeforeSubmission.filter((entry) => restorableEntries.has(entry)),
             ...admittedAfterSubmission,
           );
           queuedInputCount += submittedInputCount;
           queuedInputBytes += submittedInputBytes;
         }
-        activeTurnSnapshot = null;
+        if (activeTurnSnapshot?.turnId === streamId) activeTurnSnapshot = null;
         throw error;
       } finally {
+        pendingSubmissions.delete(streamId);
+        if (observedSubmission === submission) observedSubmission = undefined;
         inFlightInputCount = Math.max(
           0,
           inFlightInputCount - submittedInputCount,
@@ -1298,6 +1271,45 @@ export function createDaemonTuiSession<
           0,
           inFlightInputBytes - submittedInputBytes,
         );
+      }
+      if (recovered?.terminal !== undefined) {
+        broadcastDaemonEvent({
+          type: "message_submission_recovered",
+          payload: {
+            clientMessageId,
+            ...(recovered.turnId === undefined ? {} : { turnId: recovered.turnId }),
+            ...recovered.terminal,
+          },
+        });
+      }
+      if (completion !== undefined && !terminalDaemonTurnObserved && (
+        activeTurnSnapshot?.turnId === streamId ||
+        (completion.turnId !== undefined && (
+          activeDaemonTurnId() === completion.turnId ||
+          (activeTurnSnapshot === null && lastObservedTurnId === completion.turnId)
+        ))
+      )) {
+        // The response is a second authoritative terminal delivery path. Only
+        // reconcile its own turn; an older RPC may finish after a successor starts.
+        // Some submissions complete without starting a model turn. Their
+        // response can retire only the local placeholder, never a daemon turn.
+        const { terminal } = completion;
+        const turnId = completion.turnId ?? streamId;
+        activeTurnSnapshot = { turnId };
+        if (completion.turnId !== undefined) lastObservedTurnId = completion.turnId;
+        broadcastDaemonEvent({
+          id: `daemon-submission:${clientMessageId}:terminal`,
+          clientMessageId,
+          ...(terminal.code === 1
+            ? createTurnFailedEvent({
+                turnId,
+                code: "daemon_submission_failed",
+                message: terminal.message ?? "Daemon turn failed",
+              })
+            : terminal.code === 130
+              ? { type: "turn_aborted", payload: { turnId, reason: terminal.message ?? "interrupted" } }
+              : { type: "turn_complete", payload: { turnId, ...(terminal.message !== undefined ? { lastAgentMessage: terminal.message } : {}) } }),
+        });
       }
     },
     enqueueIdleInput: (input, ownership) => {
@@ -1359,8 +1371,45 @@ export function createDaemonTuiSession<
         evidenceSha256: params.evidenceSha256,
         ...(params.reviewer !== undefined ? { reviewer: params.reviewer } : {}),
       }),
-    getDaemonSessionSnapshot: async () =>
-      client.request("session.snapshot", { sessionId }),
+    getDaemonSessionSnapshot: async () => {
+      const snapshot = await client.request("session.snapshot", { sessionId });
+      if (snapshot.sessionId !== sessionId) {
+        throw new Error("Daemon snapshot belongs to a different session");
+      }
+      return snapshot;
+    },
+    updateDaemonSessionGoal: async (goalParams) => {
+      if (client.supportsMethod?.("session.goal") !== true) {
+        throw new Error(
+          "This daemon does not support /goal. Restart it with `agenc daemon restart` to pick up the current runtime.",
+        );
+      }
+      return client.request("session.goal", { ...goalParams, sessionId });
+    },
+    listDaemonSessionProcesses: async () => {
+      if (client.supportsMethod?.("session.processes.list") !== true) return undefined;
+      try {
+        return await client.request("session.processes.list", { sessionId });
+      } catch (error) {
+        // A reconnected daemon may no longer provide the advertised method.
+        if (error instanceof AgenCDaemonResponseError && error.code === -32601) return undefined;
+        throw error;
+      }
+    },
+    stopDaemonSessionProcess: async (taskId: string) => {
+      const unsupportedMessage = "This daemon does not support stopping session processes";
+      if (client.supportsMethod?.("session.processes.stop") !== true) {
+        throw new Error(unsupportedMessage);
+      }
+      try {
+        return await client.request("session.processes.stop", { sessionId, taskId });
+      } catch (error) {
+        if (error instanceof AgenCDaemonResponseError && error.code === -32601) {
+          throw new Error(unsupportedMessage, { cause: error });
+        }
+        throw error;
+      }
+    },
     executeShellCommand: async ({ command, commandId, signal }) => {
       if (inFlightShellExecutionCount === 0) {
         shellBatchStartedWithActiveTurn =
@@ -1401,40 +1450,19 @@ export function createDaemonTuiSession<
       }
     },
     cancelActiveTurn: async (reason?: string) => {
-      // Best-effort: a closed/disconnected daemon socket throws. The
-      // user pressed ESC — they want the turn to stop, but a thrown
-      // error here doesn't help them. Swallow and let the next health
-      // check / event surface the disconnection separately.
-      // Timeout: a WEDGED daemon (idle deadlock) never answers the RPC at
-      // all — without a deadline the ESC press vanishes silently and the
-      // UI keeps showing "Working…" forever. Give up after 5s and tell the
-      // user the interrupt could not be delivered.
-      try {
-        await client.request(
-          "session.cancelTurn",
-          {
-            sessionId,
-            ...(reason !== undefined ? { reason } : {}),
-          },
-          { signal: AbortSignal.timeout(5_000) },
-        );
-      } catch (error) {
-        const timedOut =
-          error instanceof Error &&
-          (error.name === "TimeoutError" || error.name === "AbortError");
-        if (timedOut) {
-          broadcastDaemonEvent({
-            id: `agenc-daemon-cancel-unacked-${Date.now()}`,
-            type: "warning",
-            payload: {
-              cause: "daemon_delivery_failed",
-              action: "session.cancelTurn",
-              message:
-                "interrupt not acknowledged by the daemon (it may be unresponsive) — try ESC again, or restart the daemon",
-            },
-          });
-        }
+      const expectedTurnId = activeDaemonTurnId();
+      if (expectedTurnId !== undefined) {
+        await cancelDaemonTurn(expectedTurnId, reason);
+        return;
       }
+      // A pending submission's stream id is local, not cancellation authority.
+      // Bind ESC to its durable user marker and subsequent daemon turn start;
+      // an unrelated client's turn must not inherit this cancellation.
+      const pending = (activeTurnSnapshot === null
+        ? undefined
+        : pendingSubmissions.get(activeTurnSnapshot.turnId)) ??
+        [...pendingSubmissions.values()].find((submission) => !submission.dispatched);
+      if (pending !== undefined) pending.cancellation = { reason };
     },
     partialCompactFromMessage: async (params) =>
       client.request(
@@ -1601,6 +1629,20 @@ export function createDaemonTuiSession<
           );
         }
       }),
+    executeDaemonStatusLine: async (_presentation, signal) => {
+      signal?.throwIfAborted();
+      try {
+        return await client.request("session.statusLine.execute", {
+          sessionId,
+          presentation: {},
+        } satisfies SessionStatusLineExecuteParams, { signal });
+      } catch (error) {
+        signal?.throwIfAborted();
+        return error instanceof AgenCDaemonResponseError && error.code === -32601
+          ? { status: "unavailable", reason: "unsupported_method" }
+          : { status: "error", reason: "request_failed" };
+      }
+    },
     getDaemonHooksStatus: async () =>
       client.request("session.hooks.status", {
         sessionId,
@@ -1616,8 +1658,7 @@ export function createDaemonTuiSession<
         try {
           if (p.reload === true) {
             // session.applyConfig refreshes only this agent's live config
-            // store. Predictions are daemon-owned, so reload the daemon-global
-            // snapshot first.
+            // store; reload the daemon-global snapshot first.
             await client.request("daemon.reload", {});
           }
           const result = await client.request("session.applyConfig", {
@@ -1659,88 +1700,22 @@ export function createDaemonTuiSession<
           );
         }
       }),
-    acquireWorkspaceEditor: async (params) =>
-      editorCoherenceClient.request("workspace.editor.acquire", params),
-    syncWorkspaceEditor: async (params) =>
-      editorCoherenceClient.request("workspace.editor.sync", params),
-    refreshWorkspaceEditorStaleAuthority: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.staleAuthority.refresh",
-        params,
-      ),
-    heartbeatWorkspaceEditor: async (params) =>
-      editorCoherenceClient.request("workspace.editor.heartbeat", params),
-    releaseWorkspaceEditor: async (params) =>
-      editorCoherenceClient.request("workspace.editor.release", params),
-    reserveWorkspaceEditorTopology: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.topology.reserve",
-        params,
-      ),
-    completeWorkspaceEditorTopology: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.topology.complete",
-        params,
-      ),
-    releaseWorkspaceEditorTopology: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.topology.release",
-        params,
-      ),
-    listRecoveredWorkspaceEditorTopologies: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.topology.recovered.list",
-        params,
-      ),
-    resolveRecoveredWorkspaceEditorTopology: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.topology.recovered.resolve",
-        params,
-      ),
-    getWorkspaceEditorProposal: async (params) =>
-      editorCoherenceClient.request("workspace.editor.proposal.get", params),
-    getWorkspaceEditorProposalStatus: async (params) =>
-      editorCoherenceClient.request("workspace.editor.proposal.status", params),
-    applyWorkspaceEditorProposal: async (params) =>
-      editorCoherenceClient.request("workspace.editor.proposal.apply", params),
-    discardWorkspaceEditorProposal: async (params) =>
-      editorCoherenceClient.request(
-        "workspace.editor.proposal.discard",
-        params,
-      ),
-    listWorkspaceEditorChanges: async (params) =>
-      editorCoherenceClient.request("workspace.editor.changes.list", params),
-    predictEditorCode: async (params) =>
-      editorPredictionClient.request("workspace.editor.predict", {
-        ...params,
-        sessionId,
-      } satisfies WorkspaceEditorPredictParams),
-    cancelEditorPrediction: async (params) =>
-      editorPredictionClient.request("workspace.editor.cancelPrediction", {
-        ...params,
-        sessionId,
-      } satisfies WorkspaceEditorCancelPredictionParams),
-    reportEditorPredictionFeedback: async (params) =>
-      editorPredictionClient.request("workspace.editor.predictionFeedback", {
-        ...params,
-        sessionId,
-      } satisfies WorkspaceEditorPredictionFeedbackParams),
     subscribeToEvents: (cb) => {
-      // Late registrants get the backlog first (see receivedEvents above) —
-      // without this, a subscriber mounting after the daemon's one-shot RPC
-      // replay permanently misses every event that preceded it.
-      for (const event of receivedEvents) {
-        cb(event);
+      const unsubscribe = eventReplay.subscribe(cb);
+      try {
+        ensureDaemonEventsSubscribed();
+      } catch (error) {
+        unsubscribe();
+        maybeStopDaemonEvents();
+        throw error;
       }
-      eventSubscribers.add(cb);
-      ensureDaemonEventsSubscribed();
       return () => {
-        eventSubscribers.delete(cb);
+        unsubscribe();
         maybeStopDaemonEvents();
       };
     },
     getInitialTranscriptEvents: () => [
-      ...baseInitialTranscriptEvents(baseSession),
+      ...(restoredTranscriptEvents ?? baseInitialTranscriptEvents(baseSession)),
       ...connectionNoticeEvents(client.getConnectionState?.() ?? null),
     ],
   } as AgenCDaemonBackedTuiSession<Session>;
@@ -2515,28 +2490,41 @@ function subscribeToDaemonEvents(
   mcpProjection: DaemonMcpProjection,
   cb: (event: unknown) => void,
   runtimeSettingsReconciler?: RuntimeSettingsReconciler,
+  activeTurnId?: () => string | undefined,
+  transcriptSnapshot?: SessionTranscriptV2Result,
+  turnInFlight?: () => boolean,
+  probeDeadlineMs: number = AGENC_DAEMON_LOST_TURN_PROBE_MS,
 ): () => void {
   let replayingInitialEvents = true;
+  let closed = false;
+  let lostTurnProbe: Promise<void> | null = null;
+  const pendingApprovals = new DaemonApprovalRequests(MAX_BUFFERED_SESSION_EVENTS_PER_SESSION);
+  const emit = (event: unknown): void => {
+    if (!closed) cb(event);
+  };
   const deliver = (event: JsonObject): void => {
-    cb(event);
+    if (closed) return;
+    emit(event);
     void maybeBridgeDaemonApproval(
       client,
       sessionId,
       session,
       event,
-      cb,
+      emit,
+      pendingApprovals,
     );
     void maybeBridgeDaemonElicitation(
       client,
       sessionId,
       session,
       event,
-      cb,
+      emit,
     );
   };
   const unsubscribeSession = client.subscribeToSessionEvents(
     sessionId,
     (event) => {
+      if (closed) return;
       if (
         event.method === "event.mcp_status_changed" &&
         isJsonObject(event.params) &&
@@ -2546,7 +2534,11 @@ function subscribeToDaemonEvents(
         mcpProjection.invalidate(event.params.revision);
         return;
       }
-      const transcriptEvent = toTranscriptEvent(event);
+      const transcriptEvent = toTranscriptEvent(event, activeTurnId?.(), realtimeThreadId);
+      if (
+        transcriptSnapshot !== undefined &&
+        daemonTranscriptSnapshotCoversEvent(transcriptSnapshot, event, transcriptEvent)
+      ) return;
       if (runtimeSettingsReconciler === undefined) {
         deliver(transcriptEvent);
       } else if (replayingInitialEvents) {
@@ -2563,19 +2555,64 @@ function subscribeToDaemonEvents(
   replayingInitialEvents = false;
   runtimeSettingsReconciler?.finishInitialReplay();
   const unsubscribeRealtime = client.subscribeToNotifications?.((event) => {
+    if (closed) return;
     const transcriptEvent = toRealtimeTranscriptEvent(event, realtimeThreadId);
     if (transcriptEvent === null) return;
     realtime.handleTranscriptEvent(transcriptEvent);
-    cb(transcriptEvent);
+    emit(transcriptEvent);
   });
+  // A turn's terminal event comes from the daemon. When the daemon is gone
+  // (killed, crashed, replaced by one that does not host this session) that
+  // event never arrives: the TUI stays busy forever, Esc cancels nothing, and
+  // /exit and Ctrl-C are refused as "finish or cancel the turn first". A
+  // dropped socket alone proves nothing, the daemon owns the turn and may
+  // still be running it, so ask, and end the turn locally only when the
+  // daemon fails to answer or stays silent past the probe deadline.
+  const settleTurnIfDaemonLostIt = (): void => {
+    if (lostTurnProbe !== null || turnInFlight?.() !== true) return;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const silent = new Promise<never>((_, reject) => {
+      deadline = setTimeout(
+        () => reject(new Error("daemon silent past the probe deadline")),
+        probeDeadlineMs,
+      );
+    });
+    lostTurnProbe = Promise.race([
+      client.request("session.snapshot", { sessionId }),
+      silent,
+    ])
+      .then(
+        () => undefined,
+        () => {
+          if (closed || turnInFlight?.() !== true) return;
+          const turnId = activeTurnId?.();
+          emit({
+            id: `agenc-daemon-lost-turn-${turnId ?? "unknown"}`,
+            type: "turn_aborted",
+            payload: {
+              ...(turnId !== undefined ? { turnId } : {}),
+              reason: AGENC_DAEMON_LOST_TURN_REASON,
+            },
+          });
+        },
+      )
+      .finally(() => {
+        clearTimeout(deadline);
+        lostTurnProbe = null;
+      });
+  };
   const unsubscribeConnection = client.subscribeToConnectionState?.((state) => {
+    if (closed) return;
     runtimeSettingsReconciler?.noteConnectionState(state);
     mcpProjection.noteConnectionState(state);
     for (const event of connectionNoticeEvents(state)) {
-      cb(event);
+      emit(event);
     }
+    if (state.status === "disconnected") settleTurnIfDaemonLostIt();
   });
   return () => {
+    closed = true;
+    pendingApprovals.close();
     unsubscribeSession();
     unsubscribeRealtime?.();
     unsubscribeConnection?.();
@@ -2618,17 +2655,23 @@ async function maybeBridgeDaemonApproval(
   session: AgenCTuiBridgeSession,
   event: unknown,
   cb: (event: unknown) => void,
+  pendingApprovals: DaemonApprovalRequests,
 ): Promise<void> {
-  if (!isJsonObject(event) || event.type !== "request_permissions") return;
+  if (!isJsonObject(event)) return;
   const payload = event.payload;
   if (!isJsonObject(payload) || typeof payload.callId !== "string") return;
+  if (pendingApprovals.settleEvent(event.type, payload, event.turnId)) return;
+  if (event.type !== "request_permissions") return;
   const resolver = session.services.approvalResolver;
   if (resolver === undefined) return;
+  const controller = pendingApprovals.begin(payload, event.turnId);
+  if (controller === undefined) return;
   const toolName =
     typeof payload.toolName === "string" ? payload.toolName : "tool";
   const decision = await resolver
-    .request(buildDaemonApprovalCtx(session, payload, toolName))
+    .request(buildDaemonApprovalCtx(session, payload, toolName, controller.signal))
     .catch((): ReviewDecision => ({ kind: "denied" }));
+  if (controller.signal.aborted) return;
   // A transient daemon RPC failure here silently drops the user's
   // approve/deny decision and the tool call hangs forever. Catch and surface
   // it so the user gets feedback instead of an indefinite hang.
@@ -2666,6 +2709,7 @@ async function maybeBridgeDaemonApproval(
             }
           : {}),
       });
+      pendingApprovals.finish(payload.callId, controller);
       return;
     }
     await client.request("tool.deny", {
@@ -2673,7 +2717,11 @@ async function maybeBridgeDaemonApproval(
       requestId: payload.callId,
       reason: decision.kind,
     });
+    pendingApprovals.finish(payload.callId, controller);
   } catch (error) {
+    // A failed send may still be pending on the daemon. Allow replay to
+    // restore it; an already-observed canonical decision keeps its tombstone.
+    pendingApprovals.release(payload.callId, controller);
     emitDaemonDeliveryFailureNotice(
       cb,
       payload.callId,
@@ -2784,47 +2832,6 @@ async function maybeBridgeDaemonElicitation(
   }
 }
 
-function buildDaemonApprovalCtx(
-  session: AgenCTuiBridgeSession,
-  payload: JsonObject,
-  toolName: string,
-): ApprovalCtx {
-  const callId = payload.callId as string;
-  const input = isJsonObject(payload.input) ? payload.input : {};
-  return {
-    invocation: {
-      session,
-      turn: {
-        subId: typeof payload.turnId === "string" ? payload.turnId : callId,
-      },
-      tracker: {
-        appendFileDiff() {},
-        snapshot: () => [],
-        clear() {},
-      },
-      callId,
-      toolName: { name: toolName },
-      payload: {
-        kind: "function",
-        arguments: JSON.stringify(input),
-      },
-      source: "direct",
-    } as unknown as ApprovalCtx["invocation"],
-    callId,
-    toolName,
-    turnId: typeof payload.turnId === "string" ? payload.turnId : callId,
-    ...(typeof payload.reason === "string"
-      ? { retryReason: payload.reason }
-      : {}),
-    ...(typeof payload.planContent === "string"
-      ? { planContent: payload.planContent }
-      : {}),
-    ...(typeof payload.planFilePath === "string"
-      ? { planFilePath: payload.planFilePath }
-      : {}),
-  };
-}
-
 function baseInitialTranscriptEvents(
   session: AgenCTuiBridgeSession,
 ): readonly unknown[] {
@@ -2835,7 +2842,114 @@ function baseInitialTranscriptEvents(
   ];
 }
 
-function toTranscriptEvent(event: JsonObject): JsonObject {
+function transcriptEventFromPermissionRequest(params: JsonObject): JsonObject | null {
+  if (typeof params.requestId !== "string") return null;
+  const fileWritePreview = daemonFileWritePreview(params.fileWritePreview);
+  return {
+    id: daemonTranscriptEventId(
+      params,
+      `permission-request:${params.requestId}`,
+    ),
+    type: "request_permissions",
+    payload: {
+      callId: params.requestId,
+      ...(typeof params.callId === "string" ? { toolCallId: params.callId } : {}),
+      ...(fileWritePreview === undefined ? {} : { fileWritePreview }),
+      ...(typeof params.toolName === "string"
+        ? { toolName: params.toolName }
+        : {}),
+      ...(typeof params.turnId === "string" ? { turnId: params.turnId } : {}),
+      ...(typeof params.sourceConversationId === "string"
+        ? { sourceConversationId: params.sourceConversationId }
+        : {}),
+      permissions: Array.isArray(params.permissions)
+        ? params.permissions.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : [],
+      ...(params.input !== undefined ? { input: params.input } : {}),
+      ...(typeof params.reason === "string" ? { reason: params.reason } : {}),
+      ...(typeof params.planContent === "string"
+        ? { planContent: params.planContent }
+        : {}),
+      ...(typeof params.planFilePath === "string"
+        ? { planFilePath: params.planFilePath }
+        : {}),
+    },
+  };
+}
+
+function transcriptEventFromUserInputRequest(params: JsonObject): JsonObject | null {
+  if (
+    typeof params.requestId !== "string" ||
+    typeof params.callId !== "string" ||
+    typeof params.turnId !== "string" ||
+    !Array.isArray(params.questions)
+  ) return null;
+  return {
+    id: daemonTranscriptEventId(
+      params,
+      `user-input-request:${params.requestId}`,
+    ),
+    type: "request_user_input",
+    payload: {
+      requestId: params.requestId,
+      callId: params.callId,
+      turnId: params.turnId,
+      questions: jsonObjectArray(params.questions),
+      ...(isJsonObject(params.clientAction)
+        ? { clientAction: params.clientAction }
+        : {}),
+    },
+  };
+}
+
+function transcriptEventFromMcpElicitationRequest(params: JsonObject): JsonObject | null {
+  if (
+    (typeof params.requestId !== "string" &&
+      typeof params.requestId !== "number") ||
+    typeof params.serverName !== "string" ||
+    typeof params.turnId !== "string" ||
+    !isJsonObject(params.request)
+  ) return null;
+  return {
+    id: daemonTranscriptEventId(
+      params,
+      `mcp-elicitation:${String(params.requestId)}`,
+    ),
+    type: "mcp_elicitation_request",
+    payload: {
+      requestId: params.requestId,
+      serverName: params.serverName,
+      turnId: params.turnId,
+      request: params.request,
+    },
+  };
+}
+
+function transcriptEventFromSessionEvent(params: JsonObject): JsonObject | null {
+  if (!isJsonObject(params.event)) return null;
+  return {
+    ...params.event,
+    ...(typeof params.turnId === "string" ? { turnId: params.turnId } : {}),
+    ...(typeof params.clientMessageId === "string"
+      ? { clientMessageId: params.clientMessageId }
+      : {}),
+    ...(typeof params.eventId === "string" && params.eventId.length > 0
+      ? { eventId: params.eventId }
+      : {}),
+    id: daemonTranscriptEventId(
+      params,
+      typeof params.event.id === "string" ? params.event.id : "session-event",
+    ),
+  };
+}
+
+function toTranscriptEvent(
+  event: JsonObject,
+  activeTurnId?: string,
+  agentId?: string,
+): JsonObject {
   const msg = event.msg;
   if (isJsonObject(msg)) {
     return msg;
@@ -2867,98 +2981,40 @@ function toTranscriptEvent(event: JsonObject): JsonObject {
       },
     };
   }
-  if (
-    method === "event.permission_request" &&
-    typeof params.requestId === "string"
-  ) {
-    return {
-      id: daemonTranscriptEventId(
-        params,
-        `permission-request:${params.requestId}`,
-      ),
-      type: "request_permissions",
-      payload: {
-        callId: params.requestId,
-        ...(typeof params.toolName === "string"
-          ? { toolName: params.toolName }
-          : {}),
-        ...(typeof params.turnId === "string" ? { turnId: params.turnId } : {}),
-        permissions: Array.isArray(params.permissions)
-          ? params.permissions.filter(
-              (item): item is string => typeof item === "string",
-            )
-          : [],
-        ...(params.input !== undefined ? { input: params.input } : {}),
-        ...(typeof params.reason === "string" ? { reason: params.reason } : {}),
-        ...(typeof params.planContent === "string"
-          ? { planContent: params.planContent }
-          : {}),
-        ...(typeof params.planFilePath === "string"
-          ? { planFilePath: params.planFilePath }
-          : {}),
-      },
-    };
+  if (method === "event.permission_request") {
+    return transcriptEventFromPermissionRequest(params) ?? event;
   }
-  if (
-    method === "event.user_input_request" &&
-    typeof params.requestId === "string" &&
-    typeof params.callId === "string" &&
-    typeof params.turnId === "string" &&
-    Array.isArray(params.questions)
-  ) {
-    return {
-      id: daemonTranscriptEventId(
-        params,
-        `user-input-request:${params.requestId}`,
-      ),
-      type: "request_user_input",
-      payload: {
-        requestId: params.requestId,
-        callId: params.callId,
-        turnId: params.turnId,
-        questions: jsonObjectArray(params.questions),
-        ...(isJsonObject(params.clientAction)
-          ? { clientAction: params.clientAction }
-          : {}),
-      },
-    };
+  if (method === "event.user_input_request") {
+    return transcriptEventFromUserInputRequest(params) ?? event;
   }
-  if (
-    method === "event.mcp_elicitation_request" &&
-    (typeof params.requestId === "string" ||
-      typeof params.requestId === "number") &&
-    typeof params.serverName === "string" &&
-    typeof params.turnId === "string" &&
-    isJsonObject(params.request)
-  ) {
-    return {
-      id: daemonTranscriptEventId(
-        params,
-        `mcp-elicitation:${String(params.requestId)}`,
-      ),
-      type: "mcp_elicitation_request",
-      payload: {
-        requestId: params.requestId,
-        serverName: params.serverName,
-        turnId: params.turnId,
-        request: params.request,
-      },
-    };
+  if (method === "event.mcp_elicitation_request") {
+    return transcriptEventFromMcpElicitationRequest(params) ?? event;
   }
   if (method === "event.agent_status") {
-    return transcriptEventFromAgentStatus(params);
+    const ownsTurn = typeof params.agentId !== "string" || agentId === undefined || params.agentId === agentId;
+    const turnEvent = params.turnEvent;
+    if (
+      agentId !== undefined && params.agentId === agentId &&
+      isJsonObject(turnEvent) && isJsonObject(turnEvent.payload) &&
+      typeof params.turnId === "string" && params.turnId.trim().length > 0 &&
+      turnEvent.payload.turnId === params.turnId &&
+      ((turnEvent.type === "turn_started" && params.status === "running") ||
+        ((turnEvent.type === "turn_complete" || turnEvent.type === "turn_aborted") &&
+          params.status === "idle" &&
+          classifyTurnTerminal({ type: turnEvent.type, payload: turnEvent.payload }) !== undefined))
+    ) {
+      return {
+        id: daemonTranscriptEventId(params, params.turnId),
+        ...(typeof params.eventId === "string" ? { eventId: params.eventId } : {}),
+        ...(typeof params.clientMessageId === "string" ? { clientMessageId: params.clientMessageId } : {}),
+        type: turnEvent.type,
+        payload: turnEvent.payload,
+      };
+    }
+    return transcriptEventFromAgentStatus(params, activeTurnId, ownsTurn);
   }
-  if (method === "event.session_event" && isJsonObject(params.event)) {
-    return {
-      ...params.event,
-      ...(typeof params.eventId === "string" && params.eventId.length > 0
-        ? { eventId: params.eventId }
-        : {}),
-      id: daemonTranscriptEventId(
-        params,
-        typeof params.event.id === "string" ? params.event.id : "session-event",
-      ),
-    };
+  if (method === "event.session_event") {
+    return transcriptEventFromSessionEvent(params) ?? event;
   }
   return event;
 }
@@ -3073,33 +3129,38 @@ function nextRealtimeEventId(
   return `realtime:${method}:${String(threadId ?? "thread")}:${nextRealtimeTranscriptEventSequence}`;
 }
 
-function transcriptEventFromAgentStatus(params: JsonObject): JsonObject {
+function transcriptEventFromAgentStatus(
+  params: JsonObject,
+  activeTurnId?: string,
+  ownsTurn = true,
+): JsonObject {
   const status = params.status;
   const turnId = stringParam(
     params.turnId,
-    stringParam(params.eventId, "status"),
+    activeTurnId ?? stringParam(params.eventId, "status"),
   );
-  if (status === "error") {
+  if (status === "error" && ownsTurn) {
+    const failed = createTurnFailedEvent({
+      turnId,
+      code: "background_agent_error",
+      message: typeof params.message === "string" ? params.message : "agent error",
+    });
     return {
       id: daemonTranscriptEventId(params, turnId),
-      type: "error",
-      payload: {
-        turnId,
-        message:
-          typeof params.message === "string" ? params.message : "agent error",
-        terminal: true,
-        terminalSource: "agent_status",
-        ...(typeof params.runStatus === "string"
-          ? { runStatus: params.runStatus }
-          : {}),
-      },
+      type: failed.type,
+      payload: { ...failed.payload },
     };
   }
   return {
     id: daemonTranscriptEventId(params, turnId),
     type: "background_agent_status",
+    ...(typeof params.clientMessageId === "string"
+      ? { clientMessageId: params.clientMessageId }
+      : {}),
     payload: {
-      turnId,
+      ...(typeof params.turnId === "string" && params.turnId.length > 0
+        ? { turnId: params.turnId }
+        : {}),
       status,
       ...(typeof params.agentId === "string" && params.agentId.length > 0
         ? { agentId: params.agentId }

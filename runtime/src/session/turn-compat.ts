@@ -136,12 +136,6 @@ function createStatelessProviderSessionView(
     chatStream: (messages, onChunk, options) =>
       provider.chatStream(messages, onChunk, options),
     healthCheck: () => provider.healthCheck(),
-    ...(provider.predictCode !== undefined
-      ? {
-          predictCode: (request, options) =>
-            provider.predictCode!(request, options),
-        }
-      : {}),
     ...(provider.getExecutionProfile !== undefined
       ? {
           getExecutionProfile: (options) =>
@@ -310,6 +304,7 @@ export async function createTurnCompatSession(
   let session: Session;
   try {
     session = new Session({
+      fileReadScope: parent.fileReadScope,
       conversationId:
         opts.conversationId ??
         params.toolUseContext.agentId ??

@@ -4,6 +4,11 @@
  * @module
  */
 
+import { resolveReasoningEffort } from "../reasoning-effort.js";
+import {
+  anthropicFastModeRequested,
+  anthropicSupportsFastMode,
+} from "../providers/anthropic/fast-mode.js";
 import type {
   LLMChatOptions,
   LLMMessage,
@@ -18,8 +23,8 @@ import {
 import {
   coerceUsage,
   collectRequestMetrics,
-  normalizeFinishReason,
   normalizeToolCalls,
+  requireMappedFinishReason,
   parseAnthropicToolChoice,
   prepareMessagesForWire,
   toAnthropicMessageContent,
@@ -32,7 +37,12 @@ import {
   decodeMcpToolNameFromWire,
   encodeMcpToolNameForWire,
 } from "./mcp-tool-naming.js";
-import { isAlwaysOnThinkingAnthropicModel } from "../../utils/model/alwaysOnThinking.js";
+import {
+  anthropicAcceptsSamplingParameters,
+  anthropicEffort,
+  anthropicManualBudgetTokens,
+  anthropicThinkingControl,
+} from "../../utils/model/anthropicThinkingControl.js";
 
 export interface AnthropicMessagesRequestOptions {
   readonly model: string;
@@ -121,48 +131,96 @@ function buildAnthropicStructuredOutputTool(
 export { SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER } from "./shared.js";
 import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER } from "./shared.js";
 
+interface SplitOptionSystemPrompt {
+  readonly staticHead: string;
+  readonly dynamicTail?: string;
+}
+
 /**
- * Build the Anthropic `system` block(s) for the option-supplied system prompt.
- *
  * gaphunt3 #5/#33: the assembled system prompt embeds
  * {@link SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER} between its static
  * (cross-turn-stable) head and its volatile tail (env timestamp, git branch,
- * MCP servers, …). Previously the whole string was emitted as one
- * `cache_control: ephemeral` block, so the per-turn timestamp in the tail
- * changed the cached prefix and busted the prompt cache on every turn. We now
- * split on the marker and place the cache breakpoint on the static head ONLY,
- * with the volatile tail as a separate uncached block. When the marker is
- * absent (most callers / system-role messages), behaviour is unchanged: a
- * single block, cached iff `applyCacheControl`.
+ * MCP servers, …). When the marker is absent (most callers), the whole prompt
+ * is the static head.
  */
-function buildOptionSystemBlocks(
+function splitOptionSystemPrompt(
   optionSystemPrompt: string,
-  applyCacheControl: boolean,
-): Array<Record<string, unknown>> {
-  const cacheControl = applyCacheControl
-    ? { cache_control: { type: "ephemeral" } }
-    : {};
+): SplitOptionSystemPrompt {
   const markerIndex = optionSystemPrompt.indexOf(
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER,
   );
-  if (markerIndex === -1) {
-    return [{ type: "text", text: optionSystemPrompt, ...cacheControl }];
-  }
+  if (markerIndex === -1) return { staticHead: optionSystemPrompt };
   const staticHead = optionSystemPrompt.slice(0, markerIndex).trimEnd();
   const dynamicTail = optionSystemPrompt
     .slice(markerIndex + SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER.length)
     .trimStart();
+  return {
+    staticHead,
+    ...(dynamicTail.length > 0 ? { dynamicTail } : {}),
+  };
+}
+
+/**
+ * Build the Anthropic `system` block(s) for the option-supplied system prompt.
+ *
+ * The cache breakpoint sits on the static head ONLY. Prompt caching matches
+ * byte prefixes, so the volatile tail must not sit anywhere before the
+ * conversation: as a second `system` block it invalidated every
+ * message-level breakpoint on each new turn, and the whole history was
+ * re-written to the cache instead of read from it. The tail therefore rides
+ * at the end of the request (see {@link buildAnthropicMessagesRequest}) and
+ * is emitted here, uncached, only when the request has no final user
+ * message to carry it (an assistant prefill), the placement the OpenAI and
+ * xAI wires already use.
+ */
+function buildOptionSystemBlocks(
+  split: SplitOptionSystemPrompt,
+  applyCacheControl: boolean,
+  tailInSystem: boolean,
+): Array<Record<string, unknown>> {
+  const cacheControl = applyCacheControl
+    ? { cache_control: { type: "ephemeral" } }
+    : {};
   const blocks: Array<Record<string, unknown>> = [];
-  if (staticHead.length > 0) {
-    blocks.push({ type: "text", text: staticHead, ...cacheControl });
+  if (split.staticHead.length > 0) {
+    blocks.push({ type: "text", text: split.staticHead, ...cacheControl });
   }
-  if (dynamicTail.length > 0) {
-    blocks.push({ type: "text", text: dynamicTail });
+  if (tailInSystem && split.dynamicTail !== undefined) {
+    blocks.push({ type: "text", text: split.dynamicTail });
   }
   if (blocks.length === 0) {
     blocks.push({ type: "text", text: "", ...cacheControl });
   }
   return blocks;
+}
+
+/**
+ * Append the volatile system-prompt tail to the final user message as a
+ * trailing `<system-reminder>` text block. The message's own blocks (and
+ * any cache breakpoint on its last one) stay where they are, so the tail
+ * lands after every breakpoint and never enters a cached prefix. Tool
+ * results keep their leading position, which the Messages API requires.
+ */
+function contentBlocksOf(content: unknown): Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content.length > 0 ? [{ type: "text", text: content }] : [];
+  }
+  if (Array.isArray(content)) {
+    return [...(content as Array<Record<string, unknown>>)];
+  }
+  return [];
+}
+
+function appendDynamicTailBlock(
+  message: Record<string, unknown>,
+  dynamicTail: string,
+): void {
+  const blocks = contentBlocksOf(message.content);
+  blocks.push({
+    type: "text",
+    text: `<system-reminder>\n${dynamicTail}\n</system-reminder>`,
+  });
+  message.content = blocks;
 }
 
 export function buildAnthropicMessagesRequest(
@@ -173,38 +231,13 @@ export function buildAnthropicMessagesRequest(
     message.role === "system" || message.role === "developer"
   );
   const optionSystemPrompt = input.options?.systemPrompt?.trim();
+  const optionSplit = optionSystemPrompt
+    ? splitOptionSystemPrompt(optionSystemPrompt)
+    : undefined;
   const systemMessageHasCacheControl = systemMessages.some((message) =>
     hasEphemeralCacheControl(message)
   );
-  const systemBlocks = [
-    ...(optionSystemPrompt
-      ? buildOptionSystemBlocks(
-        optionSystemPrompt,
-        !systemMessageHasCacheControl,
-      )
-      : []),
-    ...systemMessages.flatMap((message) => {
-      const normalized = normalizeAnthropicMessageContent(message);
-      if (typeof normalized === "string") {
-        return normalized.length > 0
-          ? [{
-            type: "text",
-            text: normalized,
-          }]
-          : [];
-      }
-      return normalized.filter((block) => block.type === "text");
-    }),
-  ];
-  const systemHasCacheControl = systemBlocks.some((block) =>
-    Object.prototype.hasOwnProperty.call(block, "cache_control")
-  );
-  const system =
-    systemBlocks.length === 0
-      ? ""
-      : systemHasCacheControl
-      ? systemBlocks
-      : systemBlocks.map((block) => String(block.text ?? "")).join("\n\n");
+  const maxTokens = input.maxTokens ?? 4096;
 
   const body: Record<string, unknown> = {
     model: input.model,
@@ -279,15 +312,63 @@ export function buildAnthropicMessagesRequest(
           content: normalizeAnthropicMessageContent(message),
         };
       }),
-    max_tokens: input.maxTokens ?? 4096,
+    max_tokens: maxTokens,
   };
 
+  const wireMessages = body.messages as Array<Record<string, unknown>>;
+  const lastWireMessage = wireMessages.at(-1);
+  const dynamicTail = optionSplit?.dynamicTail;
+  const tailOnLastUserMessage =
+    dynamicTail !== undefined && lastWireMessage?.role === "user";
+  if (tailOnLastUserMessage) {
+    appendDynamicTailBlock(lastWireMessage, dynamicTail);
+  }
+
+  const systemBlocks = [
+    ...(optionSplit
+      ? buildOptionSystemBlocks(
+        optionSplit,
+        !systemMessageHasCacheControl,
+        !tailOnLastUserMessage,
+      )
+      : []),
+    ...systemMessages.flatMap((message) => {
+      const normalized = normalizeAnthropicMessageContent(message);
+      if (typeof normalized === "string") {
+        return normalized.length > 0
+          ? [{
+            type: "text",
+            text: normalized,
+          }]
+          : [];
+      }
+      return normalized.filter((block) => block.type === "text");
+    }),
+  ];
+  const systemHasCacheControl = systemBlocks.some((block) =>
+    Object.prototype.hasOwnProperty.call(block, "cache_control")
+  );
+  let system: string | Array<Record<string, unknown>> = "";
+  if (systemHasCacheControl) {
+    system = systemBlocks;
+  } else if (systemBlocks.length > 0) {
+    system = systemBlocks
+      .map((block) => (typeof block.text === "string" ? block.text : ""))
+      .join("\n\n");
+  }
   if (system.length > 0) body.system = system;
   // Task 28: the Fable/Mythos 5 family removed sampling parameters —
   // sending `temperature` returns a 400 (provider docs, verified
   // 2026-07-08). Opus-family behavior is unchanged.
-  const alwaysOnThinking = isAlwaysOnThinkingAnthropicModel(input.model);
-  if (input.options?.temperature !== undefined && !alwaysOnThinking) {
+  const thinkingControl = anthropicThinkingControl(input.model);
+  const alwaysOnThinking = thinkingControl === "always_on";
+  // `temperature` is "deprecated for this model" (400) on Opus 5, Sonnet 5,
+  // Opus 4.8 and Opus 4.7 as well (probed 2026-09-11); the 4.6 generation
+  // and older still take it.
+  if (
+    input.options?.temperature !== undefined &&
+    anthropicAcceptsSamplingParameters(input.model)
+  ) {
     body.temperature = input.options.temperature;
   }
   if (
@@ -341,17 +422,45 @@ export function buildAnthropicMessagesRequest(
   // family — thinking is always on and any explicit configuration other
   // than `{type:"adaptive"}` (incl. `disabled` and `enabled`/budget_tokens)
   // returns a 400; omitting the param runs adaptive thinking. Depth is the
-  // effort parameter's job on that family. Opus-family (>= 4.6) behavior
-  // below is unchanged.
+  // effort parameter's job on that family.
+  //
+  // Opus 5, Sonnet 5, Opus 4.8 and Opus 4.7 return the same 400 for
+  // `enabled` + `budget_tokens` ("Use thinking.type.adaptive and
+  // output_config.effort"); they and the 4.6 generation take adaptive
+  // thinking, with depth steered by effort. Only Opus 4.5, Sonnet 4.5,
+  // Haiku 4.5 and older still budget their thinking. Probed live
+  // 2026-09-11; see anthropicThinkingControl.ts.
+  const effortLevels = resolveReasoningEffort({ provider: "anthropic", model: input.model }).levels;
+  const requestedEffort = input.options?.reasoningEffort;
+  const normalizedEffort = (requestedEffort === "max" || requestedEffort === "xhigh") &&
+    !effortLevels.includes(requestedEffort) ? "high" : requestedEffort;
   if (thinkingEnabled && !alwaysOnThinking) {
-    body.thinking = {
-      type: "enabled",
-      budget_tokens:
-        input.options?.reasoningEffort === "high" ||
-          input.options?.reasoningEffort === "xhigh"
-          ? 4096
-          : 2048,
-    };
+    body.thinking = thinkingControl === "adaptive"
+      ? { type: "adaptive" }
+      : {
+          type: "enabled",
+          budget_tokens: anthropicManualBudgetTokens(
+            normalizedEffort,
+            maxTokens,
+          ),
+        };
+  }
+  // The effort dial only means something on the wire as output_config.effort;
+  // Sonnet 4.5 and Haiku 4.5 reject the field, so it stays off for them.
+  const effort = anthropicEffort(normalizedEffort);
+  if (
+    effort !== undefined &&
+    effortLevels.includes(effort)
+  ) {
+    body.output_config = { effort };
+  }
+  // Fast mode rides the session's "priority" service tier. It is sent only
+  // to the models that accept it; the adapter adds the matching beta header.
+  if (
+    anthropicFastModeRequested(input.options) &&
+    anthropicSupportsFastMode(input.model)
+  ) {
+    body.speed = "fast";
   }
   if (input.contextManagement) {
     body.context_management = input.contextManagement;
@@ -399,7 +508,10 @@ export function parseAnthropicMessagesResponse(
           // Decode the encoded `mcp__server__tool` form back to the
           // internal-registry `mcp.server.tool` form before dispatch.
           // Non-MCP names (e.g. `FileEdit`) pass through unchanged.
-          name: decodeMcpToolNameFromWire(String(block.name ?? "")),
+          name: decodeMcpToolNameFromWire(
+            String(block.name ?? ""),
+            request.tools.map((tool) => tool.function.name),
+          ),
           arguments: JSON.stringify(block.input ?? {}),
         }),
       ),
@@ -467,7 +579,7 @@ export function parseAnthropicMessagesResponse(
         toolCalls.length === 0 &&
         structuredOutput
         ? "stop"
-        : normalizeFinishReason(response.stop_reason),
+        : requireMappedFinishReason("anthropic", response.stop_reason),
     requestMetrics: withEndpointMarkers(requestMetrics, "/messages", response),
     ...(structuredOutput ? { structuredOutput } : {}),
     ...(thinking.length > 0 ? { thinking } : {}),

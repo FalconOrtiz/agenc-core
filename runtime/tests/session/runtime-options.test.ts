@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { windowsPathToPosixPath } from "../../src/utils/windowsPaths.js";
 
 import {
   AgentRuntimeOptionsError,
@@ -60,6 +61,7 @@ describe("agent runtime options", () => {
     expect(result).toEqual({
       simpleMode: true,
       dangerouslyBypassApprovalsAndSandbox: false,
+      nonInteractive: false,
       stdinDataMode: true,
       remoteMode: false,
       posixShellPath: "/bin/zsh",
@@ -93,6 +95,7 @@ describe("agent runtime options", () => {
         TMPDIR: "/ambient/posix",
         TEMP: "C:\\ambient\\temp",
         TMP: "C:\\ambient\\tmp",
+        TMPPREFIX: "/ambient/zsh",
       },
     );
 
@@ -105,6 +108,7 @@ describe("agent runtime options", () => {
         TMPDIR: sessionTempRoot,
         TEMP: sessionTempRoot,
         TMP: sessionTempRoot,
+        TMPPREFIX: `${process.platform === "win32" ? windowsPathToPosixPath(sessionTempRoot) : sessionTempRoot}/zsh`,
       },
     });
     expect(Object.isFrozen(authority)).toBe(true);
@@ -218,6 +222,34 @@ describe("agent runtime options", () => {
     [{ AGENC_BARE: "0" }, "AGENC_BARE was removed; use --bare"],
   ])("rejects invalid or obsolete boundary input", (env, message) => {
     expect(() => resolveAgentRuntimeOptions(env)).toThrow(message);
+  });
+
+  test("nonInteractive is an explicit override, false by default, boolean on the wire", () => {
+    const pluginStorageRoot = join(makeTemporaryDirectory(), "headless-plugins");
+    expect(resolveAgentRuntimeOptions({}).nonInteractive).toBe(false);
+    expect(
+      resolveAgentRuntimeOptions({}, { nonInteractive: true }).nonInteractive,
+    ).toBe(true);
+    expect(
+      validateAgentRuntimeOptions({
+        simpleMode: false,
+        nonInteractive: true,
+        stdinDataMode: false,
+        remoteMode: false,
+        pluginStorageRoot,
+        allowUntrustedHooks: false,
+      }).nonInteractive,
+    ).toBe(true);
+    expect(() =>
+      validateAgentRuntimeOptions({
+        simpleMode: false,
+        nonInteractive: "yes",
+        stdinDataMode: false,
+        remoteMode: false,
+        pluginStorageRoot,
+        allowUntrustedHooks: false,
+      }),
+    ).toThrow("runtimeOptions.nonInteractive must be boolean");
   });
 
   test("wire validation is strict and preserves explicit values", () => {

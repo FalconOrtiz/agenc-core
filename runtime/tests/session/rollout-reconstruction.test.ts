@@ -21,6 +21,32 @@ import {
 import { llmMessageToResponseItem } from "./message-history-conversion.js";
 
 describe("rollout-reconstruction", () => {
+  test("clear retires legacy compaction context before a fresh turn establishes its own", () => {
+    const context = {
+      turnId: "new-turn", model: "new-model", cwd: "/workspace",
+      approvalPolicy: "on-request", sandboxPolicy: "workspace-write",
+    };
+    const result = reconstructFromRollout([
+      { type: "response_item", payload: { role: "user", content: "old request" } },
+      { type: "compacted", payload: { message: "old summary" } },
+      { type: "event_msg", payload: {
+        id: "clear", msg: { type: "history_cleared", payload: { timestamp: 1 } },
+      } },
+      { type: "event_msg", payload: {
+        id: "start", msg: { type: "turn_started", payload: { turnId: "new-turn" } },
+      } },
+      { type: "turn_context", payload: context },
+      { type: "response_item", payload: { role: "user", content: "new request" } },
+      { type: "event_msg", payload: {
+        id: "complete", msg: { type: "turn_complete", payload: { turnId: "new-turn" } },
+      } },
+    ]);
+    expect(result.history).toEqual([{ role: "user", content: "new request" }]);
+    expect(result.state.lastCompaction).toBeUndefined();
+    expect(result.referenceContextItem).toEqual(context);
+    expect(result.previousTurnSettings).toMatchObject({ model: "new-model" });
+  });
+
   test("replays response_items into history", () => {
     const items: RolloutItem[] = [
       {
@@ -234,11 +260,10 @@ describe("rollout-reconstruction", () => {
     // function_call_output / tool_use_result must NOT count as a
     // user-turn boundary during reverse-scan. We verify this via
     // the thread_rolled_back drop logic, which counts boundaries
-    // the same way. agenc runtime `trim_pre_turn_context_updates`
-    // (history.rs:428-456) additionally strips contextual user
+    // the same way. The rollback additionally strips contextual user
     // injections sitting *above* the cut index, so the
     // `<environment_context>` fragment between real-u1 and real-u2
-    // is trimmed along with the rolled-back turn (history.rs:260).
+    // is trimmed along with the rolled-back turn.
     const items: RolloutItem[] = [
       { type: "response_item", payload: { role: "user", content: "real-u1" } },
       { type: "response_item", payload: { role: "assistant", content: "a1" } },
@@ -279,7 +304,7 @@ describe("rollout-reconstruction", () => {
     // real-u1 survives: the rolled-back turn is real-u2, not real-u1.
     expect(userTexts).toContain("real-u1");
     expect(userTexts).not.toContain("real-u2");
-    // agenc runtime `trim_pre_turn_context_updates` (history.rs:428-456)
+    // The rollback
     // strips the contextual <environment_context> injection that
     // sat immediately above the rollback cut, so the fragment is
     // dropped too.
@@ -444,7 +469,7 @@ describe("rollout-reconstruction", () => {
     expect(texts).toContain("first ask");
     expect(texts).toContain("second ask");
     expect(texts[texts.length - 1]).toBe("summary blob");
-    // Reference context cleared per agenc runtime legacy-compaction branch.
+    // Reference context cleared by the legacy-compaction branch.
     expect(r.referenceContextItem).toBeUndefined();
   });
 
@@ -477,7 +502,7 @@ describe("rollout-reconstruction", () => {
   });
 
   test("replay truncation caps oversized tool-output text only (tool item)", () => {
-    // agenc runtime `ContextManager::process_item` (history.rs:375-409)
+    // Replay processing
     // only truncates FunctionCallOutput / CustomToolCallOutput on
     // replay — plain Message (role=assistant/user) content passes
     // through unchanged. Verify both branches.
@@ -485,7 +510,7 @@ describe("rollout-reconstruction", () => {
     const items: RolloutItem[] = [
       // Assistant Message: must NOT be truncated.
       { type: "response_item", payload: { role: "assistant", content: big } },
-      // Tool-role output: MUST be truncated (agenc runtime FunctionCallOutput).
+      // Tool-role output: MUST be truncated.
       {
         type: "response_item",
         payload: {
@@ -597,11 +622,9 @@ describe("rollout-reconstruction", () => {
   });
 
   /**
-   * Port of agenc runtime
-   * `reconstruct_history_rollback_counts_inter_agent_assistant_turns`
-   * (agenc-rs/core/src/session/rollout_reconstruction_tests.rs:479-571).
+   * Rollback counts inter-agent assistant turns.
    *
-   * agenc runtime `is_user_turn_boundary` (history.rs:703-710) counts an
+   * The user-turn boundary check counts an
    * assistant-role message whose content is an inter-agent
    * instruction JSON payload as a user-turn boundary. Rolling back
    * one user turn must therefore drop the inter-agent assistant turn
@@ -643,7 +666,7 @@ describe("rollout-reconstruction", () => {
         },
       },
       // Turn 2: inter-agent assistant-instruction turn (counts as a
-      // user-turn boundary per agenc runtime).
+      // user-turn boundary).
       {
         type: "event_msg",
         payload: {
@@ -701,8 +724,7 @@ describe("rollout-reconstruction", () => {
    * (`# AGENC.md instructions for ` / `</INSTRUCTIONS>`). A
    * content-array fragment whose text matches both the start and
    * end markers is contextual and must NOT count as a user-turn
-   * boundary. The matcher is case-insensitive per
-   * `fragment.rs:23-33`.
+   * boundary. The matcher is case-insensitive.
    */
   test("AGENC.md-style contextual fragments require matching close tag", () => {
     const agencMdBody =
@@ -736,8 +758,7 @@ describe("rollout-reconstruction", () => {
 
   /**
    * `collectUserMessages` / legacy compaction rebuild must skip a
-   * previously-emitted summary message (agenc runtime `is_summary_message`
-   * at `compact.rs:410-412`). We feed a history with the rendered
+   * previously-emitted summary message. We feed a history with the rendered
    * summary prefix verbatim and assert that a subsequent legacy
    * compaction rebuild does not re-feed it.
    */

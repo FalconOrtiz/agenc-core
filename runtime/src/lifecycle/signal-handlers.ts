@@ -26,7 +26,7 @@ export interface AgenCShutdownSignalHandle {
 }
 
 export interface AgenCSignalProcess {
-  once(signal: AgenCShutdownSignal, listener: () => void): unknown;
+  on(signal: AgenCShutdownSignal, listener: () => void): unknown;
   removeListener(signal: AgenCShutdownSignal, listener: () => void): unknown;
 }
 
@@ -52,20 +52,26 @@ export function installAgenCShutdownSignalHandlers(
     const listener = (): void => {
       if (settled) return;
       settled = true;
-      dispose();
       const event: AgenCShutdownSignalEvent = {
         reason: "signal",
         signal,
         exitCode: exitCodeForSignal(signal),
       };
-      Promise.resolve(onSignal(event))
-        .catch(() => {
+      void (async () => {
+        try {
+          await onSignal(event);
+        } catch {
           /* Cleanup errors are reported by the cleanup registry caller. */
-        })
-        .finally(() => resolveCompleted(event));
+        } finally {
+          resolveCompleted(event);
+        }
+      })();
     };
     listeners.set(signal, listener);
-    proc.once(signal, listener);
+    // Keep ownership until the caller finishes cleanup. Removing our listener
+    // during delivery lets signal-exit treat this signal as unhandled and
+    // re-raise it before asynchronous cleanup can finish.
+    proc.on(signal, listener);
   }
 
   return { completed, dispose };

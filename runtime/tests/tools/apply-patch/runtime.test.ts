@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -18,16 +17,13 @@ import { afterEach, describe, expect, test } from "vitest";
 import { ConfigStore } from "../../config/store.js";
 import { enterCanonicalSettingsAuthority } from "../../utils/settings/canonicalAuthority.js";
 import { applyPatchText, unifiedDiffFromChunks } from "./runtime.js";
+import { ApplyPatchRuntimeError } from "./types.js";
 import { parsePatch } from "./parser.js";
 import {
   canonicalizePath,
   clearSessionReadState,
   recordSessionRead,
 } from "../system/filesystem.js";
-import {
-  sha256,
-  workspaceMutationCoordinators,
-} from "../../workspace/mutation-coordinator.js";
 
 async function tempRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), "agenc-apply-patch-"));
@@ -137,135 +133,6 @@ describe("apply-patch runtime", () => {
     );
   });
 
-  test("never exposes a source-only proposal for a move from a loaded file", async () => {
-    const root = await tempRoot();
-    const agencHome = await tempRoot();
-    const originalAgencHome = process.env.AGENC_HOME;
-    process.env.AGENC_HOME = agencHome;
-    const source = join(root, "source.txt");
-    const destination = join(root, "destination.txt");
-    const before = "line\n";
-    await writeFile(source, before, "utf8");
-
-    try {
-      const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-      const lease = coordinator.acquire({
-        workspaceRoot: root,
-        editorInstanceId: "loaded-move-editor",
-      });
-      coordinator.sync({
-        workspaceRoot: root,
-        editorInstanceId: "loaded-move-editor",
-        leaseToken: lease.leaseToken,
-        epoch: lease.epoch,
-        sequence: 0,
-        buffers: [
-          {
-            path: source,
-            bufferHandle: 4,
-            changedtick: 2,
-            contentSha256: sha256(before),
-            contentBytes: Buffer.byteLength(before),
-            dirty: false,
-          },
-        ],
-      });
-
-      await expect(
-        applyPatchText(
-          wrapPatch(`*** Update File: source.txt
-*** Move to: destination.txt
-@@
--line
-+line2`),
-          { cwd: root, allowedPaths: [root] },
-        ),
-      ).rejects.toThrow(/multi-path transaction.*active Editor revision/u);
-
-      await expect(readFile(source, "utf8")).resolves.toBe(before);
-      await expect(stat(destination)).rejects.toMatchObject({ code: "ENOENT" });
-      expect(
-        coordinator
-          .listChanges({
-            workspaceRoot: root,
-            editorInstanceId: "loaded-move-editor",
-            leaseToken: lease.leaseToken,
-            epoch: lease.epoch,
-          })
-          .changes.some((change) => change.status === "proposed"),
-      ).toBe(false);
-    } finally {
-      workspaceMutationCoordinators.clearForTests();
-      if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
-      else process.env.AGENC_HOME = originalAgencHome;
-    }
-  });
-
-  test.each([
-    { label: "clean", dirty: false },
-    { label: "dirty", dirty: true },
-  ])(
-    "blocks a true single-file delete of a loaded $label Editor path",
-    async ({ dirty }) => {
-      const root = await tempRoot();
-      const agencHome = await tempRoot();
-      const originalAgencHome = process.env.AGENC_HOME;
-      process.env.AGENC_HOME = agencHome;
-      const path = join(root, "loaded-delete.txt");
-      const before = "must remain present\n";
-      await writeFile(path, before, "utf8");
-
-      try {
-        const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-        const lease = coordinator.acquire({
-          workspaceRoot: root,
-          editorInstanceId: `loaded-delete-${dirty ? "dirty" : "clean"}`,
-        });
-        coordinator.sync({
-          workspaceRoot: root,
-          editorInstanceId: lease.editorInstanceId,
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-          sequence: 0,
-          buffers: [
-            {
-              path,
-              bufferHandle: 5,
-              changedtick: 2,
-              contentSha256: sha256(before),
-              contentBytes: Buffer.byteLength(before),
-              dirty,
-              ...(dirty ? { content: before } : {}),
-            },
-          ],
-        });
-
-        await expect(
-          applyPatchText(wrapPatch("*** Delete File: loaded-delete.txt"), {
-            cwd: root,
-            allowedPaths: [root],
-          }),
-        ).rejects.toThrow(/delete transaction.*active Editor revision/u);
-
-        await expect(readFile(path, "utf8")).resolves.toBe(before);
-        expect(
-          coordinator
-            .listChanges({
-              workspaceRoot: root,
-              editorInstanceId: lease.editorInstanceId,
-              leaseToken: lease.leaseToken,
-              epoch: lease.epoch,
-            })
-            .changes.some((change) => change.status === "proposed"),
-        ).toBe(false);
-      } finally {
-        workspaceMutationCoordinators.clearForTests();
-        if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
-        else process.env.AGENC_HOME = originalAgencHome;
-      }
-    },
-  );
-
   test("matches typographic punctuation with ASCII patch text", async () => {
     const root = await tempRoot();
     const path = join(root, "unicode.py");
@@ -352,6 +219,42 @@ describe("apply-patch read-before-write gate", () => {
       "File has not been read yet. Read it first before writing to it.",
     );
     await expect(readFile(path, "utf8")).resolves.toBe("foo\n");
+  });
+
+  test("marks a planning refusal as pre-effect and a commit-race as not", async () => {
+    const root = await tempRoot();
+    const unread = join(root, "unread.txt");
+    await writeFile(unread, "foo\n", "utf8");
+    await expect(
+      applyPatchText(updatePatch(unread, "foo", "bar"), {
+        cwd: root,
+        allowedPaths: [root],
+        sessionId: SESSION_ID,
+      }),
+    ).rejects.toMatchObject({
+      name: "ApplyPatchRuntimeError",
+      preEffect: true,
+    });
+
+    try {
+      await applyPatchText(
+        wrapPatch(`*** Add File: commit-race.txt\n+hello`),
+        {
+          cwd: root,
+          allowedPaths: [root],
+          __testAfterBackupsCaptured: async () => {
+            throw new ApplyPatchRuntimeError("injected commit-phase failure");
+          },
+        },
+      );
+      throw new Error("expected commit-phase failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ApplyPatchRuntimeError);
+      expect((error as ApplyPatchRuntimeError).preEffect).toBe(false);
+      expect((error as ApplyPatchRuntimeError).message).toContain(
+        "injected commit-phase failure",
+      );
+    }
   });
 
   test("authorizes an update after a partial offset/limit read", async () => {
@@ -527,19 +430,6 @@ describe("apply-patch atomicity", () => {
     const concurrentContent = "owned by the concurrent writer\n";
 
     try {
-      const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-      const lease = coordinator.acquire({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-concurrent-publish-editor",
-      });
-      coordinator.sync({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-concurrent-publish-editor",
-        leaseToken: lease.leaseToken,
-        epoch: lease.epoch,
-        sequence: 0,
-        buffers: [],
-      });
 
       await expect(
         applyPatchText(
@@ -557,25 +447,7 @@ describe("apply-patch atomicity", () => {
       ).rejects.toThrow(/stopped before writing|path identity changed/iu);
 
       await expect(readFile(target, "utf8")).resolves.toBe(concurrentContent);
-      expect(
-        coordinator.listChanges({
-          workspaceRoot: root,
-          editorInstanceId: "apply-patch-concurrent-publish-editor",
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }).changes,
-      ).toEqual([]);
-
-      const retry = await coordinator.prepareMutation({
-        path: target,
-        source: "apply_patch",
-        beforeText: concurrentContent,
-        afterText: "retry\n",
-      });
-      expect(retry).toMatchObject({ decision: "allow" });
-      if (retry.decision === "allow") coordinator.cancelMutation(retry.token);
     } finally {
-      workspaceMutationCoordinators.clearForTests();
       if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
       else process.env.AGENC_HOME = originalAgencHome;
     }
@@ -628,19 +500,6 @@ describe("apply-patch atomicity", () => {
     await writeFile(outsideTarget, outsideContent, "utf8");
 
     try {
-      const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-      const lease = coordinator.acquire({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-parent-exchange-editor",
-      });
-      coordinator.sync({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-parent-exchange-editor",
-        leaseToken: lease.leaseToken,
-        epoch: lease.epoch,
-        sequence: 0,
-        buffers: [],
-      });
 
       await expect(
         applyPatchText(
@@ -664,25 +523,7 @@ describe("apply-patch atomicity", () => {
       await expect(stat(displacedTarget)).rejects.toMatchObject({
         code: "ENOENT",
       });
-      expect(
-        coordinator.listChanges({
-          workspaceRoot: root,
-          editorInstanceId: "apply-patch-parent-exchange-editor",
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }).changes,
-      ).toEqual([]);
-
-      const retry = await coordinator.prepareMutation({
-        path: displacedTarget,
-        source: "apply_patch",
-        beforeText: "",
-        afterText: "retry\n",
-      });
-      expect(retry).toMatchObject({ decision: "allow" });
-      if (retry.decision === "allow") coordinator.cancelMutation(retry.token);
     } finally {
-      workspaceMutationCoordinators.clearForTests();
       if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
       else process.env.AGENC_HOME = originalAgencHome;
     }
@@ -828,19 +669,6 @@ describe("apply-patch atomicity", () => {
     await writeFile(outsideTarget, outsideContent, "utf8");
 
     try {
-      const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-      const lease = coordinator.acquire({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-rollback-parent-editor",
-      });
-      coordinator.sync({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-rollback-parent-editor",
-        leaseToken: lease.leaseToken,
-        epoch: lease.epoch,
-        sequence: 0,
-        buffers: [],
-      });
       let parentExchanged = false;
 
       await expect(
@@ -872,36 +700,13 @@ describe("apply-patch atomicity", () => {
       await expect(readFile(displacedTarget, "utf8")).resolves.toBe(
         patchedContent,
       );
-      expect(
-        coordinator.listChanges({
-          workspaceRoot: root,
-          editorInstanceId: "apply-patch-rollback-parent-editor",
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }).changes,
-      ).toContainEqual(
-        expect.objectContaining({
-          path: target,
-          status: "unknown_outcome",
-        }),
-      );
-
-      const retry = await coordinator.prepareMutation({
-        path: displacedTarget,
-        source: "apply_patch",
-        beforeText: patchedContent,
-        afterText: "retry\n",
-      });
-      expect(retry).toMatchObject({ decision: "allow" });
-      if (retry.decision === "allow") coordinator.cancelMutation(retry.token);
     } finally {
-      workspaceMutationCoordinators.clearForTests();
       if (originalAgencHome === undefined) delete process.env.AGENC_HOME;
       else process.env.AGENC_HOME = originalAgencHome;
     }
   });
 
-  test("marks an unrestored path unknown, reconciles every token, and reports the partial rollback truthfully", async () => {
+  test("marks an unrestored path unknown and reports the partial rollback truthfully", async () => {
     const root = await tempRoot();
     const agencHome = await tempRoot();
     enterCanonicalSettingsAuthority(
@@ -920,20 +725,6 @@ describe("apply-patch atomicity", () => {
     await writeFile(firstPath, before, "utf8");
 
     try {
-      const coordinator = workspaceMutationCoordinators.getOrCreate(root);
-      const lease = coordinator.acquire({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-rollback-editor",
-      });
-      coordinator.sync({
-        workspaceRoot: root,
-        editorInstanceId: "apply-patch-rollback-editor",
-        leaseToken: lease.leaseToken,
-        epoch: lease.epoch,
-        sequence: 0,
-        buffers: [],
-      });
-      await coordinator.flushQuarantinePersistence();
 
       let failure: unknown;
       try {
@@ -963,63 +754,10 @@ describe("apply-patch atomicity", () => {
       expect(message).toContain("rollback was incomplete");
       expect(message).toContain(firstPath);
       expect(message).toContain("forced first-path restore failure");
-      expect(message).toContain("durably marked unknown_outcome");
       expect(message).not.toContain("no files were changed");
       await expect(readFile(firstPath, "utf8")).resolves.toBe(after);
       await expect(stat(ghostPath)).rejects.toMatchObject({ code: "ENOENT" });
-
-      expect(
-        coordinator.listChanges({
-          workspaceRoot: root,
-          editorInstanceId: "apply-patch-rollback-editor",
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }).changes,
-      ).toContainEqual(
-        expect.objectContaining({
-          path: firstPath,
-          status: "unknown_outcome",
-          beforeSha256: sha256(before),
-          afterSha256: sha256(after),
-        }),
-      );
-      const key = createHash("sha256").update(root).digest("hex").slice(0, 32);
-      const ledger = await readFile(
-        join(agencHome, "workspace-mutations", key, "ledger-v1.jsonl"),
-        "utf8",
-      );
-      expect(ledger).toContain('"status":"unknown_outcome"');
-      expect(ledger).toContain(`"path":${JSON.stringify(firstPath)}`);
-
-      // Both the failed-write token and the failed-restore token must be
-      // terminal. Sync probes both paths and fails if either remains executing.
-      expect(() =>
-        coordinator.sync({
-          workspaceRoot: root,
-          editorInstanceId: "apply-patch-rollback-editor",
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-          sequence: 1,
-          buffers: [
-            {
-              path: firstPath,
-              bufferHandle: 41,
-              changedtick: 2,
-              contentSha256: sha256(after),
-              dirty: false,
-            },
-            {
-              path: ghostPath,
-              bufferHandle: 42,
-              changedtick: 1,
-              contentSha256: sha256(""),
-              dirty: false,
-            },
-          ],
-        }),
-      ).not.toThrow();
     } finally {
-      workspaceMutationCoordinators.clearForTests();
     }
   });
 

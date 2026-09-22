@@ -3,7 +3,7 @@
  * guarantees, flock acquisition, atomic write-then-rename, and the
  * per-turn `toolResultBytes` index used by compaction.
  *
- * On-disk layout (per `docs/plan/agenc runtime-inventory.md §8`):
+ * On-disk layout:
  *
  *   ~/.agenc/projects/<slug>/
  *     sessions/<sessionId>/
@@ -67,6 +67,8 @@ import {
   writeSync,
   unlinkSync,
 } from "node:fs";
+import { homedir } from "node:os";
+import { timed } from "../utils/slow-store-op.js";
 import {
   basename,
   dirname,
@@ -74,8 +76,10 @@ import {
   join,
   relative,
   resolve,
+  sep,
 } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { projectStorageKey } from "../utils/project-storage-key.js";
 import {
   MAX_RECOVERY_CANONICAL_LINE_BYTES,
   RECOVERY_SCAN_CHUNK_BYTES,
@@ -239,9 +243,7 @@ class AppendRollbackError extends Error {
 // ─────────────────────────────────────────────────────────────────────
 
 export function slugifyCwd(cwd: string): string {
-  const base = cwd.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
-  return `${base.slice(0, 40) || "root"}-${hash}`;
+  return projectStorageKey(cwd);
 }
 
 export function getAgencHomeDir(agencHome?: string): string {
@@ -266,10 +268,41 @@ export const DEFAULT_SESSION_ROOT_MARKERS: readonly string[] = [
   ".hg",
 ];
 
+export interface ProjectRootSearchOptions {
+  /**
+   * Exclusive ancestor boundary for marker discovery. When `cwd` is a strict
+   * descendant of this directory, markers in the boundary itself (and above
+   * it) are ignored. This prevents a workspace beneath the platform home from
+   * inheriting an unrelated home-level package manifest or VCS checkout.
+   */
+  readonly stopBefore?: string;
+}
+
+function projectRootStopBefore(
+  cwd: string,
+  requestedBoundary: string,
+): string | undefined {
+  const start = resolve(cwd);
+  const boundary = resolve(requestedBoundary);
+  const fromBoundary = relative(boundary, start);
+  if (
+    fromBoundary === "" ||
+    fromBoundary === ".." ||
+    fromBoundary.startsWith(`..${sep}`) ||
+    isAbsolute(fromBoundary)
+  ) {
+    return undefined;
+  }
+  return boundary;
+}
+
 /**
  * Synchronous ancestor walk to the nearest directory that contains one
  * of the configured project-root markers. Returns `null` when no marker
- * is found before reaching the filesystem root.
+ * is found before reaching the filesystem root. By default, a workspace
+ * strictly beneath the platform home does not inspect the home directory
+ * itself; callers with an injected platform home can pass the same boundary
+ * explicitly.
  *
  * Kept sync (unlike `findProjectRoot` in `prompts/project-instructions.ts`)
  * because `getProjectDir` and the SessionStore constructor are called
@@ -280,10 +313,18 @@ export const DEFAULT_SESSION_ROOT_MARKERS: readonly string[] = [
 export function findProjectRootSync(
   cwd: string,
   markers: readonly string[] = DEFAULT_SESSION_ROOT_MARKERS,
+  options: ProjectRootSearchOptions = {},
 ): { rootDir: string; marker: string } | null {
   if (markers.length === 0) return null;
+  const stopBefore = projectRootStopBefore(
+    cwd,
+    options.stopBefore ?? homedir(),
+  );
   let currentDir = cwd;
   while (true) {
+    if (stopBefore !== undefined && resolve(currentDir) === stopBefore) {
+      return null;
+    }
     for (const marker of markers) {
       if (existsSync(join(currentDir, marker))) {
         return { rootDir: currentDir, marker };
@@ -808,7 +849,7 @@ function processIsAlive(pid: number): boolean {
  *      durable. On ext4 (and most journalled Linux filesystems) a
  *      file fsync does NOT imply directory-entry durability — the
  *      rename is a directory operation and needs its own fsync on
- *      the parent. See agenc runtime pattern in
+ *      the parent. See
  *      `runtime/src/session/rollout-store.ts:238-251`
  *      (`persistThreadSpawnEdgesSnapshot`) which follows the same
  *      sequence for the thread-spawn-edges snapshot.
@@ -1421,6 +1462,16 @@ export class SessionStore {
   private readonly diagnosticsBuffer: SessionStoreDiagnostic[] = [];
   private onDiagnostic?: (d: SessionStoreDiagnostic) => void;
   /**
+   * Depth of an in-flight `flushBatch`. Diagnostics raised while > 0 are
+   * deferred so a listener wired to `session.emit` (see
+   * `Session.mountRolloutStore`) cannot append a live-sequenced event into
+   * the batch currently being written (#2032).
+   */
+  private flushDepth = 0;
+  private readonly deferredFlushDiagnostics: SessionStoreDiagnostic[] = [];
+  /** Best-effort mirror notification after rollout bytes are appended. */
+  private onRolloutCommitted?: (rolloutPath: string) => void;
+  /**
    * I-38 async fsync retries currently in flight. Tracked so `close()`
    * can wait for them to settle (or so tests can await completion).
    * Each entry is the Promise returned by `scheduleFsyncRetry()`.
@@ -1812,12 +1863,32 @@ export class SessionStore {
     for (const d of buffered) listener(d);
   }
 
-  private emitDiagnostic(d: SessionStoreDiagnostic): void {
+  private deliverDiagnostic(d: SessionStoreDiagnostic): void {
     if (this.onDiagnostic) {
       this.onDiagnostic(d);
     } else {
       this.diagnosticsBuffer.push(d);
     }
+  }
+
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.onRolloutCommitted = listener;
+  }
+
+  private emitDiagnostic(d: SessionStoreDiagnostic): void {
+    if (this.flushDepth > 0) {
+      this.deferredFlushDiagnostics.push(d);
+      return;
+    }
+    this.deliverDiagnostic(d);
+  }
+
+  private releaseDeferredFlushDiagnostics(): void {
+    if (this.flushDepth !== 0) return;
+    const deferred = this.deferredFlushDiagnostics.splice(0);
+    for (const d of deferred) this.deliverDiagnostic(d);
   }
 
   /** Drain any buffered diagnostics. Used by tests. */
@@ -1965,143 +2036,155 @@ export class SessionStore {
    * for tests.
    */
   flushBatch(durable: boolean): boolean {
+    // A slow flush (a large batch, or a durable fsync on a busy disk) stalls
+    // the event loop that streams to every client, so it is worth reporting.
+    // It must NOT go through this store's diagnostic channel:
+    // `mountRolloutStore` turns every diagnostic into `session.emit`, which
+    // allocates a live event sequence and appends a warning to the very
+    // rollout being flushed. Two
+    // consequences, both observed: the canonical journal's contents become a
+    // function of how long one fsync took, so a resumed session can fail its
+    // startup scan with "canonical journal repeats its preceding event
+    // sequence"; and the warning is itself appended and flushed, so a disk slow
+    // enough to cross the threshold keeps crossing it, writing more each time.
+    // Timing evidence belongs in the process-wide slow-op sink (the daemon's
+    // rotating daemon.log), which is where every other `timed` call site sends
+    // it. The I-83 batch-delay warning stays a journal event: it records a
+    // suspend/resume gap in the session itself, not the speed of a write.
+    return timed(
+      durable ? "rollout_flush_durable" : "rollout_flush_batch",
+      () => this.flushBatchUntimed(durable),
+    );
+  }
+
+  private flushBatchUntimed(durable: boolean): boolean {
     if (this.pending.length === 0) {
       this.batchOpenedAtMs = null;
       return true;
     }
-    // I-83 suspend detection: if the batch was open for > 10s (e.g.
-    // system suspend/resume gap), emit TWO marker events (warning +
-    // sentinel system_resumed_from) AHEAD of the pending batch.
-    // The markers are informational warnings (non-state-mutating in the
-    // reducer); the queued durable response_item / session_state lines
-    // that straddle the suspend window MUST be preserved and flushed,
-    // not discarded — dropping them permanently loses in-flight history.
-    if (
-      this.batchOpenedAtMs !== null &&
-      monotonicMs() - this.batchOpenedAtMs > I83_SUSPEND_DETECTION_MS
-    ) {
-      const durationMs = Math.round(monotonicMs() - this.batchOpenedAtMs);
-      this.batchOpenedAtMs = null;
-      // Prepend the two I-83 marker events so the log shows (a) the
-      // operator-visible warning and (b) a structural sentinel the
-      // reducer can reason about, while the original pending items
-      // remain queued behind them.
-      const warning: RolloutItem = {
-        type: "event_msg",
-        payload: {
-          id: "system",
-          msg: {
-            type: "warning",
-            payload: {
-              cause: "event_log_batch_delayed",
-              message: `event-log batch delayed ${durationMs}ms (I-83)`,
-            },
-          },
-        },
-      };
-      // Sentinel encoded as a warning with cause=system_resumed_from
-      // so it round-trips through the 24-variant EventMsg union
-      // without adding a new variant.
-      const sentinel: RolloutItem = {
-        type: "event_msg",
-        payload: {
-          id: "system",
-          msg: {
-            type: "warning",
-            payload: {
-              cause: "system_resumed_from",
-              message: `${durationMs}`,
-            },
-          },
-        },
-      };
-      this.pending = [warning, sentinel, ...this.pending];
-      this.emitDiagnostic({
-        at: Date.now(),
-        level: "warning",
-        cause: "event_log_batch_delayed",
-        message: `system_resumed_from(${durationMs}ms)`,
-      });
-    }
-
-    // Record byte offsets for each event row before write so the
-    // index.json snapshot + fast-seek readers can jump to a specific
-    // seq without parsing the whole file.
-    let offsetAccumulator = this.fileSize;
-    for (const item of this.pending) {
-      if (item.type === "event_msg" && item.payload.seq !== undefined) {
-        this.offsetsBySeq.set(item.payload.seq, offsetAccumulator);
-      }
-      offsetAccumulator += Buffer.byteLength(
-        serializeRolloutItem(item),
-        "utf8",
-      );
-    }
-    this.boundIndexMap(this.offsetsBySeq);
-
-    const lines = this.pending.map(serializeRolloutItem).join("");
-    const toWrite = this.pending;
-    this.pending = [];
-    this.batchOpenedAtMs = null;
-
-    // `requeue` distinguishes the failure shapes (#11):
-    //   - writeSync failed before writing, or a partial append was rolled back
-    //     and fsync'd: the items can be re-queued into the degraded ring buffer
-    //     for a later complete re-append (requeue=true).
-    //   - a partial append could not be durably rolled back: the on-disk tail
-    //     is uncertain and re-append could duplicate it (requeue=false).
-    //   - writeSync succeeded but fsync (+ its I-38 retry) failed: the
-    //     bytes are ALREADY appended to the rollout on disk. Re-queueing
-    //     them would re-serialize + re-append the same rows on degraded
-    //     flush, bypassing the append()-level seq/UUID dedup and landing
-    //     duplicates in the JSONL (double on resume). So we enter
-    //     degraded mode WITHOUT re-queueing (requeue=false).
-    const routeToDegraded = (err: unknown, requeue: boolean) => {
-      if (isDegradedErrno(err)) {
-        // I-12 / I-38 path: enter degraded so subsequent appends buffer
-        // instead of touching the sick disk.
-        this.degraded.enterDegraded(
-          `${(err as { code?: string }).code} during append`,
-        );
-        if (requeue) {
-          for (const item of toWrite) this.degraded.append(item);
-        }
+    this.flushDepth += 1;
+    try {
+      // I-83 suspend detection: if the batch was open for > 10s (e.g. a
+      // host suspend/resume gap), record the window as a diagnostic. The
+      // queued durable response_item / session_state lines that straddle
+      // the window MUST be preserved and flushed, not discarded — dropping
+      // them permanently loses in-flight history.
+      //
+      // The window is NOT written here as a raw rollout row. Rows appended
+      // outside the EventLog carry no `seq`, and the canonical journal must
+      // be entirely sequenced or entirely legacy: one unsequenced row makes
+      // every later validation of that rollout fail
+      // ("canonical journal mixes sequenced and legacy events"), which
+      // refuses compaction for the rest of the session and ends the turn at
+      // the context limit. The diagnostic below reaches the rollout through
+      // the session's own emit path, properly stamped.
+      if (
+        this.batchOpenedAtMs !== null &&
+        monotonicMs() - this.batchOpenedAtMs > I83_SUSPEND_DETECTION_MS
+      ) {
+        const durationMs = Math.round(monotonicMs() - this.batchOpenedAtMs);
+        this.batchOpenedAtMs = null;
         this.emitDiagnostic({
           at: Date.now(),
-          level: "error",
-          cause: "rollout_degraded",
-          message: requeue
-            ? `${(err as { code?: string }).code ?? "unknown"} during append — ${toWrite.length} events queued in degraded ring buffer`
-            : `${(err as { code?: string }).code ?? "unknown"} during fsync — ${toWrite.length} events already on disk, entering degraded mode without re-queue`,
+          level: "warning",
+          cause: "event_log_batch_delayed",
+          message: `system_resumed_from(${durationMs}ms)`,
         });
-        return true;
       }
-      return false;
-    };
 
-    let committed = true;
-    try {
-      if (durable) {
-        // I-38: async retry on fsync failure routes to degraded via
-        // the callback. The bytes were already writeSync'd by this
-        // point, so we MUST NOT re-queue them (#11) — only enter
-        // degraded mode.
-        committed = this.writeBytesWithFsync(lines, (err) => {
-          routeToDegraded(err, /*requeue*/ false);
-        });
-      } else {
-        this.writeBytesAppendOnly(lines);
+      // Record byte offsets for each event row before write so the
+      // index.json snapshot + fast-seek readers can jump to a specific
+      // seq without parsing the whole file.
+      let offsetAccumulator = this.fileSize;
+      for (const item of this.pending) {
+        if (item.type === "event_msg" && item.payload.seq !== undefined) {
+          this.offsetsBySeq.set(item.payload.seq, offsetAccumulator);
+        }
+        offsetAccumulator += Buffer.byteLength(
+          serializeRolloutItem(item),
+          "utf8",
+        );
       }
-      this.fileSize += Buffer.byteLength(lines, "utf8");
-      this.trajectoryExport.writeItems(toWrite);
-    } catch (err) {
-      const safeToRequeue = !(err instanceof AppendRollbackError);
-      if (!routeToDegraded(err, safeToRequeue)) {
-        throw err;
+      this.boundIndexMap(this.offsetsBySeq);
+
+      const lines = this.pending.map(serializeRolloutItem).join("");
+      const toWrite = this.pending;
+      this.pending = [];
+      this.batchOpenedAtMs = null;
+
+      // `requeue` distinguishes the failure shapes (#11):
+      //   - writeSync failed before writing, or a partial append was rolled back
+      //     and fsync'd: the items can be re-queued into the degraded ring buffer
+      //     for a later complete re-append (requeue=true).
+      //   - a partial append could not be durably rolled back: the on-disk tail
+      //     is uncertain and re-append could duplicate it (requeue=false).
+      //   - writeSync succeeded but fsync (+ its I-38 retry) failed: the
+      //     bytes are ALREADY appended to the rollout on disk. Re-queueing
+      //     them would re-serialize + re-append the same rows on degraded
+      //     flush, bypassing the append()-level seq/UUID dedup and landing
+      //     duplicates in the JSONL (double on resume). So we enter
+      //     degraded mode WITHOUT re-queueing (requeue=false).
+      const routeToDegraded = (err: unknown, requeue: boolean) => {
+        if (isDegradedErrno(err)) {
+          // I-12 / I-38 path: enter degraded so subsequent appends buffer
+          // instead of touching the sick disk. Emit once on the transition
+          // so a live-sequenced diagnostic listener cannot re-enter flush
+          // and recurse on the still-failing write (#2032).
+          const entered = !this.degraded.isDegraded;
+          this.degraded.enterDegraded(
+            `${(err as { code?: string }).code} during append`,
+          );
+          if (requeue) {
+            for (const item of toWrite) this.degraded.append(item);
+          }
+          if (entered) {
+            this.emitDiagnostic({
+              at: Date.now(),
+              level: "error",
+              cause: "rollout_degraded",
+              message: requeue
+                ? `${(err as { code?: string }).code ?? "unknown"} during append — ${toWrite.length} events queued in degraded ring buffer`
+                : `${(err as { code?: string }).code ?? "unknown"} during fsync — ${toWrite.length} events already on disk, entering degraded mode without re-queue`,
+            });
+          }
+          return true;
+        }
+        return false;
+      };
+
+      let committed = true;
+      try {
+        if (durable) {
+          // I-38: async retry on fsync failure routes to degraded via
+          // the callback. The bytes were already writeSync'd by this
+          // point, so we MUST NOT re-queue them (#11) — only enter
+          // degraded mode.
+          committed = this.writeBytesWithFsync(lines, (err) => {
+            routeToDegraded(err, /*requeue*/ false);
+          });
+        } else {
+          this.writeBytesAppendOnly(lines);
+        }
+        this.fileSize += Buffer.byteLength(lines, "utf8");
+        this.trajectoryExport.writeItems(toWrite);
+        try {
+          this.onRolloutCommitted?.(this.rolloutPath);
+        } catch {
+          // The rollout is already appended. A mirror callback cannot make this
+          // canonical flush fail or cause its items to be re-queued.
+        }
+      } catch (err) {
+        const safeToRequeue = !(err instanceof AppendRollbackError);
+        if (!routeToDegraded(err, safeToRequeue)) {
+          throw err;
+        }
+        committed = false;
       }
-      committed = false;
+      return committed;
+    } finally {
+      this.flushDepth -= 1;
+      this.releaseDeferredFlushDiagnostics();
     }
-    return committed;
   }
 
   /**
@@ -3141,7 +3224,6 @@ export class SessionStore {
    * rollout find the session metadata even after many compacts have
    * pushed the original header out of that window.
    *
-   * Port of agenc `sessionStorage.ts::reAppendSessionMetadata`.
    * Idempotent; safe to call multiple times. No-op if no session_meta
    * has been written yet (shouldn't happen post-open).
    *

@@ -5,13 +5,9 @@ import {
   type SlashCommandResult,
 } from "./types.js";
 import React from "react";
-import type { LLMContentPart, LLMMessage, LLMProvider, LLMTool } from "../llm/types.js";
+import type { LLMMessage, LLMProvider, LLMTool } from "../llm/types.js";
 import { createChildAbortController } from "../utils/abortController.js";
-import {
-  cloneLlmContent as cloneContent,
-  fromRuntimeMessageContent,
-  toRuntimeMessageContent,
-} from "../llm/content-conversion.js";
+import { cloneLlmContent as cloneContent } from "../llm/content-conversion.js";
 import type {
   CompactCleanupDeps,
   CompactionResult,
@@ -26,8 +22,16 @@ import {
 } from "../services/compact/finalize-transaction.js";
 import { formatCompactionOperatorDisplay } from "../services/compact/operator.js";
 import type { CompactedItem } from "../session/rollout-item.js";
-import { validateAgentInvocationMessageSequence } from "../contracts/agent-invocation-envelope.js";
+import {
+  extractMessageText,
+  fromAgenCRuntimeMessages,
+  toAgenCRuntimeMessages,
+  type AgenCRuntimeMessage,
+} from "../session/runtime-message-conversion.js";
 import type { Session } from "../session/session.js";
+import type { SessionSnapshotResult } from "../app-server/protocol/index.js";
+import { configuredContextWindow, contextUsagePercentage, projectResidentContextUsage } from "../session/resident-context-usage.js";
+import { getSessionPermissionInstructions } from "../session/permission-instructions.js";
 import { isAuthenticatedCompactionBoundary } from "../session/compaction-history-marker.js";
 import {
   llmMessageToReplacementResponseItem,
@@ -36,12 +40,15 @@ import {
 import type { TurnContext } from "../session/turn-context.js";
 import { modelContextWindow } from "../session/turn-context.js";
 import {
+  buildPrompt,
+  builtTools,
+} from "../session/run-turn-sampling-request.js";
+import {
   createEmptyToolPermissionContext,
   isPermissionMode,
   type ToolPermissionContext,
 } from "../permissions/types.js";
 import { asRecord } from "../utils/record.js";
-import { DEFAULT_MAX_RESULT_SIZE_CHARS } from "../constants/toolLimits.js";
 import {
   getAutoCompactThresholdForEnvironment,
   getEffectiveContextWindowSizeForEnvironment,
@@ -52,6 +59,7 @@ import { estimateMessagesTokens } from "../services/compact/_deps/runtime.js";
 import {
   assembleSystemPrompt,
   buildAssembleSystemPromptOpts,
+  resolveMemoryPromptInputs,
   type McpServerInstructionsInput,
 } from "../prompts/system-prompt.js";
 import { loadSessionMcpServerInstructions } from "../prompts/mcp-server-instructions.js";
@@ -251,8 +259,11 @@ async function buildFallbackContextUsageText(
   const tools = readFallbackTools(ctx.session);
   const messages = readFallbackMessages(ctx.session);
   const config = ctx.configStore?.current() ?? ctx.session.services.configStore?.current?.();
-  const model = readFallbackModel(ctx, config);
-  const contextWindowTokens = readFallbackContextWindow(config);
+  const resident = snapshot?.contextBreakdown;
+  const model = resident?.model ?? readFallbackModel(ctx, config);
+  const contextWindowTokens = resident && resident.windowTokens > 0
+    ? resident.windowTokens
+    : configuredContextWindow(config);
   const estimated = computeContextUsageBreakdown({
     messages,
     tools,
@@ -261,41 +272,28 @@ async function buildFallbackContextUsageText(
     ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
     ...(sessionTokenUsage !== undefined ? { sessionTokenUsage } : {}),
   });
-  const totalFromEvents = snapshot?.tokenUsage?.totalTokens;
-  const breakdown =
-    typeof totalFromEvents === "number" && Number.isFinite(totalFromEvents)
-      ? {
-          ...estimated,
-          messagesTokens: Math.max(0, totalFromEvents - estimated.toolsTokens),
-          totalUsed: totalFromEvents,
-          freeUntilCompact: Math.max(0, estimated.compactionThreshold - totalFromEvents),
-          freeUntilHardLimit: Math.max(0, estimated.hardLimit - totalFromEvents),
-        }
-      : estimated;
+  const breakdown = resident ? {
+    ...estimated,
+    ...projectResidentContextUsage(resident, {
+      providerEnvironment: providerEnvironmentFromCommandContext(ctx),
+      ...(model !== undefined ? { model } : {}),
+      ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+    }),
+  } : estimated;
   return [
     formatContextUsageReport(breakdown),
-    `  • estimate: ${reason}`,
+    `  • estimate: ${resident ? "daemon resident context" : reason}`,
   ].join("\n");
 }
 
 async function readDaemonTokenSnapshot(
   ctx: SlashCommandContext,
-): Promise<{ readonly tokenUsage?: {
-  readonly inputTokens?: number;
-  readonly outputTokens?: number;
-  readonly totalTokens?: number;
-  readonly costUsd?: number;
-} } | null> {
+): Promise<Partial<Pick<SessionSnapshotResult,
+  "tokenUsage" | "contextBreakdown" | "cacheStats"
+>> | null> {
   const getDaemonSnapshot = (
     ctx.session as unknown as {
-      getDaemonSessionSnapshot?: () => Promise<{
-        readonly tokenUsage?: {
-          readonly inputTokens?: number;
-          readonly outputTokens?: number;
-          readonly totalTokens?: number;
-          readonly costUsd?: number;
-        };
-      }>;
+      getDaemonSessionSnapshot?: () => ReturnType<typeof readDaemonTokenSnapshot>;
     }
   ).getDaemonSessionSnapshot;
   if (typeof getDaemonSnapshot !== "function") return null;
@@ -311,9 +309,13 @@ function readSessionTokenUsage(
   snapshot: Awaited<ReturnType<typeof readDaemonTokenSnapshot>>,
 ): ContextUsageInputs["sessionTokenUsage"] | undefined {
   if (snapshot?.tokenUsage?.totalTokens !== undefined) {
+    const cache = snapshot.cacheStats;
     return {
-      promptTokens: snapshot.tokenUsage.inputTokens ?? snapshot.tokenUsage.totalTokens,
-      cachedInputTokens: 0,
+      promptTokens: cache?.cacheTotalInputTokens ?? snapshot.tokenUsage.inputTokens ?? 0,
+      ...(cache !== undefined ? {
+        cachedInputTokens: cache.cacheReadInputTokens,
+        cacheCreationInputTokens: cache.cacheCreationInputTokens,
+      } : {}),
     };
   }
   const unsafePeek = (session as unknown as {
@@ -361,19 +363,6 @@ function readFallbackModel(
   return config?.model;
 }
 
-function readFallbackContextWindow(
-  config: {
-    readonly model_provider?: string;
-    readonly providers?: Readonly<Record<string, { readonly context_window_tokens?: number }>>;
-  } | undefined,
-): number | undefined {
-  const provider = config?.model_provider;
-  if (!provider) return undefined;
-  const contextWindow = config?.providers?.[provider]?.context_window_tokens;
-  return typeof contextWindow === "number" && contextWindow > 0
-    ? contextWindow
-    : undefined;
-}
 
 async function ensureNoActiveTurn(ctx: SlashCommandContext): Promise<void> {
   const activeTurn = (ctx.session as unknown as {
@@ -416,7 +405,7 @@ interface AgenCToolUseContext {
   readonly sessionId: string;
   readonly options: {
     readonly mainLoopModel: string;
-    readonly tools: readonly AgenCRuntimeTool[];
+    readonly tools: readonly LLMTool[];
     readonly mcpClients: readonly unknown[];
     readonly contextWindowTokens: number;
     readonly maxOutputTokens?: number;
@@ -458,14 +447,6 @@ interface AgenCToolUseContext {
   readonly deps?: { readonly cleanup?: CompactCleanupDeps };
 }
 
-type AgenCRuntimeTool = LLMTool & {
-  readonly name: string;
-  readonly description: string;
-  readonly inputJSONSchema: Record<string, unknown>;
-  readonly isMcp: boolean;
-  readonly maxResultSizeChars: number;
-};
-
 function buildAgenCToolUseContext(
   session: Session,
   ctx: TurnContext,
@@ -490,6 +471,7 @@ function buildAgenCToolUseContext(
     ctx.baseInstructions,
     ctx.developerInstructions,
     ctx.userInstructions,
+    getSessionPermissionInstructions(session, ctx),
   ]
     .filter(
       (value): value is string =>
@@ -507,7 +489,7 @@ function buildAgenCToolUseContext(
     sessionId: session.conversationId,
     options: {
       mainLoopModel: model.model,
-      tools: toAgenCRuntimeTools(session.services.registry.toLLMTools()),
+      tools: buildPrompt([], builtTools(session, ctx), ctx, systemPrompt).tools,
       mcpClients: Array.isArray(surface.mcpClients) ? surface.mcpClients : [],
       contextWindowTokens: model.contextWindowTokens,
       ...(model.maxOutputTokens !== undefined
@@ -569,20 +551,6 @@ function buildAgenCToolUseContext(
     provider: session.services.provider,
     cwd,
   };
-}
-
-function toAgenCRuntimeTools(tools: readonly LLMTool[]): AgenCRuntimeTool[] {
-  return tools.map((tool) => {
-    const name = tool.function.name;
-    return {
-      ...tool,
-      name,
-      description: tool.function.description,
-      inputJSONSchema: tool.function.parameters,
-      isMcp: name.startsWith("mcp__"),
-      maxResultSizeChars: DEFAULT_MAX_RESULT_SIZE_CHARS,
-    };
-  });
 }
 
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
@@ -680,45 +648,6 @@ interface AgenCManualCompactResult {
 interface AgenCContextUsageResult {
   readonly text: string;
 }
-
-type AgenCMessageRole =
-  | "system"
-  | "developer"
-  | "user"
-  | "assistant"
-  | "tool";
-
-interface AgenCMessage {
-  readonly role: AgenCMessageRole;
-  readonly content: string | readonly LLMContentPart[];
-  readonly toolCallId?: string;
-  readonly toolName?: string;
-  readonly phase?: string;
-  readonly runtimeOnly?: LLMMessage["runtimeOnly"];
-}
-
-type AgenCRuntimeWireRole = NonNullable<RuntimeMessage["role"]>;
-
-type AgenCRuntimeMessage = Omit<
-  RuntimeMessage,
-  "role" | "originalRole" | "message"
-> & {
-  readonly role?: AgenCRuntimeWireRole;
-  readonly originalRole?: AgenCMessage["role"];
-  readonly toolCallId?: string;
-  readonly toolName?: string;
-  readonly toolCalls?: readonly {
-    readonly id: string;
-    readonly name: string;
-    readonly arguments?: string;
-  }[];
-  readonly phase?: string;
-  readonly type?: string;
-  readonly message?: {
-    readonly role?: string;
-    readonly content?: unknown;
-  };
-};
 
 type AgenCCompactionResult = {
   readonly boundaryMarker?: AgenCRuntimeMessage;
@@ -1033,16 +962,17 @@ async function buildSyntheticSystemMessage(opts: {
         ?.autonomousMode === true;
     const provider = opts.ctx.modelProviderId;
     const outputStyle = await getOutputStyleConfig();
-    const assembled = await assembleSystemPrompt(
-      buildAssembleSystemPromptOpts({
+    // Mirror `prepareTurnRuntimeInputs`: the memory instructions and the
+    // directory block are part of every turn's prompt when auto memory is
+    // enabled, so /context must count them too.
+    const memory = await resolveMemoryPromptInputs(opts.session, opts.ctx.cwd);
+    const assembled = await assembleSystemPrompt({
+      ...buildAssembleSystemPromptOpts({
         session: opts.session,
         ctx: opts.ctx,
         projectInstructions: opts.projectInstructions,
-        // /context isn't a real turn boundary, so it has no `memdir`
-        // tail to surface. Production passes
-        // `turnInputs.memoryPromptText`, which is currently always ""
-        // out of `prepareTurnRuntimeInputs`. Match that explicitly.
-        memoryPrompt: "",
+        memoryInstructions: memory.memoryInstructions,
+        memoryPrompt: memory.memoryPrompt,
         mcpServers: opts.mcpServers,
         enabledToolNames: opts.enabledToolNames,
         provider,
@@ -1050,12 +980,19 @@ async function buildSyntheticSystemMessage(opts: {
         autonomousMode,
         outputStyle,
       }),
-    );
+      deferPermissionInstructions: opts.ctx.permissionInstructionsDeferred === true,
+    });
+    const text = [
+      assembled.text,
+      ...(permissionContext === null ? [] : [
+        getSessionPermissionInstructions(opts.session, opts.ctx, permissionContext),
+      ]),
+    ].filter((section) => section.length > 0).join("\n\n");
     return {
       role: "system",
       type: "system",
-      content: assembled.text,
-      message: { role: "system", content: assembled.text },
+      content: text,
+      message: { role: "system", content: text },
     };
   } catch {
     return null;
@@ -1071,34 +1008,6 @@ function buildAgenCCompactedRolloutItem(
     preCompactTokens: result.preCompactTokens,
     postCompactTokens: result.postCompactTokens,
   });
-}
-
-function toAgenCMessage(message: LLMMessage): AgenCMessage {
-  return {
-    role: message.role,
-    content: cloneContent(message.content),
-    ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
-    ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
-    ...(message.phase !== undefined ? { phase: message.phase } : {}),
-    ...(message.runtimeOnly?.toolResultIntegrity !== undefined ||
-    message.runtimeOnly?.agentInvocation !== undefined
-      ? {
-          runtimeOnly: {
-            ...(message.runtimeOnly?.toolResultIntegrity !== undefined
-              ? {
-                  toolResultIntegrity: message.runtimeOnly.toolResultIntegrity,
-                }
-              : {}),
-            ...(message.runtimeOnly?.agentInvocation !== undefined
-              ? {
-                  agentInvocation: message.runtimeOnly.agentInvocation,
-                  mergeBoundary: "user_context" as const,
-                }
-              : {}),
-          },
-        }
-      : {}),
-  };
 }
 
 function buildCompactedRolloutPayload(params: {
@@ -1194,6 +1103,8 @@ interface ContextUsageBreakdown {
   readonly autoCompactEnabled: boolean;
   readonly messagesTokens: number;
   readonly toolsTokens: number;
+  readonly systemTokens?: number;
+  readonly fileTokens?: number;
   readonly totalUsed: number;
   readonly freeUntilCompact: number;
   readonly freeUntilHardLimit: number;
@@ -1315,14 +1226,18 @@ function formatContextUsageReport(breakdown: ContextUsageBreakdown): string {
   const used = breakdown.totalUsed.toLocaleString();
   const hard = breakdown.hardLimit.toLocaleString();
   const threshold = breakdown.compactionThreshold.toLocaleString();
-  const usedPct = breakdown.hardLimit > 0
-    ? Math.min(100, Math.round((breakdown.totalUsed / breakdown.hardLimit) * 100))
-    : 0;
+  const usedPct = contextUsagePercentage(breakdown.totalUsed, breakdown.hardLimit);
   const lines: string[] = [
     `Context: ${used} / ${hard} tokens (${usedPct}% of hard limit)`,
     `  • messages: ${breakdown.messagesTokens.toLocaleString()} tokens`,
     `  • tool catalog: ${breakdown.toolsTokens.toLocaleString()} tokens`,
   ];
+  if (breakdown.systemTokens !== undefined) {
+    lines.push(`  • system: ${breakdown.systemTokens.toLocaleString()} tokens`);
+  }
+  if (breakdown.fileTokens !== undefined) {
+    lines.push(`  • files: ${breakdown.fileTokens.toLocaleString()} tokens`);
+  }
   if (breakdown.autoCompactEnabled) {
     lines.push(
       `  • compaction threshold: ${threshold} tokens (${breakdown.freeUntilCompact.toLocaleString()} until auto-compact fires)`,
@@ -1440,6 +1355,16 @@ async function toAgenCCompactionResult(
   };
 }
 
+/** @internal Regression seam for the manual-compaction runtime projection. */
+export async function projectManualCompactionReplacementHistoryForTests(
+  result: unknown,
+): Promise<LLMMessage[]> {
+  return [
+    ...(await toAgenCCompactionResult(result as AgenCCompactionResult))
+      .replacementHistory,
+  ];
+}
+
 function toCompactServiceResult(result: AgenCCompactionResult): CompactionResult {
   if (!result.boundaryMarker) {
     throw new Error("Compaction result is missing its boundary marker");
@@ -1500,175 +1425,6 @@ async function addManualCompactSlashMessages(
       ...slashMessages,
     ],
   };
-}
-
-function toAgenCRuntimeMessages(
-  messages: readonly LLMMessage[],
-): AgenCRuntimeMessage[] {
-  return messages.map((message, index) => {
-    const converted = toAgenCMessage(message);
-    const runtimeContent = toRuntimeMessageContent(message.content);
-    if (message.role === "system") {
-      return {
-        ...converted,
-        role: "system",
-        type: "system",
-        content: runtimeContent,
-        uuid: `agenc-system-${index}`,
-        timestamp: new Date(0).toISOString(),
-      };
-    }
-    const role = toAgenCRuntimeWireRole(message.role);
-    return {
-      ...converted,
-      content: runtimeContent,
-      role,
-      ...(message.role !== role ? { originalRole: message.role } : {}),
-      type: role,
-      message: {
-        role,
-        content: runtimeContent,
-      },
-      uuid: `agenc-${role}-${index}`,
-      timestamp: new Date(0).toISOString(),
-      ...(message.toolCalls !== undefined
-        ? {
-            toolCalls: message.toolCalls.map((call) => ({
-              id: call.id,
-              name: call.name,
-              arguments: call.arguments,
-            })),
-          }
-        : {}),
-      ...(message.role === "tool" ? { isMeta: true } : {}),
-    };
-  });
-}
-
-function toAgenCRuntimeWireRole(role: LLMMessage["role"]): AgenCRuntimeWireRole {
-  if (role === "tool") return "user";
-  if (role === "developer") return "system";
-  return role;
-}
-
-function fromAgenCRuntimeMessages(
-  messages: readonly AgenCRuntimeMessage[],
-): LLMMessage[] {
-  const converted = messages
-    .map(fromAgenCRuntimeMessage)
-    .filter((message): message is LLMMessage => message !== null);
-  validateAgentInvocationMessageSequence(converted);
-  return converted;
-}
-
-function fromAgenCRuntimeMessage(
-  message: AgenCRuntimeMessage,
-): LLMMessage | null {
-  if (message.role && message.content !== undefined) {
-    const role = message.originalRole ?? message.role;
-    return {
-      role,
-      content: fromRuntimeMessageContent(message.content),
-      ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
-      ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
-      ...(message.phase === "commentary" || message.phase === "final_answer"
-        ? { phase: message.phase }
-        : {}),
-      ...(message.runtimeOnly?.toolResultIntegrity !== undefined ||
-      message.runtimeOnly?.agentInvocation !== undefined
-        ? {
-            runtimeOnly: {
-              ...(message.runtimeOnly?.toolResultIntegrity !== undefined
-                ? {
-                    toolResultIntegrity:
-                      message.runtimeOnly.toolResultIntegrity,
-                  }
-                : {}),
-              ...(message.runtimeOnly?.agentInvocation !== undefined
-                ? {
-                    agentInvocation: message.runtimeOnly.agentInvocation,
-                    mergeBoundary: "user_context" as const,
-                  }
-                : {}),
-            },
-          }
-        : {}),
-    };
-  }
-  const role = normalizeRole(message.message?.role ?? message.type);
-  if (!role) return null;
-  return {
-    role,
-    content: fromRuntimeMessageContent(readContent(message)),
-    ...(message.toolCalls !== undefined
-      ? {
-          toolCalls: message.toolCalls.map((call) => ({
-            id: call.id,
-            name: call.name,
-            arguments: call.arguments ?? "",
-          })),
-        }
-      : {}),
-    ...(message.toolCallId !== undefined
-      ? { toolCallId: message.toolCallId }
-      : {}),
-    ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
-    ...(message.phase === "commentary" || message.phase === "final_answer"
-      ? { phase: message.phase }
-      : {}),
-    ...(message.runtimeOnly?.toolResultIntegrity !== undefined ||
-    message.runtimeOnly?.agentInvocation !== undefined
-      ? {
-          runtimeOnly: {
-            ...(message.runtimeOnly?.toolResultIntegrity !== undefined
-              ? {
-                  toolResultIntegrity: message.runtimeOnly.toolResultIntegrity,
-                }
-              : {}),
-            ...(message.runtimeOnly?.agentInvocation !== undefined
-              ? {
-                  agentInvocation: message.runtimeOnly.agentInvocation,
-                  mergeBoundary: "user_context" as const,
-                }
-              : {}),
-          },
-        }
-      : {}),
-  };
-}
-
-function normalizeRole(value: unknown): LLMMessage["role"] | null {
-  if (
-    value === "system" ||
-    value === "developer" ||
-    value === "user" ||
-    value === "assistant" ||
-    value === "tool"
-  ) {
-    return value;
-  }
-  return null;
-}
-
-function readContent(
-  message: AgenCRuntimeMessage,
-): LLMMessage["content"] {
-  const content = message.message?.content ?? message.content ?? "";
-  return cloneContent(content);
-}
-
-function extractMessageText(
-  message: AgenCRuntimeMessage | undefined,
-): string | undefined {
-  if (!message) return undefined;
-  const content = readContent(message);
-  if (typeof content === "string") return content;
-  const text = content
-    .map((part) => (part.type === "text" ? part.text : ""))
-    .filter(Boolean)
-    .join("\n")
-    .trim();
-  return text.length > 0 ? text : undefined;
 }
 
 function cloneLLMMessage(message: LLMMessage): LLMMessage {

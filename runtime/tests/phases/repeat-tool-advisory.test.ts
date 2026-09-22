@@ -3,10 +3,18 @@ import { describe, expect, test } from "vitest";
 import type { LLMToolCall } from "../../src/llm/types.js";
 import type { Session } from "../../src/session/session.js";
 import type { TurnState } from "../../src/session/turn-state.js";
+import type { CompletedToolResultRecord } from "../../src/session/turn-state.js";
 import {
   appendRepeatToolAdvisory,
+  blockRepeatedFailingCall,
+  identicalFailureRun,
   observeRepeatToolCalls,
   REPEAT_TOOL_THRESHOLDS,
+  REPEATED_FAILURE_BLOCK_THRESHOLD,
+  REPEATED_FAILURE_BLOCKED_METADATA_KEY,
+  REPEATED_FAILURE_SAMPLE_METADATA_KEY,
+  repeatedFailingCallStopExplanation,
+  failureSignature,
 } from "../../src/phases/repeat-tool-advisory.js";
 
 function call(name: string, args: unknown, id = "c"): LLMToolCall {
@@ -195,5 +203,388 @@ describe("appendRepeatToolAdvisory", () => {
     expect(state.toolResults).toHaveLength(1);
     expect(warnings).toHaveLength(1);
     expect(warnings[0]!.cause).toBe("repeat_tool_advisory");
+  });
+});
+
+describe("blockRepeatedFailingCall", () => {
+  const DENIAL =
+    '{"error":"file_path is outside allowed directories: /root/memory/style.md"}';
+
+  function mkSessionStub(): {
+    session: Session;
+    warnings: Array<{ cause: string; message: string }>;
+  } {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    let i = 0;
+    const session = {
+      eventLog: {
+        emit(event: {
+          id: string;
+          msg: { type: string; payload?: { cause: string; message: string } };
+        }) {
+          if (event.msg.type === "warning" && event.msg.payload) {
+            warnings.push(event.msg.payload);
+          }
+          return event;
+        },
+      },
+      nextInternalSubId: () => `sub-${(i += 1)}`,
+    } as unknown as Session;
+    return { session, warnings };
+  }
+
+  function completed(
+    toolCall: LLMToolCall,
+    content: string,
+    isError: boolean,
+    metadata?: Record<string, unknown>,
+  ): CompletedToolResultRecord {
+    return {
+      callId: toolCall.id,
+      toolName: toolCall.name,
+      arguments: toolCall.arguments,
+      content,
+      isError,
+      ...(metadata !== undefined ? { metadata } : {}),
+    };
+  }
+
+  function mkState(
+    records: readonly CompletedToolResultRecord[],
+    modelSampleOrdinal = 4,
+  ): TurnState {
+    return {
+      completedToolResults: [...records],
+      modelSampleOrdinal,
+    } as unknown as TurnState;
+  }
+
+  /** The refusal executeTools records for `call` in sample `ordinal`. */
+  function refusalRecord(
+    toolCall: LLMToolCall,
+    ordinal: number | undefined,
+  ): CompletedToolResultRecord {
+    return completed(
+      { ...toolCall, id: `${toolCall.id}-refused` },
+      JSON.stringify({ error: "refused" }),
+      true,
+      {
+        [REPEATED_FAILURE_BLOCKED_METADATA_KEY]: true,
+        ...(ordinal === undefined
+          ? {}
+          : { [REPEATED_FAILURE_SAMPLE_METADATA_KEY]: ordinal }),
+        repeatedFailures: 3,
+      },
+    );
+  }
+
+  const write = call("Write", { file_path: "/root/memory/style.md", content: "x" });
+
+  test("three identical failures block the fourth attempt with a plain message", () => {
+    const { session, warnings } = mkSessionStub();
+    const failures = Array.from({ length: REPEATED_FAILURE_BLOCK_THRESHOLD }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    const state = mkState(failures.slice(0, 2));
+    // Two failures: the call may still run.
+    expect(blockRepeatedFailingCall(state, session, write)).toBeNull();
+    expect(warnings).toHaveLength(0);
+
+    const blocked = blockRepeatedFailingCall(mkState(failures), session, write);
+    expect(blocked).not.toBeNull();
+    expect(blocked?.isError).toBe(true);
+    // The first refusal does not end the turn: the model is told to change
+    // approach and gets the sample in which to do it.
+    expect(blocked?.preventContinuation).toBeUndefined();
+    expect(blocked?.metadata).toMatchObject({
+      [REPEATED_FAILURE_BLOCKED_METADATA_KEY]: true,
+      repeatedFailures: 3,
+    });
+    expect(JSON.parse(blocked!.content).error).toBe(
+      "This exact Write call already failed 3 times with the same error in this turn and will not run again. The error is not going to change. Take a different action now: change the arguments, use another tool, work around what is failing, or finish with what you have. Issuing this same call again stops the turn. Last error: " +
+        DENIAL,
+    );
+    expect(warnings).toEqual([
+      {
+        cause: "repeated_failing_call_blocked",
+        message:
+          "Write refused: identical call failed 3 times with the same error in this turn; the model may change approach",
+      },
+    ]);
+  });
+
+  test("a refusal repeated in a LATER sample ends the turn", () => {
+    const { session, warnings } = mkSessionStub();
+    const failures = Array.from({ length: REPEATED_FAILURE_BLOCK_THRESHOLD }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    const blocked = blockRepeatedFailingCall(
+      mkState([...failures, refusalRecord(write, 3)], 4),
+      session,
+      write,
+    );
+    expect(blocked?.preventContinuation).toBe(true);
+    expect(JSON.parse(blocked!.content).error).toContain(
+      "This is the second refusal of the same call, so the turn stops here.",
+    );
+    expect(warnings[0]?.message).toContain("refused twice, stopping the turn");
+    // A refusal of a different call is independent: it gets its own chance.
+    const other = call("Write", { file_path: "/root/other.md", content: "x" }, "o-1");
+    const otherFailures = Array.from({ length: REPEATED_FAILURE_BLOCK_THRESHOLD }, (_, i) =>
+      completed(call(other.name, other.arguments, `o-${i}`), DENIAL, true),
+    );
+    expect(
+      blockRepeatedFailingCall(
+        mkState([...failures, refusalRecord(write, 3), ...otherFailures], 4),
+        session,
+        other,
+      )?.preventContinuation,
+    ).toBeUndefined();
+
+    // A refusal with no recorded sample predates this batch (resumed turn,
+    // legacy record) and still ends the turn.
+    expect(
+      blockRepeatedFailingCall(
+        mkState([...failures, refusalRecord(write, undefined)], 4),
+        session,
+        write,
+      )?.preventContinuation,
+    ).toBe(true);
+  });
+
+  test("the same failing call twice in one model output is refused twice and still yields the sample", () => {
+    const { session } = mkSessionStub();
+    const failures = Array.from({ length: REPEATED_FAILURE_BLOCK_THRESHOLD }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    // executeTools records each refusal before it considers the next call of
+    // the same batch; no sampling happens in between.
+    const state = mkState(failures, 4);
+    const first = blockRepeatedFailingCall(state, session, write);
+    expect(first?.preventContinuation).toBeUndefined();
+    state.completedToolResults.push(
+      completed(call(write.name, write.arguments, "w-dup-1"), first!.content, true, first!.metadata),
+    );
+    const second = blockRepeatedFailingCall(state, session, {
+      ...write,
+      id: "w-dup-2",
+    });
+    expect(state.modelSampleOrdinal).toBe(4);
+    expect(second?.preventContinuation).toBeUndefined();
+    expect(second?.metadata).toMatchObject({
+      [REPEATED_FAILURE_SAMPLE_METADATA_KEY]: 4,
+    });
+    // The next sample repeating it stops the turn.
+    state.modelSampleOrdinal = 5;
+    expect(
+      blockRepeatedFailingCall(state, session, { ...write, id: "w-next" })
+        ?.preventContinuation,
+    ).toBe(true);
+  });
+
+  // Live incident (session conv-mtjdmlfc, 2026-09-02): one `npm start` was
+  // denied by the sandbox 21 times over 412 s and the guard never fired.
+  // Two independent reasons, both reproduced here.
+  describe("the live sandbox-denial loop", () => {
+    const EPERM_BODY = (wallTime: string) =>
+      "\n> start\n> node server.js\n\nError: listen EPERM: operation not permitted 0.0.0.0:8080\n" +
+      `\n[exec exit_code=1 wall_time=${wallTime}s tokens=212]`;
+
+    const npmStart = (overrides: Record<string, unknown> = {}) => ({
+      cmd: "npm start",
+      workdir: "/w/arcade15",
+      timeoutMs: 15_000,
+      yield_time_ms: 4_000,
+      ...overrides,
+    });
+
+    test("a reworded justification and a nudged timeout do not split the failure run", () => {
+      const { session } = mkSessionStub();
+      const failures = [
+        completed(
+          call("exec_command", npmStart({ justification: "May I bind the port?" }), "e-0"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+        completed(
+          call("exec_command", npmStart({ justification: "Do you want to allow the server?", timeoutMs: 20_000 }), "e-1"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+        completed(
+          call("exec_command", npmStart({ prefix_rule: ["npm", "start"], yield_time_ms: 3_000 }), "e-2"),
+          EPERM_BODY("0.2630"),
+          true,
+        ),
+      ];
+      const retry = call("exec_command", npmStart({ justification: "One more time?" }), "e-3");
+      const blocked = blockRepeatedFailingCall(mkState(failures), session, retry);
+      expect(blocked).not.toBeNull();
+      expect(blocked?.metadata).toMatchObject({ repeatedFailures: 3 });
+    });
+
+    test("a volatile wall time in the result does not reset the failure run", () => {
+      const { session } = mkSessionStub();
+      // 13 of the incident's 14 bodies were distinct; only the wall time moved.
+      const failures = ["0.2630", "0.1990", "0.3120"].map((wallTime, i) =>
+        completed(call("exec_command", npmStart(), `e-${i}`), EPERM_BODY(wallTime), true),
+      );
+      const blocked = blockRepeatedFailingCall(
+        mkState(failures),
+        session,
+        call("exec_command", npmStart(), "e-3"),
+      );
+      expect(blocked).not.toBeNull();
+      expect(blocked?.metadata).toMatchObject({ repeatedFailures: 3 });
+      // The model still sees the raw last error, wall time included.
+      expect(JSON.parse(blocked!.content).error).toContain("wall_time=0.3120s");
+    });
+
+    test("a session id in the result does not reset the failure run", () => {
+      const { session } = mkSessionStub();
+      const failures = [10, 11, 12].map((sessionId, i) =>
+        completed(
+          call("exec_command", npmStart(), `e-${i}`),
+          `blocked\n\n[exec exit_code=1 wall_time=0.1000s tokens=4 session_id=${sessionId}]`,
+          true,
+        ),
+      );
+      expect(
+        blockRepeatedFailingCall(mkState(failures), session, call("exec_command", npmStart(), "e-3")),
+      ).not.toBeNull();
+    });
+
+    test("a genuinely different error still resets the run", () => {
+      const { session } = mkSessionStub();
+      const failures = [
+        completed(call("exec_command", npmStart(), "e-0"), EPERM_BODY("0.2630"), true),
+        completed(call("exec_command", npmStart(), "e-1"), EPERM_BODY("0.1990"), true),
+        completed(
+          call("exec_command", npmStart(), "e-2"),
+          "\nError: Cannot find module './server.js'\n\n[exec exit_code=1 wall_time=0.1120s tokens=9]",
+          true,
+        ),
+      ];
+      expect(
+        blockRepeatedFailingCall(mkState(failures), session, call("exec_command", npmStart(), "e-3")),
+      ).toBeNull();
+    });
+
+    test("a different command still starts its own count", () => {
+      const { session } = mkSessionStub();
+      const failures = Array.from({ length: 3 }, (_, i) =>
+        completed(call("exec_command", npmStart(), `e-${i}`), EPERM_BODY("0.2630"), true),
+      );
+      expect(
+        blockRepeatedFailingCall(
+          mkState(failures),
+          session,
+          call("exec_command", npmStart({ cmd: "npm test" }), "e-3"),
+        ),
+      ).toBeNull();
+    });
+
+    test("failureSignature elides only the volatile runtime values", () => {
+      expect(failureSignature(EPERM_BODY("0.2630"))).toBe(failureSignature(EPERM_BODY("9.9999")));
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("listen EPERM");
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("exit_code=1");
+      expect(failureSignature(EPERM_BODY("0.2630"))).toContain("tokens=212");
+    });
+  });
+
+  test("the refusal's turn stop is worded like the behavioral backstop", () => {
+    const { session } = mkSessionStub();
+    const failures = Array.from({ length: 5 }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    const blocked = blockRepeatedFailingCall(mkState(failures), session, write);
+    expect(repeatedFailingCallStopExplanation(write, blocked!)).toBe(
+      "Turn stopped by the no-progress backstop: the exact Write call failed 5 " +
+        "times with the same error and was refused (count=5). No further progress " +
+        "was being made. No task was completed.",
+    );
+    // Without the recorded count the threshold is the honest lower bound.
+    expect(
+      repeatedFailingCallStopExplanation(write, { content: "", isError: true }),
+    ).toContain(`failed ${REPEATED_FAILURE_BLOCK_THRESHOLD} times`);
+  });
+
+  test("identical successes are never blocked", () => {
+    const { session, warnings } = mkSessionStub();
+    const read = call("FileRead", { file_path: "src/app.ts" });
+    const state = mkState(
+      Array.from({ length: 10 }, (_, i) =>
+        completed(call(read.name, read.arguments, `r-${i}`), "1\tconst a = 1;", false),
+      ),
+    );
+    expect(identicalFailureRun(state, read)).toEqual({ count: 0, lastError: "" });
+    expect(blockRepeatedFailingCall(state, session, read)).toBeNull();
+    expect(warnings).toHaveLength(0);
+  });
+
+  test("a different argument starts its own count", () => {
+    const { session } = mkSessionStub();
+    const other = call("Write", { file_path: "/root/memory/other.md", content: "x" });
+    const state = mkState([
+      completed(call(write.name, write.arguments, "w-0"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-1"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-2"), DENIAL, true),
+      completed(call(other.name, other.arguments, "o-0"), DENIAL, true),
+    ]);
+    expect(identicalFailureRun(state, write).count).toBe(3);
+    expect(identicalFailureRun(state, other).count).toBe(1);
+    expect(blockRepeatedFailingCall(state, session, other)).toBeNull();
+  });
+
+  test("a success or a different error for the same call resets the run", () => {
+    const { session } = mkSessionStub();
+    const afterSuccess = mkState([
+      completed(call(write.name, write.arguments, "w-0"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-1"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-2"), "File created successfully", false),
+      completed(call(write.name, write.arguments, "w-3"), DENIAL, true),
+    ]);
+    expect(identicalFailureRun(afterSuccess, write).count).toBe(1);
+    expect(blockRepeatedFailingCall(afterSuccess, session, write)).toBeNull();
+
+    const differentError = mkState([
+      completed(call(write.name, write.arguments, "w-0"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-1"), DENIAL, true),
+      completed(call(write.name, write.arguments, "w-2"), '{"error":"disk full"}', true),
+    ]);
+    expect(identicalFailureRun(differentError, write)).toEqual({
+      count: 1,
+      lastError: '{"error":"disk full"}',
+    });
+    expect(blockRepeatedFailingCall(differentError, session, write)).toBeNull();
+  });
+
+  test("its own refusal never masks the original error", () => {
+    const { session } = mkSessionStub();
+    const failures = Array.from({ length: 3 }, (_, i) =>
+      completed(call(write.name, write.arguments, `w-${i}`), DENIAL, true),
+    );
+    const state = mkState(failures);
+    const blocked = blockRepeatedFailingCall(state, session, write)!;
+    state.completedToolResults.push(
+      completed(call(write.name, write.arguments, "w-3"), blocked.content, true, blocked.metadata),
+    );
+    // The fifth attempt is still refused with the original error quoted.
+    const again = blockRepeatedFailingCall(state, session, write);
+    expect(again).not.toBeNull();
+    expect(JSON.parse(again!.content).error).toContain(DENIAL);
+    expect(identicalFailureRun(state, write).count).toBe(3);
+  });
+
+  test("argument key order does not split the failure run", () => {
+    const { session } = mkSessionStub();
+    const ab = call("Edit", '{"a":1,"b":2}');
+    const ba = call("Edit", '{"b":2,"a":1}');
+    const state = mkState([
+      completed(call(ab.name, ab.arguments, "e-0"), "String to replace not found", true),
+      completed(call(ba.name, ba.arguments, "e-1"), "String to replace not found", true),
+      completed(call(ab.name, ab.arguments, "e-2"), "String to replace not found", true),
+    ]);
+    expect(blockRepeatedFailingCall(state, session, ba)).not.toBeNull();
   });
 });

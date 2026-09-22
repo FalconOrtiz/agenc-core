@@ -69,6 +69,8 @@ function makeSession(conversationId = "root-thread") {
   let rolloutPersistenceSuspendDepth = 0;
   return {
     conversationId,
+    seedInternalSubId: vi.fn(),
+    restoreUserStopFromRollout: vi.fn(),
     roleWorkspace: ROLE_WORKSPACE,
     state,
     agentStatus: {

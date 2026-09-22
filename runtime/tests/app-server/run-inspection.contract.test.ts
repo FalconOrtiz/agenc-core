@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AgenCDaemonAgentManager } from "../../src/app-server/agent-lifecycle.js";
 import { AgenCDaemonJsonRpcDispatcher } from "../../src/app-server/daemon-dispatcher.js";
@@ -91,6 +91,54 @@ function admissionRequest(
       { key: `run:${runId}`, maxTokens: 1_000, maxCostUsd: 1 },
     ],
   };
+}
+
+/**
+ * Seed the durable runs, open epoch 1 for run-complete and write one canonical
+ * rollout under sessions/run-complete that carries its run_terminal event.
+ * Returns the rollout path.
+ */
+function seedCanonicalTerminalRollout(fileName: string, eventId: string): string {
+  seedDurableRuns();
+  new StateRunDurabilityRepository(driver).ensureInitialEpoch({
+    runId: "run-complete",
+    openedAt: NOW,
+  });
+  const sessionDir = join(paths.projectDir, "sessions", "run-complete");
+  mkdirSync(sessionDir, { recursive: true });
+  const rolloutPath = join(sessionDir, fileName);
+  writeFileSync(
+    rolloutPath,
+    serializeRolloutItem({
+      type: "event_msg",
+      payload: {
+        eventId,
+        id: eventId,
+        seq: 1,
+        msg: {
+          type: "run_terminal",
+          payload: {
+            runId: "run-complete",
+            epoch: 1,
+            status: "completed",
+            exitCode: 0,
+            stopReason: "turn_completed",
+            finalMessage: "Recovered from the journal",
+            usage: {
+              inputTokens: 5,
+              outputTokens: 3,
+              totalTokens: 8,
+              costUsd: 0.001,
+            },
+            lastSequenceBeforeTerminal: null,
+            finishedAt: "2026-07-18T12:05:00.000Z",
+          },
+        },
+      },
+    }),
+    "utf8",
+  );
+  return rolloutPath;
 }
 
 function seedDurableRuns(): readonly number[] {
@@ -600,45 +648,7 @@ describe("durable run inspection", () => {
   });
 
   it("rebuilds a missing terminal projection from the canonical JSONL event", () => {
-    seedDurableRuns();
-    new StateRunDurabilityRepository(driver).ensureInitialEpoch({
-      runId: "run-complete",
-      openedAt: NOW,
-    });
-    const sessionDir = join(paths.projectDir, "sessions", "run-complete");
-    mkdirSync(sessionDir, { recursive: true });
-    const rolloutPath = join(sessionDir, "rollout-terminal.jsonl");
-    writeFileSync(
-      rolloutPath,
-      serializeRolloutItem({
-        type: "event_msg",
-        payload: {
-          eventId: "terminal-from-jsonl",
-          id: "terminal-from-jsonl",
-          seq: 1,
-          msg: {
-            type: "run_terminal",
-            payload: {
-              runId: "run-complete",
-              epoch: 1,
-              status: "completed",
-              exitCode: 0,
-              stopReason: "turn_completed",
-              finalMessage: "Recovered from the journal",
-              usage: {
-                inputTokens: 5,
-                outputTokens: 3,
-                totalTokens: 8,
-                costUsd: 0.001,
-              },
-              lastSequenceBeforeTerminal: null,
-              finishedAt: "2026-07-18T12:05:00.000Z",
-            },
-          },
-        },
-      }),
-      "utf8",
-    );
+    seedCanonicalTerminalRollout("rollout-terminal.jsonl", "terminal-from-jsonl");
 
     expect(service.result({ runId: "run-complete" })).toMatchObject({
       status: "completed",
@@ -655,6 +665,59 @@ describe("durable run inspection", () => {
         "run-complete",
       ),
     ).toMatchObject({ eventId: "terminal-from-jsonl", lastSequence: 1 });
+  });
+
+  // Review P1-7: an ordinary desktop refresh of a running session turned it
+  // into an "operator action required" run at the next daemon restart.
+  it("serves a live run's current projection without recording a recovery deferral", () => {
+    const rolloutPath = seedCanonicalTerminalRollout(
+      "rollout-live.jsonl",
+      "terminal-from-live-jsonl",
+    );
+    // The live writer's lease, held by this process.
+    const lockPath = `${rolloutPath}.lock`;
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({
+        pid: process.pid,
+        startNs: "live-writer",
+        acquiredAtIso: NOW,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const deferredRows = (): number =>
+      driver
+        .prepareState<[], { readonly count: number }>(
+          "SELECT COUNT(*) AS count FROM run_recovery_deferred",
+        )
+        .get()?.count ?? 0;
+
+    for (let i = 0; i < 3; i++) {
+      // The projection is served as it stands: the epoch is open and the
+      // journal's terminal has not been projected because the source is live.
+      expect(service.status({ runId: "run-complete" })).toMatchObject({
+        runId: "run-complete",
+        status: "running",
+        statusSource: "run_lifecycle_epoch",
+        durableRun: { status: "completed" },
+      });
+      expect(service.replay({ runId: "run-complete" })).toMatchObject({
+        runId: "run-complete",
+      });
+    }
+    expect(deferredRows()).toBe(0);
+
+    // Once the writer is gone the next read projects the journal as usual.
+    rmSync(lockPath);
+    expect(service.result({ runId: "run-complete" })).toMatchObject({
+      status: "completed",
+      output: {
+        available: true,
+        finalMessage: "Recovered from the journal",
+        lastSequence: 1,
+      },
+    });
+    expect(deferredRows()).toBe(0);
   });
 
   it("exports bounded hashes and explicitly excludes workflow evidence", () => {
@@ -792,7 +855,7 @@ describe("M5 workflow run inspection (additive fields)", () => {
   const WORKFLOW_RUN_ID = "wf-run-inspection";
   let sequence = 0;
 
-  function seedWorkflowEffects(): void {
+  function seedWorkflowEffects(permissionMode?: "bypassPermissions"): void {
     sequence = 0;
     const durability = new StateRunDurabilityRepository(driver);
     durability.ensureInitialEpoch({ runId: WORKFLOW_RUN_ID, openedAt: NOW });
@@ -837,7 +900,7 @@ describe("M5 workflow run inspection (additive fields)", () => {
     complete("workflow.intake", {
       stage: "workflow.intake",
       attempt: 1,
-      spec: { runId: WORKFLOW_RUN_ID, goal: "fix it", repoPath: cwd },
+      spec: { runId: WORKFLOW_RUN_ID, goal: "fix it", repoPath: cwd, ...(permissionMode !== undefined ? { permissionMode } : {}) },
       specDigest: `sha256:${"2".repeat(64)}`,
     });
     begin("workflow.worktree", "workflow.worktree", "idempotent");
@@ -880,6 +943,45 @@ describe("M5 workflow run inspection (additive fields)", () => {
 
     // Ordinary runs stay untouched: no workflow field at all.
     expect(service.status({ runId: "run-complete" }).workflow).toBeUndefined();
+  });
+
+  it("keeps frozen requested bypass separate from the current live mode and omits unavailable authority", () => {
+    seedDurableRuns();
+    seedWorkflowEffects("bypassPermissions");
+    expect(service.status({ runId: WORKFLOW_RUN_ID }).workflow).toMatchObject({ requestedPermissionMode: "bypassPermissions" });
+    expect(service.status({ runId: WORKFLOW_RUN_ID }).workflow).not.toHaveProperty("effectivePermissionMode");
+    let mode: import("../../src/types/permissions.js").InternalPermissionMode | undefined = "default";
+    const lookup = vi.fn((runId: string) => { expect(runId).toBe(WORKFLOW_RUN_ID); return mode; });
+    const live = new AgenCDaemonRunInspectionService({
+      stateDatabasePaths: () => [paths], agencHome: home, effectivePermissionMode: lookup,
+    });
+    expect(live.status({ runId: WORKFLOW_RUN_ID }).workflow).toMatchObject({
+      requestedPermissionMode: "bypassPermissions", effectivePermissionMode: "default",
+    });
+    mode = "unattended";
+    expect(live.status({ runId: WORKFLOW_RUN_ID }).workflow!.effectivePermissionMode).toBe("unattended");
+    mode = undefined;
+    expect(live.status({ runId: WORKFLOW_RUN_ID }).workflow).not.toHaveProperty("effectivePermissionMode");
+    mode = "invalid-runtime-mode" as never;
+    expect(live.status({ runId: WORKFLOW_RUN_ID }).workflow).not.toHaveProperty("effectivePermissionMode");
+    lookup.mockClear();
+    expect(live.status({ runId: "run-live" }).workflow).toBeUndefined();
+    expect(lookup).not.toHaveBeenCalled();
+    const durability = new StateRunDurabilityRepository(driver);
+    durability.recordTerminalResult({
+      epoch: durability.currentEpoch(WORKFLOW_RUN_ID)!.epoch,
+      eventId: `evt-${++sequence}`,
+      result: {
+        runId: WORKFLOW_RUN_ID, status: "cancelled", exitCode: 1,
+        stopReason: "user_cancelled", finalMessage: "cancelled", usage: null,
+        lastSequence: sequence, finishedAt: NOW,
+      },
+    });
+    const terminal = live.status({ runId: WORKFLOW_RUN_ID });
+    expect(terminal.terminal).toBe(true);
+    expect(terminal.workflow).toMatchObject({ requestedPermissionMode: "bypassPermissions" });
+    expect(terminal.workflow).not.toHaveProperty("effectivePermissionMode");
+    expect(lookup).not.toHaveBeenCalled();
   });
 
   it("carries the frozen workflow stop reason through the projection", () => {

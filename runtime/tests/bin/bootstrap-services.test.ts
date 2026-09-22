@@ -8,7 +8,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const policyLimitsMocks = vi.hoisted(() => ({
   configurePolicyLimitsService: vi.fn(),
@@ -67,6 +67,7 @@ import {
 } from "../services/lsp/manager.js";
 import type { LSPServerInstance } from "../services/lsp/LSPServerInstance.js";
 import { bootstrapSession } from "../session/bootstrap.js";
+import { PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS } from "../permissions/guardian/reviewer.js";
 
 const TEST_RUNTIME_OPTIONS = Object.freeze({
   simpleMode: false,
@@ -836,6 +837,78 @@ describe("SessionStart bootstrap hooks", () => {
   });
 });
 
+describe("buildBootstrapSessionServices guardian approval reviewer", () => {
+  test("wires a bounded review deadline so a dead provider cannot park an approval", async () => {
+    // The guardian approval reviewer stands between the user and a tool call
+    // they are waiting on, and the review delegate it runs through opts out of
+    // the ambient stream-idle watchdog because it owns its own deadline. If
+    // production builds the reviewer with no deadline at all, nothing bounds a
+    // dead provider socket: the approval hangs until the user cancels. An
+    // expiry here is the reviewer's typed `timed_out` decision (fails closed,
+    // retryable, not a breaker denial), never a "denied / high risk" verdict.
+    mockPolicyLimits();
+    const home = mkdtempSync(join(tmpdir(), "agenc-guardian-deadline-home-"));
+    const workspace = mkdtempSync(join(tmpdir(), "agenc-guardian-deadline-ws-"));
+    try {
+      const handle = buildBootstrapSessionServices({
+        provider: createProvider("anthropic", {
+          apiKey: "guardian-deadline-key",
+          model: "claude-opus-4-7",
+        }),
+        providerName: "anthropic",
+        registry: { tools: [] } as never,
+        mcpManager: {} as never,
+        unifiedExecManager: {} as never,
+        sandboxExecutionBroker: explicitDangerBroker,
+        permissionModeRegistry: new PermissionModeRegistry(
+          createEmptyToolPermissionContext(),
+        ),
+        configStore: {
+          current: () => defaultConfig(),
+          authoritySnapshot: () => ({ config: defaultConfig(), layers: [] }),
+          subscribe: () => () => {},
+        } as never,
+        toolApprovals: {
+          get: () => undefined,
+          set: () => {},
+          clear: () => {},
+          withCachedApproval: async (request: {
+            fetchDecision: () => Promise<unknown>;
+          }) => request.fetchDecision(),
+        } as never,
+        networkApproval: {
+          clearSessionHosts: () => {},
+          requestNetworkApproval: async () => ({ kind: "approved" }),
+          requestDeferredApproval: async () => ({ kind: "approved" }),
+        } as never,
+        modelsManager: {} as never,
+        agencHome: home,
+        workspaceRoot: workspace,
+        env: { HOME: home, SHELL: "/bin/sh" },
+        conversationId: "session-guardian-deadline",
+        model: "agenc-opus-4-7",
+        sessionConfiguration: {} as never,
+        runtimeOptions: TEST_RUNTIME_OPTIONS,
+        commandExecutionAuthority: TEST_COMMAND_EXECUTION_AUTHORITY,
+      });
+
+      try {
+        const deadlineMs =
+          handle.services.guardianApprovalReviewer?.reviewTimeoutMs;
+        expect(typeof deadlineMs).toBe("number");
+        expect(Number.isFinite(deadlineMs)).toBe(true);
+        expect(deadlineMs).toBeGreaterThan(0);
+        expect(deadlineMs).toBe(PRODUCTION_GUARDIAN_APPROVAL_REVIEW_TIMEOUT_MS);
+      } finally {
+        await handle.shutdown();
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildBootstrapSessionServices policy limits wiring", () => {
   test("initializes policy limits and stops polling on shutdown", async () => {
     const stopBackgroundPolling = vi.fn();
@@ -1316,6 +1389,19 @@ describe("buildBootstrapSessionServices policy limits wiring", () => {
 });
 
 describe("loadBootstrapLspServers", () => {
+  // These tests are about the typed lsp_servers config alone. Built-in
+  // profiles would otherwise start whatever language server the host happens
+  // to have on PATH and make an empty typed config mean "one server".
+  let previousBuiltinLsp: string | undefined;
+  beforeEach(() => {
+    previousBuiltinLsp = process.env.AGENC_DISABLE_BUILTIN_LSP;
+    process.env.AGENC_DISABLE_BUILTIN_LSP = "1";
+  });
+  afterEach(() => {
+    if (previousBuiltinLsp === undefined) delete process.env.AGENC_DISABLE_BUILTIN_LSP;
+    else process.env.AGENC_DISABLE_BUILTIN_LSP = previousBuiltinLsp;
+  });
+
   function rejectingStopServer(): LSPServerInstance {
     const config = normalizeLspServerConfig("ts", {
       command: "typescript-language-server",

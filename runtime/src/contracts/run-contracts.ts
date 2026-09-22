@@ -116,10 +116,12 @@ export type RunRuntimePermissionMode =
   (typeof RUN_RUNTIME_PERMISSION_MODES)[number];
 
 export const RUN_RUNTIME_REASONING_EFFORTS = [
+  "minimal",
   "low",
   "medium",
   "high",
   "xhigh",
+  "max",
   "none",
 ] as const;
 export type RunRuntimeReasoningEffort =

@@ -273,6 +273,18 @@ Trusted verification requires an
 preregistered receipt verifier. The API never discovers a local "latest seal"
 and labels journal-only inspection `integrity_only_unanchored`.
 
+Providers and verifiers explicitly pin a `trustClass` and `signatureAlgorithm`.
+Receipt verification checks both before accepting the provider's result.
+`verifyEvidenceLedger` accepts only externally anchored asymmetric signatures
+and is the only API that creates the external-verification runtime brand.
+
+`verifyLocalEvidenceLedger` verifies local seals and returns `integrity_only`.
+Local HMAC-SHA256 receipts cannot pass `isExternallyVerifiedEvidenceLedger`,
+even if a caller changes their advertised trust class. HMAC is permitted in
+stored seal receipts, but not in external evidence references or score summaries.
+The local result and its nested evidence are frozen without acquiring the
+external brand.
+
 The local filesystem boundary requires canonical local paths, one SQLite lock
 for create/append/inspect/seal/verify, `0700` directories, `0600` single-link
 regular files, no create/truncate flags on append, descriptor/path identity
@@ -331,12 +343,12 @@ calendar fields, never to order runs or access/seal events.
 - [Harbor](https://github.com/harbor-framework/harbor) informed the neutral
   task/container/agent-adapter boundary. AgenC keeps the contract portable rather
   than coupling competitive tasks to daemon-specific protocol semantics.
-- [OpenClaw ShellBench](https://github.com/openclaw/shellbench) informed <!-- branding-scan: allow comparator research citation -->
+- [OpenClaw ShellBench](https://github.com/openclaw/shellbench) informed
   deterministic completion and reliability diagnostics, but product-specific
   trace/process scoring is not used as neutral coding-quality truth.
 - Official comparator releases inspected on 2026-07-15 were
-  [Hermes Agent `v2026.7.7.2`](https://github.com/NousResearch/hermes-agent/releases/tag/v2026.7.7.2) <!-- branding-scan: allow comparator release research -->
-  and [OpenClaw `v2026.7.1`](https://github.com/openclaw/openclaw/releases/tag/v2026.7.1). <!-- branding-scan: allow comparator release research -->
+  [Hermes Agent `v2026.7.7.2`](https://github.com/NousResearch/hermes-agent/releases/tag/v2026.7.7.2)
+  and [OpenClaw `v2026.7.1`](https://github.com/openclaw/openclaw/releases/tag/v2026.7.1).
   These links are research snapshots, not mutable runtime defaults. Every real
   comparison must preregister its exact tag, commit, package digest, install
   command, public/redacted config, model lane, and limitations.

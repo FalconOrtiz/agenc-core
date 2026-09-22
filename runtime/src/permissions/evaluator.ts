@@ -41,12 +41,24 @@
  * @module
  */
 
+import { resolve } from "node:path";
+import { isReadOnlyCoordinationName, isReadOnlyCoordinationTool, readOnlyDelegationToolRefusal, sessionReadOnlyDelegation } from "../agents/readonly-delegation.js";
 import {
+  freshDenialTracking,
   handleDenialLimitExceeded,
   recordDenial,
   recordSuccess,
   type DenialTrackingState,
 } from "./denial-tracking.js";
+import { SAFE_YOLO_ALLOWLISTED_TOOLS } from "./classifier.js";
+import { commandHasAnyCd } from "../tools/BashTool/bashPermissions.js";
+import { checkReadOnlyConstraints } from "../tools/BashTool/readOnlyValidation.js";
+import { checkPathConstraints } from "../tools/BashTool/pathValidation.js";
+import {
+  readOnlyGrantRefusalMessage,
+  readOnlyGrantVerdict,
+  type ShellGateDeps,
+} from "./read-only-grant.js";
 import {
   getAskRuleForTool,
   getDenyRuleForTool,
@@ -57,8 +69,10 @@ import {
   unattendedAllowDecision,
   unattendedDenyDecision,
   unattendedPauseDecision,
+  unattendedPolicyForContext,
 } from "./unattended-policy.js";
 import type { Session } from "../session/session.js";
+import { isSessionPlanMutation } from "../planning/session-plan-authority.js";
 import {
   classifyYoloAction,
   isAutoModeAllowlistedTool,
@@ -150,7 +164,7 @@ export interface ToolLike {
   readonly name: string;
   readonly isReadOnly?: boolean;
   readonly requiresApproval?: boolean;
-  readonly metadata?: { readonly mutating?: boolean };
+  readonly metadata?: { readonly mutating?: boolean; readonly source?: string };
   checkPermissions?(
     input: unknown,
     context: ToolEvaluatorContext,
@@ -261,6 +275,17 @@ export async function checkRuleBasedPermissions(
 
   const appState = context.getAppState();
 
+  const delegatedRefusal = readOnlyDelegationToolRefusal(context.session, tool, input);
+  if (delegatedRefusal !== undefined) {
+    return Object.freeze({ behavior: "deny" as const, message: delegatedRefusal, decisionReason: { type: "other" as const, reason: delegatedRefusal } });
+  }
+  if (appState.toolPermissionContext.mode === "plan" && isReadOnlyCoordinationName(tool.name) && !isReadOnlyCoordinationTool(tool)) {
+    return Object.freeze({ behavior: "deny" as const, message: "Plan delegation requires the canonical runtime coordinator implementation.", decisionReason: { type: "other" as const, reason: "untrusted coordinator implementation" } });
+  }
+  const readOnlyCoordination = isReadOnlyCoordinationTool(tool) && (
+    appState.toolPermissionContext.mode === "plan" || sessionReadOnlyDelegation(context.session) !== undefined
+  );
+
   // 1a. Whole-tool deny rule.
   const denyRule = getDenyRuleForTool(
     appState.toolPermissionContext,
@@ -271,6 +296,30 @@ export async function checkRuleBasedPermissions(
       behavior: "deny" as const,
       message: `Permission to use ${tool.name} has been denied.`,
       decisionReason: { type: "rule" as const, rule: denyRule },
+    });
+  }
+
+  // 1a2. Plan mode is read, ask, plan. Any tool that changes something is
+  // denied until ExitPlanMode restores the mode the session came from, and
+  // the message says so. Read-only tools and the plan-mode UI tools pass, and
+  // so does a shell command the read-only classifier accepts (#2205);
+  // plan-with-auto keeps its classifier path below (the explicit exception).
+  // Before this the mode gated nothing here, and a session in plan mode ran
+  // whatever its underlying policy approved (#2169).
+  if (
+    appState.toolPermissionContext.mode === "plan" &&
+    appState.autoModeActive !== true &&
+    !toolDoesNotRequireApproval(tool) &&
+    !SAFE_YOLO_ALLOWLISTED_TOOLS.has(tool.name) &&
+    !readOnlyCoordination &&
+    !planModeReadOnlyShellCommand(tool, input) &&
+    !isSessionPlanMutation(tool, input, context.session)
+  ) {
+    const message = planModeDenyMessage(tool.name);
+    return Object.freeze({
+      behavior: "deny" as const,
+      message,
+      decisionReason: { type: "other" as const, reason: message },
     });
   }
 
@@ -359,6 +408,9 @@ export async function checkRuleBasedPermissions(
   if (toolResult.behavior === "allow") {
     return toolResult as PermissionAllowDecision;
   }
+  if (readOnlyCoordination && toolResult.behavior !== "ask") {
+    return { behavior: "allow", updatedInput: input !== null && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {}, decisionReason: { type: "other", reason: "Read-only agent coordination" } };
+  }
   return null;
 }
 
@@ -406,6 +458,167 @@ function checkModeGate(
   }
 
   return null;
+}
+
+const SHELL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "exec_command",
+  "system.bash",
+  "Bash",
+]);
+
+/**
+ * Planning is mostly reading, and the shell is how a model reads a
+ * repository's history and layout. A shell command the read-only classifier
+ * accepts (`ls`, `git log`, `grep`, `wc`) passes the plan gate and continues
+ * into the normal checks; anything it cannot parse, cannot classify or that
+ * writes stays denied with the plan-mode message (#2205).
+ */
+/**
+ * The two shipped gates the grant leans on. `checkReadOnlyConstraints` answers
+ * "does this command change anything"; `checkPathConstraints` answers "does it
+ * stay inside this project". Neither is sufficient alone: the first says yes to
+ * `cat ~/.ssh/id_rsa`, and the second says nothing about `rm`.
+ */
+const READ_ONLY_GRANT_DEPS: ShellGateDeps = {
+  checkReadOnly: (input) =>
+    checkReadOnlyConstraints(
+      input as Parameters<typeof checkReadOnlyConstraints>[0],
+      commandHasAnyCd(input.command),
+    ) as { behavior: string },
+  checkPaths: (input, cwd, context) =>
+    checkPathConstraints(
+      input as Parameters<typeof checkPathConstraints>[0],
+      cwd,
+      context,
+    ) as { behavior: string },
+};
+
+/**
+ * The folder this run works in, or null when it cannot be named.
+ *
+ * This is the base every relative path argument resolves from and, via
+ * `withRunFolderAsRoot`, the folder the shell path gate contains to.
+ *
+ * It used to read the first key of `additionalWorkingDirectories`, falling
+ * back to `process.cwd()`. Neither is this run's folder. That Map holds only
+ * the extra directories settings and `--add-dir` declare (permissions/
+ * settings.ts), never the session's own; on the routine path it is reliably
+ * empty, because the executor passes a cwd and no addDirs (routines/
+ * daemon-executor.ts) so no `--add-dir` is emitted. The fallback then handed
+ * the gate the daemon's process directory, and a routine in its own project
+ * was refused its own folder.
+ *
+ * `sessionConfiguration.cwd` is the workspace root bootstrap started this
+ * session with (bin/bootstrap.ts, session/configuration.ts), it is per
+ * session rather than per process, and it follows the session into a
+ * worktree. Absent it there is no folder to measure against, so this returns
+ * null and the gate refuses rather than guessing.
+ */
+function readOnlyGrantWorkingDirectory(
+  context: ToolEvaluatorContext,
+): string | null {
+  const configured: unknown = context.session?.sessionConfiguration?.cwd;
+  return typeof configured === "string" && configured.length > 0
+    ? resolve(configured)
+    : null;
+}
+
+/**
+ * The whole decision for a run with nobody attached: proceed on read-only
+ * work, refuse everything else. Never returns "ask", because an ask is what
+ * this policy exists to remove.
+ */
+async function decideReadOnlyGrant(
+  tool: ToolLike,
+  input: unknown,
+  context: ToolEvaluatorContext,
+  permissionContext: ToolPermissionContext,
+  unattended: { readonly behavior: string; readonly toolName: string },
+): Promise<PermissionDecision> {
+  const appState = context.getAppState();
+  // A refused call is the end of that road, and the model needs to hear that
+  // it is: left to a plain refusal it re-issues the same tool until the turn
+  // errors, which costs minutes and loses the report it was about to write.
+  const refuse = (message: string): PermissionDecision => {
+    const next = recordDenial(
+      context.denialTracking ?? appState.denialTracking ?? freshDenialTracking(),
+    );
+    persistDenialState(context, next);
+    return unattendedReadOnlyDenyDecision(
+      tool.name,
+      next.consecutiveDenials >= 2
+        ? `${message} This run has now been refused ${next.consecutiveDenials} times. Stop calling tools and write your findings as your final answer.`
+        : message,
+    );
+  };
+  // An operator naming the tool explicitly is a decision already made; the
+  // set decides everything else.
+  if (unattended.behavior !== "allow") {
+    const verdict = readOnlyGrantVerdict(
+      tool,
+      input,
+      readOnlyGrantWorkingDirectory(context),
+      permissionContext,
+      READ_ONLY_GRANT_DEPS,
+    );
+    if (!verdict.granted) {
+      return refuse(readOnlyGrantRefusalMessage(tool.name, verdict.refusal));
+    }
+  }
+  // Being admitted is not authority to skip the tool's own check. Anything
+  // that still wants a human is refused here too.
+  const toolResult = await resolveToolPermissionResult(tool, input, context);
+  if (toolResult.behavior === "ask" || toolResult.behavior === "deny") {
+    return refuse(readOnlyGrantRefusalMessage(tool.name, { kind: "interactive" }));
+  }
+  // A granted call clears the streak, so an occasional refusal mid-report does
+  // not accumulate into the escalated wording.
+  persistDenialState(
+    context,
+    recordSuccess(context.denialTracking ?? appState.denialTracking ?? freshDenialTracking()),
+  );
+  return unattendedAllowDecision(unattended.toolName, input);
+}
+
+function unattendedReadOnlyDenyDecision(
+  toolName: string,
+  message: string,
+): PermissionDenyDecision {
+  return Object.freeze({
+    behavior: "deny" as const,
+    message,
+    decisionReason: Object.freeze({
+      type: "other" as const,
+      reason: `unattended read-only run refused ${toolName}`,
+    }),
+    ruleSuggestions: null,
+  });
+}
+
+function planModeReadOnlyShellCommand(tool: ToolLike, input: unknown): boolean {
+  if (!SHELL_TOOL_NAMES.has(tool.name)) return false;
+  if (typeof input !== "object" || input === null) return false;
+  const fields = input as { readonly cmd?: unknown; readonly command?: unknown };
+  const command =
+    typeof fields.cmd === "string"
+      ? fields.cmd
+      : typeof fields.command === "string"
+        ? fields.command
+        : undefined;
+  if (command === undefined || command.trim().length === 0) return false;
+  const verdict = checkReadOnlyConstraints(
+    { command } as Parameters<typeof checkReadOnlyConstraints>[0],
+    commandHasAnyCd(command),
+  );
+  return verdict.behavior === "allow";
+}
+
+function planModeDenyMessage(toolName: string): string {
+  return (
+    `Plan mode: ${toolName} would change something, so it is not allowed yet. ` +
+    "Explore with read-only tools, ask with AskUserQuestion if you must, then call " +
+    "ExitPlanMode to present the plan; changes start after it is approved."
+  );
 }
 
 function toolDoesNotRequireApproval(tool: ToolLike): boolean {
@@ -563,6 +776,24 @@ async function checkUnattendedPolicy(
   // so behavior is unchanged when no operator denylist is set.
   if (unattended.behavior === "deny") {
     return unattendedDenyDecision(unattended.toolName);
+  }
+
+  // A run with nobody attached cannot be asked anything, so `pause` never
+  // resolves and the run parks until a person cancels it. Under this policy it
+  // proceeds alone on read-only work and refuses the rest, which is how the
+  // run finishes its report rather than stopping at the first tool.
+  //
+  // This sits ABOVE the mode gate below on purpose: a routine still carrying
+  // permissionMode "plan" keeps `mode: "plan"` through `preserveMode`, so a
+  // branch placed after that early return would never run for it.
+  if (unattendedPolicyForContext(permissionContext).readOnly) {
+    return decideReadOnlyGrant(
+      tool,
+      input,
+      context,
+      permissionContext,
+      unattended,
+    );
   }
 
   // The allowlist / pause behaviors are the additive subset semantics that
@@ -974,7 +1205,7 @@ function getUpdatedInputOrFallback(
   return undefined;
 }
 
-function persistDenialState(
+export function persistDenialState(
   context: ToolEvaluatorContext,
   next: DenialTrackingState,
 ): void {

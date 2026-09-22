@@ -1,8 +1,7 @@
 /**
- * Ports upstream `src/services/tokenEstimation.ts` rough-estimation helpers
- * onto AgenC's provider-neutral runtime.
+ * Rough token-estimation helpers for AgenC's provider-neutral runtime.
  *
- * Why this lives here / shape difference from upstream:
+ * Design notes:
  *   - AgenC keeps live API token counting out of this module. The exported
  *     helpers are deterministic local estimates that can be used by tools,
  *     compaction, prompt budgeting, and provider routing.
@@ -15,7 +14,11 @@
  */
 
 import { isRecord } from "../utils/record.js";
-import { estimateUtf8TokenUnits } from "./token-accounting.js";
+import {
+  TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS,
+  estimateInlineImageTokenUnits,
+  estimateUtf8TokenUnits,
+} from "./token-accounting.js";
 
 export interface ModelTokenizerConfig {
   readonly modelFamily: string;
@@ -63,7 +66,6 @@ export interface TokenEstimationMessage {
 
 export const DEFAULT_BYTES_PER_TOKEN = 4;
 
-// branding-scan: allow Anthropic model family identifier
 const ANTHROPIC_MODEL_RE = /\bclaude[-_]/i;
 
 export const MODEL_TOKENIZER_CONFIGS: readonly ModelTokenizerConfig[] = [
@@ -112,6 +114,46 @@ export const MODEL_TOKENIZER_CONFIGS: readonly ModelTokenizerConfig[] = [
     providerNames: ["ollama", "groq", "lmstudio"],
     modelMatchers: [/llama/i, /mixtral/i, /mistral/i, /qwen/i],
     bytesPerToken: 3.8,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
+    modelFamily: "meta",
+    providerNames: ["meta"],
+    modelMatchers: [/muse-spark/i],
+    bytesPerToken: DEFAULT_BYTES_PER_TOKEN,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
+    modelFamily: "qwen",
+    providerNames: ["qwen", "qwen-token-plan"],
+    modelMatchers: [/qwen/i],
+    bytesPerToken: 3.8,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
+    modelFamily: "cerebras",
+    providerNames: ["cerebras"],
+    modelMatchers: [/gpt-oss/i, /qwen-3\.8/i, /gemma-4/i],
+    bytesPerToken: 3.8,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
+    modelFamily: "zai",
+    providerNames: ["zai", "zai-coding-plan"],
+    modelMatchers: [/glm-5\.3/i],
+    bytesPerToken: 3.5,
+    supportsJson: true,
+    supportsCode: true,
+  },
+  {
+    modelFamily: "kimi",
+    providerNames: ["kimi"],
+    modelMatchers: [/kimi-k(?:3|2\.)/i],
+    bytesPerToken: 3.5,
     supportsJson: true,
     supportsCode: true,
   },
@@ -373,7 +415,12 @@ function roughTokenCountEstimationForBlock(
       );
     case "image":
     case "image_url":
-    case "input_image":
+    case "input_image": {
+      const dataUrl = imageDataUrlFromBlock(block);
+      return dataUrl === undefined
+        ? TOKEN_ACCOUNTING_MAX_INLINE_IMAGE_TOKENS
+        : estimateInlineImageTokenUnits(dataUrl);
+    }
     case "document":
       return roughTokenCountEstimationForProvider(
         safeJsonStringify(block),
@@ -407,6 +454,33 @@ function roughTokenCountEstimationForBlock(
         hint,
       );
   }
+}
+
+function imageDataUrlFromBlock(
+  block: Record<string, unknown>,
+): string | undefined {
+  if (typeof block.image_url === "string") {
+    return block.image_url.startsWith("data:image/")
+      ? block.image_url
+      : undefined;
+  }
+  if (isRecord(block.image_url) && typeof block.image_url.url === "string") {
+    return block.image_url.url.startsWith("data:image/")
+      ? block.image_url.url
+      : undefined;
+  }
+  if (
+    isRecord(block.source) &&
+    block.source.type === "base64" &&
+    typeof block.source.data === "string"
+  ) {
+    const mediaType =
+      typeof block.source.media_type === "string"
+        ? block.source.media_type
+        : "image/unknown";
+    return `data:${mediaType};base64,${block.source.data}`;
+  }
+  return undefined;
 }
 
 function matchesModel(config: ModelTokenizerConfig, model: string): boolean {

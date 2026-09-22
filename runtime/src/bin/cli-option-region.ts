@@ -10,10 +10,13 @@ export const STARTUP_VALUE_OPTIONS = Object.freeze([
   "--model",
   "--profile",
   "--config",
+  "--add-dir",
   "--permission-mode",
   "--output-format",
   "--input-format",
   "--image",
+  "--deadline",
+  "--deadline-reserve",
 ] as const);
 
 export const CLI_VALUE_OPTIONS = Object.freeze([

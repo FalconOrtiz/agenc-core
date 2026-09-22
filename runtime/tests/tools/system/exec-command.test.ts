@@ -8,6 +8,7 @@ import {
   createExecCommandTool as createUnboundExecCommandTool,
   runtimeSandboxForExec,
 } from "./exec-command.js";
+import { RESIDUAL_PROCESSES_NOTE } from "./exec-result-format.js";
 import { bindExplicitDangerBoundary } from "../../helpers/explicit-danger-boundary.js";
 import { createWriteStdinTool as createUnboundWriteStdinTool } from "./write-stdin.js";
 import { UnifiedExecProcessManager } from "../../unified-exec/process-manager.js";
@@ -91,6 +92,215 @@ describe("exec_command tool", () => {
   afterEach(async () => {
     if (root) await rm(root, { recursive: true, force: true });
     root = "";
+  });
+
+  /**
+   * Args with a runtime context attached the way the dispatcher does. The
+   * defaults describe the full bypass (approvals never, no sandbox); the
+   * options narrow it: a sandboxed mode with a platform sandbox declared on
+   * the turn, a permission mode published by the session, directories the
+   * user added, an unresolved approval.
+   */
+  function contextArgs(
+    overrides: Record<string, unknown>,
+    options: {
+      readonly approvalPolicy?: string;
+      readonly sandboxMode?: string;
+      readonly mode?: string;
+      readonly added?: readonly string[];
+      readonly approvalResolved?: boolean;
+      readonly platformSandbox?: boolean;
+    } = {},
+  ): Record<string, unknown> {
+    const args: Record<string, unknown> = { ...overrides };
+    const sandboxMode = options.sandboxMode ?? "danger_full_access";
+    attachToolRuntimeContext(args, {
+      callId: "call-context",
+      toolName: "exec_command",
+      runtimeKind: "function",
+      classification: "exclusive",
+      supportsParallelToolCalls: false,
+      source: { type: "model" },
+      submittedAtMs: 0,
+      approvalPolicy: options.approvalPolicy ?? "never",
+      requestedSandboxMode: sandboxMode,
+      sandboxMode,
+      approvalResolved: options.approvalResolved ?? true,
+      rawArgs: "{}",
+      invocation: {
+        session: {
+          ...(options.mode !== undefined
+            ? {
+                permissionModeRegistry: {
+                  current: () => ({
+                    mode: options.mode,
+                    additionalWorkingDirectories: new Map(
+                      (options.added ?? []).map((path) => [path, { path, source: "cliArg" }]),
+                    ),
+                  }),
+                },
+              }
+            : {}),
+          services: { runtimeOptions: { sessionTempRoot: root } },
+        },
+        payload: { kind: "function", arguments: "{}" },
+        turn: {
+          subId: "turn-context",
+          cwd: root,
+          ...(options.platformSandbox === true ? { agencLinuxSandboxExe: "/bin/true" } : {}),
+        },
+      },
+    } as never);
+    return args;
+  }
+
+  /** The tool over a mock manager; the mocks it did not receive answer an empty success. */
+  function mockManagerTool(
+    mocks: {
+      readonly execCommand?: UnifiedExecProcessManagerLike["execCommand"];
+      readonly startDetachedProcess?: UnifiedExecProcessManagerLike["startDetachedProcess"];
+    } = {},
+  ) {
+    const execCommand =
+      mocks.execCommand ??
+      vi.fn<UnifiedExecProcessManagerLike["execCommand"]>(async () => completedExecOutput("ran"));
+    const manager: UnifiedExecProcessManagerLike = {
+      maxTimeoutMs: 30_000,
+      execCommand,
+      ...(mocks.startDetachedProcess !== undefined
+        ? { startDetachedProcess: mocks.startDetachedProcess }
+        : {}),
+      writeStdin: vi.fn<UnifiedExecProcessManagerLike["writeStdin"]>(
+        async () => completedExecOutput(""),
+      ),
+      closeAll: vi.fn<UnifiedExecProcessManagerLike["closeAll"]>(async () => {}),
+    };
+    return {
+      execCommand,
+      tool: createExecCommandTool({ cwd: root, allowedPaths: [root], unifiedExecManager: manager }),
+    };
+  }
+
+  // Live incident (session conv-mtjdmlfc, 2026-09-02): 21 `npm start` calls
+  // over 412 s, each denied by the sandbox, each answered only by the child's
+  // own errno text and an escalation request the parser silently discarded.
+  describe("a sandbox denial answers the model definitively", () => {
+    function sandboxedArgs(
+      overrides: Record<string, unknown>,
+      approvalPolicy = "never",
+    ): Record<string, unknown> {
+      return contextArgs(overrides, {
+        approvalPolicy,
+        sandboxMode: "read_only",
+        platformSandbox: true,
+      });
+    }
+
+    function toolWith(output: ExecCommandToolOutput) {
+      return mockManagerTool({
+        execCommand: vi.fn<UnifiedExecProcessManagerLike["execCommand"]>(async () => output),
+      });
+    }
+
+    const BIND_DENIED = failedExecOutput(
+      "Error: listen EPERM: operation not permitted 0.0.0.0:8080",
+      1,
+    );
+
+    test("a removed alias names the field that replaced it, so the model can correct the call", async () => {
+      const { tool } = toolWith(completedExecOutput(""));
+      const byCwd = await tool.execute(sandboxedArgs({ cmd: "npm test", cwd: root }));
+      expect(byCwd.isError).toBe(true);
+      expect(String(byCwd.content)).toContain("unknown field `cwd`");
+      expect(String(byCwd.content)).toContain("`workdir`");
+      const byCommand = await tool.execute(sandboxedArgs({ command: "npm test" }));
+      expect(byCommand.isError).toBe(true);
+      expect(String(byCommand.content)).toContain("unknown field `command`");
+      expect(String(byCommand.content)).toContain("`cmd`");
+    });
+
+    test("a denied bind says the sandbox did it and that retrying is pointless", async () => {
+      const { tool } = toolWith(BIND_DENIED);
+      const result = await tool.execute(sandboxedArgs({ cmd: "npm start", workdir: root }));
+
+      expect(result.isError).toBe(true);
+      // The child's own text is still there, unchanged.
+      expect(result.content).toContain("listen EPERM");
+      // And now so is the verdict.
+      expect(result.content).toContain("[sandbox]");
+      expect(result.content).toContain("Do not run this command again");
+      expect(result.content).toContain("give them the exact command to run in their own terminal");
+    });
+
+    test("under a policy with a human it asks for one escalated retry instead", async () => {
+      const { tool } = toolWith(BIND_DENIED);
+      const result = await tool.execute(
+        sandboxedArgs({ cmd: "npm start", workdir: root }, "on_request"),
+      );
+      expect(result.content).toContain("require_escalated");
+      expect(result.content).not.toContain("Do not run this command again");
+    });
+
+    test("an ordinary failure is left alone", async () => {
+      const { tool } = toolWith(failedExecOutput("npm ERR! missing script: start", 1));
+      const result = await tool.execute(sandboxedArgs({ cmd: "npm start", workdir: root }));
+      expect(result.content).not.toContain("[sandbox]");
+    });
+
+    test("an unreadable escalation request is refused instead of dropped", async () => {
+      // The schema used to invite `{type:"object"}` here and the parser threw
+      // every object away, so the model could not tell a refused request from
+      // an unread one.
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "npm start",
+          workdir: root,
+          sandbox_permissions: { network: "full" },
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content as string).error).toContain(
+        'sandbox_permissions must be one of "default", "require_escalated" or "with_additional_permissions"',
+      );
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_no_effect",
+      });
+      // Refused means not run.
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("a malformed additional_permissions is refused too", async () => {
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "npm start",
+          workdir: root,
+          sandbox_permissions: "with_additional_permissions",
+          additional_permissions: { network: "full" },
+        }),
+      );
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content as string).error).toContain(
+        "additional_permissions has an unsupported shape",
+      );
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("the documented escalation values still run", async () => {
+      const { execCommand, tool } = toolWith(completedExecOutput("ran"));
+      const result = await tool.execute(
+        sandboxedArgs({
+          cmd: "echo hi",
+          workdir: root,
+          sandbox_permissions: "require_escalated",
+          justification: "needs the network",
+        }),
+      );
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
   });
 
   test("threads network policy interfaces into runtime sandbox requests", () => {
@@ -408,6 +618,171 @@ describe("exec_command tool", () => {
     expect(writeStdin).not.toHaveBeenCalled();
   });
 
+  describe("workspace deletions", () => {
+    /** The command the live refactor session retried 14 times. */
+    const REFACTOR_CLEANUP =
+      "rm arcade15/game.js && ls -la arcade15 && node --check arcade15/main.js";
+
+    function permissionArgs(
+      cmd: string,
+      permission: {
+        readonly mode: string;
+        readonly approvalResolved?: boolean;
+        readonly approvalPolicy?: "on_request" | "never";
+        readonly sandboxMode?: "danger_full_access" | "workspace_write";
+      },
+    ): Record<string, unknown> {
+      return contextArgs({ cmd, workdir: root }, {
+        approvalPolicy: permission.approvalPolicy ?? "on_request",
+        sandboxMode: permission.sandboxMode ?? "danger_full_access",
+        mode: permission.mode,
+        approvalResolved: permission.approvalResolved ?? false,
+      });
+    }
+
+    const deletionTool = () => mockManagerTool();
+
+    test("runs rm on a workspace file under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(execCommand.mock.calls[0]?.[0]).toMatchObject({ cmd: REFACTOR_CLEANUP });
+    });
+
+    // Never touched by the refusal cases: the policy refuses before anything
+    // spawns. Chosen outside the workspace, the temp directory and the
+    // hermetic home the test harness points HOME and AGENC_HOME at (the home
+    // is a protected path with its own message).
+    const outside = "/srv/agenc-outside-workspace/outside.txt";
+
+    test("refuses rm outside the workspace under bypassPermissions while a sandbox is on", async () => {
+      // `--bypass-approvals`: prompts off, the OS sandbox stays the boundary,
+      // so the policy still keeps shell removals to the workspace.
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(`rm ${outside}`, {
+          mode: "bypassPermissions",
+          sandboxMode: "workspace_write",
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_delete_disallowed");
+      expect(result.content).toContain("only inside the workspace");
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_no_effect",
+        evidenceRef: "tool:system.exec-command:workspace-write-policy",
+      });
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("runs rm outside the workspace under the full bypass", async () => {
+      // `--dangerously-bypass-approvals-and-sandbox`: bypassPermissions and
+      // danger-full-access together. Nothing but this policy would gate the
+      // removal, and the user chose that.
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(`rm ${outside}`, { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+
+    test("runs a command with an unresolvable write target under the full bypass", async () => {
+      // 51 of 459 shell calls in one Terminal-Bench task were refused as
+      // indeterminate, most for an `echo "$(...)"` beside a harmless write.
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs('for f in refs/heads/*; do echo "$f: $(cat $f)"; done > /tmp/agenc-refs.txt', {
+          mode: "bypassPermissions",
+          approvalPolicy: "never",
+        }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+
+    test("the full bypass keeps the protected paths refused", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs("rm -rf .git", { mode: "bypassPermissions", approvalPolicy: "never" }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("protected paths");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("refuses rm of a protected path under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs("rm .git/config", { mode: "bypassPermissions" }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_delete_disallowed");
+      expect(result.content).toContain("protected paths");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("still refuses a redirect write into a source file under bypassPermissions", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs("cat > src/x.js <<'EOF'\nexport const x = 1;\nEOF", {
+          mode: "bypassPermissions",
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("shell_workspace_file_write_disallowed");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("a deletion under a prompting mode runs only after the approval path", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const unapproved = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default" }),
+      );
+      expect(unapproved.isError).toBe(true);
+      expect(unapproved.content).toContain(
+        "shell_workspace_file_delete_requires_approval",
+      );
+      expect(unapproved.content).toContain("ask the user to approve this exact command");
+      expect(execCommand).not.toHaveBeenCalled();
+
+      const approved = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default", approvalResolved: true }),
+      );
+      expect(approved.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+
+    test("a session that never asks may delete without a resolver decision", async () => {
+      const { tool, execCommand } = deletionTool();
+
+      const result = await tool.execute(
+        permissionArgs(REFACTOR_CLEANUP, { mode: "default", approvalPolicy: "never" }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+  });
+
   test(
     "returns a session id for live PTY commands and write_stdin can resume it",
     async () => {
@@ -452,4 +827,255 @@ describe("exec_command tool", () => {
       }
     },
   );
+
+  describe("detach", () => {
+    const fullAccessArgs = (overrides: Record<string, unknown>) => contextArgs(overrides);
+    const sandboxedArgs = (overrides: Record<string, unknown>) =>
+      contextArgs(overrides, { sandboxMode: "read_only", platformSandbox: true });
+
+    function detachedOutput(overrides: Partial<ExecCommandToolOutput>): ExecCommandToolOutput {
+      return {
+        ...completedExecOutput("starting"),
+        exitCode: null,
+        exit_code: null,
+        detached: true,
+        log_path: "/srv/agenc-session/detached/service.log",
+        ...overrides,
+      };
+    }
+
+    const toolWithManager = (
+      startDetachedProcess?: UnifiedExecProcessManagerLike["startDetachedProcess"],
+    ) =>
+      mockManagerTool(
+        startDetachedProcess !== undefined ? { startDetachedProcess } : {},
+      );
+
+    test("starts a detached service and reports its pid and log", async () => {
+      const startDetachedProcess = vi.fn<
+        NonNullable<UnifiedExecProcessManagerLike["startDetachedProcess"]>
+      >(async () => detachedOutput({ pid: 4242 }));
+      const { tool, execCommand } = toolWithManager(startDetachedProcess);
+
+      const result = await tool.execute(
+        fullAccessArgs({ cmd: "nginx", detach: true, yield_time_ms: 500 }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(result.content).toContain("starting");
+      expect(result.content).toContain("running=true pid=4242");
+      expect(result.content).toContain("detached=true");
+      expect(result.content).toContain("log=/srv/agenc-session/detached/service.log");
+      expect(startDetachedProcess).toHaveBeenCalledWith(
+        expect.objectContaining({ cmd: "nginx", yield_time_ms: 500 }),
+      );
+      expect(execCommand).not.toHaveBeenCalled();
+      expect(result.metadata).toMatchObject({ detached: true, pid: 4242 });
+      expect(result.codeModeResult).toMatchObject({ running: true, detached: true, pid: 4242 });
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_committed",
+        evidenceRef: "tool:system.exec-command:process-detached",
+      });
+    });
+
+    test("a detached service that dies inside the window is an error with its exit code", async () => {
+      const { tool } = toolWithManager(async () =>
+        detachedOutput({ exitCode: 1, exit_code: 1, output: "bind() failed", stdout: "bind() failed" }),
+      );
+
+      const result = await tool.execute(fullAccessArgs({ cmd: "nginx", detach: true }));
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("bind() failed");
+      expect(result.content).toContain("exit_code=1");
+      expect(result.content).toContain("detached=true");
+    });
+
+    test.skipIf(process.platform === "win32")("reports a detached process killed by a signal as an error", async () => {
+      const manager = new UnifiedExecProcessManager({
+        cwd: root,
+        sessionTempRoot: root,
+        shellPath: "/bin/sh",
+      });
+      const tool = createExecCommandTool({
+        cwd: root,
+        allowedPaths: [root],
+        unifiedExecManager: manager,
+      });
+
+      try {
+        const result = await tool.execute(
+          fullAccessArgs({ cmd: "kill -TERM $$", detach: true, yield_time_ms: 2_000 }),
+        );
+
+        expect(result.content).toContain("signal_terminated=true");
+        expect(result.content).not.toContain("running=true");
+        expect(result.isError).toBe(true);
+        expect(result.codeModeResult).toMatchObject({
+          detached: true,
+          signal_terminated: true,
+        });
+        expect(result.metadata?.pid).toBeUndefined();
+        expect(result.effectDisposition).toMatchObject({
+          disposition: "confirmed_committed",
+          evidenceRef: "tool:system.exec-command:process-exit",
+        });
+      } finally {
+        await manager.closeAll("test_cleanup");
+      }
+    });
+
+    test("refuses detach under a sandbox and names the flag and the alternative", async () => {
+      const startDetachedProcess = vi.fn<
+        NonNullable<UnifiedExecProcessManagerLike["startDetachedProcess"]>
+      >(async () => detachedOutput({ pid: 1 }));
+      const { tool, execCommand } = toolWithManager(startDetachedProcess);
+
+      const result = await tool.execute(
+        sandboxedArgs({ cmd: "python3 -m http.server 8080", detach: true, workdir: root }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("danger-full-access");
+      expect(result.content).toContain("--dangerously-bypass-approvals-and-sandbox");
+      expect(result.content).toContain("yield_time_ms");
+      expect(result.metadata).toMatchObject({ kind: "exec_detach_unavailable", recoverable: true });
+      expect(result.effectDisposition).toMatchObject({
+        disposition: "confirmed_no_effect",
+        evidenceRef: "tool:system.exec-command:detach-unavailable",
+      });
+      expect(startDetachedProcess).not.toHaveBeenCalled();
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("refuses detach when the exec manager cannot detach", async () => {
+      const { tool, execCommand } = toolWithManager();
+
+      const result = await tool.execute(fullAccessArgs({ cmd: "nginx", detach: true }));
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("not supported by this exec manager");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("refuses detach together with tty", async () => {
+      const { tool, execCommand } = toolWithManager(async () => detachedOutput({ pid: 1 }));
+
+      const result = await tool.execute(
+        fullAccessArgs({ cmd: "nginx", detach: true, tty: true }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("detach cannot be combined with tty");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("the residue note follows the footer when leftover processes were stopped", async () => {
+      // Before: `nginx` returned exit 0, the daemon was gone, and the model
+      // had no way to learn why. Now the result says so and points at detach.
+      const { tool: noteTool } = mockManagerTool({
+        execCommand: vi.fn<UnifiedExecProcessManagerLike["execCommand"]>(async () => ({
+          ...completedExecOutput("nginx started"),
+          residual_processes_terminated: true,
+        })),
+      });
+
+      const result = await noteTool.execute(fullAccessArgs({ cmd: "nginx" }));
+
+      expect(result.isError).toBeUndefined();
+      expect(result.content).toContain("nginx started");
+      expect(result.content).toContain("[exec exit_code=0");
+      expect(result.content).toContain(RESIDUAL_PROCESSES_NOTE);
+      expect(result.metadata).toMatchObject({ residualProcessesTerminated: true });
+      expect(result.codeModeResult).toMatchObject({ residual_processes_terminated: true });
+    });
+  });
+
+  describe("workdir", () => {
+    let outsideDir = "";
+
+    beforeEach(async () => {
+      outsideDir = await mkdtemp(join(tmpdir(), "agenc-exec-outside-"));
+    });
+
+    afterEach(async () => {
+      if (outsideDir) await rm(outsideDir, { recursive: true, force: true });
+      outsideDir = "";
+    });
+
+    function workdirArgs(
+      workdir: string,
+      permission: {
+        readonly mode: string;
+        readonly approvalPolicy: "on_request" | "never";
+        readonly sandboxMode: "danger_full_access" | "workspace_write";
+        readonly added?: readonly string[];
+      },
+    ): Record<string, unknown> {
+      return contextArgs({ cmd: "ls", workdir }, {
+        approvalPolicy: permission.approvalPolicy,
+        sandboxMode: permission.sandboxMode,
+        mode: permission.mode,
+        added: permission.added,
+        approvalResolved: false,
+      });
+    }
+
+    const workdirTool = () => mockManagerTool();
+
+    test("refuses a working directory outside the workspace in a prompting session", async () => {
+      const { tool, execCommand } = workdirTool();
+
+      const result = await tool.execute(
+        workdirArgs(outsideDir, {
+          mode: "default",
+          approvalPolicy: "on_request",
+          sandboxMode: "workspace_write",
+        }),
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("workdir is outside allowed workspace paths");
+      expect(execCommand).not.toHaveBeenCalled();
+    });
+
+    test("accepts a working directory the user added with --add-dir", async () => {
+      // A prompting session (neither approval policy `never` nor
+      // bypassPermissions), so the added directory is what admits the
+      // workdir. danger_full_access keeps the platform sandbox out of the
+      // test: under workspace_write the call would fail on a host without
+      // one (the Linux container) before the workdir mattered.
+      const { tool, execCommand } = workdirTool();
+
+      const result = await tool.execute(
+        workdirArgs(outsideDir, {
+          mode: "default",
+          approvalPolicy: "on_request",
+          sandboxMode: "danger_full_access",
+          added: [outsideDir],
+        }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+      expect(execCommand.mock.calls[0]?.[0]).toMatchObject({ workdir: outsideDir });
+    });
+
+    test("accepts any working directory under the full bypass", async () => {
+      // `workdir: /tmp` was refused in every Terminal-Bench pilot run even
+      // though the command could have started with `cd /tmp`.
+      const { tool, execCommand } = workdirTool();
+
+      const result = await tool.execute(
+        workdirArgs(outsideDir, {
+          mode: "bypassPermissions",
+          approvalPolicy: "on_request",
+          sandboxMode: "danger_full_access",
+        }),
+      );
+
+      expect(result.isError).toBeUndefined();
+      expect(execCommand).toHaveBeenCalledTimes(1);
+    });
+  });
 });

@@ -1,9 +1,12 @@
 import { describe, expect, test } from "vitest";
 
+import { defaultConfig } from "../../src/config/schema.js";
 import {
+  CONSERVATIVE_CONTEXT_WINDOW_TOKENS,
   ModelMetadataResolver,
   ollamaShowUrlFromBaseUrl,
 } from "../../src/llm/model-metadata.js";
+import { StaticModelsManager } from "../../src/llm/models-manager.js";
 import type { AgenCConfig } from "../../src/utils/config.js";
 
 const EMPTY_CONFIG = {} as unknown as AgenCConfig;
@@ -93,6 +96,27 @@ describe("provider metadata identity", () => {
 
     expect(resolved.source).toBe("built_in_heuristic");
     expect(resolved.contextWindow).toBe(500_000);
+  });
+
+  test.each([
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+    "kimi-k2.6",
+  ])("reserves 32768 output tokens for %s without cataloguing an upstream max", (model) => {
+    const resolved = new ModelMetadataResolver({ env: {} }).resolveSync({
+      provider: "kimi",
+      model,
+      config: EMPTY_CONFIG,
+    });
+
+    expect(resolved).toMatchObject({
+      contextWindow: 262_144,
+      maxOutputTokens: 32_768,
+      // Operational harness safety ceiling, not Moonshot model metadata.
+      maxOutputTokensUpperLimit: 64_000,
+      source: "built_in_heuristic",
+      usedFallbackModelMetadata: false,
+    });
   });
 });
 
@@ -327,5 +351,82 @@ describe("local providers resolve the real context window", () => {
       });
       expect(resolved.source, String(value)).not.toBe("live_endpoint");
     }
+  });
+});
+
+const OLLAMA_SHOW_URL = "http://127.0.0.1:11434/api/show";
+const OLLAMA_ENV = { OLLAMA_BASE_URL: "http://127.0.0.1:11434" } as const;
+
+function ollamaShowScriptFetch(
+  script: (showCall: number) => Promise<Response> | Response,
+): { readonly impl: typeof fetch; readonly showCalls: () => number } {
+  let showCalls = 0;
+  const impl = (async (input: RequestInfo | URL) => {
+    if (String(input) !== OLLAMA_SHOW_URL) {
+      return new Response("not found", { status: 404 });
+    }
+    showCalls += 1;
+    return await script(showCalls);
+  }) as unknown as typeof fetch;
+  return { impl, showCalls: () => showCalls };
+}
+
+describe("transient metadata failures do not stick", () => {
+  test("a 503 then a valid 32768 window refetches instead of caching undefined", async () => {
+    const { impl, showCalls } = ollamaShowScriptFetch((showCall) => {
+      if (showCall === 1) return new Response("unavailable", { status: 503 });
+      return new Response(JSON.stringify(OLLAMA_SHOW), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const manager = new StaticModelsManager({
+      config: defaultConfig(),
+      fallbackProvider: "ollama",
+      metadata: { fetchImpl: impl, env: OLLAMA_ENV },
+    });
+
+    const first = await manager.getModelInfo("qwen2.5-coder:1.5b");
+    expect(first.usedFallbackModelMetadata).toBe(true);
+    expect(first.contextWindow).toBe(CONSERVATIVE_CONTEXT_WINDOW_TOKENS);
+    expect(showCalls()).toBe(1);
+
+    const second = await manager.getModelInfo("qwen2.5-coder:1.5b");
+    expect(second.contextWindow).toBe(32768);
+    expect(second.usedFallbackModelMetadata).toBe(false);
+    expect(showCalls()).toBe(2);
+  });
+
+  test("concurrent ollama lookups share one in-flight /api/show request", async () => {
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const { impl, showCalls } = ollamaShowScriptFetch(async (showCall) => {
+      if (showCall === 1) await holdFirst;
+      return new Response(JSON.stringify(OLLAMA_SHOW), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const resolver = new ModelMetadataResolver({
+      fetchImpl: impl,
+      env: OLLAMA_ENV,
+    });
+    const lookup = {
+      provider: "ollama",
+      model: "qwen2.5-coder:1.5b",
+      config: EMPTY_CONFIG,
+    };
+
+    const pending = [resolver.resolve(lookup), resolver.resolve(lookup)];
+    expect(showCalls()).toBe(1);
+    releaseFirst();
+    const [left, right] = await Promise.all(pending);
+    expect(left.source).toBe("live_endpoint");
+    expect(right.source).toBe("live_endpoint");
+    expect(left.contextWindow).toBe(32768);
+    expect(right.contextWindow).toBe(32768);
+    expect(showCalls()).toBe(1);
   });
 });

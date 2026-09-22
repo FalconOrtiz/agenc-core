@@ -67,6 +67,10 @@ import {
   type WorkflowSessionSeams,
   type WorkflowSessionSeamsOptions,
 } from "./session-adapters.js";
+import { runWithBootstrapSessionScope } from "../../session/current-session.js";
+import { createPlatformProtectionVerifier } from "../../eval-contract/platform-protection.js";
+import { getSelectedProviderModel } from "../../utils/model/providers.js";
+import type { LiveApprovalBroker } from "../live-approval-broker.js";
 
 const WORKFLOW_TASK_ID = "verified-change";
 const WORKFLOW_SYSTEM_ID = "agenc.workflow.m5";
@@ -126,7 +130,13 @@ export function createDaemonWorkflowEvidenceLedgerFactory(options: {
   return async (spec: WorkflowSpec): Promise<WorkflowEvidenceLedger> => {
     const root = path.join(evidenceRoot, sanitizeIdentifierPart(spec.runId));
     await mkdir(root, { recursive: true, mode: 0o700 });
-    const access = { root };
+    // macOS and Windows need an ACL check the ledger cannot do itself; without
+    // one the ledger refuses and every goal run fails at intake on a Mac.
+    const platformProtection = createPlatformProtectionVerifier();
+    const access = {
+      root,
+      ...(platformProtection !== undefined ? { platformProtection } : {}),
+    };
     const context = {
       runId: spec.runId,
       contractDigest: computeSpecDigest(spec),
@@ -298,15 +308,43 @@ export interface DaemonWorkflowWiring {
    * the daemon's primary one).
    */
   resumeOpenWorkflows(): Promise<readonly string[]>;
-  close(): void;
+  close(): Promise<void>;
+}
+
+/**
+ * The reviewer model for a goal whose caller named none: the provider model
+ * selected in the current scope when one is bound, else the daemon's
+ * configured model. The selection accessor throws outside a startup or
+ * session scope, which is where the daemon's RPC handlers run (soak F62).
+ */
+export function resolveDaemonDefaultReviewerModel(
+  selected: () => string,
+  configured: () => string | undefined,
+): string | undefined {
+  try {
+    const model = selected().trim();
+    if (model.length > 0) return model;
+  } catch {
+    // No provider scope is bound here; the configured model decides below.
+  }
+  const fallback = configured()?.trim();
+  return fallback !== undefined && fallback.length > 0 ? fallback : undefined;
 }
 
 export function createDaemonWorkflowController(options: {
+  readonly approvalBroker?: LiveApprovalBroker;
   readonly agencHome: string;
   readonly primaryCwd: string;
   readonly kernel: ExecutionAdmissionKernel;
   readonly warn: (message: string) => void;
   readonly env: NodeJS.ProcessEnv;
+  /**
+   * The daemon's active config. A goal started without a model by a client
+   * that names none (the SDK, a script) needs a reviewer model; the selected
+   * provider model exists only inside a session's startup scope, which the
+   * daemon's RPC handlers never bind, so the configured pair is the fallback.
+   */
+  readonly config?: () => { readonly model?: string } | undefined;
   /** Executable and entrypoint coordinates for child-session bootstraps. */
   readonly argv: readonly string[];
   readonly authBackend?: AuthBackend;
@@ -410,6 +448,7 @@ export function createDaemonWorkflowController(options: {
   const seams =
     options.sessionSeams ??
     createWorkflowSessionSeams({
+      approvalBroker: options.approvalBroker,
       agencHome: options.agencHome,
       env: options.env,
       argv: options.argv,
@@ -456,6 +495,11 @@ export function createDaemonWorkflowController(options: {
     commands: seams.commands,
     spawner: seams.spawner,
     reviewer: seams.reviewer,
+    defaultReviewerModel: () =>
+      resolveDaemonDefaultReviewerModel(
+        getSelectedProviderModel,
+        () => options.config?.()?.model,
+      ),
     warn: options.warn,
   });
   return {
@@ -468,21 +512,27 @@ export function createDaemonWorkflowController(options: {
       for (const paths of candidatePaths()) {
         activeResumePaths = paths;
         try {
-          resumed.push(...(await controller.resumeOpenWorkflows()));
+          // Same scope as run.start: resumed runs spawn sessions from daemon
+          // context, where the ambient current session is undefined.
+          resumed.push(
+            ...(await runWithBootstrapSessionScope(() =>
+              controller.resumeOpenWorkflows(),
+            )),
+          );
         } finally {
           activeResumePaths = undefined;
         }
       }
       return resumed;
     },
-    close: () => {
-      void seams.close().catch((error) => {
-        options.warn(
-          `workflow session seams close failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
+    close: async () => {
+      const runIds = controller.activeRunIds();
+      for (const runId of runIds) {
+        options.approvalBroker?.abort(runId);
+        options.kernel.cancelRun(runId, "daemon_shutdown");
+      }
+      await Promise.all(runIds.map((runId) => controller.awaitRun(runId)));
+      await seams.close();
       for (const entry of opened.values()) {
         entry.driver.close();
       }

@@ -7,8 +7,13 @@ import {
   isAutoCompactEnabled,
 } from "./autoCompact.js";
 import type { RuntimeMessage } from "./types.js";
-import { createCompactionTransactionHarness } from "../../helpers/compaction-transaction-harness.js";
+import type { LLMMessage } from "../../../src/llm/types.js";
+import {
+  createCompactionTransactionHarness,
+  createProvider,
+} from "../../helpers/compaction-transaction-harness.js";
 import { runWithStartupProviderSelection } from "../../utils/model/providers.js";
+import { MAX_TOKEN_ACCOUNTING_REQUEST_BYTES } from "../../../src/llm/token-accounting.js";
 
 describe("auto compact", () => {
   const savedEnv = { ...process.env };
@@ -99,6 +104,47 @@ describe("auto compact", () => {
     expect(result.compactionResult?.transaction).toBeDefined();
     harness.close();
   });
+
+  test("compacts a history whose inline images exceed the accounting request cap (#2498)", async () => {
+    process.env.AGENC_AUTOCOMPACT_PCT_OVERRIDE = "1";
+    // 3 MiB each (under the 4 MiB rollout record ceiling); six exceed the cap.
+    const perImage = 3 * 1024 * 1024;
+    expect(6 * perImage).toBeGreaterThan(MAX_TOKEN_ACCOUNTING_REQUEST_BYTES);
+    const screenshot = (index: number): RuntimeMessage => {
+      const content = [
+        { type: "text" as const, text: `screenshot ${index}` },
+        { type: "image_url" as const, image_url: { url: `data:image/png;base64,${"B".repeat(perImage)}` } },
+      ];
+      return { role: "user", type: "user", content, message: { role: "user", content } };
+    };
+    const messages = [
+      screenshot(0),
+      message("x".repeat(10_000)),
+      screenshot(1),
+      screenshot(2),
+      screenshot(3),
+      screenshot(4),
+      screenshot(5),
+      message("recent request"),
+    ];
+    const harness = createCompactionTransactionHarness(messages, {
+      compactionMode: "automatic",
+    });
+    installNoopCompactionHooks(harness.session);
+    const warnings: string[] = [];
+    harness.session.eventLog.subscribe((event) => {
+      if (event.msg.type === "warning") warnings.push(JSON.stringify(event.msg.payload));
+    });
+
+    const result = await runWithCapturedEnvironment(() =>
+      autoCompactIfNeeded(messages, harness.context)
+    );
+
+    expect(warnings.filter((warning) => warning.includes("inline image sources"))).toEqual([]);
+    expect(result, warnings.join("\n")).toMatchObject({ wasCompacted: true });
+    expect(result.compactionResult?.transaction).toBeDefined();
+    harness.close();
+  }, 60_000);
 
   test("force still refuses a candidate that cannot prove shrink", async () => {
     const messages = [message("small current turn")];
@@ -223,6 +269,63 @@ describe("auto compact", () => {
     harness.close();
   });
 
+  describe("a transient summarizer failure", () => {
+    // Desktop soak, 2026-09-06: a session over the context limit lost its one
+    // way forward when the compaction call died on "Connection error." and
+    // the attempt was filed as a failure instead of retried.
+    function compactionWithChat(chat: (messages: LLMMessage[]) => Promise<unknown>) {
+      const messages = [message("x".repeat(10_000)), message("recent request")];
+      const harness = createCompactionTransactionHarness(messages, {
+        compactionMode: "automatic",
+        chat: chat as never,
+      });
+      process.env.AGENC_AUTOCOMPACT_PCT_OVERRIDE = "1";
+      installNoopCompactionHooks(harness.session);
+      return {
+        harness,
+        run: () => runWithCapturedEnvironment(() => autoCompactIfNeeded(messages, harness.context)),
+      };
+    }
+
+    test("is retried once and the compaction goes through", async () => {
+      const fallback = createProvider(undefined, false);
+      const chat = vi.fn(async (messages: LLMMessage[]) => {
+        if (chat.mock.calls.length === 1) throw new Error("grok error: Connection error.");
+        return fallback.chat(messages);
+      });
+      const { harness, run } = compactionWithChat(chat);
+      const result = await run();
+      expect(result.wasCompacted).toBe(true);
+      expect(result.consecutiveFailures).toBe(0);
+      expect(chat).toHaveBeenCalledTimes(2);
+      harness.close();
+    });
+
+    test("that repeats is reported after the one retry", async () => {
+      const chat = vi.fn(async () => {
+        throw new Error("grok error: Connection error.");
+      });
+      const { harness, run } = compactionWithChat(chat);
+      const result = await run();
+      expect(result.wasCompacted).toBe(false);
+      expect(result.consecutiveFailures).toBe(1);
+      expect(result.skippedReason).toContain("Connection error");
+      expect(chat).toHaveBeenCalledTimes(2);
+      harness.close();
+    });
+
+    test("does not cover a failure that is not transient", async () => {
+      const chat = vi.fn(async () => {
+        throw new Error("prompt is too long for this model");
+      });
+      const { harness, run } = compactionWithChat(chat);
+      const result = await run();
+      expect(result.wasCompacted).toBe(false);
+      expect(chat).toHaveBeenCalledTimes(1);
+      harness.close();
+    });
+  });
+
   test("respects AgenC disable switches", async () => {
     process.env.AGENC_DISABLE_AUTO_COMPACT = "1";
     await runWithCapturedEnvironment(async () => {
@@ -230,7 +333,12 @@ describe("auto compact", () => {
       await expect(autoCompactIfNeeded(
         [message("x".repeat(10_000))],
         { options: { contextWindowTokens: 100 } },
-      )).resolves.toEqual({ wasCompacted: false });
+      )).resolves.toEqual({
+        wasCompacted: false,
+        // The switch is now named in the answer, so a disabled subsystem
+        // is distinguishable from an attempt that ran and declined.
+        skippedReason: "auto-compaction is disabled",
+      });
     });
   });
 });

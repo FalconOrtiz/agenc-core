@@ -21,11 +21,9 @@ import {
 import type {
   AgentCreateResult,
   AgentSummary,
-  EditorInteractionParams,
   JsonObject,
   MessageContentBlock,
 } from "../app-server/protocol/index.js";
-import type { SessionEditorInteraction } from "../session/autonomous-mode.js";
 import { sessionConfigurationFromAgenCConfig } from "../session/configuration.js";
 import {
   resolveAgentRuntimeOptions,
@@ -63,6 +61,9 @@ import {
   RUN_RUNTIME_SERVICE_TIERS,
   type RunRuntimeSettingsSnapshot,
 } from "../contracts/run-contracts.js";
+import {
+  validateAndDedupeAdditionalWorkingDirectoryInputs,
+} from "../contracts/additional-working-directories.js";
 import { canonicalizeBypassPermissionsCwd } from "../permissions/bypass-consent-state.js";
 import type { SessionConfiguration } from "../session/turn-context.js";
 
@@ -85,10 +86,10 @@ export interface AgenCDaemonPromptAgentOptions {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly initialContent?: string | readonly MessageContentBlock[];
   readonly deferInitialTurn?: boolean;
   readonly initialDisplayUserMessage?: string | null;
-  readonly initialEditorInteraction?: SessionEditorInteraction;
   readonly metadata?: JsonObject;
   /** See `AgentCreateParams.permissionMode`. Forwarded verbatim. */
   readonly permissionMode?:
@@ -124,6 +125,7 @@ export interface ResumeAgenCDaemonPromptAgentOptions {
   readonly provider?: string;
   readonly profile?: string;
   readonly configPath?: string;
+  readonly addDirs?: readonly string[];
   readonly permissionMode?:
     | "default"
     | "plan"
@@ -131,6 +133,18 @@ export interface ResumeAgenCDaemonPromptAgentOptions {
     | "bypassPermissions"
     | "dontAsk"
     | "auto";
+}
+
+function additionalDirectoryCreateParams(
+  addDirs: readonly string[] | undefined,
+): { readonly addDirs?: readonly string[] } {
+  if (addDirs === undefined) return {};
+  return {
+    addDirs: validateAndDedupeAdditionalWorkingDirectoryInputs(
+      addDirs,
+      "daemon client addDirs",
+    ),
+  };
 }
 
 export async function startAgenCDaemonPromptAgent(
@@ -158,6 +172,7 @@ export async function startAgenCDaemonPromptAgent(
     ...(options.configPath !== undefined
       ? { configPath: resolvePath(cwd, options.configPath) }
       : {}),
+    ...additionalDirectoryCreateParams(options.addDirs),
     ...(options.initialContent !== undefined
       ? { initialContent: options.initialContent }
       : {}),
@@ -166,13 +181,6 @@ export async function startAgenCDaemonPromptAgent(
       : {}),
     ...(options.initialDisplayUserMessage !== undefined
       ? { initialDisplayUserMessage: options.initialDisplayUserMessage }
-      : {}),
-    ...(options.initialEditorInteraction !== undefined
-      ? {
-          initialEditorInteraction: editorInteractionParams(
-            options.initialEditorInteraction,
-          ),
-        }
       : {}),
     ...(options.permissionMode !== undefined
       ? { permissionMode: options.permissionMode }
@@ -212,6 +220,7 @@ export async function resumeAgenCDaemonPromptAgent(
     ...(options.configPath !== undefined
       ? { configPath: resolvePath(cwd, options.configPath) }
       : {}),
+    ...additionalDirectoryCreateParams(options.addDirs),
     ...(options.permissionMode !== undefined
       ? { permissionMode: options.permissionMode }
       : {}),
@@ -219,33 +228,6 @@ export async function resumeAgenCDaemonPromptAgent(
   });
 }
 
-function editorInteractionParams(
-  interaction: SessionEditorInteraction,
-): EditorInteractionParams {
-  return {
-    interactionId: interaction.interactionId,
-    kind: interaction.kind,
-    policy: interaction.policy,
-    editorInstanceId: interaction.editorInstanceId,
-    bufferHandle: interaction.bufferHandle,
-    changedtick: interaction.changedtick,
-    contentSha256: interaction.contentSha256,
-    ...(interaction.path !== undefined ? { path: interaction.path } : {}),
-    range: {
-      start: {
-        line: interaction.range.start.line,
-        column: interaction.range.start.column,
-      },
-      end: {
-        line: interaction.range.end.line,
-        column: interaction.range.end.column,
-      },
-    },
-    ...(interaction.selectionMode !== undefined
-      ? { selectionMode: interaction.selectionMode }
-      : {}),
-  };
-}
 
 export async function stopAgenCDaemonPromptAgent(
   options: StopAgenCDaemonPromptAgentOptions,

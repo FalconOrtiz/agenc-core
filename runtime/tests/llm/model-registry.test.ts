@@ -33,7 +33,9 @@ describe("ModelRegistry", () => {
     expect(modelRegistryEntryToModelInfo(entry)).toMatchObject({
       slug: "gpt-5",
       contextWindow: 272_000,
-      supportedReasoningLevels: ["low", "medium", "high", "xhigh"],
+      // gpt-5 predates xhigh; the API answers "Supported values are:
+      // 'minimal', 'low', 'medium', 'high'" (probed 2026-09-11).
+      supportedReasoningLevels: ["minimal", "low", "medium", "high"],
       usedFallbackModelMetadata: false,
     });
   });
@@ -63,16 +65,38 @@ describe("ModelRegistry", () => {
     });
   });
 
+  it("advertises the Fast tier for Anthropic fast-mode models and the rest of the GPT-5 family", () => {
+    const registry = new ModelRegistry({ config: defaultConfig() });
+    const tiersFor = (provider: string, model: string) =>
+      modelRegistryEntryToModelInfo(registry.resolveSync({ provider, model })).serviceTiers ?? [];
+
+    expect(tiersFor("anthropic", "claude-opus-5")).toEqual([
+      {
+        id: "priority",
+        name: "Fast",
+        description: "Up to 2.5x output speed at 2x price (fast mode research preview)",
+      },
+    ]);
+    expect(tiersFor("anthropic", "claude-opus-4-8").map((tier) => tier.id)).toEqual(["priority"]);
+    // Sonnet 5 and Fable have no fast mode; the dial must not offer one.
+    expect(tiersFor("anthropic", "claude-sonnet-5")).toEqual([]);
+    expect(tiersFor("anthropic", "claude-fable-5-1")).toEqual([]);
+    // OpenAI fast mode pricing covers the whole GPT-5.x line, not only gpt-5/5.4/5.5.
+    for (const model of ["gpt-5.2", "gpt-5.3-codex", "gpt-5.4-mini", "gpt-5.6-sol", "gpt-6-astra"]) {
+      expect(tiersFor("openai", model).map((tier) => tier.id)).toEqual(["priority"]);
+    }
+  });
+
   it("preserves hidden model visibility in model info", () => {
     const registry = new ModelRegistry({ config: defaultConfig() });
 
     const entry = registry.resolveSync({
       provider: "openai",
-      model: "codex-auto-review", // branding-scan: allow openai model identifier
+      model: "codex-auto-review",
     });
 
     expect(modelRegistryEntryToModelInfo(entry)).toMatchObject({
-      slug: "codex-auto-review", // branding-scan: allow openai model identifier
+      slug: "codex-auto-review",
       visibility: "hide",
       showInPicker: false,
     });

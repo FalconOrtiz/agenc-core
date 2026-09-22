@@ -20,6 +20,7 @@ import {
   isEnvTruthy,
 } from "../../utils/envUtils.js";
 import { sanitizePathForProjectKey } from "../../services/extractMemories/memory-paths.js";
+import { djb2Hash } from "../../utils/hash.js";
 import { getActiveAgentRuntimeOptions } from "../../session/runtime-options.js";
 
 export type SessionMemoryEnv = Readonly<Record<string, string | undefined>>;
@@ -76,7 +77,11 @@ function projectRootForSession(cwd: string): string {
 
 function safeSessionId(sessionId: string): string {
   const trimmed = sessionId.trim();
-  return sanitizePathForProjectKey(trimmed.length > 0 ? trimmed : "default");
+  const value = trimmed.length > 0 ? trimmed : "default";
+  const sanitized = value.replace(/[^a-zA-Z0-9]/gu, "-");
+  return sanitized.length <= 200
+    ? sanitized
+    : `${sanitized.slice(0, 200)}-${Math.abs(djb2Hash(value)).toString(36)}`;
 }
 
 export function createSessionMemoryState(
@@ -153,13 +158,20 @@ export function resolveSessionMemoryPath(
   return join(resolveSessionMemoryDirectory(options), "summary.md");
 }
 
+/**
+ * Whether the session-notes subagent (`summary.md`) runs. Off by default:
+ * nothing in the runtime reads the notes yet (compaction summarizes the same
+ * material itself), so running a full-history child every ~5k tokens would
+ * only double the background model calls. Opt in with
+ * `AGENC_SESSION_MEMORY_ENABLED=1`; the disable switches still win.
+ */
 export function isSessionMemoryEnabled(
   env: SessionMemoryEnv | undefined = undefined,
 ): boolean {
   const source = effectiveEnv(env);
   if (isEnvTruthy(source.AGENC_DISABLE_SESSION_MEMORY)) return false;
   if (isEnvDefinedFalsy(source.AGENC_SESSION_MEMORY_ENABLED)) return false;
-  if (isEnvTruthy(source.AGENC_SESSION_MEMORY_ENABLED)) return true;
+  if (!isEnvTruthy(source.AGENC_SESSION_MEMORY_ENABLED)) return false;
   if (isBareMode()) return false;
   const runtimeOptions = getActiveAgentRuntimeOptions();
   if (runtimeOptions?.remoteMode && !runtimeOptions.remoteMemoryRoot) {

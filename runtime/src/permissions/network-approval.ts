@@ -1,42 +1,32 @@
 /**
  * Network-approval DECISION layer.
  *
- * T11 Wave 1 Agent D — network approval decision layer.
- *
  * Caches approvals, dedups concurrent requests, and invokes the
  * approval resolver. The ENFORCEMENT counterpart lives at
  * `sandbox/escalation/network-approval.ts` — it converts approval
  * verdicts into sandbox-mode bits at child-process spawn.
  *
- * Both sides derive from codex `core/src/network_policy_decision.rs`; // branding-scan: allow upstream source citation
- * the split mirrors codex's policy/enforcement separation. // branding-scan: allow upstream source citation
+ * This module owns ONLY the approval-decision layer: session-scoped host
+ * cache (allow/deny), in-flight request dedup, short-circuit guards, and
+ * resolver/hook invocation. Wildcard / URL / allowlist matching is T13
+ * scope: the cache here operates on exact lowercased
+ * `host + protocol + port` triples that have already cleared any allowlist.
  *
- * Port of reference runtime `tools::network_approval::NetworkApprovalService`
- * (reference runtime source, 688 LOC). This module
- * owns ONLY the approval-decision layer: session-scoped host cache
- * (allow/deny), in-flight request dedup, short-circuit guards, and
- * resolver/hook invocation. Upstream wildcard / URL / allowlist
- * matching (`NetworkDomainPermission`) is T13 scope — the cache here
- * operates on exact lowercased `host + protocol + port` triples that
- * have already cleared any upstream allowlist.
- *
- * Intentionally not ported (see task brief):
- *   - Wildcard/URL matching — T13 upstream allowlist.
- *   - Execpolicy amendment persistence backend — T11 just calls the
+ * Intentionally out of scope here:
+ *   - Wildcard/URL matching (T13 allowlist).
+ *   - Execpolicy amendment persistence backend: this module just calls the
  *     `persistAmendment` hook; T12/T13 wires the actual on-disk write.
- *   - Wildcard process-level network attribution — callers must still pass
+ *   - Process-level network attribution: callers must still pass
  *     the host key being approved.
  *
  * Invariants:
- *   - Exact reference runtime short-circuit order: sandbox gate, then approval-policy
- *     gate (`network_approval.rs:128-133, 361-369`).
+ *   - Short-circuit order: sandbox gate, then approval-policy gate.
  *   - Session deny takes precedence over session allow in the same lookup
- *     turn (`network_approval.rs:320-331`).
+ *     turn.
  *   - Concurrent callers for the same `HostApprovalKey` are deduped: only
- *     the first caller runs the resolver; the rest wait on a `Notify`
- *     (`network_approval.rs:239-251, 333-336`).
- *   - Session-allow evicts session-deny and vice versa
- *     (`network_approval.rs:564-580`).
+ *     the first caller runs the resolver; the rest wait on the shared
+ *     pending promise.
+ *   - Session-allow evicts session-deny and vice versa.
  *
  * @module
  */
@@ -50,11 +40,11 @@ import {
 } from "../hooks/runtime-policy.js";
 
 // ─────────────────────────────────────────────────────────────────────
-// Re-declared enum ports (kept local to avoid an import cycle with
+// Re-declared enums (kept local to avoid an import cycle with
 // `session/turn-context.ts` which only has stub shapes today).
 // ─────────────────────────────────────────────────────────────────────
 
-/** Port of reference runtime `AskForApproval`. Only `"never"` is load-bearing here. */
+/** Approval policy. Only `"never"` is load-bearing here. */
 export type ApprovalPolicy =
   | "never"
   | "on_failure"
@@ -63,7 +53,7 @@ export type ApprovalPolicy =
   | "untrusted";
 
 /**
- * Port of reference runtime `SandboxPolicy` kinds. Only the `kind` field is load-bearing
+ * Sandbox policy kinds. Only the `kind` field is load-bearing
  * for network approval. Two kinds short-circuit to deny:
  *   - `danger_full_access`: no review flow — full access is already granted.
  *   - `external_sandbox`: review flow is not available outside the managed sandbox.
@@ -76,7 +66,7 @@ export interface SandboxPolicy {
     | "external_sandbox";
 }
 
-/** Port of reference runtime `ReviewDecision` enum (sum type with amendment payload). */
+/** Review decision (sum type with amendment payload). */
 export type ReviewDecision =
   | { readonly kind: "approved" }
   | { readonly kind: "approved_execpolicy_amendment" }
@@ -89,7 +79,7 @@ export type ReviewDecision =
   | { readonly kind: "abort" }
   | { readonly kind: "timed_out" };
 
-/** Port of reference runtime `NetworkPolicyAmendment`. */
+/** Amendment to the session network policy. */
 export interface NetworkPolicyAmendment {
   readonly action: "allow" | "deny";
   /** Optional human-readable justification (not load-bearing for caching). */
@@ -100,22 +90,22 @@ export interface NetworkPolicyAmendment {
 // Host approval key + decisions
 // ─────────────────────────────────────────────────────────────────────
 
-/** Port of reference runtime `NetworkApprovalProtocol` string labels. */
+/** Network protocol labels used in host approval keys. */
 export type NetworkProtocol = "http" | "https" | "socks5-tcp" | "socks5-udp";
 
-/** Port of reference runtime `HostApprovalKey`. Host must already be lowercased. */
+/** Host approval key. Host must already be lowercased. */
 export interface HostApprovalKey {
   readonly host: string;
   readonly protocol: NetworkProtocol;
   readonly port: number;
 }
 
-/** Decision returned to the caller (reference runtime `NetworkDecision`). */
+/** Decision returned to the caller. */
 export type NetworkDecision =
   | { readonly kind: "allow" }
   | { readonly kind: "deny"; readonly reason: string };
 
-/** Port of reference runtime `PendingApprovalDecision`. Internal cache-state value. */
+/** Internal cache-state value for a pending approval. */
 type PendingApprovalDecision = "allow_once" | "allow_for_session" | "deny";
 
 // ─────────────────────────────────────────────────────────────────────
@@ -124,9 +114,8 @@ type PendingApprovalDecision = "allow_once" | "allow_for_session" | "deny";
 
 /**
  * Lowercase, trim, and strip a single trailing dot (DNS canonical form).
- * Keeps AgenC behavior: reference runtime does `host.to_ascii_lowercase()` — we add the
- * trailing-dot strip for DNS canonicalization since TypeScript-land hosts
- * may come from `URL` parsing which preserves the dot.
+ * The trailing-dot strip matters because hosts may come from `URL`
+ * parsing, which preserves the dot.
  */
 export function normalizeHost(host: string): string {
   const trimmed = host.trim().toLowerCase();
@@ -168,9 +157,8 @@ function canonicalKey(key: HostApprovalKey): HostApprovalKey {
  * key. Only the owner (first caller) runs the resolver; subsequent
  * callers `await wait()` until the owner calls `set()`.
  *
- * reference runtime uses `tokio::sync::Notify` + `Mutex<Option<...>>`. We use a
- * single promise+resolver pair — all waiters share the same pending
- * promise and are released together when `set()` fires.
+ * Implemented as a single promise+resolver pair: all waiters share the
+ * same pending promise and are released together when `set()` fires.
  */
 export class PendingHostApproval {
   private decisionValue: PendingApprovalDecision | null = null;
@@ -201,7 +189,7 @@ export class PendingHostApproval {
 
   /**
    * Record the decision and release every waiter. Idempotent: a second
-   * call with a different value is ignored (reference runtime behavior).
+   * call with a different value is ignored.
    */
   set(decision: PendingApprovalDecision): void {
     if (this.decisionValue !== null) return;
@@ -215,9 +203,7 @@ export class PendingHostApproval {
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Contextual data handed to resolvers and hooks. Mirrors the fields
- * reference runtime gathers before calling `request_command_approval` or the
- * permission-request hook runtime.
+ * Contextual data handed to resolvers and hooks.
  */
 export interface NetworkApprovalContext {
   readonly host: string;
@@ -241,7 +227,7 @@ export type NetworkApprovalHookResult =
   | null;
 
 /**
- * Permission-request hook (reference runtime `run_permission_request_hooks`). Runs
+ * Permission-request hook. Runs
  * with the highest precedence, short-circuiting the resolver when any
  * hook returns a non-null result.
  */
@@ -255,8 +241,7 @@ export interface NetworkApprovalResolver {
 }
 
 /**
- * Persistence callback for network-policy amendments. reference runtime calls
- * `session.persist_network_policy_amendment` — T11 exposes this as a
+ * Persistence callback for network-policy amendments. Exposed as a
  * swap-in callback so T12/T13 can wire the real write path.
  *
  * Throwing from this callback is non-fatal for the approval flow: the
@@ -272,7 +257,7 @@ export type PersistNetworkPolicyAmendment = (
 // Request options + error classes
 // ─────────────────────────────────────────────────────────────────────
 
-/** Port of reference runtime `NetworkApprovalMode`. */
+/** Whether a request resolves inline or registers a deferred approval. */
 export type NetworkApprovalMode = "immediate" | "deferred";
 
 export interface RequestNetworkApprovalOptions {
@@ -372,6 +357,11 @@ interface MutablePending {
   readonly map: Map<string, PendingHostApproval>;
 }
 
+class NetworkApprovalSession {
+  readonly abortController = new AbortController();
+  readonly pendingLock = new AsyncLock<MutablePending>({ map: new Map() });
+}
+
 export class NetworkApprovalService {
   /** JSON-stringified `HostApprovalKey` → present means "session allow". */
   private readonly sessionApprovedHosts = new Set<string>();
@@ -380,12 +370,11 @@ export class NetworkApprovalService {
   private readonly sessionDeniedHosts = new Set<string>();
 
   /**
-   * In-flight host approvals keyed by `hostApprovalKeyToString`. Guarded
-   * by `pendingLock` so concurrent callers observe a consistent owner.
+   * Each session generation owns its pending approvals and cancellation.
+   * Keeping the lock with the generation prevents old cleanup from deleting
+   * a new session's approval for the same host.
    */
-  private readonly pendingLock = new AsyncLock<MutablePending>({
-    map: new Map(),
-  });
+  private session = new NetworkApprovalSession();
 
   /** Active/deferred network approvals keyed by registration ID. */
   private readonly activeNetworkApprovals =
@@ -394,13 +383,16 @@ export class NetworkApprovalService {
   // ───── Session reset ────────────────────────────────────────────────
 
   /**
-   * Clear both session caches. reference runtime `Session::reset` / `/clear` calls
-   * this on new session bootstrap. Does NOT touch in-flight pending
-   * approvals — those resolve themselves.
+   * Clear both caches and cancel approvals from the previous session.
+   * Owners and waiters return a `session_cleared` denial, even if an external
+   * resolver never settles. Late results cannot affect the new session.
    */
   clearSessionHosts(): void {
+    const previous = this.session;
+    this.session = new NetworkApprovalSession();
     this.sessionApprovedHosts.clear();
     this.sessionDeniedHosts.clear();
+    previous.abortController.abort();
   }
 
   /** Test/observability helper: current session-allow set size. */
@@ -415,7 +407,7 @@ export class NetworkApprovalService {
 
   /** Test/observability helper: in-flight pending approval count. */
   pendingSize(): number {
-    return this.pendingLock.unsafePeek().map.size;
+    return this.session.pendingLock.unsafePeek().map.size;
   }
 
   /** Test/observability helper: active + deferred approval registration count. */
@@ -472,7 +464,6 @@ export class NetworkApprovalService {
   // ───── Main entrypoint ──────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `NetworkApprovalService::handle_inline_policy_request`.
    * Consult caches, dedup concurrent callers, and invoke hooks/resolver
    * exactly once per host key.
    *
@@ -487,13 +478,12 @@ export class NetworkApprovalService {
   async requestNetworkApproval(
     opts: RequestNetworkApprovalOptions,
   ): Promise<NetworkDecision> {
-    // Signal check — reference runtime spawns the approval task on the runtime; we
-    // proactively refuse if the caller already cancelled.
+    // Signal check: refuse up front if the caller already cancelled.
     if (opts.signal?.aborted) {
       throw makeAbortError(opts.signal);
     }
 
-    // (1) Sandbox gate — `network_approval.rs:128-133`.
+    // (1) Sandbox gate.
     if (
       opts.sandboxPolicy.kind === "danger_full_access" ||
       opts.sandboxPolicy.kind === "external_sandbox"
@@ -501,7 +491,7 @@ export class NetworkApprovalService {
       return { kind: "deny", reason: "not_allowed_in_sandbox_mode" };
     }
 
-    // (2) Approval policy gate — `network_approval.rs:361-369`.
+    // (2) Approval policy gate.
     if (opts.approvalPolicy === "never") {
       return { kind: "deny", reason: "approval_policy_never" };
     }
@@ -519,21 +509,42 @@ export class NetworkApprovalService {
       return { kind: "allow" };
     }
 
-    // (5) Pending-map lookup — owner vs waiter.
-    const { pending, isOwner } = await this.getOrCreatePending(stringKey);
+    return this.requestUncachedApproval(normalizedKey, opts);
+  }
 
-    if (!isOwner) {
-      // Waiter path: block until owner notifies, then project the
-      // decision. Abort propagates if the caller cancels while waiting.
-      const pendingDecision = await raceAbort(pending.wait(), opts.signal);
-      return pendingDecisionToNetwork(pendingDecision);
-    }
+  private async requestUncachedApproval(
+    normalizedKey: HostApprovalKey,
+    opts: RequestNetworkApprovalOptions,
+  ): Promise<NetworkDecision> {
+    const stringKey = hostApprovalKeyToString(normalizedKey);
 
-    // Owner path: run hooks → resolver → project decision.
+    // (5) Capture the session before awaiting the pending-map lookup.
+    const session = this.session;
+    const sessionSignal = session.abortController.signal;
+    const signal = opts.signal
+      ? AbortSignal.any([opts.signal, sessionSignal])
+      : sessionSignal;
+    const { pending, isOwner } = await this.getOrCreatePending(stringKey, session);
+    let publicDecision: PendingApprovalDecision;
+
     try {
-      const resolved = await this.resolveApproval(normalizedKey, opts);
+      throwIfAborted(signal);
+      if (!isOwner) {
+        // Waiters are cancelled along with their owner on session reset.
+        const pendingDecision = await raceAbort(pending.wait(), signal);
+        throwIfAborted(signal);
+        return pendingDecisionToNetwork(pendingDecision);
+      }
 
-      // Cache side effects (reference runtime `network_approval.rs:564-580`).
+      // Owner path: run hooks → resolver → project decision. External work
+      // may ignore cancellation, so race it and fence all later side effects.
+      const resolved = await raceAbort(
+        this.resolveApproval(normalizedKey, { ...opts, signal }),
+        signal,
+      );
+      throwIfAborted(signal);
+
+      // Cache side effects.
       if (resolved === "allow_for_session") {
         this.sessionDeniedHosts.delete(stringKey);
         this.sessionApprovedHosts.add(stringKey);
@@ -544,18 +555,26 @@ export class NetworkApprovalService {
 
       // Normalize cached-deny to the plain `deny` value exposed via
       // `PendingApprovalDecision`. Waiters only see the coarse enum.
-      const publicDecision: PendingApprovalDecision =
-        resolved === "deny_for_session" ? "deny" : resolved;
+      publicDecision = resolved === "deny_for_session" ? "deny" : resolved;
 
       pending.set(publicDecision);
-      return pendingDecisionToNetwork(publicDecision);
     } catch (err) {
       // Release waiters with a deny so they don't hang; rethrow for owner.
-      pending.set("deny");
+      if (isOwner) pending.set("deny");
+      if (sessionSignal.aborted) {
+        return { kind: "deny", reason: "session_cleared" };
+      }
       throw err;
     } finally {
-      await this.removePending(stringKey);
+      if (isOwner) await this.removePending(stringKey, session);
     }
+
+    // Reset may run while owner cleanup waits for the pending-map lock.
+    if (sessionSignal.aborted) {
+      return { kind: "deny", reason: "session_cleared" };
+    }
+    throwIfAborted(signal);
+    return pendingDecisionToNetwork(publicDecision);
   }
 
   async requestDeferredApproval(
@@ -644,8 +663,9 @@ export class NetworkApprovalService {
 
   private async getOrCreatePending(
     stringKey: string,
+    session: NetworkApprovalSession,
   ): Promise<{ pending: PendingHostApproval; isOwner: boolean }> {
-    return this.pendingLock.with((state) => {
+    return session.pendingLock.with((state) => {
       const existing = state.map.get(stringKey);
       if (existing !== undefined) {
         return { pending: existing, isOwner: false };
@@ -656,8 +676,11 @@ export class NetworkApprovalService {
     });
   }
 
-  private async removePending(stringKey: string): Promise<void> {
-    await this.pendingLock.with((state) => {
+  private async removePending(
+    stringKey: string,
+    session: NetworkApprovalSession,
+  ): Promise<void> {
+    await session.pendingLock.with((state) => {
       state.map.delete(stringKey);
     });
   }
@@ -687,6 +710,7 @@ export class NetworkApprovalService {
       for (const hook of opts.hooks ?? []) {
         if (opts.signal?.aborted) throw makeAbortError(opts.signal);
         const result = await hook(ctx);
+        if (opts.signal?.aborted) throw makeAbortError(opts.signal);
         if (result === null || result === undefined) continue;
         if ("allow" in result && result.allow === true) return "allow_once";
         if ("deny" in result) throw new DeniedByPolicy(result.deny);
@@ -698,6 +722,7 @@ export class NetworkApprovalService {
     if (opts.signal?.aborted) throw makeAbortError(opts.signal);
 
     const review = await opts.resolver.requestNetworkApproval(ctx);
+    if (opts.signal?.aborted) throw makeAbortError(opts.signal);
 
     // (c) Map ReviewDecision → PendingApprovalDecision (+ amendment persistence).
     switch (review.kind) {
@@ -714,6 +739,7 @@ export class NetworkApprovalService {
         } catch (err) {
           opts.onAmendmentPersistError?.(err);
         }
+        if (opts.signal?.aborted) throw makeAbortError(opts.signal);
         return review.amendment.action === "allow"
           ? "allow_for_session"
           : "deny_for_session";
@@ -748,11 +774,20 @@ function formatNetworkTarget(key: HostApprovalKey): string {
 }
 
 function makeAbortError(signal: AbortSignal): Error {
-  const reason = signal.reason instanceof Error
-    ? signal.reason
-    : new Error("aborted");
-  (reason as { name?: string }).name = "AbortError";
-  return reason;
+  if (signal.reason instanceof Error && signal.reason.name === "AbortError") {
+    return signal.reason;
+  }
+  // Native DOMException names and caller-owned error objects may be read-only.
+  const error = new Error(
+    signal.reason instanceof Error ? signal.reason.message : "aborted",
+    { cause: signal.reason },
+  );
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw makeAbortError(signal);
 }
 
 /**
@@ -766,7 +801,6 @@ async function raceAbort<T>(
   signal: AbortSignal | undefined,
 ): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) throw makeAbortError(signal);
 
   return new Promise<T>((resolve, reject) => {
     const onAbort = (): void => {
@@ -774,6 +808,9 @@ async function raceAbort<T>(
       reject(makeAbortError(signal));
     };
     signal.addEventListener("abort", onAbort, { once: true });
+    // Observe the work promise even when it synchronously triggered an abort
+    // before this race was installed; it can still reject after cancellation.
+    if (signal.aborted) onAbort();
     promise.then(
       (value) => {
         signal.removeEventListener("abort", onAbort);

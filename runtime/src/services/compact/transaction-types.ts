@@ -9,6 +9,7 @@ import type { AgentInvocationChannelMetadata } from "../../contracts/agent-invoc
 import type { ToolResultIntegrity } from "../../session/tool-result-integrity.js";
 import type { RuntimeMessage } from "./types.js";
 import type { CompactionHistoryMarkerV1 } from "../../session/compaction-history-marker.js";
+import type { ProviderReasoningReplay } from "../../llm/types.js";
 
 export const COMPACTION_EVENT_FORMAT_VERSION = 1 as const;
 /** Minimum reader stamped by writers of the current event format. */
@@ -53,6 +54,14 @@ export const MAX_COMPACTION_RECONCILIATION_MS_PER_START = 30_000;
 
 export const MAX_COMPACTION_SOURCE_BYTES = 67_108_864;
 export const MAX_COMPACTION_SOURCE_MESSAGES = 100_000;
+
+/**
+ * Budgets for canonicalizing OUR OWN compaction source. They are deliberately
+ * far larger than the provider-output ceilings: a legal long history is not a
+ * hostile provider response, but it still must not be unbounded.
+ */
+export const MAX_COMPACTION_SOURCE_NODES = MAX_COMPACTION_SOURCE_BYTES;
+export const MAX_COMPACTION_SOURCE_WORK_UNITS = MAX_COMPACTION_SOURCE_BYTES * 2;
 export const MAX_COMPACTION_SEMANTIC_UNITS = 100_000;
 export const MAX_COMPACTION_CHUNKS = 64;
 export const MAX_COMPACTION_REDUCTION_LEVELS = 4;
@@ -60,7 +69,12 @@ export const MAX_COMPACTION_FAN_IN = 8;
 export const MAX_COMPACTION_PROVIDER_CALLS = 73;
 export const MAX_COMPACTION_TOTAL_INPUT_TOKENS = 4_000_000;
 export const MAX_COMPACTION_INTERMEDIATE_TOKENS = 8_192;
-export const MAX_COMPACTION_WALL_MS = 300_000;
+/**
+ * Whole-transaction wall budget, and exceeding it ends the turn. Measured grok-4.6 compactions of
+ * about 356k-token sources at effort high took 109 to 290 s, and one stopped at the former 300 s
+ * bound after a 3 h 46 min run; three times that bound keeps the observed range well inside it.
+ */
+export const MAX_COMPACTION_WALL_MS = 900_000;
 export const MAX_COMPACTION_ABORT_QUIESCENCE_MS = 5_000;
 export const MAX_COMPACTION_FOCUS_UTF8_BYTES = 16_384;
 /** Canonical JSONL record ceiling shared with strict restart recovery. */
@@ -326,6 +340,7 @@ export interface CompactionProjectionMessageV1 {
   readonly id?: string;
   readonly phase?: string;
   readonly endTurn?: boolean;
+  readonly providerReasoning?: ProviderReasoningReplay;
   readonly toolResultIntegrity?: ToolResultIntegrity;
   readonly agentInvocation?: AgentInvocationChannelMetadata;
   readonly compactionHistory?: CompactionHistoryMarkerV1;
@@ -513,6 +528,30 @@ export class CompactionTransactionError extends Error {
   ) {
     super(message, options);
     this.name = "CompactionTransactionError";
+  }
+}
+
+/**
+ * The summary was rejected before commit and the terminal failure was durably
+ * recorded. Only the transaction owner may establish this advisory outcome;
+ * matching an error message/reason alone does not prove the history is usable.
+ */
+export class CompactionSummaryRejectedError extends CompactionTransactionError {
+  constructor(reason: CompactionFailureReason, message: string, options?: ErrorOptions) {
+    super(reason, message, options);
+    this.name = "CompactionSummaryRejectedError";
+  }
+}
+
+/** A failed attempt could not be settled durably; startup reconciliation owns it. */
+export class CompactionFailurePersistenceError extends CompactionTransactionError {
+  constructor(reason: CompactionFailureReason, options?: ErrorOptions) {
+    super(
+      reason,
+      "compaction failed and its terminal failure event could not be committed; source remains pinned for startup reconciliation",
+      options,
+    );
+    this.name = "CompactionFailurePersistenceError";
   }
 }
 

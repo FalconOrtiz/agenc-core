@@ -40,8 +40,7 @@ describe("strict schema-v2 validation coverage", () => {
     ["model", { model: 42 }, /Invalid model/u],
     ["approval policy", { approval_policy: "sometimes" }, /approval_policy/u],
     ["sandbox mode", { sandbox_mode: "container" }, /sandbox_mode/u],
-    ["reasoning effort", { reasoning_effort: "max" }, /reasoning_effort/u],
-    ["retired minimal reasoning effort", { reasoning_effort: "minimal" }, /reasoning_effort/u],
+    ["reasoning effort", { reasoning_effort: "unlimited" }, /reasoning_effort/u],
     ["agent threads", { agent_max_threads: 0 }, /agent_max_threads/u],
     ["agent depth", { agent_max_depth: -1 }, /agent_max_depth/u],
     ["project markers", { project_root_markers: [".git", 4] }, /project_root_markers/u],
@@ -55,6 +54,17 @@ describe("strict schema-v2 validation coverage", () => {
     ["coordinator mode", { coordinator_mode: 1 }, /coordinator_mode/u],
   ])("rejects an invalid root %s", (_label, config, error) => {
     expect(() => validateAgenCConfigBlocks(malformed(config))).toThrow(error);
+  });
+
+  test.each(["minimal", "max"])("accepts native %s reasoning in root and profile settings", effort => {
+    expect(() =>
+      validateAgenCConfigBlocks(
+        malformed({
+          reasoning_effort: effort,
+          profiles: { native: { reasoning_effort: effort } },
+        }),
+      ),
+    ).not.toThrow();
   });
 
   test.each([
@@ -79,6 +89,9 @@ describe("strict schema-v2 validation coverage", () => {
       /web_search_endpoint_kind/u,
     ],
     ["daemon unknown field", { daemon: { socket: true } }, /daemon\.socket/u],
+    ["daemon zero stop timeout", { daemon: { agent_stop_timeout_ms: 0 } }, /daemon\.agent_stop_timeout_ms/u],
+    ["daemon fractional stop timeout", { daemon: { agent_stop_timeout_ms: 1.5 } }, /daemon\.agent_stop_timeout_ms/u],
+    ["daemon overflowing stop timeout", { daemon: { agent_stop_timeout_ms: 2_147_483_648 } }, /daemon\.agent_stop_timeout_ms/u],
     ["daemon unknown transport", { daemon: { transport: "unix" } }, /daemon\.transport.*unknown field/u],
     [
       "LSP unknown field",
@@ -99,7 +112,7 @@ describe("strict schema-v2 validation coverage", () => {
       /lsp_servers\.ts\.extensionToLanguage.*required/u,
     ],
     ["attachments unknown field", { attachments: { roots: ["/tmp"] } }, /attachments\.roots/u],
-    ["TUI unknown field", { tui: { vimMode: true, mystery: "dark" } }, /tui\.mystery/u],
+    ["TUI unknown field", { tui: { showTurnDuration: true, mystery: "dark" } }, /tui\.mystery/u],
     ["browser unknown field", { browser: { executable: "/bin/chrome" } }, /browser\.executable/u],
     [
       "durable turn unknown field",
@@ -107,6 +120,10 @@ describe("strict schema-v2 validation coverage", () => {
       /durableTurns\.resume\.replayTools/u,
     ],
     ["budget unknown field", { budget: { weekly_usd: 5 } }, /budget\.weekly_usd/u],
+    ["completion gate unknown field", { completion_gate: { rounds: 2 } }, /completion_gate\.rounds/u],
+    ["completion gate mode", { completion_gate: { mode: "sometimes" } }, /completion_gate\.mode/u],
+    ["completion gate rounds bound", { completion_gate: { max_rounds: 11 } }, /completion_gate\.max_rounds/u],
+    ["completion gate rounds integer", { completion_gate: { max_rounds: 0 } }, /completion_gate\.max_rounds/u],
     ["budget threshold", { budget: { soft_threshold: 1 } }, /budget\.soft_threshold/u],
     [
       "heartbeat active hours",
@@ -250,6 +267,31 @@ describe("strict schema-v2 validation coverage", () => {
     ).toHaveProperty("plugin:sample:local");
   });
 
+  test("accepts audited virtual non-filesystem write tool names in MCP config", () => {
+    const config = validateAgenCConfigBlocks({
+      mcp_servers: {
+        desktop: {
+          command: "node",
+          virtual_no_fs_write_tools: ["browser_navigate"],
+        },
+      },
+    });
+
+    expect(config.mcp_servers?.desktop?.virtual_no_fs_write_tools).toEqual([
+      "browser_navigate",
+    ]);
+    expect(() =>
+      validateAgenCConfigBlocks(malformed({
+        mcp_servers: {
+          desktop: {
+            command: "node",
+            virtual_no_fs_write_tools: ["browser_navigate", 42],
+          },
+        },
+      })),
+    ).toThrow(/desktop\.virtual_no_fs_write_tools.*array element/u);
+  });
+
   test("ordinary strict loading rejects the retired llm.xai surface", () => {
     expect(() =>
       validateStrictConfigDocument({
@@ -299,6 +341,7 @@ describe("strict schema-v2 validation coverage", () => {
           buildPinning: true,
         },
       },
+      completion_gate: { mode: "always", max_rounds: 2 },
       budget: {
         enabled: true,
         daily_usd: 0,
@@ -358,6 +401,7 @@ describe("strict schema-v2 validation coverage", () => {
 
     expect(config.daemon).toEqual({ autostart: true });
     expect(config.durableTurns?.resume?.onRestart).toBe(true);
+    expect(config.completion_gate).toEqual({ mode: "always", max_rounds: 2 });
     expect(config.providers?.grok?.remote_mcp?.servers?.[0]?.server_label).toBe("docs");
     expect(config.providers?.grok?.remote_mcp?.servers?.[0]?.authorization_env).toBe(
       "AGENC_CREDENTIAL_DOCS_MCP",

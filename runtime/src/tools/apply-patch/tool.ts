@@ -1,7 +1,7 @@
 /**
- * Ports the donor apply-patch tool surface onto AgenC's Tool contract.
+ * Apply-patch tool surface on AgenC's Tool contract.
  *
- * Shape differences from upstream:
+ * Design notes:
  *   - AgenC exposes the JSON input shape universally and accepts raw
  *     string calls through the registry string-argument adapter.
  *   - The Lark grammar is exported for providers/runtime surfaces that
@@ -13,15 +13,23 @@
  */
 
 import { checkToolPathPermission } from "../../permissions/path-validation.js";
+import { sessionPlanFileAuthority } from "../../planning/session-plan-authority.js";
 import type { PermissionResult } from "../../permissions/types.js";
 import { nonEmptyString as asNonEmptyString } from "../../utils/stringUtils.js";
 import type { Tool, ToolExecutionInjectedArgs, ToolResult } from "../types.js";
-import { plainTextErrorToolResult as errorResult } from "../results.js";
+import {
+  plainTextErrorToolResult as errorResult,
+  validationErrorToolResult,
+} from "../results.js";
 import { SESSION_ID_ARG } from "../system/filesystem.js";
 import { parsePatch } from "./parser.js";
 import { applyPatchText } from "./runtime.js";
-import { WorkspaceMutationRejectedError } from "../../workspace/mutation-coordinator.js";
 import type { ApplyPatchHunk } from "./types.js";
+import {
+  ApplyPatchInputError,
+  ApplyPatchParseError,
+  ApplyPatchRuntimeError,
+} from "./types.js";
 
 export const APPLY_PATCH_TOOL_NAME = "apply_patch";
 
@@ -124,6 +132,13 @@ function permissionForPatch(
     };
   }
 
+  // Resolved once: the lookup canonicalizes AGENC_HOME, and a patch can
+  // carry many targets. `execute` applies the owning session's plan file
+  // through `safePathAllowingSessionPlanFile`; without the same authority
+  // here the permission layer asked to approve a patch the tool would then
+  // apply anyway (#2131).
+  const planFileAuthority = sessionPlanFileAuthority(context.session);
+
   for (const hunk of hunks) {
     for (const target of pathsForHunk(hunk)) {
       const result = checkToolPathPermission({
@@ -134,6 +149,7 @@ function permissionForPatch(
         context: context.getAppState().toolPermissionContext,
         operationType: target.operationType,
         extraWorkingDirectories: allowedPaths,
+        planFileAuthority,
       });
       if (result.behavior !== "allow") return result;
     }
@@ -197,7 +213,12 @@ export function createApplyPatchTool(config: ApplyPatchToolConfig): Tool {
     async execute(rawArgs: Record<string, unknown>): Promise<ToolResult> {
       const args = rawArgs as ApplyPatchToolInput;
       const patch = asNonEmptyString(args.input);
-      if (!patch) return errorResult("input must be a non-empty string");
+      if (!patch) {
+        return validationErrorToolResult(
+          "tool:apply_patch:validation",
+          "input must be a non-empty string",
+        );
+      }
 
       const cwd = asNonEmptyString(args.cwd) ?? config.cwd;
       const sessionId = asNonEmptyString(args[SESSION_ID_ARG]);
@@ -224,12 +245,26 @@ export function createApplyPatchTool(config: ApplyPatchToolConfig): Tool {
           metadata: result.metadata,
         };
       } catch (error) {
-        if (error instanceof WorkspaceMutationRejectedError) {
-          return error.toolResult;
+        const message = error instanceof Error ? error.message : String(error);
+        // Failures that happen before any file is touched carry a confirmed
+        // no-effect disposition. Without it the admission layer files the
+        // error as an unknown outcome and blocks every side-effecting tool of
+        // the session until an operator runs /resolve (#2190). That includes
+        // planning-phase ApplyPatchRuntimeError (unread file, missing path,
+        // allowlist). A failure after the mutation boundary stays undecided.
+        if (
+          error instanceof ApplyPatchParseError ||
+          error instanceof ApplyPatchInputError
+        ) {
+          return validationErrorToolResult("tool:apply_patch:parse", message);
         }
-        return errorResult(
-          error instanceof Error ? error.message : String(error),
-        );
+        if (error instanceof ApplyPatchRuntimeError && error.preEffect) {
+          return validationErrorToolResult(
+            "tool:apply_patch:pre-effect",
+            message,
+          );
+        }
+        return errorResult(message);
       }
     },
   };

@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
   mkdirSync,
@@ -82,7 +83,7 @@ describe("schema: defaultConfig", () => {
     expect(cfg.max_turns).toBeUndefined();
     expect(cfg.agent_max_threads).toBeUndefined();
     expect(cfg.agent_max_depth).toBe(1);
-    expect(cfg.stream_watchdog_timeout_ms).toBeUndefined();
+    expect(cfg.stream_watchdog_timeout_ms).toBe(600_000);
     expect(cfg.auth?.backend).toBe("remote");
     expect(cfg.auth?.managedKeys?.enabled).toBe(true);
     expect(cfg.plugins?.enabled).toBe(false);
@@ -102,6 +103,7 @@ describe("schema: defaultConfig", () => {
       snapshot_days: 3,
       snapshot_max_count: 10_000,
       snapshot_max_bytes: 67_108_864,
+      rollout_days: 30,
     });
     expect(Object.isFrozen(cfg)).toBe(true);
   });
@@ -238,12 +240,12 @@ describe("schema: normalizeRawConfig", () => {
 
   test("preserves runtime/TUI feature config on the typed path", () => {
     const out = normalizeRawConfig({
-      tui: { vimMode: true },
+      tui: { showTurnDuration: false },
       agent_max_threads: 12,
       agent_max_depth: 2,
       ideConnector: { autoInstallExtension: false },
     });
-    expect(out.tui).toEqual({ vimMode: true });
+    expect(out.tui).toEqual({ showTurnDuration: false });
     expect(out.agent_max_threads).toBe(12);
     expect(out.agent_max_depth).toBe(2);
     expect(out.ideConnector).toEqual({ autoInstallExtension: false });
@@ -251,8 +253,8 @@ describe("schema: normalizeRawConfig", () => {
   });
 
   test("validates tui config shape", () => {
-    expect(validateTuiConfig({ vimMode: true })).toEqual({ vimMode: true });
-    expect(() => validateTuiConfig({ vimMode: "yes" })).toThrow(
+    expect(validateTuiConfig({ showTurnDuration: true })).toEqual({ showTurnDuration: true });
+    expect(() => validateTuiConfig({ showTurnDuration: "yes" })).toThrow(
       InvalidTuiConfigError,
     );
   });
@@ -561,7 +563,6 @@ describe("provider resolution (T13)", () => {
         grok: {
           fallback: {
             targets: [
-              // branding-scan: allow provider normalization fixture
               { provider: " OpenAI ", model: " gpt-5 ", reason: " burst " },
               { provider: "openai", model: "gpt-5" },
               { provider: " grok ", model: "grok-3" },
@@ -628,14 +629,12 @@ describe("provider resolution (T13)", () => {
     const config = mergeConfigs(defaultConfig(), {
       providers: {
         openrouter: {
-          // branding-scan: allow documented provider model id
           default_model: "anthropic/claude-3.7-sonnet",
         },
       },
     });
 
     expect(buildProviderModelCatalog(config).openrouter).toContain(
-      // branding-scan: allow documented provider model id
       "anthropic/claude-3.7-sonnet",
     );
   });
@@ -882,6 +881,25 @@ describe("schema: closed config block validators (CF-13)", () => {
     });
     expect(out?.grok?.capability_overrides?.supportsToolUse).toBe(true);
     expect(Object.isFrozen(out?.grok?.fallback?.statuses)).toBe(true);
+  });
+
+  test("validateProviderConfig accepts zero_data_retention only where the API takes it per request", () => {
+    expect(validateProviderConfig({ openrouter: { zero_data_retention: true } })).toEqual({
+      openrouter: { zero_data_retention: true },
+    });
+    expect(validateProviderConfig({ openrouter: { zero_data_retention: false } })).toEqual({
+      openrouter: { zero_data_retention: false },
+    });
+    expect(() =>
+      validateProviderConfig({ openrouter: { zero_data_retention: "yes" } }),
+    ).toThrow(InvalidProviderConfigError);
+    // Every other provider controls retention on its own console; the field
+    // must not pretend otherwise.
+    for (const provider of ["openai", "anthropic", "grok", "deepseek", "groq"]) {
+      expect(() =>
+        validateProviderConfig({ [provider]: { zero_data_retention: true } }),
+      ).toThrow(/supported only under providers\.openrouter/u);
+    }
   });
 
   test("validateProviderConfig rejects unknown nested provider fields", () => {
@@ -1535,7 +1553,14 @@ describe("env: resolvers", () => {
   });
 
   test("resolveAgencHome falls back to $HOME/.agenc", () => {
-    expect(resolveAgencHome({ HOME: "/home/user" })).toBe("/home/user/.agenc");
+    const fixtureHome = mkdtempSync(join(tmpdir(), "agenc-env-home-"));
+    try {
+      expect(resolveAgencHome({ HOME: fixtureHome })).toBe(
+        join(realpathSync(fixtureHome), ".agenc"),
+      );
+    } finally {
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
   });
 
   test("resolveApiKey prefers XAI_API_KEY over the documented GROK alias", () => {
@@ -1599,20 +1624,26 @@ describe("env: resolvers", () => {
   test("applyEnvOverrides captures only canonical AGENC_EFFORT_LEVEL values", () => {
     const base = mergeConfigs(defaultConfig(), { reasoning_effort: "low" });
     expect(
+      applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "minimal" }).reasoning_effort,
+    ).toBe("minimal");
+    expect(
       applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "xhigh" }).reasoning_effort,
     ).toBe("xhigh");
     expect(
       applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "none" }).reasoning_effort,
     ).toBe("none");
+    expect(
+      applyEnvOverrides(base, { AGENC_EFFORT_LEVEL: "max" }).reasoning_effort,
+    ).toBe("max");
   });
 
-  test.each(["minimal", "max", "auto", "unset", "warp", ""])(
+  test.each(["auto", "unset", "warp", ""])(
     "applyEnvOverrides rejects non-canonical AGENC_EFFORT_LEVEL=%j",
     (value) => {
       expect(() => applyEnvOverrides(
         mergeConfigs(defaultConfig(), { reasoning_effort: "low" }),
         { AGENC_EFFORT_LEVEL: value },
-      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*low, medium, high, xhigh, or none/u);
+      )).toThrow(/invalid AGENC_EFFORT_LEVEL.*minimal, low, medium, high, xhigh, max, or none/u);
     },
   );
 
@@ -1707,6 +1738,49 @@ describe("env: resolvers", () => {
     expect(disabled.stream_watchdog_timeout_ms).toBe(0);
   });
 
+  test("applyEnvOverrides folds AGENC_XAI_INCREMENTAL into providers.grok", () => {
+    const base = normalizeRawConfig({
+      providers: { grok: { timeout_ms: 5_000 } },
+    });
+    const on = applyEnvOverrides(base, { AGENC_XAI_INCREMENTAL: "1" });
+    expect(on.providers?.grok).toEqual({
+      timeout_ms: 5_000,
+      incremental_continuation: true,
+    });
+    const off = applyEnvOverrides(on, { AGENC_XAI_INCREMENTAL: "off" });
+    expect(off.providers?.grok?.incremental_continuation).toBe(false);
+
+    const warnings: string[] = [];
+    const invalid = applyEnvOverrides(
+      base,
+      { AGENC_XAI_INCREMENTAL: "sometimes" },
+      (message) => warnings.push(message),
+    );
+    expect(invalid.providers?.grok?.incremental_continuation).toBeUndefined();
+    expect(warnings).toEqual([
+      '[agenc:config] invalid AGENC_XAI_INCREMENTAL="sometimes"; expected boolean-like value',
+    ]);
+    // The flag is off unless set.
+    expect(defaultConfig().providers?.grok?.incremental_continuation).toBeUndefined();
+  });
+
+  test("providers.<provider>.incremental_continuation is a Grok-only boolean", () => {
+    expect(
+      normalizeRawConfig({
+        providers: { grok: { incremental_continuation: true } },
+      }).providers?.grok,
+    ).toEqual({ incremental_continuation: true });
+    expect(
+      validateProviderConfig({ grok: { incremental_continuation: true } }),
+    ).toEqual({ grok: { incremental_continuation: true } });
+    expect(() =>
+      validateProviderConfig({ grok: { incremental_continuation: "yes" } }),
+    ).toThrow(InvalidProviderConfigError);
+    expect(() =>
+      validateProviderConfig({ openai: { incremental_continuation: true } }),
+    ).toThrow(/allowed only under providers.grok/u);
+  });
+
   test("applyEnvOverrides diagnoses invalid loop, coordinator, and watchdog values", () => {
     const warnings: string[] = [];
     const out = applyEnvOverrides(
@@ -1720,7 +1794,8 @@ describe("env: resolvers", () => {
     );
     expect(out.max_turns).toBeUndefined();
     expect(out.coordinator_mode).toBeUndefined();
-    expect(out.stream_watchdog_timeout_ms).toBeUndefined();
+    // An invalid override leaves the ten-minute default in place.
+    expect(out.stream_watchdog_timeout_ms).toBe(600_000);
     expect(warnings).toEqual([
       '[agenc:config] invalid AGENC_MAX_TURNS="0"; expected a positive integer',
       '[agenc:config] invalid AGENC_COORDINATOR_MODE="sometimes"; expected boolean-like value',

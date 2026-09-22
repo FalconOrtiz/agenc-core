@@ -1,7 +1,11 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { LLMMessage, LLMTool } from "../../types.js";
-import { GrokProvider } from "./adapter.js";
+import {
+  LLMRequestRebuiltError, LLMTimeoutError } from "../../errors.js";
+import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER } from "../../wire/shared.js";
+import { encodeMcpToolNameForWire } from "../../wire/mcp-tool-naming.js";
+import { DEFAULT_REQUEST_OPEN_TIMEOUT_MS, GrokProvider } from "./adapter.js";
 
 function buildXaiResponse(id: string, text: string): Record<string, unknown> {
   return {
@@ -87,6 +91,23 @@ function useDeterministicFallbackTimers(): () => void {
     randomSpy.mockRestore();
     vi.useRealTimers();
   };
+}
+
+function primeStoredContinuation(
+  provider: GrokProvider,
+  responseId: string,
+  store: boolean,
+  messages: readonly LLMMessage[],
+): void {
+  (provider as any).incrementalTracker.recordRequest(
+    (provider as any).buildIncrementalRequestShape({ model: "grok-4-fast", store }),
+    messages,
+  );
+  (provider as any).incrementalTracker.recordResponse({
+    previousResponseId: responseId,
+    itemsAdded: [{ role: "assistant", content: "hi" }],
+    recordedAtMs: Date.now(),
+  });
 }
 
 describe("GrokProvider incremental continuation", () => {
@@ -411,6 +432,61 @@ describe("GrokProvider incremental continuation", () => {
     }
   });
 
+  test("re-throws a transport fault that cuts a text-only stream so the turn re-samples it", async () => {
+    const provider = new GrokProvider({ apiKey: "xai-test", model: "grok-4-fast" });
+    const create = vi.fn(() =>
+      withResponse(
+        streamFromEventsThenThrow(
+          [{ type: "response.output_text.delta", delta: "partial" }],
+          new TypeError("terminated"),
+        ),
+      ),
+    );
+    (provider as any).client = { responses: { create } };
+    const chunks: string[] = [];
+
+    await expect(
+      provider.chatStream([{ role: "user", content: "hello" }], (chunk) => {
+        if (chunk.content) chunks.push(chunk.content);
+      }),
+    ).rejects.toThrow(/terminated/);
+    // No in-band retry: the turn's reconnect ladder owns the re-sample.
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(chunks).toEqual(["partial"]);
+  });
+
+  test("keeps the partial response when a transport fault follows a streamed tool call", async () => {
+    const provider = new GrokProvider({ apiKey: "xai-test", model: "grok-4-fast" });
+    const functionCall = {
+      type: "function_call",
+      id: "fc_partial",
+      call_id: "call_partial",
+      name: "exec_command",
+      arguments: JSON.stringify({ cmd: "ls" }),
+    };
+    (provider as any).client = {
+      responses: {
+        create: vi.fn(() =>
+          withResponse(
+            streamFromEventsThenThrow(
+              [
+                { type: "response.output_text.delta", delta: "running" },
+                { type: "response.output_item.added", output_index: 0, item: functionCall },
+                { type: "response.output_item.done", output_index: 0, item: functionCall },
+              ],
+              Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }),
+            ),
+          ),
+        ),
+      },
+    };
+
+    const response = await provider.chatStream([{ role: "user", content: "hello" }], () => {});
+    expect(response.partial).toBe(true);
+    expect(response.finishReason).toBe("error");
+    expect(response.toolCalls.map((call) => call.id)).toEqual(["call_partial"]);
+  });
+
   test("honors request-scoped model overrides when building requests", () => {
     const provider = new GrokProvider({
       apiKey: "xai-test",
@@ -422,6 +498,169 @@ describe("GrokProvider incremental continuation", () => {
     });
 
     expect(built.params.model).toBe("grok-4-0709");
+  });
+
+  function planWithTools(parallelToolCalls?: boolean) {
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      tools: [TEST_TOOL],
+      ...(parallelToolCalls !== undefined ? { parallelToolCalls } : {}),
+    });
+    return (provider as any).buildRequestPlan(previousMessages);
+  }
+
+  test("sends parallel_tool_calls: true by default when tools are attached", () => {
+    const built = planWithTools();
+
+    expect(built.params.tools).toHaveLength(1);
+    expect(built.params.parallel_tool_calls).toBe(true);
+  });
+
+  test("parallelToolCalls: false still pins one tool call per turn", () => {
+    expect(planWithTools(false).params.parallel_tool_calls).toBe(false);
+  });
+
+  test("derives the decode catalog from the exact provider-native request subset", () => {
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      tools: [TEST_TOOL],
+      webSearch: true,
+      xSearch: true,
+    });
+    const plan = (provider as any).buildRequestPlan(previousMessages, {
+      toolRouting: { allowedToolNames: ["web_search"] },
+    });
+
+    expect(plan.params.tools).toEqual([
+      expect.objectContaining({ type: "web_search" }),
+    ]);
+    expect(
+      (provider as any).advertisedCanonicalToolNames(plan.params, undefined),
+    ).toEqual(["web_search"]);
+  });
+
+  test("decodes hashed aliases in stream start, completion, and final response events", async () => {
+    const longToolName = `mcp.plugin-${"shared-prefix-".repeat(5)}.search`;
+    const wireName = encodeMcpToolNameForWire(longToolName);
+    expect(wireName).toMatch(/^toolh__/);
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: longToolName,
+            description: "Search through a long-named plugin.",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ],
+    });
+    const functionCall = {
+      type: "function_call",
+      id: "fc-long",
+      call_id: "call-long",
+      name: wireName,
+      arguments: "{}",
+    };
+    (provider as any).client = {
+      responses: {
+        create: vi.fn(() =>
+          withResponse(
+            streamFromEvents([
+              { type: "response.output_item.added", output_index: 0, item: functionCall },
+              { type: "response.output_item.done", output_index: 0, item: functionCall },
+              {
+                type: "response.completed",
+                response: {
+                  id: "resp-long",
+                  status: "completed",
+                  model: "grok-4-fast",
+                  output: [functionCall],
+                  usage: {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    total_tokens: 2,
+                  },
+                },
+              },
+            ]),
+          )
+        ),
+      },
+    };
+    const chunks: Array<Record<string, unknown>> = [];
+
+    const response = await provider.chatStream(
+      [{ role: "user", content: "search" }],
+      (chunk) => chunks.push(chunk as unknown as Record<string, unknown>),
+    );
+
+    const start = chunks.find((chunk) => chunk.toolInputBlockStart !== undefined)
+      ?.toolInputBlockStart as {
+        contentBlock?: { name?: string };
+      } | undefined;
+    expect(start?.contentBlock?.name).toBe(longToolName);
+    expect(response.toolCalls).toEqual([
+      {
+        id: "call-long",
+        name: longToolName,
+        arguments: "{}",
+      },
+    ]);
+  });
+
+  test("rejects an unadvertised hashed alias when toolChoice none removed tools", async () => {
+    const longToolName = `mcp.plugin-${"shared-prefix-".repeat(5)}.search`;
+    const wireName = encodeMcpToolNameForWire(longToolName);
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: longToolName,
+            description: "A long tool that is disabled for this request.",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ],
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    (provider as any).client = {
+      responses: {
+        create: vi.fn((params: Record<string, unknown>) => {
+          requestBodies.push(params);
+          return withResponse({
+            id: "resp-unadvertised",
+            status: "completed",
+            model: "grok-4-fast",
+            output: [
+              {
+                type: "function_call",
+                id: "fc-unadvertised",
+                call_id: "call-unadvertised",
+                name: wireName,
+                arguments: "{}",
+              },
+            ],
+            usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+          });
+        }),
+      },
+    };
+
+    await expect(
+      provider.chat(
+        [{ role: "user", content: "hello" }],
+        { toolChoice: "none" },
+      ),
+    ).rejects.toThrow(/unknown hashed tool name/i);
+    expect(requestBodies[0]?.tools).toBeUndefined();
   });
 
   test("reuses previous_response_id and retries chat with full history on expiry", async () => {
@@ -479,6 +718,126 @@ describe("GrokProvider incremental continuation", () => {
     );
   });
 
+  const STORE_REFUSAL =
+    "Response is too large to store. You can avoid this error by setting `store` to false in your request.";
+  function storeRefusalClient(
+    requestBodies: Record<string, unknown>[],
+    second: () => unknown,
+  ): { responses: { create: ReturnType<typeof vi.fn> } } {
+    return {
+      responses: {
+        create: vi
+          .fn()
+          .mockImplementationOnce((params: Record<string, unknown>) => {
+            requestBodies.push(params);
+            throw Object.assign(new Error(STORE_REFUSAL), { status: 400 });
+          })
+          .mockImplementationOnce((params: Record<string, unknown>) => {
+            requestBodies.push(params);
+            return second();
+          }),
+      },
+    };
+  }
+
+  function completedStreamEvent(id: string, text: string): Record<string, unknown> {
+    return { type: "response.completed", response: buildXaiResponse(id, text) };
+  }
+
+  /** A provider whose first request is refused for storage and whose second gets `second()`. */
+  function refusingProvider(second: () => unknown) {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      emitWarning: (warning) => warnings.push(warning),
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    (provider as any).client = storeRefusalClient(requestBodies, second);
+    return { provider, warnings, requestBodies };
+  }
+
+  test("retries once unstored when xAI cannot store a large response", async () => {
+    const { provider, warnings, requestBodies } = refusingProvider(() =>
+      withResponse(buildXaiResponse("resp_unstored", "done")),
+    );
+    const result = await provider.chat(currentMessages);
+    expect(result.content).toBe("done");
+    expect(requestBodies.map((body) => body.store)).toEqual([true, false]);
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ cause: "xai_store_too_large" }),
+    );
+  });
+
+  test("retries the stream once unstored when xAI cannot store a large response", async () => {
+    const { provider, warnings, requestBodies } = refusingProvider(() =>
+      withResponse(streamFromEvents([completedStreamEvent("resp_unstored_stream", "stream done")])),
+    );
+    const result = await provider.chatStream(currentMessages, () => {});
+    expect(result.content).toBe("stream done");
+    expect(requestBodies.map((body) => body.store)).toEqual([true, false]);
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ cause: "xai_store_too_large" }),
+    );
+  });
+
+  test("under an admitted single wire attempt the store refusal is a retryable rebuild and the next attempt is unstored", async () => {
+    const { provider, warnings, requestBodies } = refusingProvider(() =>
+      withResponse(buildXaiResponse("resp_unstored_next", "done")),
+    );
+    primeStoredContinuation(provider, "resp_stored_prev", true, previousMessages);
+
+    await expect(
+      provider.chat(currentMessages, { singleWireAttempt: true }),
+    ).rejects.toBeInstanceOf(LLMRequestRebuiltError);
+    // No in-band retry on the admitted attempt.
+    expect(requestBodies).toHaveLength(1);
+    expect(requestBodies[0]?.store).toBe(true);
+    expect(warnings).toContainEqual(expect.objectContaining({ cause: "xai_store_too_large" }));
+
+    // The next admitted attempt carries the rebuilt plan: unstored, full history.
+    const result = await provider.chat(currentMessages, { singleWireAttempt: true });
+    expect(result.content).toBe("done");
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.store).toBe(false);
+    expect(requestBodies[1]).not.toHaveProperty("previous_response_id");
+  });
+
+  test("under an admitted single wire attempt the streaming store refusal is a retryable rebuild", async () => {
+    const { provider, requestBodies } = refusingProvider(() =>
+      withResponse(streamFromEvents([completedStreamEvent("resp_unstored_stream_next", "stream done")])),
+    );
+
+    await expect(
+      provider.chatStream(currentMessages, () => {}, { singleWireAttempt: true }),
+    ).rejects.toBeInstanceOf(LLMRequestRebuiltError);
+    expect(requestBodies).toHaveLength(1);
+    const result = await provider.chatStream(currentMessages, () => {}, { singleWireAttempt: true });
+    expect(result.content).toBe("stream done");
+    expect(requestBodies.map((body) => body.store)).toEqual([true, false]);
+  });
+
+  test("does not retry the store error when the request was already unstored", async () => {
+    const provider = new GrokProvider({ apiKey: "xai-test", model: "grok-4-fast" });
+    // An operator who opted out of stored responses (AGENC_XAI_STORE=0) already
+    // sends store: false; the provider must not loop on the same refusal.
+    const buildRequestPlan = (provider as any).buildRequestPlan.bind(provider);
+    vi.spyOn(provider as any, "buildRequestPlan").mockImplementation((...args: unknown[]) => {
+      const plan = buildRequestPlan(...args);
+      plan.params.store = false;
+      return plan;
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    const create = vi.fn().mockImplementation((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      throw Object.assign(new Error("Response is too large to store."), { status: 400 });
+    });
+    (provider as any).client = { responses: { create } };
+    await expect(provider.chat(currentMessages)).rejects.toThrow(/too large to store/);
+    expect(requestBodies[0]?.store).toBe(false);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
   test("reuses previous_response_id and retries streaming with full history on expiry", async () => {
     const warnings: Array<{ cause: string; message: string }> = [];
     const provider = new GrokProvider({
@@ -487,18 +846,7 @@ describe("GrokProvider incremental continuation", () => {
       emitWarning: (warning) => warnings.push(warning),
     });
 
-    (provider as any).incrementalTracker.recordRequest(
-      (provider as any).buildIncrementalRequestShape({
-        model: "grok-4-fast",
-        store: false,
-      }),
-      previousMessages,
-    );
-    (provider as any).incrementalTracker.recordResponse({
-      previousResponseId: "resp_prev_stream",
-      itemsAdded: [{ role: "assistant", content: "hi" }],
-      recordedAtMs: Date.now(),
-    });
+    primeStoredContinuation(provider, "resp_prev_stream", false, previousMessages);
 
     const requestBodies: Record<string, unknown>[] = [];
     (provider as any).client = {
@@ -842,6 +1190,120 @@ describe("GrokProvider incremental continuation", () => {
   });
 });
 
+describe("GrokProvider streaming incremental continuation (AGENC_XAI_INCREMENTAL)", () => {
+  const firstTurn: LLMMessage[] = [{ role: "user", content: "hello" }];
+  const secondTurn: LLMMessage[] = [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi" },
+    { role: "user", content: "follow up" },
+  ];
+  const systemPromptAt = (clock: string): string =>
+    `Static instructions.${SYSTEM_PROMPT_DYNAMIC_BOUNDARY_MARKER}Current time: ${clock}`;
+
+  function streamingProvider(incrementalContinuation: boolean | undefined) {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const provider = new GrokProvider({
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      emitWarning: (warning) => warnings.push(warning),
+      ...(incrementalContinuation !== undefined
+        ? { incrementalContinuation }
+        : {}),
+    });
+    const requestBodies: Record<string, unknown>[] = [];
+    const create = vi.fn((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      const ordinal = requestBodies.length;
+      return withResponse(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse(
+              `resp_${ordinal}`,
+              ordinal === 1 ? "hi" : "done",
+            ),
+          },
+        ]),
+      );
+    });
+    (provider as any).client = { responses: { create } };
+    return { provider, requestBodies, create, warnings };
+  }
+
+  test("the second streaming request carries previous_response_id and only the delta", async () => {
+    const { provider, requestBodies } = streamingProvider(true);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.previous_response_id).toBeUndefined();
+    expect(JSON.stringify(requestBodies[0]?.input)).toContain("Static instructions");
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    const delta = JSON.stringify(requestBodies[1]?.input);
+    // Only the items added since the stored response, plus the fresh dynamic
+    // tail; the static system prompt and the earlier turns live server-side.
+    expect(delta).toContain("follow up");
+    expect(delta).toContain("Current time: one");
+    expect(delta).not.toContain("hello");
+    expect(delta).not.toContain("Static instructions");
+    expect(delta).not.toContain("Current time: noon");
+  });
+
+  test("stays off by default: every streaming request re-sends the full history", async () => {
+    const { provider, requestBodies } = streamingProvider(undefined);
+
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    await provider.chatStream(secondTurn, () => {}, {
+      systemPrompt: systemPromptAt("one"),
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBeUndefined();
+    const full = JSON.stringify(requestBodies[1]?.input);
+    expect(full).toContain("hello");
+    expect(full).toContain("follow up");
+    expect(full).toContain("Static instructions");
+  });
+
+  test("a single-wire attempt that loses its continuation clears the tracker for the next attempt", async () => {
+    const { provider, requestBodies, create, warnings } = streamingProvider(true);
+    await provider.chatStream(firstTurn, () => {}, {
+      systemPrompt: systemPromptAt("noon"),
+    });
+    expect((provider as any).incrementalTracker.previousResponseId()).toBe("resp_1");
+
+    create.mockImplementationOnce((params: Record<string, unknown>) => {
+      requestBodies.push(params);
+      throw Object.assign(new Error("previous response not found"), {
+        status: 404,
+      });
+    });
+
+    await expect(
+      provider.chatStream(secondTurn, () => {}, {
+        systemPrompt: systemPromptAt("one"),
+        singleWireAttempt: true,
+      }),
+    ).rejects.toBeDefined();
+
+    // One rejected wire attempt, no in-band retry, continuation cleared so
+    // the reconnect ladder's next admitted attempt sends full history.
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[1]?.previous_response_id).toBe("resp_1");
+    expect((provider as any).incrementalTracker.previousResponseId()).toBeUndefined();
+    expect(warnings).toContainEqual(
+      expect.objectContaining({ cause: "previous_response_id_expired" }),
+    );
+  });
+});
+
 describe("GrokProvider stream timeout semantics", () => {
   // Chunks arrive `gapMs` after the previous chunk is consumed, so the
   // stream is never idle for longer than `gapMs` even though its total
@@ -898,6 +1360,91 @@ describe("GrokProvider stream timeout semantics", () => {
         finishReason: "stop",
       });
       expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an unconfigured request whose headers never arrive aborts at the request-open default", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+      });
+      // The SDK request honours the abort signal but never produces headers:
+      // the shape of a half-open TCP connection.
+      const create = vi.fn(
+        (_params: Record<string, unknown>, requestOptions: { signal?: AbortSignal }) =>
+          new Promise<never>((_resolve, reject) => {
+            requestOptions.signal?.addEventListener(
+              "abort",
+              () => reject(requestOptions.signal?.reason ?? new Error("aborted")),
+              { once: true },
+            );
+          }),
+      );
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      let settled = false;
+      const outcome = resultPromise.then(
+        () => "resolved" as const,
+        (error: unknown) => error,
+      );
+      void outcome.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_OPEN_TIMEOUT_MS - 1);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(LLMTimeoutError);
+      expect(error).toMatchObject({ timeoutMs: DEFAULT_REQUEST_OPEN_TIMEOUT_MS });
+      expect(create).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an explicit timeout_ms of 0 keeps the request-open phase unbounded", async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = new GrokProvider({
+        apiKey: "xai-test",
+        model: "grok-4-fast",
+        timeoutMs: 0,
+      });
+      const headersGate = Promise.withResolvers<unknown>();
+      const create = vi.fn(() => headersGate.promise);
+      (provider as any).client = { responses: { create } };
+
+      const resultPromise = provider.chatStream(
+        [{ role: "user", content: "hello" }],
+        () => {},
+      );
+      resultPromise.catch(() => {});
+      await vi.advanceTimersByTimeAsync(6 * 60 * 60_000);
+
+      // A bare promise has no withResponse(); the adapter awaits it and uses
+      // the settled value as the stream itself.
+      headersGate.resolve(
+        streamFromEvents([
+          {
+            type: "response.completed",
+            response: buildXaiResponse("resp_unbounded_open", "late but fine"),
+          },
+        ]),
+      );
+      await expect(resultPromise).resolves.toMatchObject({
+        content: "late but fine",
+        finishReason: "stop",
+      });
     } finally {
       vi.useRealTimers();
     }

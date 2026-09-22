@@ -176,6 +176,18 @@ export class ConfigRepositoryError extends Error {
   }
 }
 
+function findConfigProjectRoot(
+  cwd: string,
+  markers: readonly string[] | undefined,
+  env: EnvSnapshot,
+): { rootDir: string; marker: string } | null {
+  return findProjectRootSync(
+    cwd,
+    markers,
+    env.HOME ? { stopBefore: env.HOME } : undefined,
+  );
+}
+
 const V2_TOP_LEVEL_KEYS = new Set(
   KNOWN_CONFIG_KEYS.filter(
     (key) => key !== "configVersion" && key !== "_unknown",
@@ -726,6 +738,20 @@ function sanitizeRepositoryLayer(
           "MCP declarations require independent approval and cannot grant tool authority",
         );
       }
+      if (
+        Object.prototype.hasOwnProperty.call(
+          value,
+          "virtual_no_fs_write_tools",
+        )
+      ) {
+        delete value.virtual_no_fs_write_tools;
+        recordIgnored(
+          ignored,
+          layer,
+          `mcp_servers.${serverName}.virtual_no_fs_write_tools`,
+          "project/local configuration cannot bypass filesystem target verification",
+        );
+      }
       if (!isPlainRecord(value.tools)) continue;
       for (const [toolName, toolValue] of Object.entries(value.tools)) {
         if (!isPlainRecord(toolValue)) continue;
@@ -745,7 +771,6 @@ function sanitizeRepositoryLayer(
   for (const path of [
     ["browser", "executable_path"],
     ["browser", "profile_dir"],
-    ["buffer", "neovim", "executable"],
     ["llm", "xai", "remote_mcp"],
   ] as const) {
     removeNestedPath(
@@ -765,19 +790,6 @@ function sanitizeRepositoryLayer(
         layer,
         ignored,
         "project/local configuration cannot weaken browser isolation",
-      );
-    }
-  }
-
-  if (isPlainRecord(raw.buffer) && isPlainRecord(raw.buffer.prediction)) {
-    const prediction = raw.buffer.prediction;
-    if (prediction.enabled !== "off") {
-      removeNestedPath(
-        raw,
-        ["buffer", "prediction"],
-        layer,
-        ignored,
-        "project/local configuration cannot enable or route source-code prediction",
       );
     }
   }
@@ -1216,7 +1228,8 @@ export async function assertNoRetiredConfigInputsForMutation(
   const cwd = resolve(options.cwd ?? process.cwd());
   const projectRoot = resolve(
     options.projectRoot ??
-      findProjectRootSync(cwd, defaultConfig().project_root_markers)?.rootDir ??
+      findConfigProjectRoot(cwd, defaultConfig().project_root_markers, env)
+        ?.rootDir ??
       cwd,
   );
   await assertNoRetiredConfigInputs({
@@ -1351,7 +1364,7 @@ async function loadLayeredConfigInternal(
   const projectRoot = includeWorkspaceLayers
     ? resolve(
         options.projectRoot ??
-          findProjectRootSync(cwd, rootMarkers)?.rootDir ??
+          findConfigProjectRoot(cwd, rootMarkers, env)?.rootDir ??
           cwd,
       )
     : home.path;
@@ -1471,6 +1484,15 @@ async function loadLayeredConfigInternal(
     const merged = mergeLayer(config, managed, true, provenance, ignored);
     config = merged.config;
     sources.push(merged.source);
+  }
+
+  if (
+    config.model_provider === "gemini" &&
+    provenance.reasoning_effort?.scope === "default"
+  ) {
+    const { reasoning_effort: _defaultEffort, ...providerDefaults } = config;
+    config = providerDefaults;
+    delete provenance.reasoning_effort;
   }
 
   config = mergeConfigs(config, {

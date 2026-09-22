@@ -1,13 +1,7 @@
 import { expect, test } from 'bun:test'
-import { existsSync } from 'fs'
 import path from 'path'
 
-import { selectPinnedRipgrepPath } from '../../src/tools/system/pinned-ripgrep.ts'
-import {
-  resolveBuiltinRipgrepCommand,
-  resolveRipgrepConfig,
-  wrapRipgrepUnavailableError,
-} from '../../src/utils/ripgrep.ts'
+import { resolveRipgrepConfig, wrapRipgrepUnavailableError } from '../../src/utils/ripgrep.ts'
 
 const MOCK_BUILTIN_PATH = path.normalize(
   process.platform === 'win32'
@@ -27,7 +21,7 @@ test('ripgrepCommand falls back to system rg when builtin binary is missing', ()
 
   expect(config).toMatchObject({
     mode: 'system',
-    command: 'rg',
+    command: '/usr/bin/rg',
     args: [],
   })
 })
@@ -49,28 +43,24 @@ test('ripgrepCommand keeps builtin mode when bundled binary exists', () => {
   })
 })
 
-test('resolveBuiltinRipgrepCommand prefers the packaged @vscode/ripgrep binary', () => {
-  const pinned = selectPinnedRipgrepPath()
-  if (pinned === undefined) {
-    const resolved = resolveBuiltinRipgrepCommand(undefined)
-    expect(resolved.exists).toBe(existsSync(resolved.command))
-    return
-  }
-
-  const resolved = resolveBuiltinRipgrepCommand(pinned)
-  expect(resolved.exists).toBe(true)
-  expect(resolved.command).toBe(pinned)
-  expect(existsSync(resolved.command)).toBe(true)
+test('ripgrepCommand keeps the embedded executable branch explicit', () => {
+  const config = resolveRipgrepConfig({
+    userWantsSystemRipgrep: false,
+    bundledMode: true,
+    builtinExists: false,
+    systemExecutablePath: 'rg',
+    processExecPath: '/installed/agenc',
+  })
+  expect(config).toEqual({ mode: 'embedded', command: '/installed/agenc', args: ['--no-config'], argv0: 'rg' })
 })
 
-test('resolveBuiltinRipgrepCommand falls back to vendor when packaged path is missing', () => {
-  const resolved = resolveBuiltinRipgrepCommand(
-    path.join(path.dirname(MOCK_BUILTIN_PATH), 'missing-rg-binary'),
-  )
-  expect(resolved.command).toContain(
-    `${path.sep}vendor${path.sep}ripgrep${path.sep}`,
-  )
-  expect(resolved.exists).toBe(existsSync(resolved.command))
+test('ripgrepCommand reports unavailable only after neither candidate is usable', () => {
+  expect(() => resolveRipgrepConfig({
+    userWantsSystemRipgrep: true,
+    bundledMode: false,
+    builtinExists: false,
+    systemExecutablePath: 'rg',
+  })).toThrow('Neither system nor packaged ripgrep is an executable file.')
 })
 
 test('wrapRipgrepUnavailableError explains missing packaged fallback', () => {

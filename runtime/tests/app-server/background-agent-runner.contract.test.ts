@@ -1,3 +1,7 @@
+import { ModelRegistry, modelRegistryEntryToModelInfo } from "../../src/llm/model-registry.js";
+import { resolveSessionReasoningEffort } from "../../src/phases/stream-model.js";
+import { buildAnthropicMessagesRequest } from "../../src/llm/wire/messages-anthropic.js";
+import desktopEffortCatalog from "../llm/desktop-effort-catalog.json";
 import {
   mkdirSync,
   mkdtempSync,
@@ -18,6 +22,7 @@ import {
   AgenCBackgroundAgentMessageError,
   AgenCBackgroundAgentSuspensionShutdownError,
   AgenCDelegateBackgroundAgentRunner,
+  __installDaemonTurnDriverHooksForTest,
   daemonEventFromUnboundSessionEvent,
   notificationFromDaemonEvent,
   resolvePermissionDecisionTimeoutMs,
@@ -26,6 +31,14 @@ import {
   managedTokenUsage,
 } from "./background-agent-runner.js";
 import { collectDaemonClientEnvOverrides } from "./agent-cli.js";
+import { createDaemonTuiSessionFixture } from "../helpers/daemon-tui-session.js";
+import { getDefaultAppState } from "../../src/tui/state/AppStateStore.js";
+import { startDaemonWorkerTaskPolling } from "../../src/tui/state/daemonWorkerTasks.js";
+import type { NativeWorkerSnapshot } from "../../src/agents/control.js";
+import type { AgenCDaemonTuiClient } from "../../src/tui/daemon-session.js";
+import { AgenCDaemonAgentManager } from "./agent-lifecycle.js";
+import { AgenCDaemonJsonRpcDispatcher } from "./daemon-dispatcher.js";
+import { AgenCDaemonSessionManager } from "./session-lifecycle.js";
 import type { AgentStatus } from "../agents/status.js";
 import type { AuthBackend } from "../auth/backend.js";
 import type {
@@ -39,7 +52,8 @@ import {
   type ToolPermissionContext,
 } from "../permissions/types.js";
 import type { UserPromptSubmitHook } from "../hooks/user-prompt-submit.js";
-import { JSON_RPC_VERSION } from "./protocol/index.js";
+import { AGENC_DAEMON_PROTOCOL_VERSION, JSON_RPC_VERSION } from "./protocol/index.js";
+import { UnifiedExecProcessManager } from "../unified-exec/process-manager.js";
 import { requestApproval } from "../tools/orchestrator.js";
 import type { CsvAgentJobsRepositoryProvider } from "./csv-agent-jobs-authority.js";
 import type { RunRuntimeSettingsSnapshot } from "../contracts/run-contracts.js";
@@ -61,10 +75,22 @@ import {
 } from "../sandbox/execution-broker.js";
 import {
   clearCurrentRuntimeSession,
+  getCurrentRuntimeSession,
   peekScopedRuntimeSession,
+  runWithCurrentRuntimeSession,
   setCurrentRuntimeSession,
 } from "../session/current-session.js";
 import type { Session } from "../session/session.js";
+import type { JsonRecord } from "../config/json.js";
+import { EventLog, type Event } from "../../src/session/event-log.js";
+import { openStateDatabases } from "../../src/state/sqlite-driver.js";
+import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
+import { createOperatorEffectReviewResolution } from "../../src/state/effect-review.js";
+import { listUnresolvedUnknownOutcomeEffects } from "../../src/state/unknown-outcome-gate.js";
+import { recordInFlightToolCallUnknownOutcome } from "../../src/state/tool-output-rotation.js";
+import { seedPendingEffectReview } from "../state/helpers/effect-review-fixture.js";
+import { registerChildApprovalSession, revokeChildApprovalSession } from "../../src/agents/child-approval-context.js";
+import type { ApprovalResolver } from "../../src/permissions/guardian/arbiter.js";
 import type { TurnContext } from "../session/turn-context.js";
 import type { Tool, ToolResult } from "../tools/types.js";
 import { readToolRuntimeContext } from "../tools/runtimes/context.js";
@@ -74,7 +100,6 @@ import {
   runWithCanonicalSettingsAuthority,
   type CanonicalSettingsAuthority,
 } from "../utils/settings/canonicalAuthority.js";
-import { workspaceMutationCoordinators } from "../workspace/mutation-coordinator.js";
 import {
   COORDINATED_CONFIG_STORE_PUBLICATION,
   type CoordinatedConfigStorePublishOptions,
@@ -83,6 +108,9 @@ import {
   registerSandboxExecutionLifecycleParticipant,
   transitionSandboxExecutionBroker,
 } from "../sandbox/execution-lifecycle.js";
+import {
+  MAX_ADDITIONAL_WORKING_DIRECTORIES,
+} from "../contracts/additional-working-directories.js";
 
 const backgroundAgentRunnerSourcePath = new URL(
   "../../src/app-server/background-agent-runner.ts",
@@ -375,6 +403,7 @@ function makeTopLevelRunner(opts: {
     next: ToolPermissionContext,
     current: ToolPermissionContext,
   ) => Promise<void> | void;
+  readonly initialCliAdditionalDirectories?: readonly string[];
   readonly configLayers?: readonly {
     readonly scope: "managed" | "user" | "project" | "local";
     readonly label: string;
@@ -389,6 +418,16 @@ function makeTopLevelRunner(opts: {
     isAutoModeAvailable:
       typeof opts.env?.XAI_API_KEY === "string" ||
       typeof opts.env?.GROK_API_KEY === "string",
+    ...(opts.initialCliAdditionalDirectories !== undefined
+      ? {
+          additionalWorkingDirectories: new Map(
+            opts.initialCliAdditionalDirectories.map((path) => [
+              path,
+              { path, source: "cliArg" as const },
+            ]),
+          ),
+        }
+      : {}),
   });
   let permissionRegistryQueue: Promise<void> = Promise.resolve();
   const withPermissionRegistryLock = <T>(
@@ -422,6 +461,7 @@ function makeTopLevelRunner(opts: {
     next: ToolPermissionContext,
     current: ToolPermissionContext,
     metadata: unknown,
+    transactionPreparedUpdate?: PermissionContextPreparedUpdate,
   ): Promise<void> => {
     await opts.permissionBeforeUpdateGate?.(next, current);
     const preparedResult = await permissionBeforeUpdate?.(
@@ -429,23 +469,26 @@ function makeTopLevelRunner(opts: {
       current,
       metadata,
     );
-    const prepared =
+    const ownerPrepared =
       typeof preparedResult === "function"
         ? { commit: preparedResult }
         : preparedResult;
+    const preparedUpdates = [ownerPrepared, transactionPreparedUpdate].filter(
+      (update): update is PermissionContextPreparedUpdate => update !== undefined,
+    );
     let state: "prepared" | "committed" | "rolled_back" = "prepared";
     const publication: PermissionContextPublication = {
       commit: async () => {
         if (opts.canonicalRuntimeSettings !== false) permissionContext = next;
         try {
-          await prepared?.commit();
+          for (const update of preparedUpdates) await update.commit();
           state = "committed";
         } catch (error) {
           if (opts.canonicalRuntimeSettings !== false) {
             permissionContext = current;
           }
           state = "rolled_back";
-          await prepared?.rollback?.();
+          for (const update of [...preparedUpdates].reverse()) await update.rollback?.();
           throw error;
         }
       },
@@ -454,7 +497,7 @@ function makeTopLevelRunner(opts: {
         if (opts.canonicalRuntimeSettings !== false)
           permissionContext = current;
         state = "rolled_back";
-        await prepared?.rollback?.();
+        for (const update of [...preparedUpdates].reverse()) await update.rollback?.();
       },
     };
     try {
@@ -472,7 +515,7 @@ function makeTopLevelRunner(opts: {
       await publication.rollback();
       throw error;
     } finally {
-      await prepared?.settle?.();
+      for (const update of [...preparedUpdates].reverse()) await update.settle?.();
     }
     permissionUpdates.push(next);
   };
@@ -491,6 +534,7 @@ function makeTopLevelRunner(opts: {
         transaction: (current: ToolPermissionContext) => Promise<{
           readonly next: ToolPermissionContext | null;
           readonly metadata?: unknown;
+          readonly preparedUpdate?: PermissionContextPreparedUpdate;
           readonly result: () => T;
         }>,
       ): Promise<T> =>
@@ -505,6 +549,7 @@ function makeTopLevelRunner(opts: {
               mutation.next,
               current,
               mutation.metadata,
+              mutation.preparedUpdate,
             );
           }
           return mutation.result();
@@ -564,6 +609,7 @@ function makeTopLevelRunner(opts: {
   const rolloutStore = {
     rolloutPath: `/tmp/${opts.conversationId}.jsonl`,
     readAll: () => [...rolloutItems],
+    liveHistoryBlockedReason: vi.fn((): string | undefined => undefined),
     assertRunSuspendable: vi.fn(() => {}),
     recordRunSuspensionEvent: vi.fn(() => {}),
     recordRunStartupActivationEvent: vi.fn(() => {}),
@@ -586,10 +632,11 @@ function makeTopLevelRunner(opts: {
   // tests can still pass an explicit invalid workspaceRoot.
   const workspaceRoot = opts.workspaceRoot ?? process.cwd();
   const persistedBypassConsent = new Set(opts.persistedBypassConsent ?? []);
+  const runtimeStateNamespaces = new Map<string, JsonRecord>();
   const stateRepository = {
     reload: vi.fn(() => ({})),
-    getNamespace: vi.fn((namespace: string) =>
-      namespace === "permissions" && persistedBypassConsent.size > 0
+    getNamespace: vi.fn((namespace: string): JsonRecord =>
+      runtimeStateNamespaces.get(namespace) ?? (namespace === "permissions" && persistedBypassConsent.size > 0
         ? {
             bypassPermissionsAcceptedByCwd: Object.fromEntries(
               [...persistedBypassConsent].map((cwd) => {
@@ -607,8 +654,13 @@ function makeTopLevelRunner(opts: {
               }),
             ),
           }
-        : {},
+        : {}),
     ),
+    updateNamespace: vi.fn((namespace: string, update: (current: JsonRecord) => JsonRecord) => {
+      const next = update(stateRepository.getNamespace(namespace));
+      runtimeStateNamespaces.set(namespace, next);
+      return next;
+    }),
   };
   const configPublicationOptions: unknown[] = [];
   const configStore = {
@@ -672,10 +724,24 @@ function makeTopLevelRunner(opts: {
   });
   let configuredExecutionAuthority: SessionExecutionAuthority =
     sessionExecutionAuthorityFromAgenCConfig({
-      config: {},
+      config:
+        opts.initialCliAdditionalDirectories === undefined
+          ? {}
+          : {
+              sandbox: {
+                filesystem: {
+                  allowWrite: [...opts.initialCliAdditionalDirectories],
+                },
+              },
+            },
       workspaceRoot,
       projectTrust: "trusted",
     });
+  const preparedConfiguredExecutionAuthorities: SessionExecutionAuthority[] =
+    [];
+  const preparedConfiguredPermissionContexts: Array<
+    Pick<ToolPermissionContext, "additionalWorkingDirectories">
+  > = [];
   const sandboxExecutionBroker = new SandboxExecutionBroker({
     cwd: workspaceRoot,
     ...sandboxExecutionBrokerAuthorityFromSessionAuthority(
@@ -708,6 +774,10 @@ function makeTopLevelRunner(opts: {
   };
   let nextInternalSubId = 0;
   const sessionAbortController = new AbortController();
+  // The real Session latches a client Stop until the next user message; the
+  // stub carries the same state so tests can read it, not just the calls.
+  let stoppedByUserSinceLastPrompt = false;
+  let userStopGeneration = 0;
   const session = {
     abortController: sessionAbortController,
     abortTerminal: vi.fn((reason: string) => {
@@ -716,6 +786,7 @@ function makeTopLevelRunner(opts: {
       }
     }),
     conversationId: opts.conversationId,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     providerService,
     permissionModeRegistry,
     get sessionConfiguration() {
@@ -777,6 +848,19 @@ function makeTopLevelRunner(opts: {
       unsafePeek: () => sessionState,
     },
     abortAllTasks: vi.fn(async () => {}),
+    markStoppedByUser: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = true;
+      userStopGeneration += 1;
+    }),
+    clearUserStop: vi.fn(() => {
+      stoppedByUserSinceLastPrompt = false;
+    }),
+    get stoppedByUserSinceLastPrompt() {
+      return stoppedByUserSinceLastPrompt;
+    },
+    get userStopGeneration() {
+      return userStopGeneration;
+    },
     trackDurableOperation: <T>(operation: Promise<T>): Promise<T> => {
       durableOperations.add(operation);
       void operation.then(
@@ -917,17 +1001,26 @@ function makeTopLevelRunner(opts: {
   };
   const bootstrap = vi.fn(async () => ({
     workspaceRoot,
+    modelInfo: { slug: "base-model", contextWindow: 65_536 },
     configStore,
     get configuredExecutionAuthority() {
       return configuredExecutionAuthority;
     },
-    prepareConfiguredExecutionAuthority: (config: Record<string, unknown>) => {
+    prepareConfiguredExecutionAuthority: (
+      config: Record<string, unknown>,
+      nextPermissionContext: Pick<
+        ToolPermissionContext,
+        "additionalWorkingDirectories"
+      >,
+    ) => {
       const previous = configuredExecutionAuthority;
       const authority = sessionExecutionAuthorityFromAgenCConfig({
         config,
         workspaceRoot,
         projectTrust: "trusted",
       });
+      preparedConfiguredExecutionAuthorities.push(authority);
+      preparedConfiguredPermissionContexts.push(nextPermissionContext);
       let committed = false;
       return {
         authority,
@@ -987,6 +1080,8 @@ function makeTopLevelRunner(opts: {
     rolloutStore,
     configStore,
     configPublicationOptions,
+    preparedConfiguredExecutionAuthorities,
+    preparedConfiguredPermissionContexts,
     sandboxExecutionBroker,
     sessionState,
     stateRepository,
@@ -1199,6 +1294,110 @@ function configureSessionShellHarness(
 }
 
 describe("AgenC delegate background-agent runner", () => {
+  it("[status-line] reaches the bound deferred owner's executor without a model turn", async () => {
+    const agentId = "status-line-deferred-agent";
+    const sessionId = "status-line-bound-session";
+    const harness = makeTopLevelRunner({
+      conversationId: agentId,
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+      runtimeSimpleMode: true,
+    });
+    Object.assign(harness.session.services, {
+      mcpStartupCancellationToken: {
+        isCancelled: () => false,
+        signal: new AbortController().signal,
+      },
+    });
+    await harness.runner.startAgent({
+      objective: "defer status-line work",
+      deferInitialTurn: true,
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    await harness.runner.attachAgentSessionEvents(agentId, { sessionId, emit: async () => {} });
+    const trackOperation = vi.spyOn(harness.session, "trackDurableOperation");
+    try {
+      await expect(harness.runner.executeAgentStatusLine(agentId, { sessionId })).resolves.toEqual({
+        status: "disabled",
+        reason: "hooks_disabled",
+      });
+      expect(trackOperation).toHaveBeenCalledOnce();
+      expect(harness.control.sendInput).not.toHaveBeenCalled();
+      expect(harness.stub.thread.submit).not.toHaveBeenCalled();
+    } finally {
+      trackOperation.mockRestore();
+      await harness.runner.stopAgent(agentId);
+    }
+  });
+
+  it.each(["absent", "unbound", "mismatched"])("[status-line] rejects %s ownership before entering the executor", async (state) => {
+    const agentId = `status-line-${state}-agent`;
+    const harness = makeTopLevelRunner({
+      conversationId: agentId,
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+    });
+    if (state !== "absent") {
+      await harness.runner.startAgent({
+        objective: "defer status-line work",
+        deferInitialTurn: true,
+        unattendedAllow: [],
+        unattendedDeny: [],
+      });
+    }
+    if (state === "mismatched") {
+      await harness.runner.attachAgentSessionEvents(agentId, {
+        sessionId: "different-owner",
+        emit: async () => {},
+      });
+    }
+    const trackOperation = vi.spyOn(harness.session, "trackDurableOperation");
+    try {
+      await expect(harness.runner.executeAgentStatusLine(agentId, { sessionId: agentId })).rejects.toThrow(
+        state === "absent" ? "not running" : "does not own this runtime session",
+      );
+      expect(trackOperation).not.toHaveBeenCalled();
+      expect(harness.control.sendInput).not.toHaveBeenCalled();
+      expect(harness.stub.thread.submit).not.toHaveBeenCalled();
+    } finally {
+      trackOperation.mockRestore();
+      await harness.runner.stopAgent(agentId);
+    }
+  });
+
+  it("[status-line] rejects closed ingress while the bound runtime is still draining", async () => {
+    const agentId = "status-line-draining-agent";
+    const shutdownEntered = Promise.withResolvers<void>();
+    const releaseShutdown = Promise.withResolvers<void>();
+    const harness = makeTopLevelRunner({
+      conversationId: agentId,
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+      bootstrapShutdown: vi.fn(async () => {
+        shutdownEntered.resolve();
+        await releaseShutdown.promise;
+      }),
+    });
+    await harness.runner.startAgent({
+      objective: "defer status-line work",
+      deferInitialTurn: true,
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    await harness.runner.attachAgentSessionEvents(agentId, { sessionId: agentId, emit: async () => {} });
+    const stopping = harness.runner.stopAgent(agentId);
+    const trackOperation = vi.spyOn(harness.session, "trackDurableOperation");
+    try {
+      await shutdownEntered.promise;
+      await expect(harness.runner.executeAgentStatusLine(agentId, { sessionId: agentId })).rejects.toThrow("not running");
+      expect(trackOperation).not.toHaveBeenCalled();
+      expect(harness.control.sendInput).not.toHaveBeenCalled();
+      expect(harness.stub.thread.submit).not.toHaveBeenCalled();
+    } finally {
+      releaseShutdown.resolve();
+      await stopping;
+      trackOperation.mockRestore();
+    }
+  });
+
   it("[managed-thread] runs a deferred session shell through the canonical live router authorities", async () => {
     const harness = makeTopLevelRunner({
       conversationId: "session-direct-shell-authorities",
@@ -1563,168 +1762,6 @@ describe("AgenC delegate background-agent runner", () => {
       }),
     ]);
     expect(shell.bashExecute).not.toHaveBeenCalled();
-  });
-
-  it("[managed-thread] denies direct shell while Editor owns the workspace", async () => {
-    const workspaceRoot = mkdtempSync(
-      join(tmpdir(), "agenc-direct-shell-editor-owned-workspace-"),
-    );
-    const settingsHome = mkdtempSync(
-      join(tmpdir(), "agenc-direct-shell-editor-owned-home-"),
-    );
-    try {
-      const harness = makeTopLevelRunner({
-        conversationId: "session-direct-shell-editor-owned",
-        threadInitialStatus: { status: "pending_init" } as AgentStatus,
-        workspaceRoot,
-      });
-      const shell = configureSessionShellHarness(harness, { settingsHome });
-      const settingsAuthority =
-        harness.configStore as unknown as CanonicalSettingsAuthority;
-      await harness.runner.startAgent({
-        objective: "deferred direct shell",
-        deferInitialTurn: true,
-        unattendedAllow: [],
-        unattendedDeny: [],
-      });
-      harness.forcePermissionContextForTesting(
-        createEmptyToolPermissionContext({
-          mode: "bypassPermissions",
-          isBypassPermissionsModeAvailable: true,
-        }),
-      );
-      const lease = runWithCanonicalSettingsAuthority(settingsAuthority, () =>
-        workspaceMutationCoordinators.acquireEditor(workspaceRoot, {
-          workspaceRoot,
-          editorInstanceId: "editor-before-direct-shell",
-        }),
-      );
-
-      const result = await harness.runner.executeAgentShell(
-        "session-direct-shell-editor-owned",
-        {
-          sessionId: "session-direct-shell-editor-owned",
-          commandId: "shell-editor-owned-1",
-          command: "printf blocked-by-editor",
-        },
-      );
-
-      expect(result).toMatchObject({
-        commandId: "shell-editor-owned-1",
-        isError: true,
-        stdout: "",
-        exitCode: null,
-      });
-      expect(`${result.content}\n${result.stderr}`).toMatch(
-        /Tool 'system\.bash' is blocked while this workspace has protected Editor authority/u,
-      );
-      expect(shell.bashExecute).not.toHaveBeenCalled();
-      expect(shell.acquire).not.toHaveBeenCalled();
-
-      await runWithCanonicalSettingsAuthority(settingsAuthority, () =>
-        workspaceMutationCoordinators.getOrCreate(workspaceRoot).release({
-          workspaceRoot,
-          editorInstanceId: lease.editorInstanceId,
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }),
-      );
-    } finally {
-      workspaceMutationCoordinators.clearForTests();
-      rmSync(workspaceRoot, { recursive: true, force: true });
-      rmSync(settingsHome, { recursive: true, force: true });
-    }
-  });
-
-  it("[managed-thread] keeps Editor acquisition fenced until direct shell cleanup", async () => {
-    const workspaceRoot = mkdtempSync(
-      join(tmpdir(), "agenc-direct-shell-inflight-workspace-"),
-    );
-    const settingsHome = mkdtempSync(
-      join(tmpdir(), "agenc-direct-shell-inflight-home-"),
-    );
-    const resultGate = Promise.withResolvers<ToolResult>();
-    let execution: Promise<unknown> | undefined;
-    try {
-      const harness = makeTopLevelRunner({
-        conversationId: "session-direct-shell-inflight",
-        threadInitialStatus: { status: "pending_init" } as AgentStatus,
-        workspaceRoot,
-      });
-      const shell = configureSessionShellHarness(harness, {
-        settingsHome,
-        execute: async () => resultGate.promise,
-      });
-      const settingsAuthority =
-        harness.configStore as unknown as CanonicalSettingsAuthority;
-      const acquireEditor = (editorInstanceId: string) =>
-        runWithCanonicalSettingsAuthority(settingsAuthority, () =>
-          workspaceMutationCoordinators.acquireEditor(workspaceRoot, {
-            workspaceRoot,
-            editorInstanceId,
-          }),
-        );
-      await harness.runner.startAgent({
-        objective: "deferred direct shell",
-        deferInitialTurn: true,
-        unattendedAllow: [],
-        unattendedDeny: [],
-      });
-      harness.forcePermissionContextForTesting(
-        createEmptyToolPermissionContext({
-          mode: "bypassPermissions",
-          isBypassPermissionsModeAvailable: true,
-        }),
-      );
-
-      execution = harness.runner.executeAgentShell(
-        "session-direct-shell-inflight",
-        {
-          sessionId: "session-direct-shell-inflight",
-          commandId: "shell-inflight-1",
-          command: "printf held-open",
-        },
-      );
-      await vi.waitFor(() => expect(shell.bashExecute).toHaveBeenCalledOnce());
-      expect(() => acquireEditor("editor-during-direct-shell")).toThrow(
-        /waiting for active tool 'system\.bash'/u,
-      );
-
-      resultGate.resolve({
-        content: "shell completed",
-        metadata: {
-          stdout: "shell completed",
-          stderr: "",
-          exitCode: 0,
-          timedOut: false,
-        },
-      });
-      await expect(execution).resolves.toMatchObject({
-        commandId: "shell-inflight-1",
-        isError: false,
-        stdout: "shell completed",
-      });
-
-      const lease = acquireEditor("editor-after-direct-shell");
-      expect(lease).toMatchObject({
-        workspaceRoot,
-        editorInstanceId: "editor-after-direct-shell",
-      });
-      await runWithCanonicalSettingsAuthority(settingsAuthority, () =>
-        workspaceMutationCoordinators.getOrCreate(workspaceRoot).release({
-          workspaceRoot,
-          editorInstanceId: lease.editorInstanceId,
-          leaseToken: lease.leaseToken,
-          epoch: lease.epoch,
-        }),
-      );
-    } finally {
-      resultGate.resolve({ content: "test cleanup" });
-      await execution?.catch(() => {});
-      workspaceMutationCoordinators.clearForTests();
-      rmSync(workspaceRoot, { recursive: true, force: true });
-      rmSync(settingsHome, { recursive: true, force: true });
-    }
   });
 
   it("[managed-thread] deduplicates identical shell command ids and rejects conflicting reuse", async () => {
@@ -2223,6 +2260,72 @@ describe("AgenC delegate background-agent runner", () => {
     }
   });
 
+  it("resolves live effect evidence under its owning session and home across ambiguous or conflicting scopes", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agenc-live-review-owner-"));
+    const cwd = join(root, "workspace");
+    const home = join(root, "owner");
+    const otherHome = join(root, "other");
+    mkdirSync(cwd);
+    const sessionId = "live-review-shared-session";
+    const recordedAt = "2026-09-10T00:00:00.000Z";
+    const target = makeTopLevelRunner({ conversationId: sessionId, workspaceRoot: cwd,
+      rolloutItems: [{ type: "event_msg", timestamp: recordedAt, payload: {
+        eventId: "unknown-1", id: "unknown-1", seq: 2, msg: { type: "effect_unknown_outcome", payload: {
+          runId: sessionId, stepId: "tool:step-1", callId: "call-1", toolName: "exec_command",
+          recoveryCategory: "side-effecting", reason: "tool_error_result_without_authoritative_effect_disposition",
+          requiresReview: true, recordedAt,
+        } },
+      } }],
+    });
+    const other = makeTopLevelRunner({ conversationId: sessionId, workspaceRoot: cwd });
+    Object.assign(target.configStore, { homeContext: { path: home } });
+    Object.assign(other.configStore, { homeContext: { path: otherHome } });
+    const driver = openStateDatabases({ cwd, agencHome: home });
+    const otherDriver = openStateDatabases({ cwd, agencHome: otherHome });
+    const effects = new StateRunDurabilityRepository(driver);
+    const projectedScopes: Array<Session | null> = [];
+    Object.assign(target.rolloutStore, { recordEffectEvent: (event: Event) => {
+      projectedScopes.push(peekScopedRuntimeSession());
+      if (event.msg.type !== "effect_review_resolved") throw new Error("unexpected review event");
+      effects.resolveEffectReview({ ...event.msg.payload, eventId: event.eventId! });
+    } });
+    const resolution = createOperatorEffectReviewResolution({
+      disposition: "confirmed_no_effect", actorId: "operator", evidenceRef: "test:verified-no-effect",
+      evidenceSha256: "a".repeat(64), reviewedAt: recordedAt,
+    });
+    clearCurrentRuntimeSession();
+    try {
+      for (const database of [driver, otherDriver]) {
+        seedPendingEffectReview(database, sessionId, recordedAt);
+        recordInFlightToolCallUnknownOutcome(database, { sessionId, agentId: sessionId,
+          toolCallId: "call-1", toolName: "exec_command", observedAt: recordedAt, recoveryCategory: "side-effecting" });
+      }
+      await target.runner.startAgent({ objective: "idle review owner", deferInitialTurn: true });
+      await other.runner.startAgent({ objective: "idle other owner", deferInitialTurn: true });
+      setCurrentRuntimeSession(target.session as unknown as Session);
+      setCurrentRuntimeSession(other.session as unknown as Session);
+      const params = { sessionId, toolCallId: "call-1", resolution };
+      await expect(target.runner.resolveLiveEffectReview(sessionId, params))
+        .resolves.toMatchObject({ kind: "resolved", durable: true });
+      await expect(runWithCurrentRuntimeSession(other.session as unknown as Session,
+        () => target.runner.resolveLiveEffectReview(sessionId, params)))
+        .resolves.toMatchObject({ kind: "already_resolved", durable: true });
+      expect(projectedScopes).toEqual([target.session, target.session]);
+      expect(listUnresolvedUnknownOutcomeEffects(driver, sessionId)).toHaveLength(0);
+      expect(listUnresolvedUnknownOutcomeEffects(otherDriver, sessionId)).toHaveLength(1);
+      expect(new StateRunDurabilityRepository(otherDriver).getEffect(sessionId, "tool:step-1")?.reviewStatus).toBe("pending");
+      expect(target.rolloutItems.filter((item) => (item as { payload?: { msg?: { type?: string } } }).payload?.msg?.type === "effect_review_resolved")).toHaveLength(1);
+      await expect(target.runner.resolveLiveEffectReview(sessionId, { ...params, sessionId: "wrong-owner" })).rejects.toThrow("does not own session");
+    } finally {
+      clearCurrentRuntimeSession();
+      await target.runner.stopAgent(sessionId);
+      await other.runner.stopAgent(sessionId);
+      driver.close();
+      otherDriver.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when a skeletal session lacks canonical runtime-settings journal support", async () => {
     const { runner, shutdown } = makeTopLevelRunner({
       conversationId: "session-without-runtime-settings-journal",
@@ -2271,6 +2374,81 @@ describe("AgenC delegate background-agent runner", () => {
     expect(runtimeEnvironment).not.toHaveProperty("OPENAI_BASE_URL");
     expect(runtimeEnvironment).not.toHaveProperty("XAI_API_KEY");
     expect(runtimeEnvironment).not.toHaveProperty("AGENC_CREDENTIAL_DOCS_MCP");
+  });
+
+  it.each([30_000, 50])("bounds a hung stop at %i ms, aborts execution, and retires the generation", async (timeoutMs) => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-stop-deadline",
+      additionalRunnerOptions: { agentStopTimeoutMs: timeoutMs },
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    const abortController = new AbortController();
+    const beginShutdown = vi.fn();
+    Object.assign(h.session, {
+      abortController, beginShutdown,
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded stop", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let settled = false;
+    const stopping = h.runner.stopAgent("session-stop-deadline").catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+      expect(abortController.signal.aborted).toBe(true);
+      expect(beginShutdown).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(settled).toBe(true);
+      expect(await stopping).toMatchObject({
+        name: "DaemonOperationTimeoutError", code: "DAEMON_OPERATION_TIMEOUT",
+      });
+      expect(await h.runner.getAgentSnapshot("session-stop-deadline")).toBeNull();
+    } finally {
+      release.resolve();
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds restore waiting for a previous generation without starting another bootstrap", async () => {
+    const release = Promise.withResolvers<void>();
+    const h = makeTopLevelRunner({
+      conversationId: "session-restore-deadline",
+      bootstrapShutdown: vi.fn(() => release.promise),
+    });
+    Object.assign(h.session, {
+      abortController: new AbortController(),
+      abortAllTasks: vi.fn(() => release.promise),
+    });
+    await h.runner.startAgent({
+      objective: "bounded restore", initialContent: [],
+      unattendedAllow: [], unattendedDeny: [],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    h.stub.pushStatus({ status: "completed", turnId: "old-turn", endedAtMs: 2, lastMessage: "done" });
+    await vi.advanceTimersByTimeAsync(0);
+    let settled = false;
+    const restoring = h.runner.restoreAgent({
+      agentId: "session-restore-deadline", objective: "bounded restore",
+      reopenTerminalRun: true,
+    }).catch((error: unknown) => { settled = true; return error; });
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(settled).toBe(true);
+      expect(await restoring).toMatchObject({ name: "DaemonOperationTimeoutError" });
+      expect(h.bootstrap).toHaveBeenCalledOnce();
+    } finally {
+      release.resolve();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await restoring;
+      vi.useRealTimers();
+    }
   });
 
   it("waits for the exact terminal generation cleanup before explicit restore", async () => {
@@ -2323,6 +2501,99 @@ describe("AgenC delegate background-agent runner", () => {
     await expect(
       runner.getAgentSnapshot("session-generation-race"),
     ).resolves.not.toBeNull();
+  });
+
+  it("keeps a timed-out terminal notification bound to the retired runtime generation", async () => {
+    const agentId = "session-delayed-terminal-generation";
+    const h = makeTopLevelRunner({ conversationId: agentId });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let notification: Promise<void> | undefined;
+    let failPublication = true;
+    const manager = new AgenCDaemonAgentManager({ runner: {
+      startAgent: vi.fn(),
+      attachAgentSessionEvents: async () => {
+        if (failPublication) throw new Error("publication failed");
+      },
+    } });
+    h.runner.setOnActiveAgentTerminated((id, snapshot) => {
+      notification = (async () => {
+        entered.resolve();
+        await release.promise;
+        await manager.handleRunnerTerminated(id, snapshot);
+      })();
+      return notification;
+    });
+    const started = await h.runner.startAgent({
+      objective: "original runtime", initialContent: [], unattendedAllow: [], unattendedDeny: [],
+    });
+    const firstGeneration = started.runtimeGenerationId ?? "legacy-first-generation";
+    await expect(manager.restoreAgent({
+      agentId, objective: "original runtime", runtimeAvailable: true,
+      restoreAttemptId: firstGeneration, sessionIds: ["unpublished-session"],
+    })).rejects.toThrow("publication failed");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      h.stub.pushStatus({ status: "completed", turnId: "old-turn", endedAtMs: 2, lastMessage: "done" });
+      await vi.advanceTimersByTimeAsync(0);
+      await entered.promise;
+      await manager.rollbackRestoredAgentRecord(agentId, firstGeneration);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await h.runner.getAgentSnapshot(agentId)).toBeNull();
+      h.stub.pushStatus({ status: "running", turnId: "replacement-turn", startedAtMs: 3 });
+      expect(await h.runner.restoreAgent({
+        agentId, objective: "replacement runtime", explicitColdResume: true,
+        restoreAttemptId: "replacement-generation",
+      })).toBe(true);
+      failPublication = false;
+      await manager.restoreAgent({
+        agentId, objective: "replacement runtime", runtimeAvailable: true,
+        restoreAttemptId: "replacement-generation", sessionIds: ["replacement-session"],
+      });
+      release.resolve();
+      await notification;
+      expect(await manager.getAgent(agentId)).toMatchObject({
+        objective: "replacement runtime", status: "running", activeSessionIds: ["replacement-session"],
+      });
+      expect(await h.runner.getAgentSnapshot(agentId)).toMatchObject({ runtimeGenerationId: "replacement-generation" });
+      expect(started.runtimeGenerationId).toEqual(expect.any(String));
+      expect(started.runtimeGenerationId).not.toBe("replacement-generation");
+    } finally {
+      release.resolve();
+      await notification;
+      vi.useRealTimers();
+      await h.runner.stopAgent(agentId, "test_cleanup");
+    }
+  });
+
+  it("reports a cold-restored agent idle until a turn starts", async () => {
+    // A hydrated thread reports pending_init, which maps to "running"; with
+    // nothing to resume the restored agent must read idle until its next
+    // prompt, not sit in every agent list as a working agent.
+    const harness = makeTopLevelRunner({
+      conversationId: "session-restored-idle",
+      threadInitialStatus: { status: "pending_init" },
+    });
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: "session-restored-idle",
+        objective: "retained objective",
+        explicitColdResume: true,
+        initialMessages: [{ role: "user" as const, content: "retained" }],
+      }),
+    ).resolves.toBe(true);
+    const restored = await harness.runner.getAgentSnapshot("session-restored-idle");
+    expect(restored?.status).toBe("idle");
+
+    harness.stub.pushStatus({
+      status: "running",
+      turnId: "turn-after-restart",
+      startedAtMs: 3,
+    });
+    await vi.waitFor(async () => {
+      const snapshot = await harness.runner.getAgentSnapshot("session-restored-idle");
+      expect(snapshot?.status).toBe("running");
+    });
   });
 
   it("retires a failed restore generation so an exact retry can proceed", async () => {
@@ -2380,7 +2651,10 @@ describe("AgenC delegate background-agent runner", () => {
     await expect(
       harness.runner.getAgentSnapshot("session-restore-hydration-retry"),
     ).resolves.not.toBeNull();
-    expect(hydrateStateWith).toHaveBeenCalledTimes(3);
+    // The failed attempt and the retry's recovered-history hydration. A run
+    // without an unattended policy no longer publishes a permission-context
+    // update at restore, so nothing else touches session state here.
+    expect(hydrateStateWith).toHaveBeenCalledTimes(2);
   });
 
   it("keeps the hydration failure primary when restore cleanup also fails", async () => {
@@ -2459,13 +2733,23 @@ describe("AgenC delegate background-agent runner", () => {
       expectedMode: "plan" as const,
       expectedSettingsEvents: 2,
     },
+    {
+      label: "with native Max reasoning",
+      permissionMode: undefined,
+      expectedMode: "default" as const,
+      expectedSettingsEvents: 1,
+      reasoningEffort: "max" as const,
+    },
   ])(
     "keeps a fresh default run cold-resumable $label",
-    async ({ permissionMode, expectedMode, expectedSettingsEvents }) => {
+    async ({ permissionMode, expectedMode, expectedSettingsEvents, reasoningEffort }) => {
       const runId = `session-default-cold-${expectedMode}`;
       const harness = makeTopLevelRunner({
         conversationId: runId,
         canonicalRuntimeSettings: true,
+      });
+      Object.assign(harness.sessionState.sessionConfiguration.collaborationMode, {
+        reasoningEffort,
       });
       const baseline: RunRuntimeSettingsSnapshot = {
         permissionMode: "default",
@@ -2478,7 +2762,7 @@ describe("AgenC delegate background-agent runner", () => {
         model: "base-model",
         provider: "grok",
         profile: null,
-        reasoningEffort: null,
+        reasoningEffort: reasoningEffort ?? null,
         modelVerbosity: null,
         serviceTier: null,
         hooksDisabled: false,
@@ -2498,7 +2782,7 @@ describe("AgenC delegate background-agent runner", () => {
           }
         | undefined;
       expect(initialSettings?.payload.msg.payload).toMatchObject(baseline);
-      expect(harness.permissionModeRegistry.current().mode).toBe("unattended");
+      expect(harness.permissionModeRegistry.current().mode).toBe("default");
 
       await vi.waitFor(() =>
         expect(harness.stub.thread.submit).toHaveBeenCalledOnce(),
@@ -2951,6 +3235,77 @@ describe("AgenC delegate background-agent runner", () => {
       }),
     ).rejects.toThrow(/disabled by managed policy/u);
     expect(harness.stateRepository.reload).toHaveBeenCalled();
+  });
+
+  it("restores matching snapshot fields without comparing durable metadata", async () => {
+    const runId = "session-settings-comparison-metadata";
+    const baseline = canonicalRuntimeSettings();
+    const rolloutItems = [runtimeSettingsRolloutItem(runId, baseline)];
+    const harness = makeTopLevelRunner({
+      conversationId: runId,
+      rolloutItems,
+      canonicalRuntimeSettings: true,
+    });
+    const projection = {
+      ...baseline,
+      eventId: `runtime-settings:${runId}:initial`,
+      epoch: 1,
+    };
+
+    await expect(
+      harness.runner.restoreAgent({
+        agentId: runId,
+        objective: "compare canonical settings fields",
+        explicitColdResume: true,
+        runtimeSettings: projection,
+      }),
+    ).resolves.toBe(true);
+
+    expect(recordedRuntimeSettingsEvents(rolloutItems)).toHaveLength(1);
+    expect((await harness.runner.getAgentSnapshot(runId))?.runtimeSettings)
+      .toEqual(baseline);
+  });
+
+  it.each(["missing", "conflicting", "serialization-hook"])(
+    "rejects a %s canonical settings projection during restore",
+    async (scenario) => {
+      const runId = `session-settings-comparison-${scenario}`;
+      const baseline = canonicalRuntimeSettings();
+      const rolloutItems = scenario === "missing"
+        ? []
+        : [runtimeSettingsRolloutItem(runId, baseline)];
+      const harness = makeTopLevelRunner({
+        conversationId: runId,
+        rolloutItems,
+        canonicalRuntimeSettings: true,
+      });
+      const serialize = vi.fn(() => baseline);
+      const projection = {
+        ...baseline,
+        hooksDisabled: true,
+        ...(scenario === "serialization-hook" ? { toJSON: serialize } : {}),
+      };
+
+      await expect(
+        harness.runner.restoreAgent({
+          agentId: runId,
+          objective: "reject inconsistent settings evidence",
+          explicitColdResume: true,
+          runtimeSettings: projection,
+        }),
+      ).rejects.toThrow("runtime settings disagree with canonical run");
+
+      expect(serialize).not.toHaveBeenCalled();
+      expect(await harness.runner.getAgentSnapshot(runId)).toBeNull();
+      expect(recordedRuntimeSettingsEvents(rolloutItems))
+        .toHaveLength(scenario === "missing" ? 0 : 1);
+    },
+  );
+
+  it("uses field comparison throughout runner restore and configuration", () => {
+    const source = readFileSync(backgroundAgentRunnerSourcePath, "utf8");
+    expect(source.includes("stableStringify")).toBe(false);
+    expect(source).toContain("runtimeSettingsEqual");
   });
 
   it("durably applies explicit restore overrides after the canonical settings baseline", async () => {
@@ -3720,6 +4075,106 @@ describe("AgenC delegate background-agent runner", () => {
     expect(emitted).toHaveLength(emittedAfterRetirement);
   });
 
+  it("session.goal sets, reports, pauses, resumes and clears the session goal, journaling each change", async () => {
+    const emptyWorkspace = mkdtempSync(join(tmpdir(), "agenc-goal-runner-"));
+    const { runner, session } = makeTopLevelRunner({ conversationId: "session-goal", workspaceRoot: emptyWorkspace });
+    const started = await runner.startAgent({ objective: "goal host", unattendedAllow: [], unattendedDeny: [] });
+    const call = (params: Record<string, unknown>) =>
+      runner.updateAgentSessionGoal!(started.agentId, { sessionId: "session-goal", ...params } as never);
+    const request = { objective: "npm test passes", verify: [{ label: "tests", script: "npm test" }], noVerify: false };
+    try {
+      expect(await call({ action: "get" })).toMatchObject({ ok: true });
+      expect((await call({ action: "get" })).goal).toBeUndefined();
+      expect(await call({ action: "pause" })).toMatchObject({ ok: false, message: "No goal is set." });
+
+      // Nothing can check this one: the workspace has no test entry point.
+      const refused = await call({ action: "set", request: { objective: "make it nicer", verify: [], noVerify: false } });
+      expect(refused).toMatchObject({ ok: false, message: expect.stringContaining("--verify") });
+
+      const set = await call({ action: "set", request });
+      expect(set).toMatchObject({
+        ok: true, detectedVerification: false,
+        goal: { objective: "npm test passes", status: "active", rounds: 0, verification: [{ script: "npm test" }] },
+      });
+      expect(await call({ action: "resume" })).toMatchObject({ ok: false, message: "The goal is already active." });
+      expect(await call({ action: "pause" })).toMatchObject({ ok: true, goal: { status: "paused", pauseReason: "paused by the user" } });
+      const resumed = await call({ action: "resume" });
+      expect(resumed).toMatchObject({ ok: true, goal: { status: "active" } });
+      expect(resumed.goal?.pauseReason).toBeUndefined();
+
+      expect(await call({ action: "clear" })).toMatchObject({ ok: true, message: "Goal cleared: npm test passes" });
+      expect((await call({ action: "get" })).goal).toBeUndefined();
+
+      const causes = session.emit.mock.calls
+        .map(([event]) => event as { msg?: { type?: string; payload?: { cause?: string } } })
+        .filter((event) => event.msg?.type === "goal_changed")
+        .map((event) => event.msg!.payload!.cause);
+      expect(causes).toEqual(["set", "paused", "resumed", "cleared"]);
+    } finally {
+      await runner.stopAgent(started.agentId).catch(() => undefined);
+      rmSync(emptyWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("binds the owning session while a partial compaction runs in a multi-session daemon", async () => {
+    // Compaction samples the provider through the ambient "current session"
+    // the way a turn does. With two sessions live the unscoped fallback
+    // throws ("Ambiguous runtime session"), which is exactly what `/compact`
+    // hit on a daemon hosting a TUI session and a print-mode one-shot.
+    const { runner, session } = makeTopLevelRunner({
+      conversationId: "session-scoped-compact",
+    });
+    const otherSessionA = { conversationId: "other-a" } as unknown as Session;
+    const otherSessionB = { conversationId: "other-b" } as unknown as Session;
+    setCurrentRuntimeSession(otherSessionA);
+    setCurrentRuntimeSession(otherSessionB);
+    const observed: { scoped: unknown; ambient: unknown }[] = [];
+    Object.assign(session, {
+      partialCompactFromMessage: vi.fn(async () => {
+        observed.push({
+          scoped: peekScopedRuntimeSession(),
+          ambient: getCurrentRuntimeSession(),
+        });
+        return { ok: false as const, code: "NO_CHANGE", message: "nothing to compact" };
+      }),
+      rollbackCompaction: vi.fn(async () => {
+        observed.push({
+          scoped: peekScopedRuntimeSession(),
+          ambient: getCurrentRuntimeSession(),
+        });
+        return { ok: false as const, code: "NOT_FOUND", message: "no such attempt" };
+      }),
+    });
+    try {
+      const started = await runner.startAgent({
+        objective: "compact under ambiguity",
+        unattendedAllow: [],
+        unattendedDeny: [],
+      });
+      await expect(
+        runner.partialCompactFromMessage?.(started.agentId, {
+          sessionId: "session-scoped-compact",
+          messageOrdinal: 0,
+          direction: "from",
+        }),
+      ).resolves.toMatchObject({ ok: false, code: "NO_CHANGE" });
+      await expect(
+        runner.rollbackCompaction?.(started.agentId, {
+          sessionId: "session-scoped-compact",
+          attemptId: "compact-00000000-0000-4000-8000-000000000000",
+        }),
+      ).resolves.toMatchObject({ ok: false, code: "NOT_FOUND" });
+      expect(observed).toEqual([
+        { scoped: session, ambient: session },
+        { scoped: session, ambient: session },
+      ]);
+    } finally {
+      clearCurrentRuntimeSession(otherSessionA);
+      clearCurrentRuntimeSession(otherSessionB);
+      await runner.stopAgent("session-scoped-compact").catch(() => undefined);
+    }
+  });
+
   it("preserves compaction recovery details while broadcasting replacement history", async () => {
     const { runner, session } = makeTopLevelRunner({
       conversationId: "session-partial-compact",
@@ -3937,6 +4392,164 @@ describe("AgenC delegate background-agent runner", () => {
     expect(bootstrapShutdown).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["approved", "denied"] as const)(
+    "routes silent nested child approvals to the parent without granting them automatically: %s",
+    async (decisionKind) => {
+      const agentId = `parent-memory-${decisionKind}`;
+      const { runner, session } = makeTopLevelRunner({ conversationId: agentId });
+      const notifications: unknown[] = [];
+      await runner.startAgent({ objective: "memory approval", unattendedAllow: [], unattendedDeny: [] });
+      await runner.attachAgentSessionEvents(agentId, {
+        sessionId: "attached-parent",
+        emit: (notification) => { notifications.push(notification); },
+      });
+      const parent = session as unknown as Session;
+      const makeChild = (conversationId: string) => {
+        const eventLog = new EventLog();
+        const finalizers = new Set<() => void | Promise<void>>();
+        const durableOperations = new Set<Promise<unknown>>();
+        const child = {
+          ...session,
+          conversationId,
+          abortController: new AbortController(),
+          eventLog,
+          emit: (event: Parameters<EventLog["emit"]>[0]) => eventLog.emit(event),
+          trackDurableOperation: <Result>(operation: Promise<Result>) => {
+            durableOperations.add(operation);
+            void operation.then(() => durableOperations.delete(operation), () => durableOperations.delete(operation));
+            return operation;
+          },
+          onBeforeDurableClose: (callback: () => void | Promise<void>) => {
+            finalizers.add(callback);
+            return () => { finalizers.delete(callback); };
+          },
+        } as unknown as Session;
+        return { child, close: async () => {
+          revokeChildApprovalSession(child);
+          await Promise.all([...durableOperations]);
+          for (const callback of [...finalizers]) await callback();
+        } };
+      };
+      const intermediate = makeChild("child-intermediate");
+      registerChildApprovalSession(intermediate.child, parent);
+      const memory = makeChild("child-memory");
+      registerChildApprovalSession(memory.child, intermediate.child);
+      notifications.length = 0;
+      const childEvents: string[] = [];
+      memory.child.eventLog.subscribe((event) => childEvents.push(event.msg.type));
+      const resolver = (session.services as { approvalResolver: ApprovalResolver }).approvalResolver;
+      const makeRequest = (requestingSession: Session, callId: string, signal?: AbortSignal) => requestApproval({
+        ctx: {
+          invocation: {
+            session: requestingSession,
+            turn: { subId: "child-memory-turn" },
+            callId,
+            toolName: { name: "Glob" },
+            payload: { kind: "function", arguments: JSON.stringify({ pattern: callId, scope: requestingSession.conversationId }) },
+            source: "direct",
+          } as never,
+          callId,
+          toolName: "Glob",
+          turnId: "child-memory-turn",
+          ...(signal !== undefined ? { signal } : {}),
+        },
+        resolver,
+      });
+      const requestIdFor = (conversationId: string, callId: string): string => {
+        const prompt = notifications.find((notification) => {
+          const candidate = notification as { method?: string; params?: { input?: { pattern?: string; scope?: string } } };
+          return candidate.method === "event.permission_request" && candidate.params?.input?.pattern === callId && candidate.params.input.scope === conversationId;
+        }) as { params?: { requestId?: string } } | undefined;
+        expect(prompt?.params?.requestId).toEqual(expect.any(String));
+        return prompt!.params!.requestId!;
+      };
+      const expectDecision = async (requestId: string, decision: string) => {
+        await vi.waitFor(() => expect(notifications).toContainEqual(expect.objectContaining({
+          method: "event.session_event",
+          params: expect.objectContaining({ event: expect.objectContaining({
+            type: "permission_decision",
+            payload: expect.objectContaining({ requestId, decision }),
+          }) }),
+        })));
+      };
+      let settled = false;
+      const pending = makeRequest(memory.child, "memory-glob").then((result) => {
+        settled = true;
+        return result;
+      });
+      await vi.waitFor(() => expect(notifications).toContainEqual(expect.objectContaining({
+        method: "event.permission_request",
+        params: expect.objectContaining({ sessionId: "attached-parent", toolName: "Glob" }),
+      })));
+      expect(settled).toBe(false);
+      const prompt = notifications.find((notification) => (notification as { method?: string }).method === "event.permission_request") as { params: Record<string, unknown> };
+      expect(prompt.params).not.toHaveProperty("sequence");
+      const memoryRequestId = requestIdFor(memory.child.conversationId, "memory-glob");
+      expect(memoryRequestId).not.toBe("memory-glob");
+      expect(prompt.params.callId).toBe("memory-glob");
+      expect(memoryRequestId).toBe(prompt.params.eventId);
+      expect(await runner.resolveToolDecision(agentId, { requestId: memoryRequestId, decision: { kind: decisionKind } })).toBe(true);
+      await expect(pending).resolves.toMatchObject({ decision: { kind: decisionKind }, source: "resolver" });
+      await expectDecision(memoryRequestId, decisionKind);
+      expect(childEvents).toEqual(["request_permissions", "permission_decision"]);
+      expect(await runner.getAgentSnapshot(agentId)).toMatchObject({ status: "running" });
+
+      // A second scope on this invocation must not reuse the first answer.
+      notifications.length = 0;
+      const repeated = makeRequest(memory.child, "memory-glob");
+      await vi.waitFor(() => requestIdFor(memory.child.conversationId, "memory-glob"));
+      const repeatedRequestId = requestIdFor(memory.child.conversationId, "memory-glob");
+      expect(repeatedRequestId).not.toBe(memoryRequestId);
+      expect(await runner.resolveToolDecision(agentId, { requestId: memoryRequestId, decision: { kind: "approved" } })).toBe(false);
+      expect(await runner.resolveToolDecision(agentId, { requestId: repeatedRequestId, decision: { kind: "denied" } })).toBe(true);
+      await expect(repeated).resolves.toMatchObject({ decision: { kind: "denied" } });
+      await expectDecision(repeatedRequestId, "denied");
+
+      const forged = makeChild(agentId);
+      await expect(makeRequest(forged.child, "forged")).resolves.toMatchObject({ decision: { kind: "denied" } });
+      expect(await runner.resolveToolDecision(agentId, { requestId: "forged", decision: { kind: "approved" } })).toBe(false);
+
+      const closing = makeRequest(memory.child, "closing-child");
+      await vi.waitFor(() => requestIdFor(memory.child.conversationId, "closing-child"));
+      const closingRequestId = requestIdFor(memory.child.conversationId, "closing-child");
+      await memory.close();
+      await expect(closing).resolves.toMatchObject({ decision: { kind: "abort" } });
+      await expectDecision(closingRequestId, "abort");
+      await expect(makeRequest(memory.child, "stale-child")).resolves.toMatchObject({ decision: { kind: "denied" } });
+
+      const sibling = makeChild("child-sibling");
+      const grandchild = makeChild("child-grandchild");
+      registerChildApprovalSession(sibling.child, parent);
+      registerChildApprovalSession(grandchild.child, intermediate.child);
+      const siblingPending = makeRequest(sibling.child, "call_1");
+      const grandchildPending = makeRequest(grandchild.child, "call_1");
+      await vi.waitFor(() => {
+        requestIdFor(sibling.child.conversationId, "call_1");
+        requestIdFor(grandchild.child.conversationId, "call_1");
+      });
+      const siblingRequestId = requestIdFor(sibling.child.conversationId, "call_1");
+      const grandchildRequestId = requestIdFor(grandchild.child.conversationId, "call_1");
+      expect(siblingRequestId).not.toBe(grandchildRequestId);
+      expect(await runner.resolveToolDecision(agentId, { requestId: siblingRequestId, decision: { kind: "approved" } })).toBe(true);
+      await expect(siblingPending).resolves.toMatchObject({ decision: { kind: "approved" } });
+      await expectDecision(siblingRequestId, "approved");
+      await intermediate.close();
+      await expect(grandchildPending).resolves.toMatchObject({ decision: { kind: "abort" } });
+      await expectDecision(grandchildRequestId, "abort");
+      expect(await runner.resolveToolDecision(agentId, { requestId: grandchildRequestId, decision: { kind: "approved" } })).toBe(false);
+      await grandchild.close();
+
+      const abortController = new AbortController();
+      const aborting = makeRequest(sibling.child, "aborting-child", abortController.signal);
+      abortController.abort();
+      await expect(aborting).resolves.toMatchObject({ decision: { kind: "abort" } });
+      const stopping = makeRequest(sibling.child, "stopping-parent");
+      await runner.stopAgent(agentId, "test_cleanup");
+      await expect(stopping).resolves.toMatchObject({ decision: { kind: "abort" } });
+      await sibling.close();
+    },
+  );
+
   it("fsync-journals daemon permission requests and decisions before execution resumes", async () => {
     const { runner, session, rolloutItems } = makeTopLevelRunner({
       conversationId: "session-durable-permission",
@@ -3993,16 +4606,22 @@ describe("AgenC delegate background-agent runner", () => {
         expect.objectContaining({
           method: "event.permission_request",
           params: expect.objectContaining({
-            requestId: "permission-call-1",
+            callId: "permission-call-1",
+            requestId: expect.any(String),
             eventId: expect.any(String),
             sequence: expect.any(Number),
           }),
         }),
       ),
     );
+    const permissionPrompt = emitted.find((event) =>
+      (event as { method?: string }).method === "event.permission_request",
+    ) as { params: { requestId: string; eventId: string } };
+    expect(permissionPrompt.params.requestId).toBe(permissionPrompt.params.eventId);
+    expect(permissionPrompt.params.requestId).not.toBe("permission-call-1");
     expect(
       await runner.resolveToolDecision("session-durable-permission", {
-        requestId: "permission-call-1",
+        requestId: permissionPrompt.params.requestId,
         decision: { kind: "approved" },
       }),
     ).toBe(true);
@@ -4060,6 +4679,69 @@ describe("AgenC delegate background-agent runner", () => {
         },
       },
     });
+  });
+
+  it("binds distinct scopes of one invocation to distinct occurrences and rejects stale replies", async () => {
+    const agentId = "session-permission-occurrences";
+    const { runner, session } = makeTopLevelRunner({ conversationId: agentId });
+    const emitted: unknown[] = [];
+    await runner.startAgent({ objective: "permission occurrences", unattendedAllow: [], unattendedDeny: [] });
+    await runner.attachAgentSessionEvents(agentId, { sessionId: "attached", emit: (event) => { emitted.push(event); } });
+    const resolver = (session.services as { approvalResolver: ApprovalResolver }).approvalResolver;
+    const ctx = {
+      invocation: {
+        session, turn: { subId: "turn-scopes" }, callId: "shared-call",
+        toolName: { name: "request_permissions" },
+        payload: { kind: "function", arguments: "{}" }, source: "direct",
+      } as never,
+      callId: "shared-call", toolName: "request_permissions", turnId: "turn-scopes",
+    };
+    // A real journaled session cannot silently downgrade to legacy call IDs.
+    await expect(resolver.request(ctx)).resolves.toMatchObject({ kind: "denied" });
+    const prompts = () => emitted.filter((event) =>
+      (event as { method?: string }).method === "event.permission_request",
+    ) as { params: { requestId: string; eventId: string; callId: string; input: unknown } }[];
+    try {
+      const first = requestApproval({ ctx, args: { network: ["first.example"] }, resolver });
+      await vi.waitFor(() => expect(prompts()).toHaveLength(1));
+      const firstId = prompts()[0]!.params.requestId;
+      expect(await runner.resolveToolDecision(agentId, { requestId: firstId, decision: { kind: "approved" } })).toBe(true);
+      await expect(first).resolves.toMatchObject({ decision: { kind: "approved" } });
+
+      let secondSettled = false;
+      const second = requestApproval({ ctx, args: { network: ["second.example"] }, resolver }).then((result) => {
+        secondSettled = true;
+        return result;
+      });
+      await vi.waitFor(() => expect(prompts()).toHaveLength(2));
+      const secondId = prompts()[1]!.params.requestId;
+      expect(secondId).not.toBe(firstId);
+      for (const prompt of prompts()) {
+        expect(prompt.params.requestId).toBe(prompt.params.eventId);
+        expect(prompt.params.callId).toBe("shared-call");
+      }
+      expect(prompts().map((prompt) => prompt.params.input)).toEqual([
+        { network: ["first.example"] }, { network: ["second.example"] },
+      ]);
+      for (const requestId of [firstId, "shared-call"]) {
+        for (const kind of ["approved", "denied"] as const) {
+          expect(await runner.resolveToolDecision(agentId, { requestId, decision: { kind } })).toBe(false);
+        }
+        expect(await runner.cancelTool(agentId, { requestId })).toBe(false);
+      }
+      expect(secondSettled).toBe(false);
+      expect(await runner.resolveToolDecision(agentId, { requestId: secondId, decision: { kind: "denied" } })).toBe(true);
+      await expect(second).resolves.toMatchObject({ decision: { kind: "denied" } });
+
+      const third = requestApproval({ ctx, args: { filesystem: ["/new-scope"] }, resolver });
+      await vi.waitFor(() => expect(prompts()).toHaveLength(3));
+      const thirdId = prompts()[2]!.params.requestId;
+      expect(await runner.cancelTool(agentId, { requestId: thirdId })).toBe(true);
+      await expect(third).resolves.toMatchObject({ decision: { kind: "abort" } });
+      expect(await runner.resolveToolDecision(agentId, { requestId: thirdId, decision: { kind: "approved" } })).toBe(false);
+    } finally {
+      await runner.stopAgent(agentId, "test_cleanup");
+    }
   });
 
   it("aborts and journals a pending permission before stop seals the terminal tail", async () => {
@@ -4177,6 +4859,49 @@ describe("AgenC delegate background-agent runner", () => {
     });
     expect(canonical[terminalIndex]?.msg.payload).toMatchObject({
       stopReason: "user_stopped",
+    });
+  });
+
+  it.each(["completed", "error", "max_turns", "cancelled"] as const)("finalizes a routine's %s phase as the matching canonical outcome", async (stopReason) => {
+    const agentId = "session-routine-finalize";
+    const { runner, rolloutItems, control, session } = makeTopLevelRunner({ conversationId: agentId });
+    await runner.startAgent({ objective: "one routine", deferInitialTurn: true, unattendedAllow: [], unattendedDeny: [] });
+    control.sendInput.mockImplementationOnce(async () => { session.emitPhaseEvent({ type: "turn_complete", content: "done", stopReason, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }); });
+    await runner.submitAgentMessage(agentId, { sessionId: agentId, content: "inspect", originalContent: "inspect", messageId: "routine-message", streamId: "routine-stream", acceptedAt: "2026-05-09T00:00:00.000Z" });
+    await expect(runner.finishAgentRun(agentId, "unrelated-message")).rejects.toThrow("unknown routine message");
+    const status = stopReason === "completed" ? "completed" : stopReason === "cancelled" ? "cancelled" : "failed";
+    expect(await runner.finishAgentRun(agentId, "routine-message")).toBe(status);
+    const terminal = rolloutItems.flatMap((item) => {
+      const event = (item as { payload?: { msg?: { type?: string; payload?: unknown } } }).payload?.msg;
+      return event?.type === "run_terminal" ? [event.payload] : [];
+    });
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ status, exitCode: status === "completed" ? 0 : status === "cancelled" ? 130 : 1, stopReason: `routine_${status}` });
+    await expect(runner.getAgentSnapshot(agentId)).resolves.toBeNull();
+  });
+
+  it.each(["completed", "cancelled"] as const)("keeps permission-denied routine outcome honest after a %s answer", async (stopReason) => {
+    const agentId = "session-routine-denied";
+    const { runner, rolloutItems, control, session } = makeTopLevelRunner({ conversationId: agentId });
+    await runner.startAgent({ objective: "one routine", deferInitialTurn: true, unattendedAllow: [], unattendedDeny: [] });
+    control.sendInput.mockImplementationOnce(async () => {
+      session.emit({ id: "blocked-call", msg: { type: "error", payload: {
+        cause: "permission_denied:permission_mode", message: "This run has nobody attached to approve it.",
+      } } });
+      session.emitPhaseEvent({ type: "assistant_text", content: "Only a partial report is available." });
+      session.emitPhaseEvent({ type: "turn_complete", content: "Only a partial report is available.", stopReason, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } });
+    });
+    await runner.submitAgentMessage(agentId, { sessionId: agentId, content: "inspect", originalContent: "inspect", messageId: "routine-message", streamId: "routine-stream", acceptedAt: "2026-05-09T00:00:00.000Z" });
+    const status = stopReason === "cancelled" ? "cancelled" : "failed";
+    expect(await runner.finishAgentRun(agentId, "routine-message")).toBe(status === "cancelled" ? "cancelled" : "permission_denied");
+    const terminals = rolloutItems.flatMap(item => {
+      const event = (item as { payload?: { msg?: { type?: string; payload?: unknown } } }).payload?.msg;
+      return event?.type === "run_terminal" ? [event.payload] : [];
+    });
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({ status, exitCode: status === "cancelled" ? 130 : 1,
+      stopReason: status === "cancelled" ? "routine_cancelled" : "routine_permission_denied",
+      finalMessage: "Only a partial report is available.",
     });
   });
 
@@ -4911,6 +5636,31 @@ describe("AgenC delegate background-agent runner", () => {
     });
   });
 
+  it("keeps the requested permission mode when the run carries no unattended policy", async () => {
+    // A TUI root and a print-mode one-shot arrive with empty lists. The
+    // runner used to install the unattended policy anyway, which rewrote
+    // `default` into `unattended` with nothing allowlisted, so every tool
+    // (a FileRead inside the workspace included) paused for approval.
+    const { runner, permissionUpdates, permissionModeRegistry } =
+      makeTopLevelRunner({
+        conversationId: "parent-session",
+        argv: ["/usr/bin/node", "/opt/agenc/bin/agenc.js"],
+      });
+
+    await runner.startAgent({
+      objective: "read the project",
+      cwd: "/workspace",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    expect(permissionModeRegistry.current().mode).toBe("default");
+    expect(permissionModeRegistry.current().unattendedPolicy).toBeUndefined();
+    expect(permissionUpdates.map((update) => update.mode)).not.toContain(
+      "unattended",
+    );
+  });
+
   it("starts agent.create through the managed-thread path and keeps it alive", async () => {
     const csvAgentJobsRepositories = {
       withRepository: vi.fn(),
@@ -4941,6 +5691,7 @@ describe("AgenC delegate background-agent runner", () => {
     ).resolves.toEqual({
       agentId: "parent-session",
       agentPath: "/root",
+      runtimeGenerationId: expect.any(String),
       startedAt: "2026-05-01T12:00:00.500Z",
       status: "running",
     });
@@ -4953,6 +5704,7 @@ describe("AgenC delegate background-agent runner", () => {
         argv: ["/usr/bin/node", "/opt/agenc/bin/agenc.js", "--model", "grok-4"],
         cwd: "/workspace",
         executionAdmissionAutonomous: true,
+        costSummaryOnExit: false,
         csvAgentJobsRepositories,
       }),
     );
@@ -4992,6 +5744,11 @@ describe("AgenC delegate background-agent runner", () => {
       model: "gpt-5",
       profile: "fast",
       configPath: "/workspace/explicit-config.toml",
+      addDirs: [
+        "../shared workspace",
+        "/tmp/shared",
+        "../shared workspace",
+      ],
       permissionMode: "plan",
       unattendedAllow: [],
       unattendedDeny: [],
@@ -5010,11 +5767,67 @@ describe("AgenC delegate background-agent runner", () => {
           "fast",
           "--config",
           "/workspace/explicit-config.toml",
+          "--add-dir=../shared workspace",
+          "--add-dir=/tmp/shared",
           "--permission-mode",
           "plan",
         ],
       }),
     );
+  });
+
+  it("rebuilds repeated additional-directory flags for a cold restore", async () => {
+    const { runner, bootstrap } = makeTopLevelRunner({
+      conversationId: "add-dir-cold-restore-session",
+    });
+
+    await expect(
+      runner.restoreAgent({
+        agentId: "add-dir-cold-restore-session",
+        objective: "resume the daemon",
+        provider: "openai",
+        model: "gpt-5",
+        addDirs: ["../shared workspace", "/tmp/shared"],
+        explicitColdResume: true,
+      }),
+    ).resolves.toBe(true);
+
+    expect(bootstrap).toHaveBeenCalledWith(
+      expect.objectContaining({
+        argv: [
+          process.execPath,
+          process.argv[1] ?? "agenc",
+          "--provider",
+          "openai",
+          "--model",
+          "gpt-5",
+          "--add-dir=../shared workspace",
+          "--add-dir=/tmp/shared",
+        ],
+        resumeConversation: true,
+      }),
+    );
+  });
+
+  it("rejects additional-directory overflow before launching bootstrap", async () => {
+    const { runner, bootstrap } = makeTopLevelRunner({
+      conversationId: "add-dir-overflow-session",
+    });
+
+    await expect(
+      runner.startAgent({
+        objective: "compile the daemon",
+        addDirs: Array.from(
+          { length: MAX_ADDITIONAL_WORKING_DIRECTORIES + 1 },
+          (_, index) => `/tmp/shared-${index}`,
+        ),
+        unattendedAllow: [],
+        unattendedDeny: [],
+      }),
+    ).rejects.toThrow(
+      `session bootstrap addDirs accepts at most ${MAX_ADDITIONAL_WORKING_DIRECTORIES} paths`,
+    );
+    expect(bootstrap).not.toHaveBeenCalled();
   });
 
   it("keeps ordinary bypass out of the combined dangerous startup flag", async () => {
@@ -5270,6 +6083,46 @@ describe("AgenC delegate background-agent runner", () => {
     expect(recordedRuntimeSettingsEvents(rolloutItems)).toHaveLength(
       beforeEvents,
     );
+  });
+
+  it.each(["low", "high", "max"] as const)("persists native %s reasoning when creating a run", async (reasoningEffort) => {
+    const agentId = `native-effort-${reasoningEffort}`;
+    const { runner, sessionState, rolloutItems } = makeTopLevelRunner({
+      conversationId: agentId,
+      canonicalRuntimeSettings: true,
+    });
+    Object.assign(sessionState.sessionConfiguration.collaborationMode, { reasoningEffort });
+    await runner.startAgent({ objective: "work", cwd: process.cwd() });
+    expect((await runner.getAgentSnapshot(agentId))?.runtimeSettings).toMatchObject({ reasoningEffort });
+    expect(recordedRuntimeSettingsEvents(rolloutItems).at(-1)?.msg?.payload).toMatchObject({ reasoningEffort });
+  });
+
+  it.each([undefined, null])("normalizes absent optional runtime settings from %s", async (absent) => {
+    const agentId = `normalized-runtime-settings-${String(absent)}`;
+    const { runner, sessionState, rolloutItems } = makeTopLevelRunner({
+      conversationId: agentId,
+      canonicalRuntimeSettings: true,
+    });
+    Object.assign(sessionState.sessionConfiguration.collaborationMode, {
+      reasoningEffort: absent,
+    });
+    Object.assign(sessionState.sessionConfiguration, {
+      modelVerbosity: absent,
+      serviceTier: absent,
+    });
+    await runner.startAgent({ objective: "work", cwd: process.cwd() });
+
+    const canonicalAbsent = {
+      prePlanMode: null,
+      bypassPermissionsWorkspace: null,
+      bypassPermissionsConsentWorkspace: null,
+      profile: null,
+      reasoningEffort: null,
+      modelVerbosity: null,
+      serviceTier: null,
+    };
+    expect((await runner.getAgentSnapshot(agentId))?.runtimeSettings).toMatchObject(canonicalAbsent);
+    expect(recordedRuntimeSettingsEvents(rolloutItems).at(-1)?.msg?.payload).toMatchObject(canonicalAbsent);
   });
 
   it("keeps canonical runtime settings detached from mutable in-process snapshots", async () => {
@@ -5627,7 +6480,7 @@ describe("AgenC delegate background-agent runner", () => {
 
     expect(result).toEqual({
       applied: true,
-      previousMode: "unattended",
+      previousMode: "default",
       mode: "plan",
     });
     // The genuine daemon registry — the one the tool evaluator reads — is
@@ -5781,7 +6634,7 @@ describe("AgenC delegate background-agent runner", () => {
 
     expect(result).toEqual({
       applied: true,
-      previousMode: "unattended",
+      previousMode: "default",
       mode: "auto",
     });
     expect(permissionUpdates.at(-1)).toMatchObject({
@@ -5875,7 +6728,7 @@ describe("AgenC delegate background-agent runner", () => {
   });
 
   it("setAgentPermissionMode binds exact cwd for explicit tool approval", async () => {
-    const { runner, permissionUpdates } = makeTopLevelRunner({
+    const { runner, permissionUpdates, stateRepository } = makeTopLevelRunner({
       conversationId: "parent-session-tool-approval",
       argv: ["node", "agenc"],
       canonicalRuntimeSettings: true,
@@ -5897,6 +6750,96 @@ describe("AgenC delegate background-agent runner", () => {
       mode: "bypassPermissions",
       bypassPermissionsAcceptedIn: [process.cwd()],
     });
+    const cwd = realpathSync(process.cwd());
+    const identity = statSync(cwd);
+    expect(stateRepository.getNamespace("permissions")).toEqual({
+      bypassPermissionsAcceptedByCwd: {
+        [cwd]: { version: 1, canonicalCwd: cwd, dev: String(identity.dev), ino: String(identity.ino) },
+      },
+    });
+  });
+
+  it("cold-restores user-selected bypass using consent persisted by the live switch", async () => {
+    const agentId = "live-bypass-cold-restore";
+    const cwd = realpathSync(process.cwd());
+    const live = makeTopLevelRunner({ conversationId: agentId, canonicalRuntimeSettings: true });
+    await live.runner.startAgent({ objective: "work", cwd });
+    expect(live.stateRepository.getNamespace("permissions")).toEqual({});
+    await live.runner.setAgentPermissionMode(agentId, {
+      sessionId: agentId, mode: "bypassPermissions", bypassAuthority: "operator_tool_approval",
+    });
+    const persisted = structuredClone(live.stateRepository.getNamespace("permissions"));
+    const settings = { ...bypassRestoreSettings("bypassPermissions", cwd), autoModeAvailable: false };
+    expect(recordedRuntimeSettingsEvents(live.rolloutItems).at(-1)?.msg?.payload).toMatchObject(settings);
+
+    // A new registry starts without in-memory consent. Only the state written
+    // by the first runner crosses this simulated process boundary.
+    const cold = makeTopLevelRunner({
+      conversationId: agentId, canonicalRuntimeSettings: true,
+      rolloutItems: [runtimeSettingsRolloutItem(agentId, settings)],
+    });
+    cold.stateRepository.getNamespace.mockImplementation(namespace => namespace === "permissions" ? persisted : {});
+    expect(cold.permissionModeRegistry.current().bypassPermissionsAcceptedIn ?? []).toEqual([]);
+    await expect(cold.runner.restoreAgent({
+      agentId, objective: "work", explicitColdResume: true, runtimeSettings: settings,
+    })).resolves.toBe(true);
+    expect(cold.permissionModeRegistry.current()).toMatchObject({
+      mode: "bypassPermissions", bypassPermissionsAcceptedIn: [cwd],
+    });
+    expect(cold.stateRepository.updateNamespace).not.toHaveBeenCalled();
+  });
+
+  it("does not persist live bypass consent if runtime settings preparation fails", async () => {
+    const agentId = "live-bypass-settings-failure";
+    const h = makeTopLevelRunner({ conversationId: agentId, canonicalRuntimeSettings: true });
+    await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+    const previous = h.permissionModeRegistry.current();
+    h.session.prepareEmit.mockImplementationOnce(() => { throw new Error("injected settings append failure"); });
+    await expect(h.runner.setAgentPermissionMode(agentId, {
+      sessionId: agentId, mode: "bypassPermissions", bypassAuthority: "operator_tool_approval",
+    })).rejects.toThrow("injected settings append failure");
+    expect(h.permissionModeRegistry.current()).toBe(previous);
+    expect(h.stateRepository.updateNamespace).not.toHaveBeenCalled();
+    expect(h.stateRepository.getNamespace("permissions")).toEqual({});
+  });
+
+  it.each([false, true])("rolls back a partially failed live consent write and preserves prior consent (prior=%s)", async priorConsent => {
+    const agentId = `live-bypass-consent-write-failure-${priorConsent}`;
+    const cwd = realpathSync(process.cwd());
+    const h = makeTopLevelRunner({
+      conversationId: agentId, canonicalRuntimeSettings: true,
+      ...(priorConsent ? { persistedBypassConsent: [cwd] } : {}),
+    });
+    await h.runner.startAgent({ objective: "work", cwd });
+    const previous = h.permissionModeRegistry.current();
+    const previousState = structuredClone(h.stateRepository.getNamespace("permissions"));
+    const update = h.stateRepository.updateNamespace.getMockImplementation()!;
+    h.stateRepository.updateNamespace.mockImplementationOnce((namespace, mutate) => {
+      update(namespace, mutate);
+      throw new Error("injected consent persistence failure");
+    });
+    await expect(h.runner.setAgentPermissionMode(agentId, {
+      sessionId: agentId, mode: "bypassPermissions", bypassAuthority: "operator_tool_approval",
+    })).rejects.toThrow("injected consent persistence failure");
+    expect(h.permissionModeRegistry.current()).toBe(previous);
+    expect(h.stateRepository.getNamespace("permissions")).toEqual(previousState);
+    expect(recordedRuntimeSettingsEvents(h.rolloutItems).at(-1)?.msg?.payload).toMatchObject({
+      reason: "compensating_rollback", permissionMode: "default",
+    });
+  });
+
+  it("does not grant live bypass consent when managed policy disables it", async () => {
+    const agentId = "live-bypass-policy-disabled";
+    const h = makeTopLevelRunner({ conversationId: agentId, canonicalRuntimeSettings: true });
+    await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+    h.forcePermissionContextForTesting({
+      ...h.permissionModeRegistry.current(), bypassPermissionsModeDisabledByPolicy: true,
+    });
+    await expect(h.runner.setAgentPermissionMode(agentId, {
+      sessionId: agentId, mode: "bypassPermissions", bypassAuthority: "operator_tool_approval",
+    })).rejects.toThrow(/requires explicit consent/u);
+    expect(h.stateRepository.updateNamespace).not.toHaveBeenCalled();
+    expect(h.permissionModeRegistry.current().mode).not.toBe("bypassPermissions");
   });
 
   it("serializes a default request behind bypass durability without a stale no-op", async () => {
@@ -5942,7 +6885,7 @@ describe("AgenC delegate background-agent runner", () => {
     releaseBypass();
     await expect(bypass).resolves.toMatchObject({
       applied: true,
-      previousMode: "unattended",
+      previousMode: "default",
       mode: "bypassPermissions",
     });
     await expect(toDefault).resolves.toMatchObject({
@@ -6381,6 +7324,132 @@ describe("AgenC delegate background-agent runner", () => {
     });
     expect(setDisabled).toHaveBeenNthCalledWith(1, true);
     expect(setDisabled).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it.each(["claude-opus-4-6", "claude-sonnet-4-6"])(
+    "forwards every accepted literal applyConfig effort on %s", async model => {
+      const h = makeTopLevelRunner({ conversationId: "older-claude-effort", canonicalRuntimeSettings: true });
+      const row = { provider: "anthropic", model };
+      h.sessionState.sessionConfiguration.provider.slug = row.provider;
+      h.sessionState.sessionConfiguration.collaborationMode.model = model;
+      // This is the historical configured max seed. applyConfig must replace it.
+      h.sessionState.sessionConfiguration.collaborationMode.reasoningEffort = "xhigh";
+      await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+      const disk = h.configStore.current();
+      const registry = new ModelRegistry({ config: {} });
+      const info = modelRegistryEntryToModelInfo(registry.resolveSync(row));
+      for (const reasoningEffort of ["max", "low", "medium", "high"] as const) {
+        await expect(h.runner.applyAgentConfig("older-claude-effort", { sessionId: "session_1", reasoningEffort }))
+          .resolves.toMatchObject({ applied: true, ...row });
+        const sessionEffort = h.sessionState.sessionConfiguration.collaborationMode.reasoningEffort;
+        expect(sessionEffort).toBe(reasoningEffort);
+        expect((await h.runner.getAgentSnapshot("older-claude-effort"))?.runtimeSettings?.reasoningEffort).toBe(reasoningEffort);
+        expect(recordedRuntimeSettingsEvents(h.rolloutItems).at(-1)?.msg?.payload?.reasoningEffort).toBe(reasoningEffort);
+        const effort = resolveSessionReasoningEffort(sessionEffort, info.supportedReasoningLevels, row);
+        const body = buildAnthropicMessagesRequest({
+          model, messages: [], tools: [], maxTokens: 4096, options: { reasoningEffort: effort },
+        });
+        expect(body.output_config).toEqual({ effort: reasoningEffort });
+      }
+      const before = structuredClone(h.sessionState.sessionConfiguration);
+      const events = recordedRuntimeSettingsEvents(h.rolloutItems);
+      for (const reasoningEffort of ["none", "minimal", "xhigh"]) {
+        await expect(h.runner.applyAgentConfig("older-claude-effort", { sessionId: "session_1", reasoningEffort }))
+          .rejects.toThrow("does not support");
+      }
+      expect(h.sessionState.sessionConfiguration).toEqual(before);
+      expect(recordedRuntimeSettingsEvents(h.rolloutItems)).toEqual(events);
+      expect(h.configStore.current()).toEqual(disk);
+    });
+
+  it.each(desktopEffortCatalog.filter(row => row.levels.length > 0))(
+    "accepts Desktop session efforts for $provider/$model", async row => {
+      const h = makeTopLevelRunner({ conversationId: "desktop-effort", canonicalRuntimeSettings: true });
+      h.sessionState.sessionConfiguration.provider.slug = row.provider;
+      h.sessionState.sessionConfiguration.collaborationMode.model = row.model;
+      await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+      const disk = h.configStore.current();
+      for (const reasoningEffort of row.levels) {
+        await expect(h.runner.applyAgentConfig("desktop-effort", {sessionId: "session_1", reasoningEffort}))
+          .resolves.toMatchObject({ applied: true, provider: row.provider, model: row.model });
+        expect(h.sessionState.sessionConfiguration.collaborationMode.reasoningEffort).toBe(reasoningEffort);
+        expect((await h.runner.getAgentSnapshot("desktop-effort"))?.runtimeSettings?.reasoningEffort).toBe(reasoningEffort);
+      }
+      const events = recordedRuntimeSettingsEvents(h.rolloutItems);
+      const invalid = ["minimal", "low", "medium", "high", "xhigh", "max"].find(level => !row.levels.includes(level)) ?? "invalid";
+      await expect(h.runner.applyAgentConfig("desktop-effort", {sessionId: "session_1", reasoningEffort: invalid})).rejects.toThrow();
+      Object.assign(h.session, { activeTurn: h.activeTurn });
+      h.setActiveTurn("running-turn");
+      await expect(h.runner.applyAgentConfig("desktop-effort", {sessionId: "session_1", reasoningEffort: row.levels[0]})).rejects.toThrow("between turns");
+      expect(recordedRuntimeSettingsEvents(h.rolloutItems)).toEqual(events);
+      expect(h.configStore.current()).toEqual(disk);
+    });
+
+  it.each([
+    { provider: "anthropic", model: "claude-opus-4-6", levels: ["xhigh"] },
+    { provider: "anthropic", model: "claude-sonnet-4-6", levels: ["xhigh"] },
+    { provider: "anthropic", model: "claude-opus-4-5", levels: ["xhigh", "max"] },
+    ...["gpt-5.6-sol-unverified", "gpt-5.6-terra-unverified", "o3-unverified"].map(model => ({
+      provider: "openai", model, levels: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    })),
+    { provider: "grok", model: "grok-4-20-multi-agent-unverified", levels: ["minimal", "low", "medium", "high", "xhigh", "max"] },
+  ])("rejects unverified session efforts for $provider/$model", async row => {
+    const h = makeTopLevelRunner({ conversationId: "rejected-effort", canonicalRuntimeSettings: true });
+    h.sessionState.sessionConfiguration.provider.slug = row.provider;
+    h.sessionState.sessionConfiguration.collaborationMode.model = row.model;
+    await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+    const before = structuredClone(h.sessionState.sessionConfiguration);
+    const disk = h.configStore.current();
+    const events = recordedRuntimeSettingsEvents(h.rolloutItems);
+    for (const reasoningEffort of row.levels) {
+      await expect(h.runner.applyAgentConfig("rejected-effort", { sessionId: "session_1", reasoningEffort }))
+        .rejects.toThrow("does not support");
+    }
+    expect(h.sessionState.sessionConfiguration).toEqual(before);
+    expect(h.configStore.current()).toEqual(disk);
+    expect(recordedRuntimeSettingsEvents(h.rolloutItems)).toEqual(events);
+  });
+
+  it("rolls back a NIM effort after a live session mutation fails", async () => {
+    const h = makeTopLevelRunner({ conversationId: "nim-rollback", canonicalRuntimeSettings: true });
+    h.sessionState.sessionConfiguration.provider.slug = "nvidia-nim";
+    h.sessionState.sessionConfiguration.collaborationMode.model = "openai/gpt-oss-120b";
+    await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+    const before = h.sessionState.sessionConfiguration;
+    const settings = (await h.runner.getAgentSnapshot("nim-rollback"))?.runtimeSettings;
+    vi.mocked(h.session.state.with).mockImplementationOnce(async apply => {
+      await apply(h.sessionState);
+      throw new Error("injected effort failure");
+    });
+    await expect(h.runner.applyAgentConfig("nim-rollback", { sessionId: "session_1", reasoningEffort: "high" })).rejects.toThrow("injected effort failure");
+    expect(h.sessionState.sessionConfiguration).toEqual(before);
+    expect((await h.runner.getAgentSnapshot("nim-rollback"))?.runtimeSettings).toEqual(settings);
+    expect(recordedRuntimeSettingsEvents(h.rolloutItems).at(-1)?.msg?.payload).toMatchObject({ reason: "compensating_rollback" });
+  });
+
+  it("applies native effort between turns without changing model, permissions, or disk config", async () => {
+    const h = makeTopLevelRunner({ conversationId: "direct-deepseek-effort", canonicalRuntimeSettings: true });
+    h.sessionState.sessionConfiguration.provider.slug = "deepseek";
+    h.sessionState.sessionConfiguration.collaborationMode.model = "deepseek-v4-pro";
+    await h.runner.startAgent({ objective: "work", cwd: process.cwd() });
+    const beforeConfig = h.configStore.current();
+    const before = h.sessionState.sessionConfiguration;
+    for (const reasoningEffort of ["low", "high", "max"]) {
+      await expect(h.runner.applyAgentConfig("direct-deepseek-effort", { sessionId: "session_1", reasoningEffort }))
+        .resolves.toMatchObject({ applied: true, model: "deepseek-v4-pro", provider: "deepseek" });
+      expect(h.sessionState.sessionConfiguration.collaborationMode).toMatchObject({ model: "deepseek-v4-pro", reasoningEffort });
+      expect(h.sessionState.sessionConfiguration.approvalPolicy).toEqual(before.approvalPolicy);
+      expect(h.sessionState.sessionConfiguration.sandboxPolicy).toEqual(before.sandboxPolicy);
+      expect(h.configStore.current()).toEqual(beforeConfig);
+      expect(h.session.pendingProviderSwitch).toBeNull();
+    }
+    const recorded = recordedRuntimeSettingsEvents(h.rolloutItems);
+    await expect(h.runner.applyAgentConfig("direct-deepseek-effort", { sessionId: "session_1", reasoningEffort: "medium" })).rejects.toThrow("does not support");
+    Object.assign(h.session, { activeTurn: h.activeTurn });
+    h.setActiveTurn("running-turn");
+    await expect(h.runner.applyAgentConfig("direct-deepseek-effort", { sessionId: "session_1", reasoningEffort: "low" })).rejects.toThrow("between turns");
+    expect(recordedRuntimeSettingsEvents(h.rolloutItems)).toEqual(recorded);
+    expect(h.sessionState.sessionConfiguration.collaborationMode).toMatchObject({ reasoningEffort: "max" });
   });
 
   it("applyAgentConfig applies reasoning effort and stages a profile switch", async () => {
@@ -6875,6 +7944,109 @@ describe("AgenC delegate background-agent runner", () => {
     );
   });
 
+  it("atomically revokes a startup CLI directory on managed-only reload without later resurrection", async () => {
+    const agentId = "config-reload-managed-cli-directory";
+    const cliDirectory = join(process.cwd(), "managed-revoked-cli-root");
+    const managedLayer: {
+      readonly scope: "managed";
+      readonly label: string;
+      config: Record<string, unknown>;
+    } = {
+      scope: "managed",
+      label: "managed-policy",
+      config: { allowManagedPermissionRulesOnly: true },
+    };
+    const {
+      runner,
+      permissionModeRegistry,
+      preparedConfiguredExecutionAuthorities,
+      preparedConfiguredPermissionContexts,
+      sandboxExecutionBroker,
+      sessionState,
+    } = makeTopLevelRunner({
+      conversationId: agentId,
+      canonicalRuntimeSettings: true,
+      initialCliAdditionalDirectories: [cliDirectory],
+      configLayers: [managedLayer],
+    });
+    await runner.startAgent({ objective: "work", cwd: process.cwd() });
+
+    expect(
+      permissionModeRegistry.current().additionalWorkingDirectories.get(
+        cliDirectory,
+      ),
+    ).toEqual({ path: cliDirectory, source: "cliArg" });
+    expect(
+      sessionState.sessionConfiguration.fileSystemSandboxPolicy.allowWrite,
+    ).toContain(cliDirectory);
+    expect(
+      sandboxExecutionBroker
+        .executionAuthority()
+        .permissionProfile?.fileSystem.entries.some(
+          (entry) =>
+            entry.path.kind === "path" && entry.path.path === cliDirectory,
+        ),
+    ).toBe(true);
+
+    await expect(
+      runner.applyAgentConfig(agentId, {
+        sessionId: agentId,
+        reload: true,
+      }),
+    ).resolves.toMatchObject({ applied: true });
+
+    expect(
+      permissionModeRegistry.current().additionalWorkingDirectories.has(
+        cliDirectory,
+      ),
+    ).toBe(false);
+    expect(
+      preparedConfiguredExecutionAuthorities.at(-1)?.fileSystemSandboxPolicy
+        .allowWrite,
+    ).not.toContain(cliDirectory);
+    expect(
+      preparedConfiguredPermissionContexts
+        .at(-1)
+        ?.additionalWorkingDirectories.has(cliDirectory),
+    ).toBe(false);
+    expect(
+      sessionState.sessionConfiguration.fileSystemSandboxPolicy.allowWrite,
+    ).not.toContain(cliDirectory);
+    expect(
+      sandboxExecutionBroker
+        .executionAuthority()
+        .permissionProfile?.fileSystem.entries.some(
+          (entry) =>
+            entry.path.kind === "path" && entry.path.path === cliDirectory,
+        ),
+    ).toBe(false);
+
+    managedLayer.config = {};
+    await expect(
+      runner.applyAgentConfig(agentId, {
+        sessionId: agentId,
+        reload: true,
+      }),
+    ).resolves.toMatchObject({ applied: true });
+    expect(
+      permissionModeRegistry.current().additionalWorkingDirectories.has(
+        cliDirectory,
+      ),
+    ).toBe(false);
+    expect(
+      preparedConfiguredExecutionAuthorities.at(-1)?.fileSystemSandboxPolicy
+        .allowWrite,
+    ).not.toContain(cliDirectory);
+    expect(
+      sandboxExecutionBroker
+        .executionAuthority()
+        .permissionProfile?.fileSystem.entries.some(
+          (entry) =>
+            entry.path.kind === "path" && entry.path.path === cliDirectory,
+        ),
+    ).toBe(false);
+  });
+
   it("serializes a blocked prepared config reload after a permission-mode publication without mixed authority", async () => {
     const agentId = "config-reload-permission-race";
     const {
@@ -6985,7 +8157,7 @@ describe("AgenC delegate background-agent runner", () => {
         }),
       ).resolves.toEqual({
         applied: true,
-        previousMode: "unattended",
+        previousMode: "default",
         mode: "plan",
       });
       expect(reloadSettled).toBe(false);
@@ -7418,61 +8590,6 @@ describe("AgenC delegate background-agent runner", () => {
     );
   });
 
-  it("[managed-thread] carries validated Editor policy into the atomic first turn", async () => {
-    const { runner, stub, session, bootstrap } = makeTopLevelRunner({
-      conversationId: "session-editor-first-turn",
-    });
-    const initialEditorInteraction = {
-      interactionId: "interaction-first-fix",
-      kind: "fix" as const,
-      policy: "proposal_only" as const,
-      editorInstanceId: "editor-first-turn",
-      bufferHandle: 7,
-      changedtick: 12,
-      contentSha256: "a".repeat(64),
-      path: "/workspace/src/main.ts",
-      range: {
-        start: { line: 2, column: 3 },
-        end: { line: 4, column: 0 },
-      },
-      selectionMode: "character" as const,
-    };
-
-    await runner.startAgent({
-      objective: "internal editor prompt",
-      initialContent: "internal editor prompt",
-      initialDisplayUserMessage: "Fix the selected code",
-      initialEditorInteraction,
-      unattendedAllow: [],
-      unattendedDeny: [],
-    });
-
-    expect(stub.thread.submit).toHaveBeenCalledWith({
-      type: "user_input",
-      input: [{ type: "text", text: "internal editor prompt" }],
-      submitOptions: {
-        displayUserMessage: "Fix the selected code",
-        editorInteraction: initialEditorInteraction,
-      },
-    });
-    expect(bootstrap).toHaveBeenCalledWith(
-      expect.objectContaining({
-        deferSessionStartHooks: true,
-        deferAgentStartupSideEffects: true,
-      }),
-    );
-    expect(session.emit).toHaveBeenCalledWith({
-      id: "user-initial-session-editor-first-turn",
-      msg: {
-        type: "user_message",
-        payload: {
-          message: "internal editor prompt",
-          displayText: "Fix the selected code",
-        },
-      },
-    });
-  });
-
   it("[managed-thread] empty initialContent provisions a passive agent with no turn-1 submit", async () => {
     // The channel gateway (task 34) relies on this contract: agent.create
     // with `initialContent: []` bootstraps a live, runnable agent WITHOUT
@@ -7719,7 +8836,7 @@ describe("AgenC delegate background-agent runner", () => {
         ? { blockingError: { blockingError: "follow-up prompt denied" } }
         : {},
     );
-    const { runner, control, stub } = makeTopLevelRunner({
+    const { runner, control, stub, session } = makeTopLevelRunner({
       conversationId: "session-follow-up-prompt-survives-block",
       userPromptSubmitHooks: [blockHook],
     });
@@ -7729,6 +8846,8 @@ describe("AgenC delegate background-agent runner", () => {
       unattendedAllow: [],
       unattendedDeny: [],
     });
+    session.markStoppedByUser();
+    session.clearUserStop.mockClear();
 
     await expect(
       runner.submitAgentMessage("session-follow-up-prompt-survives-block", {
@@ -7742,6 +8861,8 @@ describe("AgenC delegate background-agent runner", () => {
     ).rejects.toMatchObject({
       code: "PROMPT_BLOCKED",
     });
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(session.clearUserStop).not.toHaveBeenCalled();
     const snapshot = await runner.getAgentSnapshot(
       "session-follow-up-prompt-survives-block",
     );
@@ -7758,7 +8879,76 @@ describe("AgenC delegate background-agent runner", () => {
       }),
     ).resolves.toMatchObject({ disposition: "started" });
     expect(control.sendInput).toHaveBeenCalledTimes(1);
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(session.clearUserStop).not.toHaveBeenCalled();
     expect(stub.thread.submit).not.toHaveBeenCalled();
+    session.markStoppedByUser();
+    await expect(runner.submitAgentMessage("session-follow-up-prompt-survives-block", {
+      sessionId: "session_1",
+      content: "allowed follow-up prompt",
+      originalContent: "allowed follow-up prompt",
+      messageId: "allowed-follow-up-after-block",
+      streamId: "duplicate-stream",
+      acceptedAt: "2026-08-25T00:00:02.000Z",
+    })).resolves.toMatchObject({ disposition: "duplicate" });
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(session.clearUserStop).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("[managed-thread] retains the stop during failed input admission (structured=%s)", async (structured) => {
+    const { runner, control, stub, session } = makeTopLevelRunner({
+      conversationId: "session-failed-stop-release",
+    });
+    await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+    session.markStoppedByUser();
+    const admission = structured ? stub.thread.submit : control.sendInput;
+    admission.mockImplementationOnce(async () => {
+      expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+      await Promise.resolve();
+      expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+      throw new Error("input admission failed");
+    });
+    const content = structured ? [{ type: "text" as const, text: "continue" }] : "continue";
+    await expect(runner.submitAgentMessage("session-failed-stop-release", {
+      sessionId: "session_1", content, originalContent: content,
+      messageId: "failed-stop-release", streamId: "stream_1", acceptedAt: "2026-09-10T00:00:00.000Z",
+    })).rejects.toThrow("input admission failed");
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(session.clearUserStop).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("[managed-thread] passes the ingress stop generation to durable turn admission (newerStop=%s)", async (newerStop) => {
+    const harness = makeTopLevelRunner({
+      conversationId: "session-generation-stop-release",
+    });
+    const { runner, control, session, configStore } = harness;
+    await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+    session.markStoppedByUser();
+    const originalGeneration = session.userStopGeneration;
+    let submitDriver: (message: string, options?: unknown) => Promise<void> = async () => { throw new Error("driver missing"); };
+    const driverSession = {
+      ...session,
+      newDefaultTurn: () => ({}),
+      installTurnDriverHooks: (hooks: { submit: typeof submitDriver }) => { submitDriver = hooks.submit; },
+    };
+    const runTurnFn = vi.fn(async function* (_session: unknown, _turn: unknown, _input: unknown, options: { userStopGenerationToRelease?: number }) {
+      expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+      expect(options.userStopGenerationToRelease).toBe(originalGeneration);
+      if (options.userStopGenerationToRelease === session.userStopGeneration) session.clearUserStop();
+    });
+    __installDaemonTurnDriverHooksForTest(driverSession as never, configStore as never, runTurnFn as never);
+    control.sendInput.mockImplementationOnce(async (...invocation: unknown[]) => {
+      expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+      if (newerStop) session.markStoppedByUser();
+      await submitDriver(invocation[1] as string, invocation[2]);
+    });
+    await runner.submitAgentMessage("session-generation-stop-release", {
+      sessionId: "session_1", content: "continue", originalContent: "continue",
+      messageId: "generation-stop-release", streamId: "stream_1", acceptedAt: "2026-09-10T00:00:00.000Z",
+    });
+    expect(runTurnFn).toHaveBeenCalledOnce();
+    expect(session.stoppedByUserSinceLastPrompt).toBe(newerStop);
+    expect(session.clearUserStop).toHaveBeenCalledTimes(newerStop ? 0 : 1);
   });
 
   it("[managed-thread] replays a legacy hook-block error as session-only after attach", async () => {
@@ -8516,6 +9706,199 @@ describe("AgenC delegate background-agent runner", () => {
     await acceptedThenCrashed;
   });
 
+  it.each(["same prompt", "different prompt"])(
+    "[managed-thread] keeps concurrent dispatcher fallback submissions distinct (%s)", async secondContent => {
+      const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+      const agentId = "session-dispatcher-fallback";
+      const sessionId = "session-dispatcher-client";
+      const { runner, control } = makeTopLevelRunner({ conversationId: agentId });
+      const sessions = new AgenCDaemonSessionManager();
+      const manager = new AgenCDaemonAgentManager({ runner, sessionManager: sessions });
+      const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: manager, sessionManager: sessions });
+      const connection = dispatcher.createConnection();
+      const emitted: JsonObject[] = [];
+      const pending: Promise<unknown>[] = [];
+      let releaseSend: (() => void) | undefined;
+      const submit = vi.spyOn(runner, "submitAgentMessage");
+      const dispatchMessage = (id: string, method: string, content: string, clientMessageId?: string) =>
+        connection.dispatch({
+          jsonrpc: "2.0", id, method,
+          params: { sessionId, content, ...(clientMessageId === undefined ? {} : { clientMessageId }) },
+        });
+      try {
+        const started = await runner.startAgent({
+          objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [],
+        });
+        await sessions.restoreSession({ sessionId, agentId, status: "waiting", createdAt: started.startedAt });
+        await manager.restoreAgent({
+          agentId, objective: "passive", startedAt: started.startedAt, lastActiveAt: started.startedAt,
+          sessionIds: [sessionId], runtimeAvailable: true,
+        });
+        await runner.attachAgentSessionEvents(agentId, { sessionId, emit: notification => emitted.push(notification) });
+        expect(await connection.dispatch({
+          jsonrpc: "2.0", id: "initialize", method: "initialize", params: { protocol: { version: "1.2.0" } },
+        })).toHaveProperty("result");
+        expect(control.sendInput).not.toHaveBeenCalled();
+        control.sendInput.mockImplementationOnce(() => new Promise<void>(resolve => { releaseSend = resolve; }));
+        const first = dispatchMessage("first", "message.send", "same prompt");
+        pending.push(first);
+        await vi.waitFor(() => expect(control.sendInput).toHaveBeenCalledOnce());
+        const second = dispatchMessage("second", "message.stream", secondContent);
+        pending.push(second);
+        await vi.waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+        const identities = submit.mock.calls.map(([, params]) => params.messageId);
+        expect(new Set(identities).size).toBe(2);
+        releaseSend!();
+        const responses = await Promise.all([first, second]);
+        for (const [index, response] of responses.entries()) {
+          expect(response).toMatchObject({ result: { messageId: identities[index], disposition: "started" } });
+        }
+        expect(responses[1]).toMatchObject({ result: { streamId: identities[1] } });
+        expect(control.sendInput).toHaveBeenCalledTimes(2);
+        const userIdentities = emitted.flatMap(notification => {
+          const params = notification.params as JsonObject | undefined;
+          const event = params?.event as JsonObject | undefined;
+          return event?.type === "user_message" ? [params?.clientMessageId] : [];
+        });
+        expect(userIdentities).toEqual(identities);
+        const transcript = await runner.getAgentSessionTranscriptV2(agentId, { sessionId });
+        expect(transcript.messages.filter(message => message.role === "user").map(message => message.clientMessageId)).toEqual(identities);
+        expect(await dispatchMessage("explicit", "message.send", "explicit prompt", "caller-message")).toMatchObject({
+          result: { messageId: "caller-message", disposition: "started" },
+        });
+        expect(await dispatchMessage("retry", "message.stream", "explicit prompt", "caller-message")).toMatchObject({
+          result: { messageId: "caller-message", disposition: "duplicate" },
+        });
+        expect(await dispatchMessage("conflict", "message.send", "changed prompt", "caller-message")).toMatchObject({
+          error: { data: { code: "CLIENT_MESSAGE_ID_CONFLICT" } },
+        });
+        expect(control.sendInput).toHaveBeenCalledTimes(3);
+      } finally {
+        releaseSend?.();
+        await Promise.allSettled(pending);
+        await connection.close();
+        await dispatcher.close();
+        await runner.stopAgent(agentId, "test_cleanup");
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it("[managed-thread] recovers a TUI response dropped after execution without resubmitting owned input", async () => {
+    const agentId = "session-tui-retry";
+    const sessionId = "session-tui-retry-client";
+    const { runner, control, stub } = makeTopLevelRunner({ conversationId: agentId });
+    const sessions = new AgenCDaemonSessionManager();
+    const manager = new AgenCDaemonAgentManager({ runner, sessionManager: sessions });
+    const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: manager, sessionManager: sessions });
+    const connection = dispatcher.createConnection();
+    const requests: JsonObject[] = [];
+    let dropResponse = true;
+    let requestSequence = 0;
+    const client = {
+      request: async (method: string, params: JsonObject) => {
+        expect(method).toBe("message.stream");
+        requests.push(params);
+        const response = await connection.dispatch({ jsonrpc: "2.0", id: ++requestSequence, method, params });
+        expect(response).not.toHaveProperty("error");
+        if (dropResponse) {
+          dropResponse = false;
+          throw new Error("response socket closed after execution");
+        }
+        return response.result;
+      },
+      subscribeToSessionEvents: () => () => {},
+    } as unknown as AgenCDaemonTuiClient;
+    try {
+      const started = await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await sessions.restoreSession({ sessionId, agentId, status: "waiting", createdAt: started.startedAt });
+      await manager.restoreAgent({ agentId, objective: "passive", startedAt: started.startedAt, lastActiveAt: started.startedAt, sessionIds: [sessionId], runtimeAvailable: true });
+      expect(await connection.dispatch({ jsonrpc: "2.0", id: "initialize", method: "initialize", params: { protocol: { version: "1.2.0" } } })).toHaveProperty("result");
+      const adapter = createDaemonTuiSessionFixture({ baseSession: { conversationId: sessionId }, client, sessionId, clientId: "tui-retry-client" });
+      const events: unknown[] = [];
+      const unsubscribe = adapter.subscribeToEvents(event => events.push(event));
+      const admission = adapter.enqueueIdleInputBatchOwned!([{ role: "user", content: "owned attachment" }], { workspaceView: "agent" });
+      const options = { clientMessageId: "tui-logical-submission", displayUserMessage: "inspect attachment" };
+      await expect(adapter.submit("inspect attachment", options)).rejects.toThrow("response socket closed");
+      expect(stub.thread.submit).toHaveBeenCalledOnce();
+      await expect(adapter.submit("inspect attachment", options)).resolves.toBeUndefined();
+      expect(stub.thread.submit).toHaveBeenCalledOnce();
+      expect(requests.map(request => request.clientMessageId)).toEqual([options.clientMessageId, options.clientMessageId]);
+      expect(requests[0]?.streamId).not.toBe(requests[1]?.streamId);
+      expect(requests[1]?.content).toEqual(requests[0]?.content);
+      expect(adapter.rollbackIdleInputAdmission!(admission.token)).toBe(false);
+      expect(adapter.activeTurn.unsafePeek()).toBeNull();
+      expect(events).toContainEqual(expect.objectContaining({ type: "message_submission_recovered", payload: expect.objectContaining({ clientMessageId: options.clientMessageId, code: 0 }) }));
+      await adapter.submit("a different prompt");
+      await adapter.submit("a different prompt");
+      expect(control.sendInput).toHaveBeenCalledTimes(2);
+      expect(new Set(requests.slice(2).map(request => request.clientMessageId)).size).toBe(2);
+      expect(requests.slice(2).map(request => request.content)).toEqual(["a different prompt", "a different prompt"]);
+      unsubscribe();
+    } finally {
+      await connection.close();
+      await dispatcher.close();
+      await runner.stopAgent(agentId, "test_cleanup");
+    }
+  });
+
+  it.each(["incomplete", 0, 1, 130] as const)("[managed-thread] preserves the persisted TUI retry outcome %s and an unrelated active turn", async outcome => {
+    const agentId = `session-tui-persisted-${outcome}`;
+    const sessionId = `${agentId}-client`;
+    const clientMessageId = "persisted-tui-message";
+    const event = (sequence: number, msg: JsonObject) => ({ type: "event_msg", payload: { id: `event-${sequence}`, eventId: `event-${sequence}`, seq: sequence, msg } });
+    const terminal = outcome === 0
+      ? { type: "turn_complete", payload: { turnId: "persisted-turn", lastAgentMessage: "saved answer" } }
+      : outcome === 130
+        ? { type: "turn_aborted", payload: { turnId: "persisted-turn", reason: "user_cancelled" } }
+        : { type: "turn_failed", payload: { turnId: "persisted-turn", code: "provider_error", message: "saved failure" } };
+    const { runner, control, stub } = makeTopLevelRunner({ conversationId: agentId, rolloutItems: [
+      event(1, { type: "user_message", payload: { message: "retry me", messageId: clientMessageId, acceptedAt: "2026-09-08T00:00:00.000Z" } }),
+      event(2, { type: "turn_started", payload: { turnId: "persisted-turn" } }),
+      ...(outcome === "incomplete" ? [] : [event(3, terminal)]),
+    ] });
+    const sessions = new AgenCDaemonSessionManager();
+    const manager = new AgenCDaemonAgentManager({ runner, sessionManager: sessions });
+    const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: manager, sessionManager: sessions });
+    const connection = dispatcher.createConnection();
+    let emit: ((event: JsonObject) => void) | undefined;
+    const client = {
+      request: async (method: string, params: JsonObject) => {
+        const response = await connection.dispatch({ jsonrpc: "2.0", id: "retry", method, params });
+        expect(response).not.toHaveProperty("error");
+        return response.result;
+      },
+      subscribeToSessionEvents: (_sessionId: string, callback: (event: JsonObject) => void) => { emit = callback; return () => {}; },
+    } as unknown as AgenCDaemonTuiClient;
+    try {
+      const started = await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await sessions.restoreSession({ sessionId, agentId, status: "waiting", createdAt: started.startedAt });
+      await manager.restoreAgent({ agentId, objective: "passive", startedAt: started.startedAt, lastActiveAt: started.startedAt, sessionIds: [sessionId], runtimeAvailable: true });
+      await connection.dispatch({ jsonrpc: "2.0", id: "initialize", method: "initialize", params: { protocol: { version: "1.2.0" } } });
+      const adapter = createDaemonTuiSessionFixture({ baseSession: { conversationId: sessionId }, client, sessionId, clientId: "persisted-tui" });
+      const events: unknown[] = [];
+      const unsubscribe = adapter.subscribeToEvents(event => events.push(event));
+      emit!({ type: "turn_started", payload: { turnId: "unrelated-turn" } });
+      if (outcome === "incomplete") {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          await expect(adapter.submit("retry me", { clientMessageId })).rejects.toThrow("already admitted, but its terminal outcome is unknown");
+        }
+        expect(events).not.toContainEqual(expect.objectContaining({ type: "message_submission_recovered" }));
+      } else {
+        await expect(adapter.submit("retry me", { clientMessageId })).resolves.toBeUndefined();
+        expect(events).toContainEqual(expect.objectContaining({ type: "message_submission_recovered", payload: expect.objectContaining({ clientMessageId, turnId: "persisted-turn", code: outcome }) }));
+      }
+      expect(adapter.activeTurn.unsafePeek()).toEqual({ turnId: "unrelated-turn" });
+      expect(control.sendInput).not.toHaveBeenCalled();
+      expect(stub.thread.submit).not.toHaveBeenCalled();
+      unsubscribe();
+    } finally {
+      await connection.close();
+      await dispatcher.close();
+      await runner.stopAgent(agentId, "test_cleanup");
+    }
+  });
+
   it("[managed-thread] joins a concurrent idempotent retry and rejects conflicting content", async () => {
     const { runner, control } = makeTopLevelRunner({
       conversationId: "session-idempotent-submit",
@@ -8577,6 +9960,34 @@ describe("AgenC delegate background-agent runner", () => {
     expect(control.sendInput).toHaveBeenCalledOnce();
   });
 
+  it("refuses a message once the session's live history is blocked", async () => {
+    const { runner, rolloutStore } = makeTopLevelRunner({
+      conversationId: "session-history-blocked",
+    });
+    await runner.startAgent({
+      objective: "history closes after this",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    const reason =
+      'tool-pair history rejected during live append: tool result repeats "call-22" (44 UTF-8 bytes)';
+    rolloutStore.liveHistoryBlockedReason.mockReturnValue(reason);
+
+    await expect(
+      runner.submitAgentMessage("session-history-blocked", {
+        sessionId: "session_1",
+        content: "another prompt",
+        originalContent: "another prompt",
+        messageId: "blocked-message",
+        streamId: "blocked-message",
+        acceptedAt: "2026-08-17T00:00:00.000Z",
+      }),
+    ).rejects.toMatchObject({
+      code: "SESSION_HISTORY_BLOCKED",
+      message: expect.stringContaining(reason),
+    });
+  });
+
   it("[managed-thread] rejects opt-in admission during the initial turn without changing legacy FIFO", async () => {
     const initialSubmissionStarted = Promise.withResolvers<void>();
     const releaseInitialSubmission = Promise.withResolvers<void>();
@@ -8626,6 +10037,82 @@ describe("AgenC delegate background-agent runner", () => {
       "legacy queued turn",
       expect.objectContaining({ displayUserMessage: "legacy queued turn" }),
     );
+  });
+
+  it("[managed-thread] a prompt refused while a stop unwinds keeps the stop latched and names it", async () => {
+    const initialSubmissionStarted = Promise.withResolvers<void>();
+    const releaseInitialSubmission = Promise.withResolvers<void>();
+    const { runner, session, control, stub } = makeTopLevelRunner({
+      conversationId: "session-stop-refusal",
+      threadInitialStatus: { status: "pending_init" } as AgentStatus,
+    });
+    stub.thread.submit.mockImplementationOnce(async () => {
+      initialSubmissionStarted.resolve();
+      await releaseInitialSubmission.promise;
+      return "session-stop-refusal";
+    });
+    await runner.startAgent({
+      objective: "fan the work out to a swarm",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+    await initialSubmissionStarted.promise;
+    const child = (name: string, depth: number) =>
+      [name, { agentId: name, agentPath: `/root/${name}`, depth }] as const;
+    control.openThreadSpawnChildren.mockReturnValue([child("worker-1", 1)]);
+    control.liveThreadSpawnChildren.mockReturnValue(
+      new Map<string, ReadonlyArray<readonly [string, unknown]>>([
+        ["session-stop-refusal", [child("worker-1", 1), child("worker-2", 1)]],
+        ["worker-1", [child("worker-1/helper", 2)]],
+      ]),
+    );
+
+    expect(
+      await runner.interruptAgentTurn("session-stop-refusal", "user_cancel"),
+    ).toBe(true);
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+
+    // #2201: the stopped turn is still unwinding, so the next prompt is
+    // refused. The refusal must say the session is stopping, and must not
+    // spend the stop latch — the user's words never entered the session, so
+    // a child receipt arriving next would restart the stopped work (#2236).
+    const refusal = await runner
+      .submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "never mind, do something else",
+        originalContent: "never mind, do something else",
+        messageId: "refused-after-stop",
+        streamId: "refused-after-stop",
+        acceptedAt: "2026-09-07T00:00:00.000Z",
+        ifBusy: "reject",
+      })
+      .then(
+        (result) => result as unknown,
+        (error: unknown) => error,
+      );
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(refusal).toBeInstanceOf(Error);
+    expect(refusal).toMatchObject({
+      code: "TURN_IN_PROGRESS",
+      // Names the stop, and counts the whole subtree still unwinding under it.
+      message: expect.stringContaining(
+        "is still stopping the turn you interrupted (3 agents still stopping)",
+      ),
+    });
+
+    releaseInitialSubmission.resolve();
+    await expect(
+      runner.submitAgentMessage("session-stop-refusal", {
+        sessionId: "session_1",
+        content: "do something else",
+        originalContent: "do something else",
+        messageId: "admitted-after-stop",
+        streamId: "admitted-after-stop",
+        acceptedAt: "2026-09-07T00:00:01.000Z",
+      }),
+    ).resolves.toMatchObject({ disposition: "started" });
+    expect(session.stoppedByUserSinceLastPrompt).toBe(true);
+    expect(session.clearUserStop).not.toHaveBeenCalled();
   });
 
   it("[managed-thread] accepts the first opt-in-admission message on a deferred spawn still in pending_init", async () => {
@@ -8817,6 +10304,82 @@ describe("AgenC delegate background-agent runner", () => {
       terminal: { code: 0, message: "done" },
     });
     expect(control.sendInput).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "errored"] as const)(
+    "[managed-thread] agrees on live and replayed %s turns after diagnostics",
+    async (outcome) => {
+      const conversationId = `session-explicit-${outcome}`;
+      const { runner, session, control, rolloutItems } = makeTopLevelRunner({ conversationId });
+      const notifications: unknown[] = [];
+      await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await runner.attachAgentSessionEvents(conversationId, {
+        sessionId: "session_1",
+        emit: (notification) => { notifications.push(notification); },
+      });
+      control.sendInput.mockImplementationOnce(async () => {
+        session.emit({ id: "start", msg: { type: "turn_started", payload: { turnId: "turn-1" } } });
+        session.emit({ id: "diagnostic", msg: { type: "error", payload: { turnId: "turn-1", cause: "stop_hook_threw", message: "hook failed" } } });
+        session.emit({ id: "stale", msg: { type: "turn_failed", payload: { turnId: "old-turn", code: "provider_error", message: "stale failure" } } });
+        session.emit({ id: "answer", msg: { type: "agent_message", payload: { message: "full answer" } } });
+        session.emit({ id: "tokens", msg: { type: "token_count", payload: { promptTokens: 4, completionTokens: 3, totalTokens: 7 } } });
+        session.emit({ id: "terminal", msg: outcome === "errored"
+          ? { type: "turn_failed", payload: { turnId: "turn-1", code: "provider_error", message: "provider failed" } }
+          : { type: "turn_complete", payload: { turnId: "turn-1", lastAgentMessage: "full answer" } },
+        });
+      });
+      const request = {
+        sessionId: "session_1", content: "retry me", originalContent: "retry me",
+        messageId: "explicit-message", streamId: "explicit-message",
+        acceptedAt: "2026-08-17T00:00:00.000Z",
+      };
+      const terminal = outcome === "errored"
+        ? { code: 1, message: "provider failed" }
+        : { code: 0, message: "full answer" };
+      const live = await runner.submitAgentMessage(conversationId, request);
+      expect(live).toMatchObject({ terminal, turnId: "turn-1" });
+      const duplicate = await runner.submitAgentMessage(conversationId, request);
+      expect(duplicate).toMatchObject({ disposition: "duplicate", duplicateState: "completed", terminal });
+      expect(duplicate.terminal).toEqual(live.terminal);
+      expect(control.sendInput).toHaveBeenCalledOnce();
+      await expect(runner.getAgentSnapshot(conversationId)).resolves.toMatchObject({ status: "idle" });
+      await expect(runner.getAgentSessionTranscriptV2(conversationId, { sessionId: "session_1" })).resolves.toMatchObject({
+        turnResults: [{ turnId: "turn-1", outcome, inputTokens: 4, outputTokens: 3, totalTokens: 7 }],
+        messages: [expect.objectContaining({ text: "retry me" }), expect.objectContaining({ text: "full answer" })],
+      });
+      if (outcome === "errored") {
+        expect(notifications).toContainEqual(expect.objectContaining({
+          method: "event.session_event",
+          params: expect.objectContaining({ event: expect.objectContaining({ type: "turn_failed", payload: expect.objectContaining({ turnId: "turn-1" }) }) }),
+        }));
+      }
+      const restored = makeTopLevelRunner({ conversationId, rolloutItems: [...rolloutItems] });
+      await restored.runner.startAgent({ objective: "restored", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      const replayed = await restored.runner.submitAgentMessage(conversationId, request);
+      expect(replayed).toMatchObject({ disposition: "duplicate", duplicateState: "completed", terminal });
+      expect(replayed.terminal).toEqual(live.terminal);
+      expect(restored.control.sendInput).not.toHaveBeenCalled();
+      await expect(runner.submitAgentMessage(conversationId, { ...request, content: "next", originalContent: "next", messageId: "next-message", streamId: "next-message" })).resolves.toMatchObject({ disposition: "started" });
+    },
+  );
+
+  it.each([false, true])("[managed-thread] journals one failed terminal before run failure (already closed: %s)", async (alreadyClosed) => {
+    const conversationId = `session-terminal-once-${alreadyClosed}`;
+    const { runner, session, stub, rolloutItems, shutdown } = makeTopLevelRunner({ conversationId });
+    await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+    session.emit({ id: "started", msg: { type: "turn_started", payload: { turnId: "failed-turn" } } });
+    if (alreadyClosed) {
+      session.emit({ id: "failed", msg: { type: "turn_failed", payload: { turnId: "failed-turn", code: "turn_execution_failed", message: "failed" } } });
+    }
+    stub.pushStatus({ status: "errored", turnId: "failed-turn", error: "failed", endedAtMs: 1_500 });
+    await vi.waitFor(() => expect(shutdown).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(rolloutItems).toContainEqual(expect.objectContaining({ payload: expect.objectContaining({ msg: expect.objectContaining({ type: "run_terminal" }) }) })));
+    const events = rolloutItems.flatMap((item) => {
+      const candidate = item as { type: string; payload: { msg: { type: string } } };
+      return candidate.type === "event_msg" ? [candidate.payload.msg] : [];
+    });
+    expect(events.filter((event) => event.type === "turn_failed")).toHaveLength(1);
+    expect(events.findIndex((event) => event.type === "turn_failed")).toBeLessThan(events.findIndex((event) => event.type === "run_terminal"));
   });
 
   it("[managed-thread] never attributes a later completed turn to a crashed submission", async () => {
@@ -9404,6 +10967,246 @@ describe("AgenC delegate background-agent runner", () => {
     ).resolves.toMatchObject({ status: "idle" });
   });
 
+  it("[managed-thread] snapshots the live model window, prompt, and per-model cost authority", async () => {
+    const { runner, session, sessionState } = makeTopLevelRunner({
+      conversationId: "session-context-accounting",
+      totalTokenUsage: () => ({
+        inputTokens: 2_000,
+        outputTokens: 100,
+        totalTokens: 2_100,
+      }),
+    });
+    const hasUnknownModelCost = vi.fn(() => false);
+    const getTotalCostUsd = vi.fn(() => 1.2345);
+    const getSessionTotals = vi.fn(() => ({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+    }));
+    Object.assign(session.services, {
+      costSidecar: {
+        getTotalCostUsd,
+        getSessionTotals,
+        hasUnknownModelCost,
+      },
+    });
+
+    await runner.startAgent({
+      objective: "inspect live context accounting",
+      unattendedAllow: [],
+      unattendedDeny: [],
+    });
+
+    // Model switching updates the live Session, not bootstrap.modelInfo.
+    // Keep the bootstrap fixture at 65,536 to catch stale-window reads.
+    Object.assign(session, {
+      modelInfo: { slug: "kimi-k2.6", contextWindow: 262_144, effectiveContextWindowPercent: 80 },
+    });
+    sessionState.sessionConfiguration = {
+      ...sessionState.sessionConfiguration,
+      provider: { slug: "kimi" },
+      collaborationMode: { model: "kimi-k2.6" },
+      baseInstructions:
+        "These are the active session base instructions after the model switch.",
+    };
+
+    const snapshot = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+
+    expect(snapshot.tokenUsage).toEqual({
+      inputTokens: 2_000,
+      outputTokens: 100,
+      totalTokens: 2_100,
+      costUsd: 1.2345,
+      costKnown: true,
+    });
+    expect(snapshot.contextBreakdown).toMatchObject({
+      provider: "kimi",
+      model: "kimi-k2.6",
+      estimated: true,
+      windowTokens: 262_144,
+      effectiveWindowTokens: 209_715,
+      systemPromptTokens: expect.any(Number),
+    });
+    expect(snapshot.contextBreakdown?.systemPromptTokens).toBeGreaterThan(0);
+    expect(getTotalCostUsd).toHaveBeenCalled();
+    expect(getSessionTotals).toHaveBeenCalled();
+    expect(hasUnknownModelCost).toHaveBeenCalled();
+
+    Object.assign(session.services, { providerEnvironment: { AGENC_AUTO_COMPACT_WINDOW: "180000" } });
+    hasUnknownModelCost.mockReturnValue(true);
+    const partiallyKnown = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(partiallyKnown.contextBreakdown).toMatchObject({ windowTokens: 262_144, effectiveWindowTokens: 180_000 });
+    expect(partiallyKnown.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    hasUnknownModelCost.mockReturnValue(false);
+    sessionState.initialTokenUsage = {
+      promptTokens: 1_500,
+      completionTokens: 50,
+      totalTokens: 1_550,
+    };
+    const resumedWithoutRestoredCosts = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(resumedWithoutRestoredCosts.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete sessionState.initialTokenUsage;
+    getSessionTotals.mockReturnValue({
+      inputTokens: 1_999,
+      outputTokens: 100,
+      totalTokens: 2_099,
+    });
+    const incompleteSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(incompleteSidecar.tokenUsage).toMatchObject({
+      costUsd: 1.2345,
+      costKnown: false,
+    });
+
+    delete (
+      session.services as typeof session.services & {
+        costSidecar?: unknown;
+      }
+    ).costSidecar;
+    const withoutSidecar = await runner.snapshotAgentSession(
+      "session-context-accounting",
+      { sessionId: "session-context-accounting" },
+    );
+    expect(withoutSidecar.tokenUsage).toMatchObject({
+      costUsd: 0,
+      costKnown: false,
+    });
+  });
+
+  it("[managed-thread] inspects and stops a real child process through session RPC without consuming its output", async () => {
+    const agentId = "process-owner-agent";
+    const sessionId = "process-owner-session";
+    const { runner, session, control } = makeTopLevelRunner({ conversationId: agentId });
+    const processes = new UnifiedExecProcessManager();
+    Object.assign(session.services, { unifiedExecManager: processes });
+    const sessions = new AgenCDaemonSessionManager();
+    const manager = new AgenCDaemonAgentManager({ runner, sessionManager: sessions });
+    const dispatcher = new AgenCDaemonJsonRpcDispatcher({ agentManager: manager, sessionManager: sessions });
+    const connection = dispatcher.createConnection();
+    const dispatch = (method: string, params: Record<string, string>) => connection.dispatch({
+      jsonrpc: "2.0", id: method, method, params,
+    });
+    try {
+      const started = await runner.startAgent({
+        objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [],
+      });
+      await sessions.restoreSession({ sessionId, agentId, status: "waiting", createdAt: started.startedAt });
+      await manager.restoreAgent({
+        agentId, objective: "passive", startedAt: started.startedAt, lastActiveAt: started.startedAt,
+        sessionIds: [sessionId], runtimeAvailable: true,
+      });
+      await expect(dispatch("session.processes.list", { sessionId })).resolves.toMatchObject({ error: { code: -32000 } });
+      await connection.dispatch({
+        jsonrpc: "2.0", id: "init", method: "initialize",
+        params: { protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION } },
+      });
+      const execution = await processes.execCommand({
+        cmd: "printf task-ready; sleep 30", ownerId: "worker-child", yield_time_ms: 250,
+      });
+      const taskId = processes.listBackgroundProcesses()[0]!.taskId;
+      await expect(dispatch("session.processes.list", { sessionId })).resolves.toMatchObject({
+        result: { processes: [{ taskId, status: "running", ownerId: "worker-child", outputTail: "task-ready" }] },
+      });
+      await expect(dispatch("session.processes.stop", { sessionId: "foreign-session", taskId })).resolves.toHaveProperty("error");
+      expect(processes.listBackgroundProcesses()[0]?.status).toBe("running");
+      await expect(dispatch("session.processes.stop", { sessionId, taskId })).resolves.toMatchObject({ result: { stopped: true } });
+      await expect(dispatch("session.processes.list", { sessionId })).resolves.toMatchObject({
+        result: { processes: [{ taskId, status: "killed", outputTail: "task-ready", endedAt: expect.any(Number) }] },
+      });
+      await expect(processes.writeStdin({ session_id: execution.session_id!, ownerId: "worker-child" }))
+        .resolves.not.toHaveProperty("session_id");
+      await expect(dispatch("session.processes.list", { sessionId })).resolves.toMatchObject({
+        result: { processes: [{ taskId, status: "killed", outputTail: "task-ready" }] },
+      });
+      expect(control.sendInput).not.toHaveBeenCalled();
+    } finally {
+      await processes.closeAll();
+      await connection.close();
+      await runner.stopAgent(agentId);
+    }
+  });
+
+  it("[managed-thread] hydrates native workers on TUI resume through the session snapshot authority", async () => {
+    const agentId = "native-worker-owner";
+    const sessionId = "native-worker-session-alias";
+    const { runner, control } = makeTopLevelRunner({ conversationId: agentId });
+    let workers: NativeWorkerSnapshot[] = ["backend", "frontend", "tests"].map((name) => ({
+      agentId: `worker-${name}`, agentPath: `/root/${name}`, nickname: name, role: "default",
+      status: "idle", toolUseCount: 4, tokenCount: 120,
+      timing: { turnId: `${name}-first`, startedAt: 100_000, endedAt: 160_000 },
+    }));
+    const nativeSnapshot = vi.fn(() => workers);
+    Object.assign(control, { snapshotNativeWorkers: nativeSnapshot });
+    const sessions = new AgenCDaemonSessionManager();
+    const manager = new AgenCDaemonAgentManager({ runner, sessionManager: sessions });
+    const connection = new AgenCDaemonJsonRpcDispatcher({ agentManager: manager, sessionManager: sessions }).createConnection();
+    let closeProjection: (() => void) | undefined;
+    try {
+      const started = await runner.startAgent({ objective: "passive", initialContent: [], unattendedAllow: [], unattendedDeny: [] });
+      await sessions.restoreSession({ sessionId, agentId, createdAt: started.startedAt });
+      await manager.restoreAgent({ agentId, objective: "passive", startedAt: started.startedAt,
+        lastActiveAt: started.startedAt, sessionIds: [sessionId], runtimeAvailable: true });
+      await connection.dispatch({ jsonrpc: "2.0", id: "init", method: "initialize",
+        params: { protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION } } });
+      const request = async (method: string, params?: Record<string, unknown>) => {
+        const response = await connection.dispatch({ jsonrpc: "2.0", id: method, method, params });
+        if ("error" in response) throw new Error(response.error.message);
+        return response.result;
+      };
+      await expect(request("session.snapshot", { sessionId: "unrelated-session" })).rejects.toThrow();
+      const bridge = createDaemonTuiSessionFixture({
+        baseSession: { conversationId: agentId, services: {} }, sessionId, clientId: "resumed-tui",
+        client: { request, subscribeToSessionEvents: () => () => {} } as unknown as AgenCDaemonTuiClient,
+      });
+      let state = getDefaultAppState();
+      const errors: string[] = [];
+      vi.useFakeTimers();
+      closeProjection = startDaemonWorkerTaskPolling(bridge, update => { state = update(state); }, message => errors.push(message));
+      await vi.waitFor(() => expect(Object.keys(state.tasks)).toHaveLength(3));
+      expect(Object.values(state.tasks).map(task => task.status)).toEqual(["completed", "completed", "completed"]);
+      closeProjection();
+      vi.setSystemTime(Date.now() + 600_000);
+      closeProjection = startDaemonWorkerTaskPolling(bridge, update => { state = update(state); }, message => errors.push(message));
+      await vi.waitFor(() => expect(Object.keys(state.tasks)).toHaveLength(3));
+      expect(nativeSnapshot).toHaveBeenCalledWith(agentId);
+      workers = [{ ...workers[0]!, status: "running", timing: { turnId: "backend-next", startedAt: 500_000 } },
+        { ...workers[1]!, status: "errored", error: "failed" }];
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(Object.keys(state.tasks)).toHaveLength(2));
+      expect(state.tasks["worker-backend"]?.status).toBe("running");
+      expect(state.tasks["worker-backend"]?.endTime).toBeUndefined();
+      expect(state.tasks["worker-frontend"]?.status).toBe("failed");
+      workers = [{ ...workers[0]!, status: "idle", timing: { turnId: "backend-next", startedAt: 500_000, endedAt: 520_000 } }];
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.waitFor(() => expect(state.tasks["worker-backend"]?.status).toBe("completed"));
+      expect(errors).toEqual([]);
+    } finally {
+      closeProjection?.();
+      vi.useRealTimers();
+      await connection.close();
+      await runner.stopAgent(agentId);
+    }
+  });
+
   it("[managed-thread] interruptAgentTurn aborts the active session and submits interrupt op on managed thread", async () => {
     const { runner, session, stub } = makeTopLevelRunner({
       conversationId: "session-interrupt",
@@ -9424,10 +11227,38 @@ describe("AgenC delegate background-agent runner", () => {
 
     expect(interrupted).toBe(true);
     expect(session.abortAllTasks).toHaveBeenCalledWith("interrupted");
+    // #2236: the stop is latched so child receipts do not restart the turn.
+    expect(session.markStoppedByUser).toHaveBeenCalledTimes(1);
     expect(stub.thread.submit).toHaveBeenCalledWith({
       type: "interrupt",
       reason: "user_cancel",
     });
+  });
+
+  it.each([false, true])("cancels the whole active subtree when durable stop recording fails (scoped=%s)", async (scoped) => {
+    const { runner, session, stub, control, setActiveTurn, abortTurnIfActive } = makeTopLevelRunner({
+      conversationId: "session-stop-persistence-failure",
+      scopedTurnCancellation: scoped,
+    });
+    await runner.startAgent({ objective: "hi", unattendedAllow: [], unattendedDeny: [] });
+    setActiveTurn("turn-stop-persistence-failure");
+    control.openThreadSpawnChildren.mockReturnValue([
+      ["child-agent", { agentId: "child-agent", agentPath: "/root/worker", depth: 1 }],
+    ]);
+    stub.thread.submit.mockClear();
+    session.markStoppedByUser.mockImplementationOnce(() => { throw new Error("stop fsync failed"); });
+
+    const cancellation = scoped
+      ? runner.interruptAgentTurnIfMatches("session-stop-persistence-failure", "user_cancel", "turn-stop-persistence-failure")
+      : runner.interruptAgentTurn("session-stop-persistence-failure", "user_cancel");
+    await expect(cancellation).rejects.toThrow("stop fsync failed");
+    if (scoped) {
+      expect(abortTurnIfActive).toHaveBeenCalledWith("turn-stop-persistence-failure", "interrupted");
+    } else {
+      expect(session.abortAllTasks).toHaveBeenCalledWith("interrupted");
+      expect(stub.thread.submit).toHaveBeenCalledWith({ type: "interrupt", reason: "user_cancel" });
+    }
+    expect(control.interrupt).toHaveBeenCalledWith("child-agent", "user_cancel");
   });
 
   it("[managed-thread] interruptAgentTurn cascades cancellation to live child agents", async () => {

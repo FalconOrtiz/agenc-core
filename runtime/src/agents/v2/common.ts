@@ -26,10 +26,17 @@ import type {
 } from "../../tools/types.js";
 import { safeStringify } from "../../tools/types.js";
 import { validationErrorToolResult } from "../../tools/results.js";
+import { strictArgsRefusal } from "../../tools/strict-args.js";
 
 export const MIN_WAIT_TIMEOUT_MS = 10_000;
 export const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 export const MAX_WAIT_TIMEOUT_MS = 3_600_000;
+/**
+ * Default number of consecutive timed-out `wait_agent` calls before the tool
+ * stops answering "timed out" and fails with a decision request. Four waits
+ * at the default timeout is two minutes of polling with nothing to show.
+ */
+export const DEFAULT_MAX_CONSECUTIVE_WAIT_TIMEOUTS = 4;
 
 /**
  * Shared evidence ref for agent-tool argument/identity refusals produced
@@ -139,24 +146,27 @@ export function strictArgs(
     readonly required?: ReadonlyArray<string>;
   },
 ): ToolResult | null {
-  const allowed = new Set<string>([
-    ...opts.allowed,
-    "__callId",
-    SESSION_ID_ARG,
-    SESSION_ID_SIG_ARG,
-  ]);
-  for (const key of Object.keys(args)) {
-    if (!allowed.has(key)) {
-      return json({ error: `unknown field \`${key}\`` }, true);
-    }
-  }
-  for (const key of opts.required ?? []) {
-    const value = args[key];
-    if (typeof value !== "string") {
-      return json({ error: `${key} is required` }, true);
-    }
-  }
-  return null;
+  return strictArgsRefusal(
+    args,
+    {
+      ...opts,
+      injected: ["__callId", SESSION_ID_ARG, SESSION_ID_SIG_ARG],
+      allowBlank: true,
+    },
+    (message) => refusal({ error: message }),
+  );
+}
+
+/**
+ * A refusal made before the tool touched anything. A bare error from a
+ * mutating agent tool is filed as an unknown outcome and gates the whole
+ * session behind /resolve (#2190).
+ */
+function refusal(content: Record<string, unknown>): ToolResult {
+  return validationErrorToolResult(
+    "tool:agents:validation",
+    JSON.stringify(content),
+  );
 }
 
 export function getSessionOrError(
@@ -164,7 +174,7 @@ export function getSessionOrError(
 ): Session | ToolResult {
   const session = opts.getSession();
   if (session === null) {
-    return json({ error: "tool invoked before session was initialized" }, true);
+    return refusal({ error: "tool invoked before session was initialized" });
   }
   return session;
 }

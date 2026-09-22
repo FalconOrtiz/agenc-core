@@ -40,8 +40,6 @@ function gitExecutable() {
 
 function isDocumentationPath(file) {
   return file === "README.md" ||
-    file === "memory_todo.md" ||
-    file === "todo.txt" ||
     file.startsWith("docs/");
 }
 
@@ -241,6 +239,21 @@ export function deletedRuntimeFallbackPlan(runtimeInputs, {
       candidates.push(
         { kind: "file", repoPath: "runtime/tests/zpurgec-build-resolution.test.ts" },
         { kind: "file", repoPath: "runtime/tests/utils/buildConfig.test.ts" },
+      );
+    }
+    if (
+      file ===
+      "runtime/scripts/check-tui-e2e/scenarios/74-slash-add-dir.mjs"
+    ) {
+      candidates.push(
+        {
+          kind: "file",
+          repoPath: "runtime/tests/bin/agenc.cli-branch.test.ts",
+        },
+        {
+          kind: "file",
+          repoPath: "runtime/tests/commands/command-surface.test.ts",
+        },
       );
     }
 

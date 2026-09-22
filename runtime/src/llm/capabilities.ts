@@ -8,6 +8,8 @@ import {
 import { resolveModelCapabilityHints } from "./registry/model-catalog.js";
 import { supportsGrokServerSideTools } from "./provider-native-search.js";
 import { normalizeProviderIdentity } from "../provider-identity.js";
+import { ollamaCloudModel } from "./registry/ollama-cloud-models.js";
+import { isVerifiedOpenAiReasoningModel } from "./registry/openai-reasoning-models.js";
 
 export interface ProviderModelCapabilities {
   readonly provider: string;
@@ -221,9 +223,8 @@ function matchesModelFamily(model: string, pattern: RegExp): boolean {
 }
 
 function isOpenAIReasoningModel(model: string): boolean {
-  return matchesModelFamily(
+  return isVerifiedOpenAiReasoningModel(model) || matchesModelFamily(
     model,
-    // branding-scan: allow OpenAI model family identifier
     /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/,
   );
 }
@@ -251,6 +252,84 @@ function isDeepSeekThinkingModel(model: string): boolean {
 
 function isGeminiThinkingModel(model: string): boolean {
   return matchesModelFamily(model, /(?:^|[/:])gemini-2\.5(?:$|[-_.:])/);
+}
+
+function isMetaMuseSparkModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])muse-spark-(?:1\.3(?:-contributor)?|1\.2(?:-contributor)?|1\.1)$/,
+  );
+}
+
+function isCerebrasReasoningModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])(?:gpt-oss-120b|qwen-3\.8-27b|gemma-4-31b)$/,
+  );
+}
+
+function isCerebrasVisionModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])(?:qwen-3\.8-27b|gemma-4-31b)$/,
+  );
+}
+
+function isZaiGlm53Model(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])glm-5\.3(?:-flash)?$/,
+  );
+}
+
+function isZaiGlm53VisionModel(model: string): boolean {
+  return matchesModelFamily(model, /(?:^|[/:])glm-5\.3-flash$/);
+}
+
+function isKimiGlobalChatModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])kimi-(?:k3|k2\.7-code(?:-highspeed)?|k2\.6)$/,
+  );
+}
+
+function isKimiK3Model(model: string): boolean {
+  return matchesModelFamily(model, /(?:^|[/:])kimi-k3$/);
+}
+
+function isQwen38ThinkingModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])qwen3\.8-(?:max|flash)(?:$|[-_.:])/,
+  );
+}
+
+function isQwenThinkingHistoryModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])qwen3\.(?:8-(?:max|flash)|7-(?:max|plus|flash)|6-(?:max-preview|plus|flash))(?:$|[-_.:])/,
+  );
+}
+
+function isQwenTokenPlanThinkingHistoryModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])qwen3\.(?:8-(?:max|flash)|7-(?:max|plus)|6-flash)(?:$|[-_.:])/,
+  );
+}
+
+function isQwenVisionModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])qwen3\.(?:8-(?:max|flash)|7-(?:plus|flash)|6-(?:plus|flash))(?:$|[-_.:])/,
+  );
+}
+
+function isQwenTokenPlanVisionModel(model: string): boolean {
+  return matchesModelFamily(
+    model,
+    /(?:^|[/:])qwen3\.(?:8-(?:max|flash)|7-plus|6-flash)(?:$|[-_.:])/,
+  );
 }
 
 const HOSTED_CHAT_COMPATIBLE_CAPABILITIES = {
@@ -390,6 +469,70 @@ const PROVIDER_CAPABILITIES: Readonly<Record<string, ProviderCapabilityDefinitio
     acceptsAudioHistory: false,
     acceptsThinkingHistory: isDeepSeekThinkingModel,
     acceptsReasoningEffort: false,
+  },
+  meta: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isMetaMuseSparkModel,
+    supportsStructuredOutput: isMetaMuseSparkModel,
+    supportsStructuredOutputWithTools: isMetaMuseSparkModel,
+    acceptsImageHistory: isMetaMuseSparkModel,
+    acceptsReasoningEffort: isMetaMuseSparkModel,
+  },
+  "ollama-cloud": {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: model => ollamaCloudModel(model)?.vision === true,
+    acceptsImageHistory: model => ollamaCloudModel(model)?.vision === true,
+    supportsExtendedThinking: model => ollamaCloudModel(model)?.thinking === true,
+    acceptsThinkingHistory: model => ollamaCloudModel(model)?.thinking === true,
+    acceptsReasoningEffort: model => (ollamaCloudModel(model)?.efforts.length ?? 0) > 0,
+  },
+  cerebras: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isCerebrasVisionModel,
+    supportsExtendedThinking: isCerebrasReasoningModel,
+    acceptsImageHistory: isCerebrasVisionModel,
+    acceptsThinkingHistory: isCerebrasReasoningModel,
+    acceptsReasoningEffort: isCerebrasReasoningModel,
+  },
+  zai: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isZaiGlm53VisionModel,
+    supportsExtendedThinking: isZaiGlm53Model,
+    acceptsImageHistory: isZaiGlm53VisionModel,
+    acceptsThinkingHistory: isZaiGlm53Model,
+    acceptsReasoningEffort: isZaiGlm53Model,
+  },
+  "zai-coding-plan": {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isZaiGlm53VisionModel,
+    supportsExtendedThinking: isZaiGlm53Model,
+    acceptsImageHistory: isZaiGlm53VisionModel,
+    acceptsThinkingHistory: isZaiGlm53Model,
+    acceptsReasoningEffort: isZaiGlm53Model,
+  },
+  kimi: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isKimiGlobalChatModel,
+    supportsExtendedThinking: isKimiGlobalChatModel,
+    acceptsImageHistory: isKimiGlobalChatModel,
+    acceptsThinkingHistory: isKimiGlobalChatModel,
+    acceptsReasoningEffort: isKimiK3Model,
+  },
+  qwen: {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isQwenVisionModel,
+    supportsExtendedThinking: isQwenThinkingHistoryModel,
+    acceptsImageHistory: isQwenVisionModel,
+    acceptsThinkingHistory: isQwenThinkingHistoryModel,
+    acceptsReasoningEffort: isQwen38ThinkingModel,
+  },
+  "qwen-token-plan": {
+    ...HOSTED_CHAT_COMPATIBLE_CAPABILITIES,
+    supportsImageInput: isQwenTokenPlanVisionModel,
+    supportsExtendedThinking: isQwenTokenPlanThinkingHistoryModel,
+    acceptsImageHistory: isQwenTokenPlanVisionModel,
+    acceptsThinkingHistory: isQwenTokenPlanThinkingHistoryModel,
+    acceptsReasoningEffort: isQwen38ThinkingModel,
   },
   gemini: {
     supportsToolUse: true,

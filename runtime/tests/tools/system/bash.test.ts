@@ -36,6 +36,7 @@ import {
   type SupervisedProcessResult,
 } from "../../../src/utils/supervisedProcess.js";
 import { classifyShellWorkspaceWritePolicy } from "../../llm/shell-write-policy.js";
+import { attachToolRuntimeContext } from "../runtimes/context.js";
 import {
   DEFAULT_DENY_LIST,
   DEFAULT_DENY_PREFIXES,
@@ -1894,6 +1895,63 @@ describe("system.bash tool", () => {
       }
     });
 
+    it("lets a prompt-free session rm a workspace file but not a protected one", async () => {
+      const workspaceRoot = mkdtempSync(
+        join(tmpdir(), "agenc-bash-shell-delete-"),
+      );
+      const bypassArgs = (command: string): Record<string, unknown> => {
+        const args: Record<string, unknown> = { command };
+        attachToolRuntimeContext(args, {
+          callId: "call-bash-rm",
+          toolName: "system.bash",
+          runtimeKind: "function",
+          classification: "exclusive",
+          supportsParallelToolCalls: false,
+          source: { type: "model" },
+          submittedAtMs: 0,
+          approvalPolicy: "on_request",
+          requestedSandboxMode: "danger_full_access",
+          sandboxMode: "danger_full_access",
+          approvalResolved: false,
+          rawArgs: "{}",
+          invocation: {
+            session: {
+              permissionModeRegistry: {
+                current: () => ({ mode: "bypassPermissions" }),
+              },
+            },
+            payload: { kind: "function", arguments: "{}" },
+            turn: { subId: "turn-bash-rm", cwd: workspaceRoot },
+          },
+        } as never);
+        return args;
+      };
+
+      try {
+        const tool = createBashTool({ cwd: workspaceRoot });
+        mockSpawnSuccess("");
+
+        const prompting = await tool.execute({ command: "rm notes.txt" });
+        expect(prompting.isError).toBe(true);
+        expect(parseContent(prompting).error).toContain(
+          "shell_workspace_file_delete_requires_approval",
+        );
+
+        const protectedPath = await tool.execute(bypassArgs("rm .git/config"));
+        expect(protectedPath.isError).toBe(true);
+        expect(parseContent(protectedPath).error).toContain(
+          "shell_workspace_file_delete_disallowed",
+        );
+        expect(mockSpawn).not.toHaveBeenCalled();
+
+        const allowed = await tool.execute(bypassArgs("rm notes.txt"));
+        expect(allowed.isError).toBeFalsy();
+        expect(mockSpawn).toHaveBeenCalledTimes(1);
+      } finally {
+        rmSync(workspaceRoot, { recursive: true, force: true });
+      }
+    });
+
     it("allows mkdir scaffolding in the workspace root", async () => {
       const workspaceRoot = mkdtempSync(
         join(tmpdir(), "agenc-bash-mkdir-write-"),
@@ -1965,6 +2023,77 @@ describe("system.bash tool", () => {
       const denied = await tool.execute({ command: "ls /tmp | grep txt" });
       expect(denied.isError).toBe(true);
       expect(parseContent(denied).error).toContain("allow list");
+    });
+
+    it.each(["2>/dev/null socat -", "echo safe |& socat -", "cat <<EOF\nEO\\\nF\nsocat -"])(
+      "checks denied executables after redirects or separators: %s",
+      async (command) => {
+        await expectShellModeExecutionError(command, "denied");
+      },
+    );
+
+    it.each([
+      'echo "$(socat -)"', "cat <(socat -)", "echo $\\\n(socat -)",
+      "cat <<EOF\n$(socat -)\nEOF",
+    ])("blocks active substitutions outside the command word: %s", async (command) => {
+      const tool = createBashTool();
+      const result = await tool.execute({ command });
+      expect(result.isError).toBe(true);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it.each(["echo 'open", 'echo "open', "cat <<EOF\nbody"])(
+      "rejects malformed shell input before spawning: %s",
+      async (command) => {
+        const tool = createBashTool();
+        const result = await tool.execute({ command });
+        expect(result.isError).toBe(true);
+        expect(mockSpawn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      "env socat$IFS-", "/usr/bin/env socat$IFS-", "C:/tools/env.exe socat$IFS-",
+      "command {socat,-}", "env /usr/bin/so* -",
+    ])(
+      "rejects expansion-dependent executable names: %s",
+      async (command) => {
+        await expectShellModeExecutionError(command, "Variable-expanded executables are not allowed");
+      },
+    );
+
+    it.each([
+      "bash /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "bash.exe /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "powershell.exe -Command - <<'EOF'\nsocat -\nEOF",
+      "'C:\\tools\\BASH.EXE' /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "ash /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "mksh /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "cat <<'EOF' | sh\nsocat -\nEOF",
+      "env -i bash /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "busybox sh /dev/stdin <<'EOF'\nsocat -\nEOF",
+      ". /dev/stdin <<'EOF'\nsocat -\nEOF",
+      "bash /dev/stdin <<< 'socat -'",
+    ])("rejects shell-evaluated heredoc and here-string input: %s", async (command) => {
+      await expectShellModeExecutionError(command, "Shell-evaluated heredoc or here-string input is not allowed");
+    });
+
+    it.each([
+      "env -i socat$IFS-", "/usr/bin/env -i socat -",
+      "'C:\\tools\\env.exe' -i socat -", "command -- {socat,-}", "nice -n 5 socat -",
+    ])(
+      "fails closed when prefix options obscure the executable: %s",
+      async (command) => {
+        await expectShellModeExecutionError(command, "Shell prefix options require explicit executable validation");
+      },
+    );
+
+    it.each(["EOF", "sh"])("allows a quoted heredoc consumed as data with delimiter %s", async (delimiter) => {
+      const tool = createBashTool();
+      mockSpawnSuccess("socat -\n");
+      const result = await tool.execute({ command: `cat <<'${delimiter}'\nsocat -\n${delimiter}` });
+      expect(result.isError).toBeUndefined();
+      expect(mockSpawn).toHaveBeenCalledOnce();
     });
 
     // ---- Shell mode safe commands ----

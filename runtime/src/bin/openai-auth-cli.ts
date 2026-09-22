@@ -27,6 +27,8 @@ import {
 } from "../utils/openAiOauthCredentials.js";
 import type { HomeContext } from "../config/home.js";
 import type { ProviderEnvironment } from "../llm/provider-options.js";
+import { providerAuthSelection } from "../llm/provider-auth-selection.js";
+import { resolveStoredChatGptSubscriptionCredentials } from "../llm/providers/openai/chatgpt-backend.js";
 
 export type OpenAiAuthCliCommand =
   | { readonly kind: "login"; readonly json: boolean }
@@ -84,6 +86,7 @@ export function formatOpenAiAuthCliHelpText(): string {
     "Sign in with ChatGPT for the OpenAI provider. A stored sign-in wins over",
     "OPENAI_API_KEY only while the selected provider is openai. Logout removes",
     "the stored credential and returns OpenAI authentication to the environment.",
+    "Set OPENAI_AUTH_MODE=oauth or api-key to choose without signing out.",
     "",
     "Aliases: chatgpt-login, chatgpt-logout, chatgpt-auth-status",
   ].join("\n");
@@ -116,6 +119,10 @@ export async function runOpenAiAuthCli(
       {
         ok: true,
         signedIn: existing !== undefined,
+        authSelection: providerAuthSelection("openai", runtime.environment, {
+          oauth: resolveStoredChatGptSubscriptionCredentials(existing) !== undefined,
+          apiKey: Boolean(runtime.environment.OPENAI_API_KEY?.trim() || existing?.apiKey?.trim()),
+        }, existing?.apiKey?.trim() ? "api-key" : undefined),
         ...(existing?.accountLabel !== undefined
           ? { account: existing.accountLabel }
           : {}),
