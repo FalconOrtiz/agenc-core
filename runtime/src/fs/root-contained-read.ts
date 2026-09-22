@@ -1,6 +1,7 @@
 import { type BigIntStats, type Dirent } from "node:fs";
 import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import process from "node:process";
 
 import {
   identityFromStats,
@@ -105,9 +106,13 @@ export async function bindContainedRoot(
   io: ContainedRootIo = defaultContainedRootIo,
 ): Promise<ContainedRoot | null> {
   const declaredPath = resolve(path);
+  let declaredStats: BigIntStats;
   try {
-    await io.lstat(declaredPath);
+    declaredStats = await io.lstat(declaredPath);
   } catch {
+    return null;
+  }
+  if (declaredStats.isSymbolicLink() || !declaredStats.isDirectory()) {
     return null;
   }
   try {
@@ -190,25 +195,74 @@ export async function readContainedUtf8(
     return { ok: false, code: "not-found", declaredPath: inspected.declaredPath };
   }
   try {
-    const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameStats(inspected.identity, opened)) {
-      return { ok: false, code: "changed", declaredPath: inspected.declaredPath };
-    }
-    const canonicalPath = await io.realpath(inspected.declaredPath);
-    if (!isInsideContainedRoot(root, canonicalPath)) {
-      return {
-        ok: false,
-        code: "outside-root",
-        declaredPath: inspected.declaredPath,
-      };
-    }
-    return {
-      ok: true,
-      declaredPath: inspected.declaredPath,
-      text: await handle.readFile("utf8"),
-    };
+    return await readOpenedContainedUtf8(root, inspected, handle, io);
+  } catch {
+    return { ok: false, code: "not-found", declaredPath: inspected.declaredPath };
   } finally {
-    await handle.close();
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function readOpenedContainedUtf8(
+  root: ContainedRoot,
+  inspected: ContainedInspectOk,
+  handle: FileHandle,
+  io: ContainedRootIo,
+): Promise<ContainedRead> {
+  const opened = await handle.stat({ bigint: true });
+  if (!opened.isFile() || !sameStats(inspected.identity, opened)) {
+    return { ok: false, code: "changed", declaredPath: inspected.declaredPath };
+  }
+  const finalPath = await resolveOpenedContainedPath(
+    handle,
+    inspected.canonicalPath,
+    opened,
+    io,
+  );
+  if (finalPath === null) {
+    return { ok: false, code: "not-found", declaredPath: inspected.declaredPath };
+  }
+  if (!isInsideContainedRoot(root, finalPath)) {
+    return {
+      ok: false,
+      code: "outside-root",
+      declaredPath: inspected.declaredPath,
+    };
+  }
+  return {
+    ok: true,
+    declaredPath: inspected.declaredPath,
+    text: await handle.readFile("utf8"),
+  };
+}
+
+/**
+ * Containment for an already-opened handle. Linux reads the live descriptor
+ * path. Other platforms prove the opened identity against the inspected
+ * canonical path instead of re-resolving the declared pathname (which an
+ * ancestor swap can point elsewhere between open and realpath).
+ */
+async function resolveOpenedContainedPath(
+  handle: FileHandle,
+  expectedCanonicalPath: string,
+  opened: BigIntStats,
+  io: ContainedRootIo,
+): Promise<string | null> {
+  if (process.platform === "linux") {
+    try {
+      return await io.realpath(`/proc/self/fd/${handle.fd}`);
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const expected = await io.lstat(expectedCanonicalPath);
+    if (expected.isSymbolicLink() || !sameStats(opened, expected)) {
+      return null;
+    }
+    return expectedCanonicalPath;
+  } catch {
+    return null;
   }
 }
 
@@ -254,6 +308,10 @@ export async function walkContainedFiles(
     queue: [{ path: start.declaredPath, depth: 0 }],
   };
   while (state.queue.length > 0) {
+    if (state.files.length >= options.maxFiles) {
+      state.queue.length = 0;
+      break;
+    }
     const current = state.queue.shift()!;
     if (current.depth > options.maxDepth) continue;
     await visitContainedDirectory(root, current, options, io, state);
@@ -280,6 +338,7 @@ async function visitContainedDirectory(
     return;
   }
   for (const entry of entries) {
+    if (state.files.length >= options.maxFiles) return;
     await visitContainedChild(root, current, entry, options, io, state);
   }
 }
@@ -303,22 +362,28 @@ async function visitContainedChild(
     return;
   }
   if (inspected.kind === "directory") {
-    enqueueContainedDirectory(inspected, current.depth, options.maxDepth, state);
+    enqueueContainedDirectory(inspected, current.depth, options, state);
     return;
   }
   if (current.depth === 0 && options.includeStartFiles === false) return;
   if (!options.collectFile(entry.name)) return;
-  if (state.files.length >= options.maxFiles) state.droppedCount += 1;
-  else state.files.push(inspected.declaredPath);
+  if (state.files.length >= options.maxFiles) {
+    state.droppedCount += 1;
+    return;
+  }
+  state.files.push(inspected.declaredPath);
 }
 
 function enqueueContainedDirectory(
   inspected: ContainedInspectOk,
   depth: number,
-  maxDepth: number,
+  options: ContainedWalkOptions,
   state: ContainedWalkState,
 ): void {
-  if (depth >= maxDepth || state.visited.has(inspected.canonicalPath)) return;
+  if (state.files.length >= options.maxFiles) return;
+  if (depth >= options.maxDepth || state.visited.has(inspected.canonicalPath)) {
+    return;
+  }
   state.visited.add(inspected.canonicalPath);
   state.queue.push({ path: inspected.declaredPath, depth: depth + 1 });
 }
