@@ -8,7 +8,6 @@ import { closeSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { assertReadOnlyInspectionInvocation } from "../permissions/readonly-inspection.js";
 import { basename, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import treeKill from "tree-kill";
 
 import { SandboxManager, type SandboxType } from "../sandbox/engine/index.js";
 import {
@@ -45,6 +44,7 @@ import {
   type IPty,
   type PtyModule,
 } from "../pty/loadPty.js";
+import { signalPtyProcessTree } from "../pty/process-tree.js";
 import {
   hasCurrentWorkspaceOperationLifetime,
   retainCurrentWorkspaceOperation,
@@ -836,13 +836,8 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       // The child holds its own copies of the log descriptor.
       closeSync(logFd);
     }
-    request.observer?.onBegin?.({
-      callId,
-      command: request.cmd,
-      cwd,
-      processId,
-      tty: false,
-    });
+    // A failed spawn reports on the next tick. Listen before anything else
+    // runs, observer.onBegin included, so that report is never uncaught.
     let settled: (ExitState & { readonly error?: Error }) | null = null;
     const exit = new Promise<void>((resolveExit) => {
       child.once("exit", (code, signal) => {
@@ -853,6 +848,31 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
         settled = { exitCode: 1, signal: null, error };
         resolveExit();
       });
+    });
+    if (child.pid === undefined) {
+      // The spawn failed: the working directory was removed after its check,
+      // the shell is missing, or the process or descriptor table is full.
+      // Nothing started, so this is a create_process error (settled as no
+      // effect) rather than an exit of a service that never ran.
+      await exit;
+      this.releaseProcessId(processId);
+      const failure = settled as (ExitState & { readonly error?: Error }) | null;
+      let message = failure?.error?.message ?? "detached process did not start";
+      try {
+        if (!statSync(cwd).isDirectory()) {
+          message = `working directory does not exist: ${cwd}`;
+        }
+      } catch {
+        message = `working directory does not exist: ${cwd}`;
+      }
+      throw new UnifiedExecError("create_process", message);
+    }
+    request.observer?.onBegin?.({
+      callId,
+      command: request.cmd,
+      cwd,
+      processId,
+      tty: false,
     });
     const yieldMs = clampExecYield(
       request.yield_time_ms ?? DEFAULT_DETACHED_YIELD_TIME_MS,
@@ -1207,25 +1227,13 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
 
   private terminatePtyStrict(entry: ProcessEntry): Promise<void> {
     if (entry.stored.kind !== "pty") return Promise.resolve();
-    const processHandle = entry.stored.process;
-    const pid = processHandle.pid;
-    if (!Number.isInteger(pid) || pid <= 1) {
-      try {
-        processHandle.kill("SIGKILL");
-        return Promise.resolve();
-      } catch (error) {
-        return Promise.reject(error);
-      }
-    }
-    return new Promise<void>((resolvePromise, reject) => {
-      treeKill(pid, "SIGKILL", (error) => {
-        if (error !== undefined && entry.exitState === null) {
-          reject(error);
-          return;
-        }
-        resolvePromise();
-      });
+    // Signals synchronously; closeProcessStrict then waits for the PTY's
+    // exit. A PTY without a pid above 1 is not signalled at all (node-pty's
+    // kill() is process.kill(pid)): its exit, or the quiesce timeout, decides.
+    signalPtyProcessTree(entry.stored.process, "SIGKILL", {
+      exited: entry.exitState !== null,
     });
+    return Promise.resolve();
   }
 
   private allocateProcessId(): number {
@@ -1376,6 +1384,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
           env: params.env,
         });
       } catch (error) {
+        detachUpstreamAbort?.();
         throw new UnifiedExecError(
           "create_process",
           error instanceof Error ? error.message : String(error),
@@ -1402,11 +1411,34 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     }
 
     this.assertSandboxAuthorityAdmission(params.sandboxAuthorityGeneration);
-    const child = spawnContainedProcess(params.program, params.args, {
-      cwd: params.cwd,
-      env: params.env,
-      argv0: params.argv0 ?? basename(params.program),
-    });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawnContainedProcess(params.program, params.args, {
+        cwd: params.cwd,
+        env: params.env,
+        argv0: params.argv0 ?? basename(params.program),
+      });
+    } catch (error) {
+      // spawnContainedProcess throws only before the command can run: the
+      // working directory is gone (the session root was deleted, or a workdir
+      // was removed after its check), the gate or broker did not start, or
+      // its launch payload was never handed over. A create_process error is
+      // what exec_command and Monitor settle as no effect.
+      detachUpstreamAbort?.();
+      throw new UnifiedExecError(
+        "create_process",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    if (child.pid === undefined) {
+      // Only the Windows Job Object path returns a child whose spawn failed.
+      // Node reports that on the next tick; nothing started.
+      const spawnError = await new Promise<Error>((resolveError) => {
+        child.once("error", resolveError);
+      });
+      detachUpstreamAbort?.();
+      throw new UnifiedExecError("create_process", spawnError.message);
+    }
     child.stdin.end();
     child.stdout.on("data", (data: Buffer) =>
       notifyData("stdout", data.toString("utf8")),
@@ -1663,7 +1695,9 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
   ): void {
     try {
       if (entry.stored.kind === "pty") {
-        this.terminatePty(entry.stored.process, signal);
+        // closeAll and a poisoned authority reach exited entries too; the
+        // exit state keeps a reused pid from being signalled.
+        this.terminatePty(entry.stored.process, signal, entry.exitState !== null);
       } else {
         signalProcessTree(
           entry.stored.process,
@@ -1675,25 +1709,18 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
     }
   }
 
-  private terminatePty(processHandle: IPty, signal: NodeJS.Signals): void {
-    const killPty = (): void => {
-      try {
-        processHandle.kill(signal);
-      } catch {
-        // Best-effort shutdown.
-      }
-    };
-    const pid = processHandle.pid;
-    if (Number.isInteger(pid) && pid > 0) {
-      try {
-        treeKill(pid, signal, () => {
-          killPty();
-        });
-        return;
-      } catch {
-        // Fall back to the PTY handle below.
-      }
-    }
-    killPty();
+  private terminatePty(
+    processHandle: IPty,
+    signal: NodeJS.Signals,
+    exited: boolean,
+  ): void {
+    // Refuses a PTY without a pid above 1. node-pty's own kill() is
+    // process.kill(pid), which for 0, -1 or 1 would reach this process's
+    // group, every process of the user, or init, so there is no fallback.
+    signalPtyProcessTree(
+      processHandle,
+      signal === "SIGKILL" ? "SIGKILL" : "SIGTERM",
+      { exited },
+    );
   }
 }

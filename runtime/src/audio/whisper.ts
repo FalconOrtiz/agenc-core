@@ -5,6 +5,7 @@ import { access, lstat, mkdir, mkdtemp, open, realpath, rename, rm } from "node:
 import { isAbsolute, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { JsonObject } from "../app-server/protocol/index.js";
+import { isSignalablePid } from "../utils/child-signal.js";
 
 export type WhisperModel = "base" | "small";
 export const WHISPER_LANGUAGES = ["auto", "en", "es", "fr", "de", "it", "pt", "nl", "pl", "ru", "uk", "zh", "ja", "ko", "ar", "hi", "tr"] as const;
@@ -302,8 +303,14 @@ export function runWhisperProcess(executable: string, args: string[], cwd: strin
     let bytes = 0;
     let failure: Error | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
+    // A failed spawn reports on the next tick, and EMFILE or ENFILE also leave
+    // stdout and stderr undefined: listen before touching them.
+    child.on("error", () => { failure ??= new WhisperError("WHISPER_ENGINE_FAILED", "Could not run the Whisper engine"); });
     const stop = (error: Error): void => {
       failure ??= error;
+      // A failed spawn has no pid, but until Node reports the failure its
+      // open handle sends kill() to pid 0: the daemon's own process group.
+      if (!isSignalablePid(child.pid)) return;
       child.kill("SIGTERM");
       killTimer ??= setTimeout(() => child.kill("SIGKILL"), 1500);
       killTimer.unref();
@@ -317,9 +324,8 @@ export function runWhisperProcess(executable: string, args: string[], cwd: strin
       if (bytes > MAX_OUTPUT_BYTES) { stop(new WhisperError("WHISPER_OUTPUT_LIMIT", "Whisper output exceeded its limit")); return; }
       if (transcript) output += decoder.write(chunk);
     };
-    child.stdout.on("data", (chunk: Buffer) => collect(chunk, true));
-    child.stderr.on("data", (chunk: Buffer) => collect(chunk, false));
-    child.on("error", () => { failure ??= new WhisperError("WHISPER_ENGINE_FAILED", "Could not run the Whisper engine"); });
+    child.stdout?.on("data", (chunk: Buffer) => collect(chunk, true));
+    child.stderr?.on("data", (chunk: Buffer) => collect(chunk, false));
     child.on("close", (code) => {
       output += decoder.end();
       clearTimeout(timer);
