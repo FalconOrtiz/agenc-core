@@ -28,10 +28,12 @@ import WebSocket, { WebSocketServer, type RawData } from "ws";
 import type { JsonObject, JsonValue } from "../protocol/index.js";
 import {
   daemonOverloadErrorResponse,
+  isDaemonPreemptiveMessage,
   isDaemonPriorityMessage,
   maxQueuedRequestsFromOptions,
 } from "../overload.js";
 import { isRecord } from "../../utils/record.js";
+import { drainAgenCTransportRequests, type AgenCTransportCloseOptions } from "./request-drain.js";
 
 export const AGENC_WEBSOCKET_DEFAULT_HOST = "127.0.0.1";
 export const AGENC_WEBSOCKET_DEFAULT_PATH = "/";
@@ -58,6 +60,7 @@ export interface AgenCWebSocketMessageContext {
   readonly remoteAddress: string | undefined;
   send(message: JsonValue): Promise<void>;
   close(code?: number, reason?: string): void;
+  terminate(): void;
 }
 
 export interface AgenCWebSocketServerOptions {
@@ -109,6 +112,10 @@ interface ActiveWebSocketConnection {
   // Priority requests can bypass model turns only after initialize/auth state
   // for this connection has settled.
   initializeBarrier: Promise<void>;
+  // Only the first handshake can gate priority requests behind normal work.
+  hasInitializeBarrier: boolean;
+  // A health/status backlog cannot consume decision/cancellation capacity.
+  readonly queuedPriorityMessages: { priority: number; control: number };
   // gaphunt3 #47: accept-auth teardown state. `accepted` is true once an
   // authenticator-approved message is seen (or when no authenticator is
   // configured). `authTimeout` is the armed teardown timer; it is cleared on
@@ -135,6 +142,9 @@ export class AgenCWebSocketServer {
   #webSocketServer: WebSocketServer | null = null;
   #listenAddress: AgenCWebSocketListenAddress | null = null;
   #nextConnectionId = 1;
+  #listening: Promise<AgenCWebSocketListenAddress> | null = null;
+  #closing: Promise<void> | null = null;
+  #closeInProgress = false;
 
   constructor(options: AgenCWebSocketServerOptions) {
     this.#options = options;
@@ -156,11 +166,21 @@ export class AgenCWebSocketServer {
     return this.#listenAddress;
   }
 
-  async listen(): Promise<AgenCWebSocketListenAddress> {
-    if (this.#server !== null || this.#webSocketServer !== null) {
-      throw new Error("AgenC websocket transport is already listening");
+  listen(): Promise<AgenCWebSocketListenAddress> {
+    if (this.#closeInProgress) {
+      return Promise.reject(new Error("AgenC websocket transport is closing"));
     }
+    if (this.#server !== null || this.#webSocketServer !== null || this.#listening !== null) {
+      return Promise.reject(new Error("AgenC websocket transport is already listening"));
+    }
+    this.#closing = null;
+    this.#listening = this.#listen().finally(() => {
+      this.#listening = null;
+    });
+    return this.#listening;
+  }
 
+  async #listen(): Promise<AgenCWebSocketListenAddress> {
     const httpServer = createServer((request, response) => {
       this.#handleHttpRequest(request, response);
     });
@@ -223,7 +243,23 @@ export class AgenCWebSocketServer {
     }
   }
 
-  async close(): Promise<void> {
+  close(options: AgenCTransportCloseOptions = {}): Promise<void> {
+    if (this.#closing !== null) return this.#closing;
+    this.#closeInProgress = true;
+    const listening = this.#listening;
+    this.#closing = (async () => {
+      // A requested startup still owns the server until address publication.
+      // Do not close beneath it or allow a replacement to inherit its cleanup.
+      if (listening !== null) await listening.catch(() => {});
+      await this.#close(options);
+    })().finally(() => {
+      this.#closeInProgress = false;
+      this.#closing = null;
+    });
+    return this.#closing;
+  }
+
+  async #close(options: AgenCTransportCloseOptions): Promise<void> {
     const webSocketServer = this.#webSocketServer;
     const httpServer = this.#server;
     this.#webSocketServer = null;
@@ -240,11 +276,7 @@ export class AgenCWebSocketServer {
       }
     }
     await Promise.allSettled(closed);
-    await Promise.allSettled(
-      activeConnections.flatMap((connection) => [
-        ...connection.pendingMessages,
-      ]),
-    );
+    const pending = activeConnections.flatMap((connection) => [...connection.pendingMessages]);
     this.#connections.clear();
 
     if (webSocketServer !== null) {
@@ -253,6 +285,7 @@ export class AgenCWebSocketServer {
     if (httpServer !== null) {
       await closeHttpServer(httpServer);
     }
+    await drainAgenCTransportRequests(pending, options);
   }
 
   #handleHttpRequest(
@@ -270,7 +303,7 @@ export class AgenCWebSocketServer {
       return;
     }
     if (path === AGENC_WEBSOCKET_READY_PATH) {
-      const ready = this.#options.ready?.() ?? true;
+      const ready = !this.#closeInProgress && (this.#options.ready?.() ?? true);
       writePlainResponse(response, ready ? 200 : 503, ready ? "ok\n" : "not ready\n");
       return;
     }
@@ -297,7 +330,7 @@ export class AgenCWebSocketServer {
     }
 
     const webSocketServer = this.#webSocketServer;
-    if (webSocketServer === null) {
+    if (webSocketServer === null || this.#closeInProgress) {
       rejectHttpUpgrade(socket, 503, "not ready\n");
       return;
     }
@@ -307,6 +340,10 @@ export class AgenCWebSocketServer {
   }
 
   #acceptConnection(socket: WebSocket, request: IncomingMessage): void {
+    if (this.#webSocketServer === null || this.#closeInProgress) {
+      socket.terminate();
+      return;
+    }
     const connectionId = this.#nextConnectionId;
     this.#nextConnectionId += 1;
 
@@ -315,6 +352,8 @@ export class AgenCWebSocketServer {
       pendingMessages: new Set(),
       dispatchChain: Promise.resolve(),
       initializeBarrier: Promise.resolve(),
+      hasInitializeBarrier: false,
+      queuedPriorityMessages: { priority: 0, control: 0 },
       // gaphunt3 #47: only require auth when an authenticator is configured;
       // otherwise the connection is accepted immediately (legacy behavior).
       accepted: this.#options.acceptAuthenticator === undefined,
@@ -333,6 +372,7 @@ export class AgenCWebSocketServer {
       close: (code, reason) => {
         socket.close(code, reason);
       },
+      terminate: () => socket.terminate(),
     };
 
     socket.on("message", (data, isBinary) => {
@@ -383,6 +423,12 @@ export class AgenCWebSocketServer {
     active: ActiveWebSocketConnection,
     context: AgenCWebSocketMessageContext,
   ): Promise<boolean> {
+    if (
+      active.socket.readyState !== WebSocket.OPEN ||
+      active.closingUnauthenticated
+    ) {
+      return false;
+    }
     if (active.accepted) {
       return !active.closingUnauthenticated;
     }
@@ -394,7 +440,11 @@ export class AgenCWebSocketServer {
     const inFlight = active.authResolution;
     if (inFlight !== resolvedWebSocketAuth) {
       await inFlight;
-      return active.accepted && !active.closingUnauthenticated;
+      return (
+        active.accepted &&
+        !active.closingUnauthenticated &&
+        active.socket.readyState === WebSocket.OPEN
+      );
     }
     let release: (() => void) | undefined;
     active.authResolution = new Promise<void>((resolve) => {
@@ -410,9 +460,15 @@ export class AgenCWebSocketServer {
         active.closingUnauthenticated = true;
         this.#options.onError?.(asError(error), context.connectionId);
         this.#connections.delete(context.connectionId);
-        if (active.socket.readyState !== WebSocket.CLOSED) {
-          active.socket.terminate();
-        }
+        active.socket.terminate();
+        return false;
+      }
+      // An accept decision cannot restore authority revoked by disconnect,
+      // server shutdown, or the authentication deadline while it awaited.
+      if (
+        active.socket.readyState !== WebSocket.OPEN ||
+        active.closingUnauthenticated
+      ) {
         return false;
       }
       if (!authenticated) {
@@ -448,6 +504,15 @@ export class AgenCWebSocketServer {
     }
 
     if (isDaemonPriorityMessage(message)) {
+      const lane = isDaemonPreemptiveMessage(message) ? "control" : "priority";
+      const maxQueuedRequests = maxQueuedRequestsFromOptions(this.#options);
+      if (active.queuedPriorityMessages[lane] >= maxQueuedRequests) {
+        void context.send(daemonOverloadErrorResponse(
+          message, "TOO_MANY_QUEUED_REQUESTS", { maxQueuedRequests, lane },
+        )).catch((error) => this.#options.onError?.(asError(error), context.connectionId));
+        return;
+      }
+      active.queuedPriorityMessages[lane] += 1;
       // Control-plane requests must NOT queue behind a full model stream.
       // Dispatch them off-chain while keeping ordinary, order-dependent work
       // FIFO. The promise is still tracked so close() drains it.
@@ -459,15 +524,24 @@ export class AgenCWebSocketServer {
       const pending = Promise.resolve()
         .then(async () => {
           await initializeBarrier;
-          if (active.accepted && !active.closingUnauthenticated) {
+          if (
+            active.accepted &&
+            !active.closingUnauthenticated &&
+            active.socket.readyState === WebSocket.OPEN
+          ) {
             await this.#options.onMessage(message, context);
           }
         })
         .catch((error) => {
           this.#options.onError?.(asError(error), context.connectionId);
         });
+      if (message.method === "agent.create") {
+        // Preserve create-to-attach ordering without delaying creation behind a stream.
+        active.dispatchChain = Promise.all([active.dispatchChain, pending]).then(() => {});
+      }
       active.pendingMessages.add(pending);
       pending.finally(() => {
+        active.queuedPriorityMessages[lane] -= 1;
         active.pendingMessages.delete(pending);
       });
       return;
@@ -496,7 +570,7 @@ export class AgenCWebSocketServer {
           // gaphunt3 #47: gate dispatch on the accept-auth decision so an
           // accepted-but-unauthenticated connection cannot drive the dispatcher.
           const proceed = await this.#resolveAcceptance(message, active, context);
-          if (!proceed) return;
+          if (!proceed || active.socket.readyState !== WebSocket.OPEN) return;
           await this.#options.onMessage(message, context);
         } finally {
           active.queuedNormalMessages = Math.max(
@@ -509,7 +583,8 @@ export class AgenCWebSocketServer {
       this.#options.onError?.(asError(error), context.connectionId);
     }));
     active.pendingMessages.add(pending);
-    if (message.method === "initialize") {
+    if (message.method === "initialize" && !active.hasInitializeBarrier) {
+      active.hasInitializeBarrier = true;
       active.initializeBarrier = pending;
     }
     pending.finally(() => {
@@ -680,6 +755,9 @@ function closeHttpServer(server: HttpServer): Promise<void> {
       }
       resolve();
     });
+    // Upgraded peers were terminated separately. Incomplete HTTP requests
+    // must not retain the listener while daemon shutdown drains RPC handlers.
+    server.closeAllConnections();
   });
 }
 

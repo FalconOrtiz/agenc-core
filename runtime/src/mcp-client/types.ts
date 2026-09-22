@@ -11,6 +11,7 @@ import type {
   PermissionDefaultMode,
   PerToolConfig,
 } from "../config/schema.js";
+import type { McpOAuthConfig } from "../config/mcp-oauth.js";
 import type { Tool } from "./_deps/tools-types.js";
 
 /** Runtime-only metadata injected after canonical config validation. */
@@ -54,6 +55,7 @@ export interface MCPServerOrigin {
  *   - `"websocket"`: connect to a remote WebSocket endpoint.
  */
 export interface MCPServerConfig {
+  readonly oauth?: McpOAuthConfig;
   /** Human-readable server name (used for tool namespacing) */
   readonly name: string;
   /** Transport kind. Default: "stdio". */
@@ -67,6 +69,11 @@ export interface MCPServerConfig {
   readonly endpoint?: string;
   /** Optional headers to send on the initial request (SSE/HTTP/WebSocket). */
   readonly headers?: Readonly<Record<string, string>>;
+  /** Runtime-only session attachment restriction, never loaded from configuration. */
+  readonly localOnly?: boolean;
+  readonly desktopAuthority?: import("./desktop-authority.js").DesktopAuthorityProof;
+  /** Process-minted authority; never accepted from JSON or persisted config. */
+  readonly desktopAuthorityGrant?: import("./desktop-authority.js").DesktopAuthorityGrant;
   /** Optional environment variables for the child process (stdio only). */
   readonly env?: Readonly<Record<string, string>>;
   /** Optional parent environment variable names to copy into stdio process env. */

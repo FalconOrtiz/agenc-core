@@ -11,8 +11,6 @@ const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
 
 function isDocumentationPath(file) {
   return file === "README.md" ||
-    file === "memory_todo.md" ||
-    file === "todo.txt" ||
     file.startsWith("docs/");
 }
 
@@ -279,6 +277,9 @@ export function commandsForPlan(plan, {
     ...plan.mappedRuntimeTests,
     ...deletedRuntime.targets,
   ])].sort();
+  if (runtimeTestTargets.length > 0 || existingRuntimeInputs.length > 0) {
+    commands.unshift({ executable: process.execPath, args: ["runtime/scripts/check-ripgrep.mjs"] });
+  }
   if (runtimeTestTargets.length > 0) {
     commands.push({
       executable: process.execPath,

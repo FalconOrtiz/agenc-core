@@ -31,6 +31,7 @@
  * @module
  */
 
+import { resolveReasoningEffort } from "../llm/reasoning-effort.js";
 import type {
   LLMChatOptions,
   LLMMessage,
@@ -64,17 +65,30 @@ import {
 import { isPlanMode } from "../session/plan-mode.js";
 import {
   createProviderTraceSink,
+  providerTraceBodiesEnabled,
   providerTraceEnabled,
   type ProviderTraceSink,
 } from "../llm/provider-trace-sink.js";
 import { getAgencHomeDir } from "../session/session-store.js";
 import {
-  effortValueToReasoningEffort,
   getInitialEffortSetting,
 } from "../utils/effort.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
+import { resolveGeminiReasoningEffort } from "../llm/registry/gemini-thinking-models.js";
 
 type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
+
+function resolveGeminiSessionReasoningEffort(
+  turnEffort: ReasoningEffort | undefined,
+  model: string,
+  effortSource: string | undefined,
+): WireReasoningEffort | undefined {
+  if (turnEffort !== undefined) return resolveGeminiReasoningEffort(model, turnEffort);
+  const configuredEffort = effortSource === "default"
+    ? undefined
+    : getInitialEffortSetting();
+  return resolveGeminiReasoningEffort(model, configuredEffort);
+}
 
 /**
  * Sessions created without an explicit reasoning effort — every
@@ -85,34 +99,55 @@ type WireReasoningEffort = NonNullable<LLMChatOptions["reasoningEffort"]>;
  * a 150-word answer, matching the user's "grok is fucking slow").
  * An explicit per-session "none" stays respected as an opt-out.
  *
- * The persisted spelling of the deepest tier is `max`; on the wire it is
- * `xhigh`. It is forwarded only when the model's catalog advertises xhigh
- * (grok-4.6); every other model clamps to `high`, which every reasoning
- * Grok accepts. Before this mapping a configured xhigh reached this function
- * as `max`, fell through the switch, and no `reasoning.effort` was sent at
- * all, so the session ran at the provider default (measured: 348 reasoning
- * tokens per call on a coding task, effort `null` in every settings event).
+ * Persistence historically spells Grok's deepest `xhigh` tier as `max`, while
+ * providers such as Z.AI use `max` as the literal wire value and do not accept
+ * `xhigh`. Resolve that alias against the selected model's catalog: prefer the
+ * requested top-tier spelling when supported, translate to the other top-tier
+ * spelling when that is the model's only form, and otherwise clamp to `high`.
  */
 function resolveSessionReasoningEffort(
   turnEffort: ReasoningEffort | undefined,
   supportedReasoningLevels?: ReadonlyArray<ReasoningEffort>,
+  selection?: {
+    readonly provider: string;
+    readonly model: string;
+    readonly effortSource?: string;
+  },
 ): WireReasoningEffort | undefined {
-  let requested: ReasoningEffort | undefined;
-  if (turnEffort === undefined) {
-    requested = effortValueToReasoningEffort(getInitialEffortSetting());
-  } else if (turnEffort !== "none") {
-    requested = turnEffort;
+  if (selection?.provider === "gemini") {
+    return resolveGeminiSessionReasoningEffort(
+      turnEffort,
+      selection.model,
+      selection.effortSource,
+    );
   }
-  if (requested === undefined) return undefined;
-  const wire: WireReasoningEffort = requested === "max" ? "xhigh" : requested;
-  if (
-    wire === "xhigh" &&
-    supportedReasoningLevels !== undefined &&
-    !supportedReasoningLevels.includes("xhigh")
-  ) {
+  const requested = turnEffort ?? getInitialEffortSetting();
+  if (requested === undefined || requested === "none") return undefined;
+  // Hosted providers can expose an effort contract absent from ModelInfo.
+  // Preserve accepted literal tiers before applying legacy max/xhigh aliases.
+  const contract = selection === undefined ? undefined : resolveReasoningEffort(selection);
+  if (selection?.provider === "anthropic" && contract?.registered === false) {
+    // Settings fallback is legacy configuration, not a literal session choice.
+    // Configured max is seeded as xhigh for these older models; an explicit
+    // applyConfig max remains max and must be forwarded exactly as accepted.
+    if (turnEffort === undefined && !contract.levels.includes("xhigh") &&
+        (requested === "max" || requested === "xhigh")) return "high";
+    if (contract.levels.includes(requested)) return requested;
+    if (requested === "max" || requested === "xhigh") return "high";
+  }
+  if (contract?.registered === false && contract.levels.includes(requested)) {
+    return requested;
+  }
+  if (requested === "max" || requested === "xhigh") {
+    if (supportedReasoningLevels === undefined) {
+      return requested === "max" ? "xhigh" : requested;
+    }
+    if (supportedReasoningLevels.includes(requested)) return requested;
+    const topTierAlias = requested === "max" ? "xhigh" : "max";
+    if (supportedReasoningLevels.includes(topTierAlias)) return topTierAlias;
     return "high";
   }
-  return wire;
+  return requested;
 }
 
 // Exported for unit tests; the wiring above is the single call site.
@@ -129,6 +164,8 @@ import type {
 import { runAdmittedModelCall } from "../budget/admitted-model-call.js";
 
 export interface StreamModelRequestContract {
+  /** Internal managed transport UUID, stable for every retry of this snapshot. */
+  readonly managedRequestId?: string;
   readonly input: ReadonlyArray<LLMMessage>;
   readonly tools: ReadonlyArray<LLMTool>;
   readonly parallelToolCalls: boolean;
@@ -278,6 +315,7 @@ function resolveProviderTraceSink(session: Session): ProviderTraceSink | undefin
       sink = createProviderTraceSink({
         agencHome: getAgencHomeDir(configuredHome),
         conversationId: String(session.conversationId),
+        bodies: providerTraceBodiesEnabled(),
       });
     } catch {
       sink = null;
@@ -287,7 +325,7 @@ function resolveProviderTraceSink(session: Session): ProviderTraceSink | undefin
   return sink ?? undefined;
 }
 
-function buildProviderOptions(
+export function buildProviderOptions(
   request: StreamModelRequestContract,
   ctx: TurnContext,
   signal: AbortSignal,
@@ -300,6 +338,9 @@ function buildProviderOptions(
   const traceSink = resolveProviderTraceSink(session);
   return {
     signal,
+    ...(request.managedRequestId !== undefined
+      ? { managedRequestId: request.managedRequestId }
+      : {}),
     tools: cloneProviderTools(request.tools),
     parallelToolCalls: request.parallelToolCalls,
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
@@ -325,6 +366,12 @@ function buildProviderOptions(
     reasoningEffort: resolveSessionReasoningEffort(
       ctx.reasoningEffort,
       ctx.modelInfo.supportedReasoningLevels,
+      {
+        provider: session.services.provider.name,
+        model: session.config?.model ?? ctx.modelInfo.slug,
+        effortSource: session.services.configStore
+          ?.provenance?.("reasoning_effort")?.scope,
+      },
     ),
     reasoningSummary: ctx.reasoningSummary,
     modelVerbosity: ctx.modelVerbosity,
@@ -675,7 +722,8 @@ function assistantMessageFromResponse(
         : response.finishReason === "content_filter"
           ? "refusal"
           : undefined;
-  const allowToolCalls = response.finishReason !== "length";
+  const allowToolCalls =
+    response.finishReason === "stop" || response.finishReason === "tool_calls";
   // I-55: normalize tool_use blocks into canonical shape before the
   // validator sees them (provider-family quirks collapsed here).
   const normalizedToolCalls = normalizeToolCallsForProvider(
@@ -1003,6 +1051,15 @@ export async function streamModel(
   if (signal?.aborted) {
     throw new StreamModelError(new Error("aborted before provider call"));
   }
+  state.pendingTextToolCallCorrection = undefined;
+  state.textToolCallCorrectionFailure = undefined;
+
+  // The prepared provider contract, after all model/turn filters, is the
+  // authority for discovery's "advertised" state. Keep a request snapshot
+  // for both mid-stream and post-stream execution of this response's calls.
+  state.samplingRequestToolNames = Object.freeze(
+    request.tools.map(tool => tool.function.name),
+  );
 
   const planMode = isPlanMode(ctx);
 
@@ -1411,10 +1468,7 @@ export async function streamModel(
     state.needsFollowUp = false;
   } else {
     const mergedToolBlocks = new Map(streamedToolBlocks);
-    const admittedAssistantToolCalls = assistant.toolCalls.filter(
-      (call) => !state.editorToolCallLimitDeniedIds.has(call.id),
-    );
-    for (const block of parseToolUseBlocks(admittedAssistantToolCalls)) {
+    for (const block of parseToolUseBlocks([...assistant.toolCalls])) {
       mergedToolBlocks.set(block.id, block);
     }
     state.toolUseBlocks = [...mergedToolBlocks.values()];
@@ -1492,9 +1546,7 @@ export async function streamModel(
       ...(availability !== undefined ? { availability } : {}),
       ...(provenance !== undefined ? { provenance } : {}),
     };
-    // Cross-turn token accumulator — agenc runtime
-    // `Session::update_token_info_from_usage` (session/mod.rs:2739-2749)
-    // plus `TokenUsageInfo::append_last_usage` (protocol.rs:2294-2297).
+    // Cross-turn token accumulator.
     // Runs under the session state lock so the mid-turn compact gate in
     // run-turn.ts sees a consistent read even when a concurrent
     // recovery path also touches state. Providers that don't surface
@@ -1534,6 +1586,12 @@ export async function streamModel(
   state.messages.push({
     role: "assistant",
     content: response.content,
+    ...(response.providerReasoningContent !== undefined
+      ? { providerReasoningContent: response.providerReasoningContent }
+      : {}),
+    ...(response.providerReasoningProvenance !== undefined
+      ? { providerReasoningProvenance: response.providerReasoningProvenance }
+      : {}),
     toolCalls:
       !maxOutputTruncated && assistant.toolCalls.length > 0
         ? [...assistant.toolCalls]
@@ -1598,6 +1656,28 @@ export async function streamModel(
 
   if (response.error) {
     throw new StreamModelError(response.error, response);
+  }
+  if (response.toolCallRecovery !== undefined) {
+    const marker = response.toolCallRecovery;
+    const advertised = state.samplingRequestToolNames ?? [];
+    const safeName = typeof marker.toolName === "string" &&
+      marker.toolName.length <= 256 && /^[A-Za-z0-9_.:-]+$/.test(marker.toolName);
+    const safeMessage = typeof marker.message === "string" &&
+      marker.message.length > 0 && marker.message.length <= 1_024 &&
+      !/[\u0000-\u001f\u007f]/.test(marker.message);
+    const validTarget = marker.reason === "invalid_arguments"
+      ? advertised.includes(marker.toolName)
+      : marker.reason === "not_advertised" &&
+        advertised.includes("system.searchTools") &&
+        !advertised.includes(marker.toolName) &&
+        /^mcp\.[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+$/.test(marker.toolName);
+    if (providerName !== "ollama" || !safeName || !safeMessage || !validTarget ||
+        response.content !== "" || response.toolCalls.length !== 0 ||
+        streamedToolCalls.size !== 0 || state.toolUseBlocks.length !== 0 ||
+        response.finishReason !== "stop") {
+      throw new StreamModelError(new Error("Invalid tool-call correction response; no correction was admitted."), response);
+    }
+    state.pendingTextToolCallCorrection = { toolName: marker.toolName, reason: marker.reason };
   }
   return state;
 }

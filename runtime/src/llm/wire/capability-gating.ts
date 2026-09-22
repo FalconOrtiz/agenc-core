@@ -22,9 +22,17 @@
  * pass a recognizable slug.
  */
 
+import { resolveReasoningEffort } from "../reasoning-effort.js";
 import { normalizeProviderIdentity } from "../../provider-identity.js";
 import { BRIEF_TOOL_NAME } from "../../tools/BriefTool/prompt.js";
-import { supportsXaiReasoningEffortParam } from "../structured-output.js";
+import {
+  resolveModelCapabilityHints,
+} from "../registry/model-catalog.js";
+import type { ProviderReasoningProvenance } from "../types.js";
+import { isQwenFlashNextModel } from "../registry/qwen-flash-next.js";
+import { isQwenCoder30BModel } from "../registry/qwen-coder-30b.js";
+import { isAgenCDeepSeekModel, AGENC_DEEPSEEK_V41_MODEL } from "../registry/agenc-deepseek.js";
+import { isNativeDeepSeekModel } from "../registry/deepseek-models.js";
 
 export interface ChatCompletionsCapabilityHints {
   /**
@@ -43,19 +51,114 @@ export interface ChatCompletionsCapabilityHints {
    */
   readonly reasoningEffortAllowedValues?: ReadonlySet<string>;
   /**
-   * Restricts explicit tool-choice values to `auto`. Requests for `required`
-   * or a named function are downgraded to `auto`; `none` preserves its
-   * no-tools semantics by omitting both `tools` and `tool_choice`.
+   * Restricts provider-specific explicit tool-choice values. `auto_only`
+   * downgrades `required` and named functions while preserving `none` by
+   * omitting tools. `no_required` and `no_named` downgrade only the named
+   * unsupported mode while keeping the other explicit choices intact.
    */
-  readonly toolChoicePolicy?: "auto_only";
+  readonly toolChoicePolicy?: "auto_only" | "no_required" | "no_named";
+  /** Omit the field entirely for APIs whose thinking mode rejects it. */
+  readonly acceptsToolChoice?: boolean;
+  /** Omit tool-selection controls when no tool definitions are attached. */
+  readonly omitsToolControlsWithoutTools?: boolean;
+  /** Whether the selected model accepts `parallel_tool_calls`. */
+  readonly acceptsParallelToolCalls?: boolean;
+  /** Enforce API-v2 adjacent, complete, unique tool-call/result groups. */
+  readonly requiresStrictToolResultSequence?: boolean;
+  /** Apply Cerebras' strict base64 PNG/JPEG image payload contract. */
+  readonly imageInputContract?: "cerebras_v2" | "zai_flash" | "kimi_global";
+  /** Whether the selected model accepts direct user image input. */
+  readonly acceptsDirectImageInput?: boolean;
+  /** Apply Cerebras API v2's supported strict JSON-Schema subset. */
+  readonly structuredOutputContract?: "cerebras_v2" | "zai_json_object";
+  /**
+   * Some OpenAI-compatible endpoints accept multimodal content on user
+   * messages but require tool-result `content` to remain a string. When this
+   * policy is enabled, image parts are removed from the tool message. Vision
+   * models receive them immediately after the complete tool-result group as a
+   * user image message; text-only models discard them. Text remains attached
+   * to the original tool call.
+   */
+  readonly toolResultImagePolicy?: "relay_as_user" | "strip";
+  /** Keep runtime context after a tool result inside that tool continuation. */
+  readonly runtimeContextInToolResults?: boolean;
+  /** Explain encoded function aliases when instructions use canonical names. */
+  readonly includeToolNameAliases?: boolean;
+  /**
+   * Replay the provider-owned reasoning_content field on assistant messages.
+   * Qwen's thinking-mode function calling requires this value to be echoed
+   * unchanged before the corresponding tool results are submitted.
+   */
+  readonly replaysReasoningContent?: boolean;
+  /** Provider-specific assistant reasoning field used for parse and replay. */
+  readonly reasoningContentField?: "reasoning_content" | "reasoning";
+  /** Older compatible runtimes may emit the legacy name while replay uses canonical. */
+  readonly reasoningContentFallbackField?: "reasoning_content" | "reasoning";
+  /**
+   * MiniMax inlines thinking in `content` behind think markers unless
+   * `reasoning_split` is set; with it the thinking arrives in
+   * `reasoning_content`, where the tool turn can replay it.
+   */
+  readonly reasoningSplit?: boolean;
+  /** vLLM receives Jinja thinking controls inside chat_template_kwargs. */
+  readonly usesVllmThinkingTemplate?: boolean;
+  /**
+   * Replay provider-owned reasoning only for the complete assistant-tool/result
+   * group immediately preceding this request. Z.AI requires that state for a
+   * tool continuation, but stale history must be cleared after compaction or a
+   * later user turn.
+   */
+  readonly replaysReasoningContentOnlyForAdjacentToolContinuation?: boolean;
+  /** Replay all matching historical reasoning only if normalization changed none of the history. */
+  readonly replaysReasoningContentOnlyForIntactHistory?: boolean;
+  /** Canonical destination required for opaque reasoning replay. */
+  readonly reasoningContentProvenance?: ProviderReasoningProvenance;
+  /**
+   * Provider-native nested thinking configuration. `enabled` is the always-on
+   * form (DeepSeek, Z.AI, Kimi). `adaptive` is MiniMax-M3's two-position
+   * switch: the wire sends `disabled` for a `low` effort, `adaptive` otherwise.
+   */
+  readonly thinkingConfig?: {
+    readonly type: "enabled" | "adaptive";
+    readonly clearThinking?: boolean;
+    readonly keep?: "all";
+  };
+  /** Enable provider-native incremental function argument streaming. */
+  readonly streamsToolCalls?: boolean;
+  /**
+   * Qwen 3.6/3.7 default `preserve_thinking` to false. Their thinking-mode
+   * tool loop only consumes replayed `reasoning_content` when this request
+   * switch is explicitly enabled. Qwen 3.8 defaults it to true and uses the
+   * separate `reasoning_effort` control, so it intentionally does not opt in
+   * here.
+   */
+  readonly preservesThinkingHistory?: boolean;
+  /** Forced Qwen tool choices require hybrid thinking to be disabled. */
+  readonly disablesThinkingForForcedToolChoice?: boolean;
   /**
    * If `false`, caller-supplied stop sequences are omitted. Some compatible
    * APIs reject the otherwise-standard `stop` request field.
    */
   readonly acceptsStopSequences?: boolean;
+  /** Provider limit for stop sequences; excess values are omitted. */
+  readonly maxStopSequences?: number;
+  /** Provider limit for advertised function definitions. */
+  readonly maxToolDefinitions?: number;
+  /** Treat Z.AI's context-window terminal reason as overflow, not truncation. */
+  readonly rejectsContextWindowExceededFinishReason?: boolean;
+  /** Never dispatch tool calls unless the provider finalized with tool_calls. */
+  readonly requiresToolCallsFinishReason?: boolean;
+  /** Reject truncated/error terminal responses that contain partial tool calls. */
+  readonly rejectsPartialToolCalls?: boolean;
+  /** Provider-documented terminal finish reasons for final response frames. */
+  readonly allowedFinishReasons?: ReadonlySet<string>;
+  /** Reject EOF/[DONE] unless a documented terminal finish reason was seen. */
+  readonly requiresExplicitFinishReason?: boolean;
+  /** Whether caller-supplied temperature is accepted by this wire contract. */
+  readonly acceptsTemperature?: boolean;
   /**
    * If `false`, `service_tier` is stripped. The field is recognized
-   * only on a single upstream provider; non-matching providers
+   * only on an explicit provider allowlist; non-matching providers
    * either reject it or silently ignore it.
    */
   readonly acceptsServiceTier?: boolean;
@@ -94,19 +197,22 @@ export interface ChatCompletionsCapabilityHints {
 }
 
 // Providers that document `service_tier` on chat-completions.
-// branding-scan: allow real provider identifiers in capability matrix
-const SERVICE_TIER_PROVIDERS = new Set(["openai", "azure-openai"]);
-
-// Meta Model API rejects `none` and `max`, but accepts the five levels below
-// for every Muse Spark chat model. Keep this allowlist fail-closed because the
-// shared ReasoningEffort type also contains both rejected values.
-const META_REASONING_EFFORT_VALUES = new Set([
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
+const SERVICE_TIER_PROVIDERS = new Set([
+  "openai",
+  "azure-openai",
+  "cerebras",
 ]);
+
+const ZAI_FINISH_REASONS = new Set([
+  "stop",
+  "tool_calls",
+  "length",
+  "sensitive",
+  "model_context_window_exceeded",
+  "network_error",
+]);
+
+const KIMI_FINISH_REASONS = new Set(["stop", "length", "tool_calls"]);
 
 // Providers explicitly known to reject `stream_options.include_usage`.
 // Currently empty by design: the default is "include" because losing
@@ -128,70 +234,19 @@ const GRAMMAR_CONSTRAINED_TOOL_PROVIDERS = new Set([
   "openai-compatible",
 ]);
 
-/**
- * Lightweight test for the upstream-provider reasoning model family.
- * Mirrors the regex in `capabilities.ts:isOpenAIReasoningModel` so we
- * don't have to widen that file's exports for this single use site.
- */
-function isUpstreamReasoningModel(model: string | undefined): boolean {
-  if (model === undefined) return false;
-  // branding-scan: allow real model-family identifiers in regex
-  return /(?:^|[/:])(?:gpt-5|o1|o3|o4|codex|chatgpt-5)(?:$|[-_.:])/i.test(
-    model.trim(),
-  );
-}
-
-/**
- * NVIDIA NIM hosts big-player models whose hosted OpenAPI schemas
- * (docs.api.nvidia.com/nim/reference/<slug>-infer) document a
- * top-level `reasoning_effort` — but each family with its own enum,
- * and no endpoint-wide contract. Families absent here (kimi-k2.x,
- * minimax-m3, plain llama instructs) control thinking through
- * `chat_template_kwargs` or not at all, so the field stays stripped
- * for them. Verified against the hosted schemas 2026-08.
- */
-const NIM_REASONING_EFFORT_FAMILIES: readonly {
-  readonly pattern: RegExp;
-  readonly values: ReadonlySet<string>;
-}[] = [
-  // branding-scan: allow real model-family identifiers in capability matrix
-  {
-    // moonshotai/kimi-k3: enum low|high|max, default max.
-    pattern: /(?:^|\/)kimi-k3(?:$|[-.:])/i,
-    values: new Set(["low", "high", "max"]),
-  },
-  {
-    // deepseek-ai/deepseek-v4-{pro,flash}(+dated snapshots):
-    // enum none|high|max (defaults differ: pro none, flash high).
-    pattern: /(?:^|\/)deepseek-v4-(?:pro|flash)(?:$|[-.:])/i,
-    values: new Set(["none", "high", "max"]),
-  },
-  {
-    // openai/gpt-oss-20b|120b on NIM: enum low|medium|high.
-    pattern: /(?:^|\/)gpt-oss-\d+b(?:$|[-.:])/i,
-    values: new Set(["low", "medium", "high"]),
-  },
-  {
-    // nvidia/nemotron-3-super-*: enum none|low|high.
-    pattern: /(?:^|\/)nemotron-3-super(?:$|[-.:])/i,
-    values: new Set(["none", "low", "high"]),
-  },
-  {
-    // nvidia/nemotron-3-ultra-*: enum none|medium|high.
-    pattern: /(?:^|\/)nemotron-3-ultra(?:$|[-.:])/i,
-    values: new Set(["none", "medium", "high"]),
-  },
-];
-
-function nimReasoningEffortValues(
-  model: string | undefined,
-): ReadonlySet<string> | undefined {
-  if (model === undefined) return undefined;
-  const trimmed = model.trim();
-  return NIM_REASONING_EFFORT_FAMILIES.find((family) =>
-    family.pattern.test(trimmed),
-  )?.values;
-}
+// Providers that serve small local models and therefore get the
+// reduced tool catalog (see LOCAL_PROFILE_TOOL_NAMES). This is a
+// separate axis from the grammar constraint above: a server can need
+// a smaller catalog without compiling tool schemas into a GBNF
+// grammar. Ollama is the common case — it accepts the full JSON
+// Schema dialect, so it must not inherit the grammar-safe rewrite or
+// the /no_think prompt suffix, but its models are the same 7-32B
+// class that the frontier catalog drowns.
+const LOCAL_TOOL_PROFILE_PROVIDERS = new Set([
+  "lmstudio",
+  "openai-compatible",
+  "ollama",
+]);
 
 /**
  * Tools a small local model can actually drive. The frontier catalog
@@ -205,6 +260,7 @@ const LOCAL_PROFILE_TOOL_NAMES = new Set([
   "exec_command",
   "write_stdin",
   "kill_process",
+  "list_processes",
   "FileRead",
   "Edit",
   "MultiEdit",
@@ -223,13 +279,14 @@ const LOCAL_PROFILE_TOOL_NAMES = new Set([
 
 /**
  * Whether the provider gets the reduced local tool catalog. Keyed on
- * the same set as the grammar constraints: these are the providers
- * that serve small local models.
+ * its own provider set, not on the grammar constraints: the catalog
+ * size and the wire-schema dialect are independent properties of a
+ * local server.
  */
 export function usesLocalToolProfile(
   providerName: string | undefined,
 ): boolean {
-  return GRAMMAR_CONSTRAINED_TOOL_PROVIDERS.has(
+  return LOCAL_TOOL_PROFILE_PROVIDERS.has(
     normalizeProviderIdentity(providerName, "local tool profile") ?? "",
   );
 }
@@ -251,28 +308,53 @@ export function filterToolsForLocalProfile<
 export function chatCompletionsCapabilityHintsForProvider(
   providerName: string | undefined,
   model: string | undefined,
+  options: { readonly managedGateway?: boolean } = {},
 ): ChatCompletionsCapabilityHints {
   const slug = normalizeProviderIdentity(providerName, "capability gate") ?? "";
+  const isManagedDeepSeek = options.managedGateway === true &&
+    slug === "openrouter" && isAgenCDeepSeekModel(model);
+  const isNativeDeepSeek = slug === "deepseek" && isNativeDeepSeekModel(model);
+  const normalizedModel = model?.trim().toLowerCase() ?? "";
+  const reasoningContentProvenance =
+    slug.length > 0 && normalizedModel.length > 0
+      ? Object.freeze({ provider: slug, model: normalizedModel })
+      : undefined;
+  const acceptsToolResultImages =
+    resolveModelCapabilityHints({ provider: slug, model })
+      ?.supportsImageInput === true;
+  const isZai = slug === "zai" || slug === "zai-coding-plan";
+  const isKimi = slug === "kimi";
+  const isMinimax = slug === "minimax";
+  const isMinimaxM3 =
+    isMinimax && /(?:^|[/:])minimax-m3(?:$|[-_.:])/i.test(model ?? "");
+  const isKimiK3 = isKimi && normalizedModel === "kimi-k3";
+  const isKimiK27 =
+    isKimi && /^kimi-k2\.7-code(?:-highspeed)?$/u.test(normalizedModel);
+  const isKimiK26 = isKimi && normalizedModel === "kimi-k2.6";
+  const isKnownKimiModel = isKimiK3 || isKimiK27 || isKimiK26;
+  const supportsZaiToolStreaming =
+    isZai &&
+    /(?:^|[/:])glm-(?:5(?:\.(?:1|2|3))?|4\.(?:6|7))(?:$|[-_.:])/i.test(
+      model ?? "",
+    );
+  const isQwenCloud = (slug === "qwen" || slug === "qwen-token-plan") &&
+    !isQwenCoder30BModel(model);
+  const isQwenFlashNext = slug === "qwen" && isQwenFlashNextModel(model);
+  const preservesThinkingHistory =
+    (slug === "qwen" &&
+      /(?:^|[/:])qwen3\.(?:7-(?:max|plus|flash)|6-(?:max-preview|plus|flash))(?:$|[-_.:])/i.test(
+        model ?? "",
+      )) ||
+    (slug === "qwen-token-plan" &&
+      /(?:^|[/:])qwen3\.(?:7-(?:max|plus)|6-flash)(?:$|[-_.:])/i.test(
+        model ?? "",
+      ));
 
-  // reasoning_effort: allow only provider/model combinations with a verified
-  // contract. Every other destination either rejects it or silently ignores
-  // it, so unrecognized combinations default to the safe "strip" behavior.
-  // branding-scan: allow factual reference to real provider in routing comment
-  let acceptsReasoningEffort = false;
-  let reasoningEffortAllowedValues: ReadonlySet<string> | undefined;
-  if (slug === "openai") {
-    acceptsReasoningEffort = isUpstreamReasoningModel(model);
-  } else if (slug === "grok") {
-    acceptsReasoningEffort = supportsXaiReasoningEffortParam(model);
-  } else if (slug === "meta" && /(?:^|[/:])muse-spark-/i.test(model ?? "")) {
-    reasoningEffortAllowedValues = META_REASONING_EFFORT_VALUES;
-    acceptsReasoningEffort = true;
-  } else if (slug === "nvidia-nim") {
-    reasoningEffortAllowedValues = nimReasoningEffortValues(model);
-    acceptsReasoningEffort = reasoningEffortAllowedValues !== undefined;
-  }
+  const effort = resolveReasoningEffort({ provider: slug, model, managedGateway: options.managedGateway });
+  const acceptsReasoningEffort = effort.acceptsChatEffort;
+  const reasoningEffortAllowedValues = effort.chatLevels;
 
-  // service_tier: recognized by a single upstream provider. Strip
+  // service_tier: recognized only by documented providers. Strip
   // everywhere else — most servers ignore it silently, but at least
   // one custom proxy in the wild rejects unknown fields.
   const acceptsServiceTier = SERVICE_TIER_PROVIDERS.has(slug);
@@ -310,13 +392,191 @@ export function chatCompletionsCapabilityHintsForProvider(
 
   return {
     acceptsReasoningEffort,
+    ...(slug === "ollama-cloud" ? {
+      acceptsDirectImageInput: acceptsToolResultImages,
+      toolResultImagePolicy: acceptsToolResultImages ? "relay_as_user" as const : "strip" as const,
+      replaysReasoningContent: true,
+      reasoningContentField: "reasoning" as const,
+      reasoningContentFallbackField: "reasoning_content" as const,
+      acceptsParallelToolCalls: false,
+      omitsToolControlsWithoutTools: true,
+      includeToolNameAliases: true,
+    } : {}),
+    ...(isNativeDeepSeek ? {
+      acceptsToolChoice: false,
+      acceptsParallelToolCalls: false,
+      acceptsDirectImageInput: acceptsToolResultImages,
+      toolResultImagePolicy: acceptsToolResultImages ? "relay_as_user" as const : "strip" as const,
+      toolChoicePolicy: "auto_only" as const,
+      acceptsTemperature: false,
+      thinkingConfig: { type: "enabled" as const },
+      replaysReasoningContent: true,
+      reasoningContentField: "reasoning_content" as const,
+    } : {}),
+    ...(isManagedDeepSeek ? {
+      // The reviewed V4.1 route supports automatic tool selection, not forced
+      // or named choices. All tools remain available to the agent.
+      ...(model === AGENC_DEEPSEEK_V41_MODEL ? {
+        acceptsToolChoice: false,
+        toolChoicePolicy: "auto_only" as const,
+      } : {}),
+      acceptsParallelToolCalls: false,
+      acceptsDirectImageInput: model === AGENC_DEEPSEEK_V41_MODEL,
+      toolResultImagePolicy: model === AGENC_DEEPSEEK_V41_MODEL ? "relay_as_user" as const : "strip" as const,
+      runtimeContextInToolResults: true,
+      includeToolNameAliases: true,
+      replaysReasoningContent: true,
+      reasoningContentField: "reasoning" as const,
+      reasoningContentFallbackField: "reasoning_content" as const,
+      // Runtime reminders may follow tool results as user-role messages.
+      // Preserve same-route reasoning across those boundaries and later turns;
+      // the wire builder still checks the original provider/model provenance.
+      maxToolDefinitions: 100,
+    } : {}),
+    // DeepSeek and Meta document a terminal chunk carrying finish_reason.
+    // Tool-call arguments received before that signal are not finalized.
+    ...(slug === "deepseek" || slug === "meta"
+      ? {
+          requiresToolCallsFinishReason: true,
+          rejectsPartialToolCalls: true,
+          requiresExplicitFinishReason: true,
+        }
+      : {}),
     ...(reasoningEffortAllowedValues !== undefined
       ? { reasoningEffortAllowedValues }
       : {}),
-    ...(slug === "meta" ? { toolChoicePolicy: "auto_only" as const } : {}),
+    ...(slug === "meta" || isZai
+      ? { toolChoicePolicy: "auto_only" as const }
+      : {}),
+    ...(isKimi
+      ? {
+          toolChoicePolicy: isKimiK3
+            ? ("no_named" as const)
+            : ("auto_only" as const),
+        }
+      : {}),
+    ...(isZai
+      ? {
+          acceptsDirectImageInput: acceptsToolResultImages,
+          omitsToolControlsWithoutTools: true,
+          acceptsParallelToolCalls: false,
+          maxStopSequences: 1,
+          maxToolDefinitions: 128,
+          rejectsContextWindowExceededFinishReason: true,
+          requiresToolCallsFinishReason: true,
+          requiresExplicitFinishReason: true,
+          allowedFinishReasons: ZAI_FINISH_REASONS,
+        }
+      : {}),
+    ...(supportsZaiToolStreaming ? { streamsToolCalls: true } : {}),
+    ...(isKnownKimiModel
+      ? {
+          acceptsDirectImageInput: true,
+          acceptsParallelToolCalls: false,
+          maxToolDefinitions: 128,
+          ...(isKimiK3 ? { outputTokensCeiling: 1_048_576 } : {}),
+          requiresToolCallsFinishReason: true,
+          rejectsPartialToolCalls: true,
+          requiresExplicitFinishReason: true,
+          allowedFinishReasons: KIMI_FINISH_REASONS,
+          acceptsTemperature: false,
+          replaysReasoningContent: true,
+          replaysReasoningContentOnlyForIntactHistory: true,
+          reasoningContentField: "reasoning_content" as const,
+          imageInputContract: "kimi_global" as const,
+          ...(isKimiK26
+            ? {
+                thinkingConfig: {
+                  type: "enabled" as const,
+                  keep: "all" as const,
+                },
+              }
+            : {}),
+        }
+      : {}),
+    ...(slug === "meta" ||
+    slug === "qwen" ||
+    slug === "qwen-token-plan" ||
+    slug === "cerebras" ||
+    isZai ||
+    isMinimax
+      ? {
+          toolResultImagePolicy: acceptsToolResultImages
+            ? ("relay_as_user" as const)
+            : ("strip" as const),
+        }
+      : {}),
+    ...(isQwenCloud
+      ? {
+          replaysReasoningContent: true,
+          ...(preservesThinkingHistory
+            ? { preservesThinkingHistory: true }
+            : {}),
+          disablesThinkingForForcedToolChoice: true,
+        }
+      : {}),
+    ...(isQwenFlashNext
+      ? {
+          reasoningContentField: "reasoning" as const,
+          reasoningContentFallbackField: "reasoning_content" as const,
+          usesVllmThinkingTemplate: true,
+        }
+      : {}),
+    ...(slug === "cerebras"
+      ? {
+          replaysReasoningContent:
+            /(?:^|[/:])(?:gpt-oss-120b|qwen-3\.8-27b|gemma-4-31b)$/i.test(
+              model ?? "",
+            ),
+          reasoningContentField: "reasoning" as const,
+          omitsToolControlsWithoutTools: true,
+          acceptsParallelToolCalls:
+            /(?:^|[/:])(?:qwen-3\.8-27b|gemma-4-31b)$/i.test(model ?? ""),
+          requiresStrictToolResultSequence: true,
+          imageInputContract: "cerebras_v2" as const,
+          acceptsDirectImageInput: acceptsToolResultImages,
+          structuredOutputContract: "cerebras_v2" as const,
+        }
+      : {}),
+    ...(isZai &&
+    /(?:^|[/:])glm-5\.3(?:-flash)?$/i.test(model ?? "")
+      ? {
+          replaysReasoningContent: true,
+          replaysReasoningContentOnlyForAdjacentToolContinuation: true,
+          reasoningContentField: "reasoning_content" as const,
+          thinkingConfig: {
+            type: "enabled" as const,
+            clearThinking: true,
+          },
+          structuredOutputContract: "zai_json_object" as const,
+          ...(acceptsToolResultImages
+            ? { imageInputContract: "zai_flash" as const }
+            : {}),
+        }
+      : {}),
+    ...(isMinimax
+      ? {
+          // MiniMax inlines thinking in `content` behind think markers by
+          // default. reasoning_split moves it to reasoning_content, and the
+          // docs want thinking preserved unchanged in later turns, above all
+          // in tool-use conversations, so every same-route turn replays it
+          // (the Qwen and Kimi shape, not Z.AI's adjacent-only rule: a
+          // runtime reminder after a tool result must not drop the chain).
+          reasoningSplit: true,
+          replaysReasoningContent: true,
+          reasoningContentField: "reasoning_content" as const,
+          // Only M3 has the thinking switch; M2.x always think.
+          ...(isMinimaxM3
+            ? { thinkingConfig: { type: "adaptive" as const } }
+            : {}),
+        }
+      : {}),
+    ...(reasoningContentProvenance !== undefined
+      ? { reasoningContentProvenance }
+      : {}),
     acceptsStopSequences: slug !== "meta",
     acceptsServiceTier,
-    acceptsStreamUsage,
+    acceptsStreamUsage: isZai ? false : acceptsStreamUsage,
     requiresGrammarSafeToolSchemas,
     ...(outputTokensCeiling !== undefined ? { outputTokensCeiling } : {}),
     ...(reasoningSoftSwitchSuffix !== undefined

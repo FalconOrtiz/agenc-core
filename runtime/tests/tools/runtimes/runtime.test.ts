@@ -5,10 +5,12 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, normalize, resolve } from "node:path";
+import { basename, dirname, join, normalize, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test, vi } from "vitest";
 import {
@@ -28,6 +30,12 @@ import {
 } from "../system/file-edit.js";
 import { createFileWriteTool } from "../system/file-write.js";
 import { createPlanningTools } from "../system/planning.js";
+import {
+  clearAllPlanSlugs,
+  getPlanFilePath,
+  setPlanSlug,
+} from "../../planning/plan-files.js";
+import { resolveHomeContext } from "../../config/home.js";
 import { recordSessionRead } from "../system/filesystem.js";
 import { createWriteStdinTool } from "../system/write-stdin.js";
 import {
@@ -1022,6 +1030,117 @@ describe("tools/runtimes", () => {
     ).toThrow(/could not verify write targets/);
   });
 
+  test("workspace-write preflight admits only the active session plan file outside the workspace", () => {
+    const agencHome = mkdtempSync(join(tmpdir(), "agenc-runtime-plan-home-"));
+    const aliasRoot = mkdtempSync(join(tmpdir(), "agenc-runtime-plan-alias-"));
+    // A symlinked spelling of the home stands in for macOS, where the
+    // advertised `/tmp/...` plan path resolves under `/private/tmp`.
+    const aliasHome = join(aliasRoot, "home");
+    symlinkSync(agencHome, aliasHome, process.platform === "win32" ? "junction" : "dir");
+    try {
+      const sessionId = "runtime-plan-session";
+      setPlanSlug({ agencHome, sessionId }, "ivory-bridge-aaed0227");
+      const planPath = getPlanFilePath({ agencHome, sessionId });
+      const agentPlanPath = getPlanFilePath({ agencHome, sessionId, agentId: "agent-1" });
+      const plansDirectory = dirname(planPath);
+      expect(planPath.startsWith(resolve("/repo"))).toBe(false);
+      // The session's bound ConfigStore home is the plan-path authority.
+      const boundServices = {
+        ...TEST_RUNTIME_SERVICES,
+        configStore: {
+          homeContext: resolveHomeContext(
+            { AGENC_HOME: agencHome, HOME: agencHome },
+            { platformHome: agencHome },
+          ),
+        },
+      };
+
+      const mutatingTool: Tool = {
+        name: "Write",
+        description: "",
+        inputSchema: { type: "object" },
+        metadata: { mutating: true },
+        execute: async () => ({ content: "not reached" }),
+      };
+      const base = callContext("call-plan-preflight", EXCLUSIVE, false);
+      const attempt = (
+        args: Record<string, unknown>,
+        overrides: {
+          readonly conversationId?: string;
+          readonly sandboxMode?: "workspace_write" | "read_only";
+          readonly services?: typeof TEST_RUNTIME_SERVICES;
+        } = {},
+      ) => () =>
+        enforceRuntimeSandboxAttempt({
+          context: {
+            ...base,
+            approvalPolicy: "never",
+            requestedSandboxMode: overrides.sandboxMode ?? "workspace_write",
+            sandboxMode: overrides.sandboxMode ?? "workspace_write",
+            approvalResolved: false,
+            rawArgs: "{}",
+            invocation: {
+              session: {
+                ...("conversationId" in overrides
+                  ? { conversationId: overrides.conversationId }
+                  : { conversationId: sessionId }),
+                services: overrides.services ?? boundServices,
+              } as never,
+              turn: { cwd: "/repo" } as never,
+              tracker: tracker() as never,
+              callId: "call-plan-preflight",
+              toolName: { name: "Write" },
+              payload: { kind: "function", arguments: "{}" },
+              source: "direct",
+            } as const,
+          },
+          tool: mutatingTool,
+          args,
+        });
+
+      expect(attempt({ file_path: planPath })).not.toThrow();
+      expect(attempt({ file_path: agentPlanPath })).toThrow(/workspace_write blocked/);
+      expect(
+        attempt({ file_path: join(aliasHome, "plans", basename(planPath)) }),
+      ).not.toThrow();
+
+      const fallbackSessionId = "runtime-plan-fallback-session";
+      const fallbackPlanPath = getPlanFilePath({ sessionId: fallbackSessionId });
+      expect(
+        attempt(
+          { file_path: fallbackPlanPath },
+          { conversationId: fallbackSessionId, services: TEST_RUNTIME_SERVICES },
+        ),
+      ).toThrow(/workspace_write blocked/);
+
+      expect(attempt({ file_path: join(plansDirectory, "other-plan.md") })).toThrow(
+        /workspace_write blocked/,
+      );
+      expect(attempt({ file_path: join(plansDirectory, ".slugs.json") })).toThrow(
+        /workspace_write blocked/,
+      );
+      expect(
+        attempt({ file_path: join(plansDirectory, "nested", basename(planPath)) }),
+      ).toThrow(/workspace_write blocked/);
+
+      // A different session gets no carve-out for this plan, no session
+      // identity gets none at all, and read_only stays read-only.
+      expect(
+        attempt({ file_path: planPath }, { conversationId: "some-other-session" }),
+      ).toThrow(/workspace_write blocked/);
+      expect(attempt({ file_path: planPath }, { conversationId: undefined })).toThrow(
+        /workspace_write blocked/,
+      );
+      expect(attempt({ file_path: planPath }, { sandboxMode: "read_only" })).toThrow(
+        /read_only blocked/,
+      );
+    } finally {
+      clearAllPlanSlugs();
+      rmSync(aliasRoot, { recursive: true, force: true });
+      rmSync(agencHome, { recursive: true, force: true });
+    }
+  });
+
   test("virtualNoFsWrites tools bypass the indeterminate-target denial without weakening real writers", () => {
     const invocation = {
       session: { services: TEST_RUNTIME_SERVICES } as never,
@@ -1140,6 +1259,87 @@ describe("tools/runtimes", () => {
         args: { file_path: "/etc/passwd" },
       }),
     ).not.toThrow();
+  });
+
+  /** Direct-dispatch attempt context under /repo for a targetless tool call. */
+  function repoAttempt(callId: string, toolName: string) {
+    const invocation = {
+      session: { services: TEST_RUNTIME_SERVICES } as never,
+      turn: { cwd: "/repo" } as never,
+      tracker: tracker() as never,
+      callId,
+      toolName: { name: toolName },
+      payload: { kind: "function", arguments: "{}" },
+      source: "direct",
+    } as const;
+    const base = callContext(callId, EXCLUSIVE, false);
+    return (sandboxMode: "read_only" | "workspace_write") => ({
+      ...base,
+      approvalPolicy: "never" as const,
+      requestedSandboxMode: sandboxMode,
+      sandboxMode,
+      approvalResolved: false,
+      rawArgs: "{}",
+      invocation,
+    });
+  }
+
+  test("fixedWriteTargets are verified like path arguments instead of denied as unverifiable", () => {
+    const attempt = repoAttempt("call-fixed-write-targets", "ImagineImage");
+    const stub = (name: string, metadata: Tool["metadata"]): Tool => ({
+      name,
+      description: "",
+      inputSchema: { type: "object" },
+      metadata,
+      execute: async () => ({ content: "not reached" }),
+    });
+    const mediaTool = (outputDir: string): Tool =>
+      stub("ImagineImage", { mutating: true, fixedWriteTargets: () => [outputDir] });
+
+    // The declared output directory under the workspace is a verified write.
+    expect(() =>
+      enforceRuntimeSandboxAttempt({
+        context: attempt("workspace_write"),
+        tool: mediaTool("/repo/.agenc/imagine"),
+        args: { prompt: "a cat" },
+      }),
+    ).not.toThrow();
+
+    // A relative declaration resolves against the turn cwd.
+    expect(() =>
+      enforceRuntimeSandboxAttempt({
+        context: attempt("workspace_write"),
+        tool: mediaTool(".agenc/imagine"),
+        args: { prompt: "a cat" },
+      }),
+    ).not.toThrow();
+
+    // read_only still refuses the write.
+    expect(() =>
+      enforceRuntimeSandboxAttempt({
+        context: attempt("read_only"),
+        tool: mediaTool("/repo/.agenc/imagine"),
+        args: { prompt: "a cat" },
+      }),
+    ).toThrow(/read_only blocked write-capable operation ImagineImage/);
+
+    // A model-directed path into the protected .agenc directory stays denied.
+    expect(() =>
+      enforceRuntimeSandboxAttempt({
+        context: attempt("workspace_write"),
+        tool: stub("Write", { mutating: true }),
+        args: { file_path: "/repo/.agenc/config.toml", contents: "x" },
+      }),
+    ).toThrow(/blocked write outside workspace: \/repo\/\.agenc\/config\.toml/);
+
+    // A declaration outside the workspace is blocked as such, not hidden.
+    expect(() =>
+      enforceRuntimeSandboxAttempt({
+        context: attempt("workspace_write"),
+        tool: mediaTool("/elsewhere/.agenc/imagine"),
+        args: { prompt: "a cat" },
+      }),
+    ).toThrow(/blocked write outside workspace: \/elsewhere\/\.agenc\/imagine/);
   });
 
   test("real planning tools advertise virtualNoFsWrites while file writers do not", () => {

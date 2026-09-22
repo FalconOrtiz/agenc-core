@@ -1,6 +1,15 @@
-import type { LLMContentPart, LLMMessage } from "../llm/types.js";
+import type {
+  LLMContentPart,
+  LLMMessage,
+  ProviderReasoningReplay,
+} from "../llm/types.js";
 import { assertAgentInvocationChannelMessage } from "../contracts/agent-invocation-envelope.js";
 import { redactSecretsInValue } from "../secrets/index.js";
+import {
+  OMITTED_BINARY_CARRIER_TEXT,
+  omitAlteredBinaryCarriers,
+  validatedBinaryCarrierBody,
+} from "../llm/content-conversion.js";
 import type { ResponseItem } from "./rollout-item.js";
 import {
   deterministicToolResultId,
@@ -9,6 +18,8 @@ import {
   type ToolResultIntegrity,
   type ToolResultRepresentation,
 } from "./tool-result-integrity.js";
+
+import { isGrokEncryptedReplay, redactDurableSecrets } from "./provider-replay-redaction.js";
 
 type RolloutContentPart = Extract<
   ResponseItem["content"],
@@ -33,6 +44,29 @@ export function llmMessageToResponseItem(message: LLMMessage): ResponseItem {
       ? { toolCallId: message.toolCallId }
       : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
+    ...(message.providerReasoningContent !== undefined &&
+    message.providerReasoningContent.length > 0
+      ? {
+          providerReasoning: {
+            ...(message.providerReasoningProvenance !== undefined &&
+            typeof message.providerReasoningProvenance.provider === "string" &&
+            typeof message.providerReasoningProvenance.model === "string" &&
+            message.providerReasoningProvenance.provider.trim().length > 0 &&
+            message.providerReasoningProvenance.model.trim().length > 0
+              ? {
+                  version: 2 as const,
+                  provider: message.providerReasoningProvenance.provider
+                    .trim()
+                    .toLowerCase(),
+                  model: message.providerReasoningProvenance.model
+                    .trim()
+                    .toLowerCase(),
+                }
+              : { version: 1 as const }),
+            content: message.providerReasoningContent,
+          },
+        }
+      : {}),
     ...(message.phase !== undefined ? { phase: message.phase } : {}),
     ...(message.runtimeOnly?.toolResultIntegrity !== undefined
       ? { toolResultIntegrity: message.runtimeOnly.toolResultIntegrity }
@@ -90,7 +124,21 @@ export function llmMessageToReplacementResponseItem(
 export function responseItemToLlmMessage(item: ResponseItem): LLMMessage {
   const message: LLMMessage = {
     role: item.role,
-    content: cloneContent(item.content),
+    // A rollout written before binary carriers were protected can hold an
+    // already-damaged payload. Replaying it fails the next provider call, so a
+    // carrier that is no longer canonical is omitted on the way out. The
+    // durable record is not rewritten.
+    //
+    // A sealed tool result is left exactly as persisted: its integrity record
+    // covers these bytes, so omitting them here would leave a body the seal no
+    // longer verifies, and re-digesting would authenticate whatever the record
+    // now contains, including tampering. Such a result still replays broken and
+    // fails at the provider, which is the honest outcome for a seal we must not
+    // silently void.
+    content:
+      item.toolResultIntegrity === undefined
+        ? withoutBrokenBinaryCarriers(cloneContent(item.content))
+        : cloneContent(item.content),
     ...(item.toolCalls !== undefined
       ? {
           toolCalls: item.toolCalls.map((call) => ({
@@ -105,6 +153,24 @@ export function responseItemToLlmMessage(item: ResponseItem): LLMMessage {
       : {}),
     ...(item.toolCallId !== undefined ? { toolCallId: item.toolCallId } : {}),
     ...(item.toolName !== undefined ? { toolName: item.toolName } : {}),
+    ...(item.providerReasoning !== undefined &&
+    item.providerReasoning.content.length > 0
+      ? {
+          providerReasoningContent: item.providerReasoning.content,
+          ...(item.providerReasoning.version === 2 &&
+          typeof item.providerReasoning.provider === "string" &&
+          item.providerReasoning.provider.trim().length > 0 &&
+          typeof item.providerReasoning.model === "string" &&
+          item.providerReasoning.model.trim().length > 0
+            ? {
+                providerReasoningProvenance: {
+                  provider: item.providerReasoning.provider,
+                  model: item.providerReasoning.model,
+                },
+              }
+            : {}),
+        }
+      : {}),
     ...(item.toolResultIntegrity !== undefined ||
     item.agentInvocation !== undefined ||
     item.compactionHistory !== undefined
@@ -136,6 +202,13 @@ export function cloneLlmMessage(message: LLMMessage): LLMMessage {
     content: cloneContent(message.content),
     ...(message.toolCalls !== undefined
       ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
+      : {}),
+    ...(message.providerReasoningProvenance !== undefined
+      ? {
+          providerReasoningProvenance: {
+            ...message.providerReasoningProvenance,
+          },
+        }
       : {}),
     ...(message.runtimeOnly !== undefined
       ? { runtimeOnly: { ...message.runtimeOnly } }
@@ -209,15 +282,53 @@ function currentIntegrity(
   throw new Error(`cannot persist tool result: ${verification.failure.reason}`);
 }
 
+/**
+ * Only canonical Grok ciphertext is exempt from text redaction.
+ * True when durable persistence drops invalid Grok replay or other replay because secret
+ * redaction would alter it.
+ *
+ * The durable record then carries no replay while the caller's live message
+ * still does, so anything that projects a live message onto the canonical
+ * rollout has to apply the same drop or the two can never match. Keeping this
+ * rule in one place is the point: the writer dropping the replay while the
+ * compaction projection kept it is what made a redacted replay fail the pin
+ * check with "caller history is not an ordered projection of canonical active
+ * history".
+ *
+ * Redaction is context free (per-string patterns plus per-key names, none of
+ * which match `providerReasoning`, `content`, `provider`, `model` or
+ * `version`), so redacting the replay alone gives the same answer as reading
+ * it back off a whole-item redaction.
+ */
+export function durableRedactionDropsProviderReplay(
+  providerReasoning: ProviderReasoningReplay | undefined,
+): boolean {
+  if (providerReasoning === undefined) return false;
+  if (providerReasoning.version === 2 && providerReasoning.provider === "grok") {
+    if (!isGrokEncryptedReplay(providerReasoning)) return true;
+    const metadata = redactSecretsInValue({ provider: providerReasoning.provider, model: providerReasoning.model });
+    return metadata.provider !== providerReasoning.provider || metadata.model !== providerReasoning.model;
+  }
+  const redacted = redactSecretsInValue(providerReasoning);
+  return (
+    redacted?.content !== providerReasoning.content ||
+    redacted.version !== providerReasoning.version ||
+    (providerReasoning.version === 2 &&
+      (redacted.version !== 2 ||
+        redacted.provider !== providerReasoning.provider ||
+        redacted.model !== providerReasoning.model))
+  );
+}
+
 function redactResponseItemForPersistence(
   item: ResponseItem,
   integrity: ToolResultIntegrity | undefined,
   bodyMode: "authenticate" | "preserve",
 ): ResponseItem {
   const { toolResultIntegrity: _omittedIntegrity, ...unsealedItem } = item;
-  const redacted =
+  let redacted =
     unsealedItem.agentInvocation === undefined
-      ? (redactSecretsInValue(unsealedItem) as ResponseItem)
+      ? (redactDurableSecrets(unsealedItem, "response") as ResponseItem)
       : (() => {
           const {
             content,
@@ -225,7 +336,7 @@ function redactResponseItemForPersistence(
             ...untrustedUnauthenticatedFields
           } = unsealedItem;
           return {
-            ...(redactSecretsInValue(untrustedUnauthenticatedFields) as Omit<
+            ...(redactDurableSecrets(untrustedUnauthenticatedFields, "response") as Omit<
               ResponseItem,
               "content" | "agentInvocation"
             >),
@@ -233,6 +344,19 @@ function redactResponseItemForPersistence(
             agentInvocation,
           } as ResponseItem;
         })();
+  if (durableRedactionDropsProviderReplay(item.providerReasoning)) {
+    // The replay is opaque provider state: redacting it would corrupt what
+    // the provider gets back, and persisting it unredacted would write the
+    // matched secret into the rollout. Neither is acceptable, so the replay
+    // is dropped from the durable record and the message itself is kept.
+    // The cost is one lost replay on resume. Failing the turn here cost the
+    // whole task: DeepSeek V4 Pro reasoning that quoted a generated password
+    // or a long token-shaped string ended every such run with
+    // turn_execution_failed.
+    const { providerReasoning: _droppedReplay, ...withoutReplay } = redacted;
+    redacted = withoutReplay as ResponseItem;
+  }
+  redacted = withoutAlteredBinaryCarriers(item, redacted);
   assertResponseAgentInvocationItem(redacted);
   if (integrity === undefined) return redacted;
   if (redacted.role !== "tool" || redacted.toolCallId === undefined) {
@@ -268,6 +392,59 @@ function redactResponseItemForPersistence(
     }
   }
   return { ...redacted, toolResultIntegrity: durableIntegrity };
+}
+
+/**
+ * Secret redaction is text-oriented, and a long base64 payload can contain a
+ * run that matches a credential heuristic by chance: a Solana secret key is an
+ * unbroken 80-90 character base58 run, and base58 is a subset of the base64
+ * alphabet, so a large enough inline image will eventually contain one. Marking
+ * it rewrites bytes inside the payload, and the provider then rejects the whole
+ * request with "Invalid base64 data", losing the turn.
+ *
+ * Persisting the original is not acceptable either: the match may be a real
+ * secret. So a carrier whose validated binary redaction would alter is dropped
+ * and replaced with a text omission, exactly as an altered opaque replay is
+ * dropped. Only carriers that are canonical base64 to begin with are treated
+ * as binary, so plaintext wearing a `data:image/png;base64,` label stays
+ * redacted as text rather than passing through.
+ */
+/** Drop carriers already damaged on disk, so historical rollouts still replay. */
+function withoutBrokenBinaryCarriers(
+  content: LLMMessage["content"],
+): LLMMessage["content"] {
+  if (!Array.isArray(content)) return content;
+  const kept = content.map((part) => {
+    const record = part as unknown as Record<string, unknown>;
+    // Only inline payloads can be damaged by text redaction. A remote https
+    // image carries no bytes here, so it must survive untouched.
+    const image = record.image_url as Record<string, unknown> | undefined;
+    const source = record.source as Record<string, unknown> | undefined;
+    const isInline =
+      (record.type === "image_url" &&
+        typeof image?.url === "string" &&
+        image.url.startsWith("data:")) ||
+      (record.type === "document" &&
+        source?.type === "base64" &&
+        typeof source.data === "string");
+    if (!isInline) return part;
+    return validatedBinaryCarrierBody(part) === null
+      ? ({ type: "text", text: OMITTED_BINARY_CARRIER_TEXT } as typeof part)
+      : part;
+  });
+  return kept as LLMMessage["content"];
+}
+
+function withoutAlteredBinaryCarriers(
+  original: ResponseItem,
+  redacted: ResponseItem,
+): ResponseItem {
+  const { content, omitted } = omitAlteredBinaryCarriers(
+    original.content,
+    redacted.content,
+    (body) => redactSecretsInValue(body) !== body,
+  );
+  return omitted ? ({ ...redacted, content } as ResponseItem) : redacted;
 }
 
 function assertResponseAgentInvocationItem(item: ResponseItem): void {

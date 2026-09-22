@@ -21,6 +21,7 @@ import {
   digestWithDomain,
   sha256Hex,
 } from "./summary-v1.js";
+import { redactDurableSecrets } from "../../session/provider-replay-redaction.js";
 import { canonicalizeJson as canonicalizePayloadJson } from "../../eval-contract/canonical-json.js";
 
 const COMPACTION_ROLLOUT_ITEM_VERSION = 2;
@@ -33,7 +34,15 @@ export function createCompactionPayloadBundleV1(params: {
   readonly value: unknown;
   readonly itemCount: number;
 }): CompactionPayloadBundleV1 {
-  const canonicalJson = canonicalizePayloadJson(params.value);
+  // Every rollout line is secret-redacted as it is written. A payload chunk is
+  // content-addressed, so it is redacted here, before the bytes are counted
+  // and hashed, and the line encoder leaves chunk records alone. Hashing the
+  // raw value and redacting on the way to disk made every chunk that carried
+  // a secret fail its own digest on read: the commit failed and every later
+  // strict read of the session rejected the chunk (soak session, 2026-09-05).
+  const canonicalJson = canonicalizePayloadJson(
+    redactDurableSecrets(params.value, params.payloadKind === "replacement_history" || params.payloadKind === "source_history" ? "history" : "ordinary"),
+  );
   const canonicalBytes = Buffer.byteLength(canonicalJson, "utf8");
   if (canonicalBytes > MAX_COMPACTION_PAYLOAD_CANONICAL_UTF8_BYTES) {
     throw new CompactionTransactionError(

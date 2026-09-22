@@ -24,7 +24,10 @@ import type {
   ResponseItem,
   RolloutItem,
 } from "./rollout-item.js";
-import { isKnownRolloutType } from "./rollout-item.js";
+import {
+  isKnownRolloutType,
+  sessionStateUpdateAddressesSlot,
+} from "./rollout-item.js";
 import { agentInvocationGroupStartIndex } from "../contracts/agent-invocation-envelope.js";
 import {
   isUserTurnBoundary,
@@ -46,7 +49,7 @@ export type { ReductionReport } from "./reduction-report.js";
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * The state the reducer builds up. Mirrors the subset of agenc runtime
+ * The state the reducer builds up: the subset of
  * `SessionState` that rollout replay is responsible for. Full
  * SessionState (session.ts) is a superset — other fields are wired
  * outside replay (e.g. services DI, mailbox state).
@@ -56,7 +59,7 @@ export interface ReducedSessionState {
   history: ResponseItem[];
   /** Most-recent TurnContextItem emitted (turn baseline). */
   lastTurnContext?: TurnContextItem;
-  /** Cached agent task from the most recent session_state update. */
+  /** Cached agent task from the newest session_state update that addressed that slot. */
   agentTask?: unknown;
   /** Most-recent compaction boundary metadata. */
   lastCompaction?: CompactedItem;
@@ -135,6 +138,12 @@ export function reduce(
       };
 
     case "session_state":
+      // Writers persist one slot per item. An item that carries another
+      // slot (the memory-extraction cadence) says nothing about the agent
+      // task, so it must not read as a clear.
+      if (!sessionStateUpdateAddressesSlot(item.payload, "agentTask")) {
+        return { state, report: {} };
+      }
       return {
         state: { ...state, agentTask: item.payload.agentTask },
         report: {},
@@ -254,6 +263,11 @@ export function reduce(
 
       // Handle structural events that affect the reduced state.
       switch (innerType) {
+        case "history_cleared":
+          nextState.history = [];
+          delete nextState.lastCompaction;
+          delete nextState.lastTurnContext;
+          break;
         case "turn_context":
           nextState.lastTurnContext = (
             inner as unknown as { payload: TurnContextItem }
@@ -343,11 +357,10 @@ function authenticateLegacyCompactedHistory(
 }
 
 /**
- * Port of agenc runtime `History::drop_last_n_user_turns`
- * (`context_manager/history.rs:240-263`) + companion
- * `trim_pre_turn_context_updates` (`history.rs:428-456`).
+ * Drops the last `n` user turns from history and trims any contextual
+ * injections left dangling above the cut.
  *
- * AgenC semantics:
+ * Semantics:
  *   - a "user-turn boundary" is defined by `is_user_turn_boundary`
  *     (role==="user" with non-contextual content, OR role==="assistant"
  *     carrying an inter-agent-instruction payload). We delegate to the
@@ -367,7 +380,7 @@ function dropLastNUserTurns(
 ): { readonly history: ResponseItem[]; readonly clearedTurnContext: boolean } {
   if (n <= 0) return { history: [...history], clearedTurnContext: false };
 
-  // Collect user-turn boundary indices (agenc runtime `user_message_positions`).
+  // Collect user-turn boundary indices.
   const userPositions: number[] = [];
   for (let i = 0; i < history.length; i += 1) {
     const item = history[i];
@@ -387,7 +400,7 @@ function dropLastNUserTurns(
     cutIndex = userPositions[userPositions.length - n]!;
   }
 
-  // agenc runtime `trim_pre_turn_context_updates`: walk backward from the
+  // Trim pre-turn context updates: walk backward from the
   // cut, stripping contiguous contextual user-message injections
   // above the boundary. We stop at the first non-contextual item and
   // never cross `firstInstructionTurnIdx`.

@@ -1,7 +1,7 @@
 /**
  * runAgent — drive one subagent's run-turn loop.
  *
- * Hand-port of the donor subagent runner subset. Responsibilities:
+ * Responsibilities:
  *
  *   1. Build a child Session from the parent + fork context.
  *   2. Initialize MCP servers (30s wait, cancellable — I-50).
@@ -18,7 +18,17 @@
  */
 
 import { normalize } from "node:path";
+import { inheritBuiltinToolProvenance } from "../tools/builtin-provenance.js";
+import { filesystemRootsForDispatch } from "../tools/filesystem-dispatch-roots.js";
+import {
+  attachToolRuntimeContext,
+  readToolRuntimeContext,
+} from "../tools/runtimes/context.js";
+import { attachReadOnlyDelegationReadGuard } from "../permissions/readonly-read-guard.js";
 import { LRUCache } from "lru-cache";
+import { registerChildApprovalSession, revokeChildApprovalSession } from "./child-approval-context.js";
+import { bindLiveAgentSession } from "./live-session.js";
+import { createInertMcpManager } from "../mcp-client/inert-manager.js";
 import { createChildAbortController } from "../utils/abortController.js";
 import type {
   LLMChatOptions,
@@ -27,7 +37,6 @@ import type {
   LLMProvider,
   LLMProviderStartupPrewarmHandle,
   LLMProviderStartupPrewarmParams,
-  LLMTool,
   LLMUsage,
 } from "../llm/types.js";
 import { validateAgentInvocationMessageSequence } from "../contracts/agent-invocation-envelope.js";
@@ -42,7 +51,25 @@ import {
   readProviderIdentity,
 } from "../llm/provider.js";
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
+import {
+  isReadOnlyCoordinationTool,
+  readOnlyDelegationToolAvailable,
+  readOnlyDelegationToolRefusal,
+  readOnlyDelegationPathAllowed,
+  readOnlyDelegationDeniedReadPatterns,
+  READ_ONLY_DELEGATION_PROMPT,
+  type ReadOnlyDelegationConstraint,
+} from "./readonly-delegation.js";
+import {
+  attachReadOnlyInspectionInvocation,
+  inspectReadOnlyCommand,
+  prepareReadOnlyInspectionInvocation,
+} from "../permissions/readonly-inspection.js";
 import { DEFAULT_MAX_RESULT_SIZE_CHARS } from "../constants/toolLimits.js";
+import {
+  toRuntimeTools,
+  type RuntimeTool as AgentRuntimeTool,
+} from "../llm/runtime-tool-projection.js";
 import type {
   ToolRegistry,
   ToolDispatchResult,
@@ -55,7 +82,11 @@ import {
 import {
   withSignedAllowedRoots,
   withSignedSessionId,
+  signedSessionPlanFileArgs,
+  SESSION_PLAN_FILE_ARG,
+  SESSION_PLAN_FILE_SIG_ARG,
 } from "./_deps/filesystem-args.js";
+import { sessionFilesystemContext, sessionPlanFileAuthority } from "../planning/session-plan-authority.js";
 import {
   Session as ChildSession,
   type InterAgentCommunication as SessionInterAgentCommunication,
@@ -121,6 +152,8 @@ import { runAdmittedToolCall } from "../budget/admitted-tool-call.js";
 import { AdmissionDeniedError } from "../budget/admission-client.js";
 import type { AssistantOutputStreamSink } from "../contracts/assistant-output-stream.js";
 
+const inspectionBrokers = new WeakMap<Session, Map<string, SandboxExecutionBrokerLike>>();
+
 // ─────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────
@@ -154,6 +187,8 @@ export interface RunAgentParams {
    * enabled because silent internal agents can still perform admitted work.
    */
   readonly silent?: boolean;
+  /** Stop this maintenance child when a new human approval would be required. */
+  readonly deferInteractiveApprovals?: (toolName: string) => void;
   /** Captured once the child turn has the exact cache-safe request state. */
   readonly onCacheSafeParams?: (params: CacheSafeParams) => void;
   /**
@@ -169,6 +204,8 @@ export interface RunAgentParams {
   readonly taskId?: string;
   /** Exact commit captured at the start of this worktree-backed run. */
   readonly worktreeBaseCommit?: string;
+  /** Internal cleanup evidence, including receipts that cannot be persisted. */
+  readonly onWorktreeEvidence?: (evidence: WorktreeTurnEvidence) => void;
   /** Backpressured provider-delta sink for bounded workflow handoffs. */
   readonly finalMessageSink?: AssistantOutputStreamSink;
 }
@@ -656,14 +693,6 @@ interface AgentRunContext {
   readonly cwd?: string;
 }
 
-type AgentRuntimeTool = LLMTool & {
-  readonly name: string;
-  readonly description: string;
-  readonly inputJSONSchema: Record<string, unknown>;
-  readonly isMcp: boolean;
-  readonly maxResultSizeChars: number;
-};
-
 interface AgentModelContext {
   readonly model: string;
   readonly contextWindowTokens: number;
@@ -733,7 +762,10 @@ function buildAgentRunContext(
     sessionId: session.conversationId,
     options: {
       mainLoopModel: model.model,
-      tools: toAgentRuntimeTools(session.services.registry.toLLMTools()),
+      tools: toRuntimeTools(
+        session.services.registry.toLLMTools(),
+        DEFAULT_MAX_RESULT_SIZE_CHARS,
+      ),
       mcpClients: Array.isArray(surface.mcpClients) ? surface.mcpClients : [],
       contextWindowTokens: model.contextWindowTokens,
       ...(model.maxOutputTokens !== undefined
@@ -805,20 +837,6 @@ function toAgentModelContext(ctx: TurnContext): AgentModelContext {
       ? { maxOutputTokens: ctx.modelInfo.maxOutputTokens }
       : {}),
   };
-}
-
-function toAgentRuntimeTools(tools: readonly LLMTool[]): AgentRuntimeTool[] {
-  return tools.map((tool) => {
-    const name = tool.function.name;
-    return {
-      ...tool,
-      name,
-      description: tool.function.description,
-      inputJSONSchema: tool.function.parameters,
-      isMcp: name.startsWith("mcp__"),
-      maxResultSizeChars: DEFAULT_MAX_RESULT_SIZE_CHARS,
-    };
-  });
 }
 
 function firstNonEmpty(
@@ -1575,6 +1593,7 @@ interface ParentFollowupState {
   transientFailureCount: number;
   transientFailureWarningReported: boolean;
   lastAuthor: string;
+  readonly generation: number;
 }
 
 const followupTurnStateByParent = new WeakMap<Session, ParentFollowupState>();
@@ -1591,6 +1610,11 @@ function requestParentFollowupTurn(params: {
   readonly parent: Session;
 }): void {
   const parent = params.parent;
+  // The user stopped this session's last turn and has not spoken since: hold
+  // the receipt in the mailbox for the next user turn instead of starting a
+  // turn of our own, which would resume the very work the user stopped
+  // (#2236: an interrupted verifier's receipt restarted an 18-minute turn).
+  if (parent.stoppedByUserSinceLastPrompt === true) return;
   // Coalesce bursts of subagent completions into ONE parent turn. Each
   // completion notifies the parent's mailbox and then requests a follow-up
   // turn; without coalescing, N near-simultaneous completions queue N
@@ -1598,7 +1622,10 @@ function requestParentFollowupTurn(params: {
   // parent context. Defer the submit by a short window so clustered
   // completions drain together in a single turn.
   const existing = followupTurnStateByParent.get(parent);
-  if (existing !== undefined) {
+  if (existing !== undefined && existing.generation !== parent.userStopGeneration) {
+    if (existing.timer !== null) clearTimeout(existing.timer);
+    followupTurnStateByParent.delete(parent);
+  } else if (existing !== undefined) {
     existing.lastAuthor = params.live.agentPath;
     // Requests that arrive inside the coalescing window are already covered by
     // the pending submit, which drains the entire burst. Only a receipt that
@@ -1616,15 +1643,24 @@ function requestParentFollowupTurn(params: {
     transientFailureCount: 0,
     transientFailureWarningReported: false,
     lastAuthor: params.live.agentPath,
+    generation: parent.userStopGeneration,
   };
   const schedule = (delayMs = PARENT_FOLLOWUP_COALESCE_MS): void => {
     state.timer = setTimeout(() => {
       state.timer = null;
+      if (followupTurnStateByParent.get(parent) !== state) return;
+      // A stop that landed inside the coalescing window holds the burst too.
+      if (parent.stoppedByUserSinceLastPrompt === true || state.generation !== parent.userStopGeneration) {
+        followupTurnStateByParent.delete(parent);
+        return;
+      }
       state.submitInFlight = true;
       let transientSubmitFailure = false;
+      let suppressed = false;
       void parent
-        .submit("", { displayUserMessage: null })
-        .then(() => {
+        .submitChildFollowup(state.generation)
+        .then((admitted) => {
+          suppressed = !admitted;
           state.transientFailureCount = 0;
           state.transientFailureWarningReported = false;
         })
@@ -1650,7 +1686,8 @@ function requestParentFollowupTurn(params: {
         })
         .finally(() => {
           state.submitInFlight = false;
-          if (parent.abortController.signal.aborted) {
+          if (followupTurnStateByParent.get(parent) !== state) return;
+          if (parent.abortController.signal.aborted || suppressed || parent.stoppedByUserSinceLastPrompt || state.generation !== parent.userStopGeneration) {
             followupTurnStateByParent.delete(parent);
             return;
           }
@@ -2168,6 +2205,7 @@ export function buildFilteredRegistry(
   opts: {
     readonly allowlist?: ReadonlyArray<string>;
     readonly childConversationId: string;
+    readonly executionConstraint?: ReadOnlyDelegationConstraint;
     readonly worktree?: WorktreeHandle;
     readonly disabledTools?: ReadonlySet<string>;
     readonly childToolPolicy?: ChildToolPolicy;
@@ -2183,7 +2221,11 @@ export function buildFilteredRegistry(
   const mcpOriginToolNames = new Set(
     base.tools.filter(isMcpOriginTool).map((tool) => tool.name),
   );
+  const constrainedTools = opts.executionConstraint === undefined ? undefined : new Set(
+    base.tools.filter(readOnlyDelegationToolAvailable).map((tool) => tool.name),
+  );
   const isEligible = (name: string): boolean =>
+    (constrainedTools === undefined || constrainedTools.has(name)) &&
     !disabled.has(name) &&
     !mcpOriginToolNames.has(name) &&
     !isMcpWireToolName(name) &&
@@ -2192,11 +2234,6 @@ export function buildFilteredRegistry(
     .filter((tool) => isEligible(tool.name))
     .map((tool) => wrapToolForChild(tool, opts));
   const wrappedByName = new Map(wrappedTools.map((tool) => [tool.name, tool]));
-  const baseByName = new Map(
-    base.tools
-      .filter((tool) => isEligible(tool.name))
-      .map((tool) => [tool.name, tool]),
-  );
   const fallbackAdvertisedTools = () =>
     wrappedTools.map((tool) => ({
       type: "function" as const,
@@ -2266,13 +2303,17 @@ export function buildFilteredRegistry(
       const parsedArgs = stripModelSuppliedChildArgs(parseResult.args);
       const wrappedTool = wrappedByName.get(toolCall.name);
       if (wrappedTool) {
-        const baseTool = baseByName.get(toolCall.name);
-        if (baseTool === undefined) {
+        const binding = childToolBindings.get(wrappedTool);
+        if (binding === undefined) {
           throw new AdmissionDeniedError(
             "child_tool_admission_descriptor_unavailable",
           );
         }
-        const prepared = await prepareChildToolCall(baseTool, parsedArgs, opts);
+        const baseTool = binding.source;
+        const prepared = await prepareChildToolCall(baseTool, parsedArgs, {
+          ...opts,
+          ...(binding.policy !== undefined ? { childToolPolicy: binding.policy } : {}),
+        });
         if ("result" in prepared) return prepared.result;
         const session = opts.getSession?.() ?? null;
         if (session === null) {
@@ -2544,12 +2585,13 @@ function stripModelSuppliedChildArgs(
   return out;
 }
 
-function injectChildToolArgs(
+export function injectChildToolArgs(
   parsedArgs: Record<string, unknown>,
   toolName: string,
   opts: {
     readonly childConversationId: string;
     readonly worktree?: WorktreeHandle;
+    readonly getSession?: () => Session | null | undefined;
   },
 ): Record<string, unknown> {
   // NOTE: model-supplied `__agenc*` keys are stripped UPSTREAM
@@ -2568,20 +2610,78 @@ function injectChildToolArgs(
     parsedArgs,
     opts.childConversationId,
   );
+  const childSession = opts.getSession?.();
+  const filesystemContext = sessionFilesystemContext(childSession);
+  const owner = sessionPlanFileAuthority(childSession);
+  const planAuthority = owner?.sessionId === opts.childConversationId ? owner : null;
+  if (filesystemContext?.sessionId === opts.childConversationId) {
+    injectedArgs.__agencHome = filesystemContext.agencHome;
+  }
+  if (planAuthority !== null) {
+    Object.assign(injectedArgs, signedSessionPlanFileArgs(planAuthority));
+    injectedArgs.__agencHome = planAuthority.agencHome;
+  } else {
+    delete injectedArgs[SESSION_PLAN_FILE_ARG];
+    delete injectedArgs[SESSION_PLAN_FILE_SIG_ARG];
+  }
   if (opts.worktree?.path) {
     injectedArgs = withSignedAllowedRoots(injectedArgs, [opts.worktree.path]);
   }
-  if (
-    opts.worktree?.path &&
-    (toolName === "system.bash" ||
-      toolName === "exec_command" ||
-      toolName === "apply_patch") &&
-    (typeof injectedArgs.cwd !== "string" || injectedArgs.cwd.length === 0)
-  ) {
-    injectedArgs.cwd = opts.worktree.path;
-  }
-  return injectedArgs;
+  // A descendant without a new worktree still inherits its caller's cwd.
+  // Source tool closures may belong to the root registry, so fill defaults
+  // from the current Session rather than retaining an ancestor wrapper.
+  const executionCwd = opts.worktree?.path ?? childSession?.sessionConfiguration.cwd;
+  return withChildToolDefaultCwd(injectedArgs, toolName, executionCwd);
 }
+
+/** Path normalization only: permission review must not receive new authority. */
+function withChildToolDefaultCwd(
+  args: Record<string, unknown>,
+  toolName: string,
+  executionCwd: string | undefined,
+): Record<string, unknown> {
+  if (executionCwd) {
+    // Each tool names its working-directory field differently. exec_command
+    // takes `workdir` and rejects `cwd` as a removed alias, so injecting
+    // `cwd` there made every exec_command in a worktree child fail with a
+    // message that blamed the model for a field it never sent.
+    const field = WORKTREE_CWD_FIELD_BY_TOOL[toolName];
+    const value = field === undefined ? undefined : args[field];
+    const isSearch = toolName === "Glob" || toolName === "Grep";
+    // These file tools and Glob treat whitespace-only cwd as absent. Grep
+    // and Write treat it as a path, so preserve that explicit spelling.
+    const blankDefaultCwd =
+      (toolName === "Glob" || toolName === "FileRead" ||
+        toolName === "Edit" || toolName === "MultiEdit") &&
+      typeof value === "string" && value.trim().length === 0;
+    // Source closures retain the original registry root. Supply the current
+    // caller's default while preserving each tool's explicit input semantics.
+    const missingSearchCwd = value === undefined || value === null || value === "" ||
+      blankDefaultCwd;
+    if (
+      field !== undefined &&
+      (isSearch ? missingSearchCwd : typeof value !== "string" || value.length === 0 || blankDefaultCwd)
+    ) {
+      return { ...args, [field]: executionCwd };
+    }
+  }
+  return args;
+}
+
+const CHILD_FILE_CWD_TOOLS = new Set(["FileRead", "Write", "Edit", "MultiEdit"]);
+
+/** Tools pinned to the child's worktree, and the argument that carries it. */
+export const WORKTREE_CWD_FIELD_BY_TOOL: Readonly<Record<string, string>> = {
+  "system.bash": "cwd",
+  exec_command: "workdir",
+  apply_patch: "cwd",
+  Glob: "cwd",
+  Grep: "cwd",
+  FileRead: "cwd",
+  Write: "cwd",
+  Edit: "cwd",
+  MultiEdit: "cwd",
+};
 
 async function applyChildToolPolicy(
   tool: Pick<Tool, "name">,
@@ -2612,6 +2712,14 @@ async function applyChildToolPolicy(
   return { args: decision.updatedInput ?? args };
 }
 
+// Flatten only wrappers constructed here. Ancestor eligibility/visibility is
+// still evaluated by buildFilteredRegistry, and every inherited policy remains
+// in force; only identity and broker injection belong to the current child.
+const childToolBindings = new WeakMap<Tool, {
+  readonly source: Tool;
+  readonly policy?: ChildToolPolicy;
+}>();
+
 function wrapToolForChild(
   tool: Tool,
   opts: {
@@ -2619,17 +2727,101 @@ function wrapToolForChild(
     readonly worktree?: WorktreeHandle;
     readonly childToolPolicy?: ChildToolPolicy;
     readonly sandboxExecutionBroker?: SandboxExecutionBrokerLike;
+    readonly getSession?: () => Session | null | undefined;
   },
 ): Tool {
-  return {
-    ...tool,
+  const inherited = childToolBindings.get(tool);
+  const source = inherited?.source ?? tool;
+  const parentPolicy = inherited?.policy;
+  const currentPolicy = opts.childToolPolicy;
+  const policy: ChildToolPolicy | undefined = parentPolicy === undefined
+    ? currentPolicy : currentPolicy === undefined ? parentPolicy
+    : async (candidate, input) => {
+      // Preserve nested-wrapper order: ancestor restrictions must inspect
+      // input after the current child has normalized it.
+      const currentDecision = await currentPolicy(candidate, input);
+      return currentDecision.behavior === "deny" ? currentDecision
+        : parentPolicy(candidate, currentDecision.updatedInput ?? input);
+    };
+  const executionOpts = { ...opts, ...(policy !== undefined ? { childToolPolicy: policy } : {}) };
+  const wrapped = inheritBuiltinToolProvenance(source, {
+    ...source,
+    ...(policy !== undefined || (source.checkPermissions !== undefined && CHILD_FILE_CWD_TOOLS.has(source.name)) ? {
+      async checkPermissions(input, context) {
+        if (input === null || typeof input !== "object" || Array.isArray(input)) {
+          return { behavior: "deny" as const, message: "Child tool input must be an object" };
+        }
+        const sanitized = stripModelSuppliedChildArgs(input as Record<string, unknown>);
+        const decision = policy === undefined
+          ? { behavior: "allow" as const, updatedInput: sanitized }
+          : await policy(source, sanitized);
+        if (decision.behavior === "deny") {
+          return { behavior: "deny" as const, message: decision.message,
+            decisionReason: { type: "other" as const, reason: "child_tool_policy" } };
+        }
+        // Restriction runs before the interactive boundary. An allow here only
+        // narrows/normalizes input; the ordinary tool permission still decides.
+        const currentInput = decision.updatedInput ?? sanitized;
+        const reviewedInput = CHILD_FILE_CWD_TOOLS.has(source.name)
+          ? withChildToolDefaultCwd(
+              currentInput,
+              source.name,
+              opts.worktree?.path ?? opts.getSession?.()?.sessionConfiguration.cwd,
+            )
+          : currentInput;
+        const result = await source.checkPermissions?.(reviewedInput, context) ?? {
+          behavior: "passthrough" as const, updatedInput: reviewedInput,
+        };
+        // cwd is execution-only for file tools. The caller revalidates a
+        // permission rewrite against the public schema before execution.
+        // Preserve the hook's policy/grant updates, but do not publish the
+        // internal default; execution independently injects that same cwd.
+        if (reviewedInput !== currentInput && result.updatedInput !== undefined &&
+          result.updatedInput.cwd === reviewedInput.cwd) {
+          const updatedInput = { ...result.updatedInput };
+          if (Object.hasOwn(currentInput, "cwd")) updatedInput.cwd = currentInput.cwd;
+          else delete updatedInput.cwd;
+          return { ...result, updatedInput };
+        }
+        return result;
+      },
+    } : {}),
     async execute(args) {
-      const prepared = await prepareChildToolCall(tool, args, opts);
+      const prepared = await prepareChildToolCall(source, args, executionOpts);
       return "result" in prepared
         ? prepared.result
-        : tool.execute(prepared.args);
+        : source.execute(prepared.args);
     },
-  };
+  });
+  childToolBindings.set(wrapped, { source, ...(policy !== undefined ? { policy } : {}) });
+  return wrapped;
+}
+
+/**
+ * The parent's dispatcher hands file and search tools the directory they are
+ * about to touch, signed, whenever the session already allows it: an approval,
+ * a directory the user added, or the full bypass. Child tool calls never pass
+ * through that dispatcher, so a subagent under the same bypass with
+ * `--add-dir /` was still refused on every path outside its workspace
+ * ("Access denied: Path is outside allowed directories" on Glob /tmp while the
+ * parent session searched the same directory freely). Apply the same rule
+ * here, from the parent-owned permission context the child session shares.
+ * Runs before the non-enumerable runtime context is attached: the widening
+ * returns a copy of the args.
+ */
+function widenChildFilesystemRoots(
+  toolName: string,
+  args: Record<string, unknown>,
+  childSession: Session | null | undefined,
+): Record<string, unknown> {
+  const sandboxPolicy = childSession?.sessionConfiguration?.sandboxPolicy?.value;
+  return filesystemRootsForDispatch(toolName, args, {
+    approvalResolved: false,
+    ...(typeof sandboxPolicy === "string" ? { sandboxMode: sandboxPolicy } : {}),
+    ...(childSession !== undefined && childSession !== null
+      ? { session: childSession }
+      : {}),
+  });
 }
 
 async function prepareChildToolCall(
@@ -2640,6 +2832,7 @@ async function prepareChildToolCall(
     readonly worktree?: WorktreeHandle;
     readonly childToolPolicy?: ChildToolPolicy;
     readonly sandboxExecutionBroker?: SandboxExecutionBrokerLike;
+    readonly getSession?: () => Session | null | undefined;
   },
 ): Promise<
   | { readonly args: Record<string, unknown> }
@@ -2647,16 +2840,64 @@ async function prepareChildToolCall(
 > {
   // SECURITY: strip model-supplied `__agenc*` keys before the child
   // policy/injection runs (idempotent if the caller already stripped).
+  const runtimeContext = readToolRuntimeContext(args);
   const sanitizedArgs = stripModelSuppliedChildArgs(args);
+  const childSession = opts.getSession?.();
+  if (childSession !== undefined && childSession !== null) {
+    const refusal = readOnlyDelegationToolRefusal(childSession, tool, sanitizedArgs);
+    if (refusal !== undefined) {
+      return { result: { content: safeStringify({ error: refusal }), isError: true, metadata: { childPolicyDenied: true } } };
+    }
+  }
   const policyResult = await applyChildToolPolicy(tool, sanitizedArgs, opts);
   if ("result" in policyResult) return policyResult;
-  const childArgs = injectChildToolArgs(policyResult.args, tool.name, opts);
+  if (childSession !== undefined && childSession !== null) {
+    const refusal = readOnlyDelegationToolRefusal(childSession, tool, policyResult.args);
+    if (refusal !== undefined) {
+      return { result: { content: safeStringify({ error: refusal }), isError: true, metadata: { childPolicyDenied: true } } };
+    }
+  }
+  const childArgs = widenChildFilesystemRoots(
+    tool.name,
+    injectChildToolArgs(policyResult.args, tool.name, opts),
+    childSession,
+  );
+  // Policy replacement and signed child-argument copies omit non-enumerable
+  // fields. Preserve the authenticated per-attempt grant, not model-provided
+  // private keys, so the execution sink does not fall back to the base sandbox.
+  if (runtimeContext !== undefined) {
+    attachToolRuntimeContext(childArgs, runtimeContext);
+  }
+  if (childSession?.services.readOnlyDelegation !== undefined) {
+    attachReadOnlyDelegationReadGuard(childArgs, (target) => readOnlyDelegationPathAllowed(childSession, target));
+  }
   if (opts.sandboxExecutionBroker !== undefined) {
     attachSandboxExecutionBroker(
       childArgs,
       opts.sandboxExecutionBroker,
       "child_agent",
     );
+  }
+  if (childSession?.services.readOnlyDelegation !== undefined && !isReadOnlyCoordinationTool(tool)) {
+    let brokers = inspectionBrokers.get(childSession);
+    const deniedReadPatterns = readOnlyDelegationDeniedReadPatterns(childSession);
+    const authorityKey = JSON.stringify([deniedReadPatterns, opts.sandboxExecutionBroker?.executionAuthority?.()]);
+    let broker = brokers?.get(authorityKey);
+    if (broker === undefined && opts.sandboxExecutionBroker !== undefined) {
+      broker = opts.sandboxExecutionBroker.forkForReadOnlyInspection?.(childSession.sessionConfiguration.cwd, deniedReadPatterns);
+      if (broker === undefined) throw new Error("Read-only inspection requires a sandbox broker that can narrow execution authority");
+      brokers ??= new Map();
+      brokers.set(authorityKey, broker);
+      inspectionBrokers.set(childSession, brokers);
+    }
+    if (broker !== undefined) attachSandboxExecutionBroker(childArgs, broker, "child_agent");
+    if (tool.name !== "exec_command" && tool.name !== "system.bash") return { args: childArgs };
+    const inspected = inspectReadOnlyCommand(tool.name, childArgs, childSession.sessionConfiguration.cwd);
+    if (!inspected.allowed) return { result: { content: safeStringify({ error: inspected.reason }), isError: true, metadata: { childPolicyDenied: true } } };
+    if (broker === undefined) throw new Error("Read-only inspection requires a sandbox broker that can narrow execution authority");
+    const runtimeSandbox = broker.runtimeSandbox("child_agent");
+    if (runtimeSandbox === undefined) throw new Error("Read-only inspection requires platform isolation");
+    attachReadOnlyInspectionInvocation(childArgs, prepareReadOnlyInspectionInvocation(inspected.invocation, runtimeSandbox));
   }
   return { args: childArgs };
 }
@@ -2871,18 +3112,6 @@ function terminalResultForLiveAgent(live: LiveAgent): ChildRunTerminalResult {
   }
 }
 
-function createInertChildMcpManager(): Session["services"]["mcpManager"] {
-  return {
-    effectiveServers: async () => new Map(),
-    toolPluginProvenance: async () => null,
-    getTools: () => [],
-    getToolsByServer: () => [],
-    getConfiguredServers: () => [],
-    getConnectedServers: () => [],
-    isConnected: () => false,
-  };
-}
-
 function prepareChildSessionAuthority(
   params: RunAgentParams,
 ): ChildSessionAuthority {
@@ -2931,6 +3160,7 @@ function buildChildSession(
   }
   let childSession: ChildSession | undefined;
   const registry = buildFilteredRegistry(params.parent.services.registry, {
+    ...(params.live.metadata.executionConstraint !== undefined ? { executionConstraint: params.live.metadata.executionConstraint } : {}),
     allowlist:
       params.toolAllowlist ?? params.live.role.config.allowlist ?? undefined,
     childConversationId: params.live.agentId,
@@ -2951,6 +3181,7 @@ function buildChildSession(
 
   childSession = new ChildSession({
     conversationId: params.live.agentId,
+    fileReadScope: params.parent.fileReadScope,
     roleWorkspace: params.parent.roleWorkspace,
     // A worktree changes execution cwd, never the role trust domain or its
     // canonical executable catalog. Clone the complete parent envelope so a
@@ -2977,6 +3208,7 @@ function buildChildSession(
     mcpManagerOwnership: "borrowed",
     services: {
       ...params.parent.services,
+      readOnlyDelegation: params.live.metadata.executionConstraint,
       provider,
       // A provider service is session-owned. Do not let the parent's service
       // survive the spread above and silently override the forked provider in
@@ -3005,7 +3237,7 @@ function buildChildSession(
       // A child has no independently owned MCP transport in this path. Never
       // retain the parent's manager or its live tool closures under a forked
       // sandbox authority; refresh is deliberately inert and local.
-      mcpManager: createInertChildMcpManager(),
+      mcpManager: createInertMcpManager(),
       lspManager: undefined,
       ...(sandboxExecutionBroker !== undefined
         ? { sandboxExecutionBroker }
@@ -3014,6 +3246,12 @@ function buildChildSession(
       // lets a child consume or clear the parent's provider resources.
       startupPrewarm: undefined,
       querySource: params.querySource ?? params.parent.services.querySource,
+      ...(params.deferInteractiveApprovals !== undefined ? {
+        deferInteractiveApprovals: (toolName: string) => {
+          params.deferInteractiveApprovals!(toolName);
+          childSession?.abortController.abort("background maintenance requires approval");
+        },
+      } : {}),
       // Permission mode is parent-owned live authority. Sharing the registry
       // keeps persistent children from retaining a more permissive spawn-time
       // snapshot after the parent downgrades the session.
@@ -3054,6 +3292,7 @@ function buildChildSession(
     }
   }
 
+  registerChildApprovalSession(childSession, params.parent);
   return childSession;
 }
 
@@ -3067,6 +3306,7 @@ export async function* runAgent(
   params: RunAgentParams,
 ): AsyncGenerator<RunAgentProgressEvent, RunAgentResult, void> {
   const startedAt = Date.now();
+  let revokeLiveSession: (() => void) | undefined;
   let turnId: string = crypto.randomUUID();
   const { live, parent } = params;
   let childSession: ChildSession | null = null;
@@ -3177,21 +3417,13 @@ export async function* runAgent(
     options: { readonly deferParentNotification?: boolean } = {},
   ): Promise<boolean> => {
     if (currentTurnReceiptCommitted) return false;
-    if (childSession === null) {
-      // Session construction has not reached the child-owned EventLog yet.
-      // Reserve this exactly-once outcome; finally() writes it into the
-      // minimal child journal before sealing run_terminal and only then
-      // projects the correlated parent receipt.
-      pendingPreconstructionReceipt = receipt;
-      currentTurnReceiptCommitted = true;
-      return true;
-    }
     let receiptToCommit = receipt;
     if (params.worktree !== undefined) {
       let evidence: WorktreeTurnEvidence;
       if (
         currentWorktreeBaseCommit !== undefined &&
-        childSandboxExecutionBroker !== undefined
+        childSandboxExecutionBroker !== undefined &&
+        childSession !== null
       ) {
         evidence = await captureWorktreeTurnEvidence({
           locator: {
@@ -3211,12 +3443,26 @@ export async function* runAgent(
             gitRoot: params.worktree.gitRoot,
           },
           error:
-            currentWorktreeBaseCommit === undefined
-              ? "turn-start base commit is unavailable"
-              : "worktree sandbox authority is unavailable",
+            childSession === null
+              ? "child session is unavailable for worktree evidence"
+              : currentWorktreeBaseCommit === undefined
+                ? "turn-start base commit is unavailable"
+                : "worktree sandbox authority is unavailable",
         };
       }
       receiptToCommit = { ...receipt, worktreeEvidence: evidence };
+      // Cleanup must observe evidence on every exit path, independently of
+      // progress events or whether this receipt can reach durable storage.
+      params.onWorktreeEvidence?.(evidence);
+    }
+    if (childSession === null) {
+      // Session construction has not reached the child-owned EventLog yet.
+      // Reserve this exactly-once outcome; finally() writes it into the
+      // minimal child journal before sealing run_terminal and only then
+      // projects the correlated parent receipt.
+      pendingPreconstructionReceipt = receiptToCommit;
+      currentTurnReceiptCommitted = true;
+      return true;
     }
     try {
       childSession.emit(
@@ -3364,6 +3610,11 @@ export async function* runAgent(
       once: true,
     });
   }
+  // Abort events are not replayed for listeners registered after cancellation.
+  // Observe the initial state before MCP readiness or any provider dispatch.
+  if (parent.abortController.signal.aborted) onParentAbort();
+  if (live.abortController.signal.aborted) onLiveAbort();
+  if (params.externalSignal?.aborted) onExternalAbort?.();
 
   try {
     relayAgentEvent({
@@ -3571,6 +3822,7 @@ export async function* runAgent(
       childAuthority,
       terminalResultForPendingWorker,
     );
+    revokeLiveSession = bindLiveAgentSession(live, childSession);
     const {
       history,
       userMessage,
@@ -3685,6 +3937,8 @@ export async function* runAgent(
         | "error"
         | "empty_response"
         | "no_progress"
+        | "effect_review_required"
+        | "deadline_reached"
         | "compact_failed" = "completed";
       let terminalError: unknown;
 
@@ -3708,9 +3962,14 @@ export async function* runAgent(
         ...(firstTurn && userMessageRuntimeOnly !== undefined
           ? { seedUserMessageRuntimeOnly: userMessageRuntimeOnly }
           : {}),
-        ...(live.role.config.systemPrompt
+        ...(live.role.config.systemPrompt || live.metadata.executionConstraint !== undefined
           ? {
-              systemPrompt: live.role.config.systemPrompt,
+              systemPrompt: [
+                live.role.config.systemPrompt,
+                live.metadata.executionConstraint !== undefined
+                  ? READ_ONLY_DELEGATION_PROMPT
+                  : undefined,
+              ].filter(Boolean).join("\n\n"),
               systemPromptTrust: "workspace_role" as const,
             }
           : {}),
@@ -3823,12 +4082,7 @@ export async function* runAgent(
 
         if (event.type === "turn_complete") {
           turnAssistantText = event.content;
-          // Child-agent turns do not carry an Editor interaction. Fail closed
-          // if that invariant is ever violated instead of making a worker
-          // session silently recoverable on a root-only stop reason.
-          stopReason = event.stopReason === "editor_request_failed"
-            ? "error"
-            : event.stopReason;
+          stopReason = event.stopReason;
           turnUsage = event.usage;
         }
       }
@@ -3862,13 +4116,17 @@ export async function* runAgent(
         stopReason === "max_turns" ||
         stopReason === "max_budget_usd" ||
         stopReason === "no_progress" ||
-        stopReason === "compact_failed";
+        stopReason === "effect_review_required" ||
+        stopReason === "deadline_reached" ||
+        stopReason === "compact_failed" ||
+        stopReason === "empty_response";
       // A bounded stop in a keep-alive (interactive) run is a per-turn
       // outcome: the backstop's message already reached the transcript,
       // and the user must be able to keep prompting. Ending the run here
       // bricked the whole session after one capped turn. One-shot agents
       // keep failing the run — there is nobody left to continue them.
-      if (stopReason === "error" || (boundedStop && !params.keepAlive)) {
+      let turnFailureMessage: string | undefined;
+      if (stopReason === "error" || boundedStop) {
         let message: string;
         if (stopReason === "max_turns") {
           message = `subagent exceeded maxTurns${params.maxTurns !== undefined ? ` (${params.maxTurns})` : ""}`;
@@ -3878,11 +4136,18 @@ export async function* runAgent(
           message =
             assistantText ||
             "subagent stopped by the no-progress backstop (semantic non-termination)";
+        } else if (stopReason === "deadline_reached") {
+          message = "subagent stopped because the run reached its deadline";
+        } else if (stopReason === "effect_review_required") {
+          message =
+            assistantText ||
+            "subagent stopped because a tool effect has an unknown outcome and needs operator review";
         } else if (stopReason === "compact_failed") {
           message =
             (terminalError instanceof Error ? terminalError.message : undefined) ||
-            assistantText ||
             "subagent stopped because compaction could not shrink the context";
+        } else if (stopReason === "empty_response") {
+          message = "subagent returned no assistant output after a retry";
         } else if (terminalError instanceof Error) {
           message = terminalError.message;
         } else if (typeof terminalError === "string") {
@@ -3890,6 +4155,10 @@ export async function* runAgent(
         } else {
           message = assistantText || "subagent turn failed";
         }
+        turnFailureMessage = message;
+      }
+      if (stopReason === "error" || (boundedStop && !params.keepAlive)) {
+        const message = turnFailureMessage ?? "subagent turn failed";
         const result = await finishErroredRun({
           message,
           error:
@@ -3963,7 +4232,8 @@ export async function* runAgent(
         const completedTaskId = currentTaskId;
         const receipt: TaskTurnReceipt = {
           ...taskCorrelation(),
-          outcome: "completed",
+          outcome: boundedStop ? "errored" : "completed",
+          ...(turnFailureMessage !== undefined ? { reason: turnFailureMessage } : {}),
           ...(assistantText ? { message: assistantText } : {}),
           toolCallCount: turnToolCallCount,
         };
@@ -3996,11 +4266,13 @@ export async function* runAgent(
         }
         if (reuseBlockedReason === undefined) {
           live.status.markIdle(completedTurnId);
-          pendingWorkerTerminal = {
-            status: "completed",
-            turnId: completedTurnId,
-            ...(assistantText ? { message: assistantText } : {}),
-          };
+          pendingWorkerTerminal = turnFailureMessage !== undefined
+            ? { status: "errored", turnId: completedTurnId, error: turnFailureMessage }
+            : {
+                status: "completed",
+                turnId: completedTurnId,
+                ...(assistantText ? { message: assistantText } : {}),
+              };
           // The completed receipt owns the previous correlation. While parked,
           // teardown is a worker-lifecycle event, not a second task outcome.
           currentTaskId = undefined;
@@ -4014,7 +4286,9 @@ export async function* runAgent(
           kind: "turn_complete",
           turnId: completedTurnId,
           ...(completedTaskId !== undefined ? { taskId: completedTaskId } : {}),
-          ...(assistantText ? { finalMessage: assistantText } : {}),
+          ...(turnFailureMessage !== undefined
+            ? { finalMessage: turnFailureMessage }
+            : assistantText ? { finalMessage: assistantText } : {}),
           toolCallCount: turnToolCallCount,
           ...(params.worktree !== undefined
             ? {
@@ -4074,6 +4348,22 @@ export async function* runAgent(
       pendingWorkerTerminal?.status === "completed"
         ? pendingWorkerTerminal
         : undefined;
+    if (
+      params.keepAlive &&
+      currentTaskId === undefined &&
+      currentTurnReceiptCommitted &&
+      pendingWorkerTerminal?.status === "errored"
+    ) {
+      const message = pendingWorkerTerminal.error;
+      yield { kind: "run_error", error: message, ...taskCorrelation() };
+      return {
+        threadId: live.agentId,
+        durationMs: Date.now() - startedAt,
+        outcome: "errored",
+        error: new Error(message),
+        toolCallCount,
+      };
+    }
     if (merged.signal.aborted && parkedCompletion === undefined) {
       const reason = String(merged.signal.reason ?? "aborted");
       if (!currentTurnReceiptCommitted) {
@@ -4222,6 +4512,7 @@ export async function* runAgent(
     return result;
   } finally {
     let taskReceiptFinalizeError: unknown;
+    revokeLiveSession?.();
     const acceptedNotStarted =
       live.assignment?.state === "accepted" ? live.assignment : undefined;
     if (acceptedNotStarted !== undefined && childSession !== null) {
@@ -4260,6 +4551,7 @@ export async function* runAgent(
     }
     if (childSession !== null) {
       try {
+        revokeChildApprovalSession(childSession);
         await childSession.shutdown();
       } catch (error) {
         durableCloseError = error;
@@ -4318,6 +4610,17 @@ export async function* runAgent(
         await disposeSandboxExecutionBroker(childSandboxExecutionBroker);
       } catch (error) {
         cleanupErrors.push(error);
+      }
+    }
+    const childInspectionBrokers = childSession === null ? undefined : inspectionBrokers.get(childSession);
+    if (childInspectionBrokers !== undefined) {
+      inspectionBrokers.delete(childSession!);
+      for (const inspectionBroker of childInspectionBrokers.values()) {
+        try {
+          await disposeSandboxExecutionBroker(inspectionBroker);
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
       }
     }
     if (ownedChildProvider !== null) {

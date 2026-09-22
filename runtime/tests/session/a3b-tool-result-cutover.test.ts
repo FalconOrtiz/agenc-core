@@ -498,6 +498,7 @@ describe("A3b shared ID-paired validator cutover", () => {
       store.appendRollout({ type: "response_item", payload: tool });
     }).not.toThrow();
     store.flushDurable();
+    expect(store.liveHistoryBlockedReason()).toBeUndefined();
 
     expect(() =>
       store.appendRollout(
@@ -533,6 +534,11 @@ describe("A3b shared ID-paired validator cutover", () => {
         }),
       }),
     );
+    // Once the live validator has closed, the store says why, in the words the
+    // rejected append used, so a turn can be refused before it opens.
+    expect(store.liveHistoryBlockedReason()).toMatch(
+      /^tool-pair history rejected during live append: /,
+    );
 
     store.close();
 
@@ -555,6 +561,7 @@ describe("A3b shared ID-paired validator cutover", () => {
         content: "next result",
       }),
     };
+    expect(restarted.liveHistoryBlockedReason()).toBeUndefined();
     expect(() => {
       restarted.appendRollout({
         type: "response_item",
@@ -588,10 +595,6 @@ describe("A3b atomic legacy publication", () => {
       originator: "a3b-test",
       agencVersion: "0.13.0",
     } as const;
-    const seed = openRollout({ sessionId, meta });
-    const rolloutPath = seed.rolloutPath;
-    seed.close();
-
     const legacyItems: RolloutItem[] = [
       {
         type: "session_meta",
@@ -600,25 +603,17 @@ describe("A3b atomic legacy publication", () => {
       ...loadFixture("legacy-v1-tool-result-a.jsonl"),
     ];
     const legacyBytes = legacyItems.map(serializeRolloutItem).join("");
-    rewriteAtomically(rolloutPath, legacyBytes);
-
-    const crashed = new RolloutStore({
-      cwd,
-      sessionId,
-      agencVersion: "0.13.0",
-      sessionTempRoot: tmpdir(),
-      resume: true,
-      autoStartScheduler: false,
-      beforeCheckpointUpgradePublishForTestingOnly: () => {
-        throw new Error("simulated upgrade crash");
-      },
-    });
-    expect(() => crashed.open(meta)).toThrow("simulated upgrade crash");
-    expect(readFileSync(rolloutPath, "utf8")).toBe(legacyBytes);
-    expect(existsSync(`${rolloutPath}.tmp`)).toBe(false);
-
-    const upgraded = openRollout({ sessionId, meta, resume: true });
-    const upgradedItems = upgraded.readAll();
+    const crash = new Error("simulated upgrade crash");
+    const { upgradedItems, upgradedBytes, checkpointOffset } =
+      exerciseCheckpointUpgrade({
+        meta,
+        sourceBytes: legacyBytes,
+        beforeCheckpointUpgradePublishForTestingOnly: () => {
+          throw crash;
+        },
+        expectedCrash: crash,
+        checkpointSequence: 2,
+      });
     expect(
       upgradedItems
         .filter((item) => item.type === "session_meta")
@@ -648,8 +643,6 @@ describe("A3b atomic legacy publication", () => {
     ).toMatchObject({
       payload: { toolResultIntegrity: { version: 1, runId: sessionId } },
     });
-    const upgradedBytes = readFileSync(rolloutPath, "utf8");
-    const checkpointOffset = upgraded.store.getByteOffsetForSeq(2);
     expect(checkpointOffset).toBeTypeOf("number");
     const checkpointLine = upgradedBytes
       .slice(checkpointOffset)
@@ -658,166 +651,73 @@ describe("A3b atomic legacy publication", () => {
       type: "event_msg",
       payload: { seq: 2 },
     });
-    upgraded.close();
-
-    const restarted = openRollout({ sessionId, meta, resume: true });
-    expect(readFileSync(rolloutPath, "utf8")).toBe(upgradedBytes);
-    restarted.close();
   });
 
-  it("leaves schema v3 byte-identical on a pre-publish crash and publishes schema v5 once", () => {
-    const sessionId = "atomic-schema3-upgrade-session";
-    const meta = {
-      sessionId,
-      timestamp: "2026-08-31T00:00:00.000Z",
-      cwd,
-      originator: "a3b-test",
-      agencVersion: "0.17.0",
-    } as const;
-    const seed = openRollout({ sessionId, meta });
-    const rolloutPath = seed.rolloutPath;
-    seed.close();
-
-    const schema3Items: RolloutItem[] = [
-      {
-        type: "session_meta",
-        payload: { ...meta, rolloutSchemaVersion: 3 },
-      },
-      ...v2OrphanRollout("schema3-turn", []).map((item) =>
-        item.type === "event_msg"
-          ? {
-              ...item,
-              payload: {
-                ...item.payload,
-                eventId: `event:${item.payload.seq}`,
-              },
-            }
-          : item,
-      ),
-    ];
-    const schema3Bytes = schema3Items.map(serializeRolloutItem).join("");
-    rewriteAtomically(rolloutPath, schema3Bytes);
-
-    const crashed = new RolloutStore({
-      cwd,
-      sessionId,
-      agencVersion: "0.17.0",
-      sessionTempRoot: tmpdir(),
-      resume: true,
-      autoStartScheduler: false,
-      beforeCheckpointUpgradePublishForTestingOnly: () => {
-        throw new Error("simulated schema3 upgrade crash");
-      },
-    });
-    expect(() => crashed.open(meta)).toThrow("simulated schema3 upgrade crash");
-    expect(readFileSync(rolloutPath, "utf8")).toBe(schema3Bytes);
-    expect(existsSync(`${rolloutPath}.tmp`)).toBe(false);
-
-    const upgraded = openRollout({ sessionId, meta, resume: true });
-    expect(upgraded.readAll()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
+  it.each([
+    { schemaVersion: 3, checkpointVersion: 2, orphanRollout: v2OrphanRollout },
+    { schemaVersion: 4, checkpointVersion: 3, orphanRollout: v3OrphanRollout },
+  ])(
+    "leaves schema v$schemaVersion byte-identical on a pre-publish crash and publishes schema v5 once",
+    ({ schemaVersion, checkpointVersion, orphanRollout }) => {
+      const sessionId = `atomic-schema${schemaVersion}-upgrade-session`;
+      const meta = {
+        sessionId,
+        timestamp: "2026-08-31T00:00:00.000Z",
+        cwd,
+        originator: "a3b-test",
+        agencVersion: "0.17.0",
+      } as const;
+      const sourceItems: RolloutItem[] = [
+        {
           type: "session_meta",
-          payload: expect.objectContaining({ rolloutSchemaVersion: 5 }),
-        }),
-        expect.objectContaining({
-          type: "event_msg",
-          payload: expect.objectContaining({
-            msg: expect.objectContaining({
-              type: "turn_checkpoint",
-              payload: expect.objectContaining({
-                checkpointVersion: 4,
-                prefixHashVersion: 3,
+          payload: { ...meta, rolloutSchemaVersion: schemaVersion },
+        },
+        ...orphanRollout(`schema${schemaVersion}-turn`, []).map((item) =>
+          item.type === "event_msg"
+            ? {
+                ...item,
+                payload: {
+                  ...item.payload,
+                  eventId: `event:${item.payload.seq}`,
+                },
+              }
+            : item,
+        ),
+      ];
+      const sourceBytes = sourceItems.map(serializeRolloutItem).join("");
+      expect(sourceBytes).toContain(`"rolloutSchemaVersion":${schemaVersion}`);
+      expect(sourceBytes).toContain(`"checkpointVersion":${checkpointVersion}`);
+      const crash = new Error(`simulated schema${schemaVersion} upgrade crash`);
+      const { upgradedItems } = exerciseCheckpointUpgrade({
+        meta,
+        sourceBytes,
+        beforeCheckpointUpgradePublishForTestingOnly: () => {
+          throw crash;
+        },
+        expectedCrash: crash,
+      });
+      expect(upgradedItems).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "session_meta",
+            payload: expect.objectContaining({ rolloutSchemaVersion: 5 }),
+          }),
+          expect.objectContaining({
+            type: "event_msg",
+            payload: expect.objectContaining({
+              msg: expect.objectContaining({
+                type: "turn_checkpoint",
+                payload: expect.objectContaining({
+                  checkpointVersion: 4,
+                  prefixHashVersion: 3,
+                }),
               }),
             }),
           }),
-        }),
-      ]),
-    );
-    const upgradedBytes = readFileSync(rolloutPath, "utf8");
-    upgraded.close();
-
-    const restarted = openRollout({ sessionId, meta, resume: true });
-    expect(readFileSync(rolloutPath, "utf8")).toBe(upgradedBytes);
-    restarted.close();
-  });
-
-  it("keeps schema v4 checkpoint v3 readable and upgrades it atomically once", () => {
-    const sessionId = "atomic-schema4-upgrade-session";
-    const meta = {
-      sessionId,
-      timestamp: "2026-08-31T00:00:00.000Z",
-      cwd,
-      originator: "a3b-test",
-      agencVersion: "0.17.0",
-    } as const;
-    const seed = openRollout({ sessionId, meta });
-    const rolloutPath = seed.rolloutPath;
-    seed.close();
-
-    const schema4Items: RolloutItem[] = [
-      {
-        type: "session_meta",
-        payload: { ...meta, rolloutSchemaVersion: 4 },
-      },
-      ...v3OrphanRollout("schema4-turn", []).map((item) =>
-        item.type === "event_msg"
-          ? {
-              ...item,
-              payload: {
-                ...item.payload,
-                eventId: `event:${item.payload.seq}`,
-              },
-            }
-          : item,
-      ),
-    ];
-    const schema4Bytes = schema4Items.map(serializeRolloutItem).join("");
-    rewriteAtomically(rolloutPath, schema4Bytes);
-
-    const crashed = new RolloutStore({
-      cwd,
-      sessionId,
-      agencVersion: "0.17.0",
-      sessionTempRoot: tmpdir(),
-      resume: true,
-      autoStartScheduler: false,
-      beforeCheckpointUpgradePublishForTestingOnly: () => {
-        throw new Error("simulated schema4 upgrade crash");
-      },
-    });
-    expect(() => crashed.open(meta)).toThrow("simulated schema4 upgrade crash");
-    expect(readFileSync(rolloutPath, "utf8")).toBe(schema4Bytes);
-    expect(existsSync(`${rolloutPath}.tmp`)).toBe(false);
-
-    const upgraded = openRollout({ sessionId, meta, resume: true });
-    expect(upgraded.readAll()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "session_meta",
-          payload: expect.objectContaining({ rolloutSchemaVersion: 5 }),
-        }),
-        expect.objectContaining({
-          type: "event_msg",
-          payload: expect.objectContaining({
-            msg: expect.objectContaining({
-              type: "turn_checkpoint",
-              payload: expect.objectContaining({
-                checkpointVersion: 4,
-                prefixHashVersion: 3,
-              }),
-            }),
-          }),
-        }),
-      ]),
-    );
-    const upgradedBytes = readFileSync(rolloutPath, "utf8");
-    upgraded.close();
-
-    const restarted = openRollout({ sessionId, meta, resume: true });
-    expect(readFileSync(rolloutPath, "utf8")).toBe(upgradedBytes);
-    restarted.close();
-  });
+        ]),
+      );
+    },
+  );
 
   it("rejects checkpoint v2 inside rollout schema v4 without rewriting it", () => {
     const sessionId = "mixed-schema4-session";
@@ -1066,6 +966,60 @@ function expectResumeLeaseAvailable(rolloutPath: string, turnId: string): void {
   const lease = new SessionLock(`${rolloutPath}.resume-${turnId}.lock`);
   expect(() => lease.acquire()).not.toThrow();
   lease.release();
+}
+
+function exerciseCheckpointUpgrade(params: {
+  readonly meta: Parameters<typeof openRollout>[0]["meta"];
+  readonly sourceBytes: string;
+  readonly beforeCheckpointUpgradePublishForTestingOnly: () => void;
+  readonly expectedCrash: Error;
+  readonly checkpointSequence?: number;
+}) {
+  const withStore = <Result>(
+    options: { resume: boolean; beforePublish?: () => void },
+    read: (store: RolloutStore) => Result,
+  ): Result => {
+    const store = new RolloutStore({
+      cwd: params.meta.cwd,
+      sessionId: params.meta.sessionId,
+      agencVersion: params.meta.agencVersion,
+      sessionTempRoot: tmpdir(),
+      resume: options.resume,
+      autoStartScheduler: false,
+      beforeCheckpointUpgradePublishForTestingOnly: options.beforePublish,
+    });
+    try {
+      store.open(params.meta);
+      return read(store);
+    } finally {
+      store.close();
+    }
+  };
+  const rolloutPath = withStore({ resume: false }, (store) => store.rolloutPath);
+  rewriteAtomically(rolloutPath, params.sourceBytes);
+  expect(() =>
+    withStore(
+      {
+        resume: true,
+        beforePublish: params.beforeCheckpointUpgradePublishForTestingOnly,
+      },
+      () => undefined,
+    ),
+  ).toThrow(params.expectedCrash);
+  expect(readFileSync(rolloutPath, "utf8")).toBe(params.sourceBytes);
+  expect(existsSync(`${rolloutPath}.tmp`)).toBe(false);
+
+  const upgraded = withStore({ resume: true }, (store) => ({
+    upgradedItems: store.readAll(),
+    upgradedBytes: readFileSync(rolloutPath, "utf8"),
+    checkpointOffset: params.checkpointSequence === undefined
+      ? undefined
+      : store.store.getByteOffsetForSeq(params.checkpointSequence),
+  }));
+  withStore({ resume: true }, () => {
+    expect(readFileSync(rolloutPath, "utf8")).toBe(upgraded.upgradedBytes);
+  });
+  return upgraded;
 }
 
 function openRollout(params: {

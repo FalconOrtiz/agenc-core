@@ -10,6 +10,15 @@ import { isRemovedLiveToolName } from "./tool-names.js";
 export interface UnattendedPermissionPolicy {
   readonly allowlist: readonly string[];
   readonly denylist: readonly string[];
+  /**
+   * Proceed alone on read-only work, refuse the rest outright.
+   *
+   * Set only for a run with nobody attached to answer an approval, where the
+   * default `pause` has no answer and parks the run forever. It never widens
+   * anything: it turns pause into allow for the narrow set decided in
+   * `read-only-grant.ts`, and into deny for everything else.
+   */
+  readonly readOnly: boolean;
 }
 
 export type UnattendedPermissionDecision =
@@ -66,6 +75,7 @@ export function createUnattendedPermissionPolicy(
   opts: {
     readonly allowlist?: readonly string[];
     readonly denylist?: readonly string[];
+    readonly readOnly?: boolean;
   } = {},
 ): UnattendedPermissionPolicy {
   return Object.freeze({
@@ -74,6 +84,7 @@ export function createUnattendedPermissionPolicy(
       DEFAULT_UNATTENDED_ALLOWLIST,
     ),
     denylist: normalizeUnattendedToolList(opts.denylist),
+    readOnly: opts.readOnly === true,
   });
 }
 
@@ -88,14 +99,17 @@ export function applyUnattendedPermissionPolicyToContext(
   opts: {
     readonly allowlist?: readonly string[];
     readonly denylist?: readonly string[];
+    readonly readOnly?: boolean;
   } = {},
 ): ToolPermissionContext {
   // Preserve modes the user explicitly opted into. The user chose
   // bypassPermissions (--dangerously-bypass-approvals-and-sandbox), plan (--permission-mode plan / EnterPlanMode),
   // or acceptEdits (--permission-mode acceptEdits / approving a plan with
-  // auto-accept); the background-agent-runner's default unattended-policy
-  // install — which runs on every startAgent/restoreAgent because the daemon
-  // always forces --autonomous — MUST NOT override those.
+  // auto-accept); the background-agent-runner's unattended-policy install —
+  // which runs on every startAgent/restoreAgent that carries an allowlist,
+  // a denylist, or the routine read-only grant — MUST NOT override those.
+  // A run without any of these keeps its mode: the runner does not call
+  // this at all, so a `default` TUI or print-mode session stays `default`.
   //
   // Without this guard, every daemon session with an explicit mode had it
   // silently rewritten to "unattended": with --dangerously-bypass-approvals-and-sandbox the evaluator's unattended

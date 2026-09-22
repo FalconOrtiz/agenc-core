@@ -146,7 +146,7 @@ export const effortCommand: SlashCommand = {
       }
 
       await updateSettingsForSource("userSettings", {
-        reasoning_effort: effortValueToReasoningEffort(level),
+        reasoning_effort: effortValueToReasoningEffort(level, available),
       });
       ctx.appState?.setAppState?.((prev: unknown) => ({
         ...(prev as Record<string, unknown>),

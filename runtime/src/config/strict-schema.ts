@@ -278,12 +278,54 @@ function validateDurableTurns(value: unknown): void {
   }
 }
 
+function validateCompletionGate(value: unknown): void {
+  if (value === undefined) return;
+  const field = "completion_gate";
+  const record = requirePlainObject(value, field);
+  rejectUnknownFields(record, new Set(["mode", "max_rounds"]), field);
+  optionalEnum(record.mode, `${field}.mode`, ["auto", "always", "never"]);
+  optionalPositiveInteger(record.max_rounds, `${field}.max_rounds`);
+  if (typeof record.max_rounds === "number" && record.max_rounds > 10) {
+    throw new InvalidStrictConfigError(`${field}.max_rounds`, "exceeds the maximum of 10 rounds");
+  }
+}
+
+function validateGoal(value: unknown): void {
+  if (value === undefined) return;
+  const field = "goal";
+  const record = requirePlainObject(value, field);
+  rejectUnknownFields(
+    record,
+    new Set(["max_rounds", "stall_rounds", "judge_model", "verify_timeout_ms"]),
+    field,
+  );
+  optionalPositiveInteger(record.max_rounds, `${field}.max_rounds`);
+  if (typeof record.max_rounds === "number" && record.max_rounds > 100) {
+    throw new InvalidStrictConfigError(`${field}.max_rounds`, "exceeds the maximum of 100 rounds");
+  }
+  optionalPositiveInteger(record.stall_rounds, `${field}.stall_rounds`);
+  optionalString(record.judge_model, `${field}.judge_model`);
+  optionalPositiveInteger(record.verify_timeout_ms, `${field}.verify_timeout_ms`);
+}
+
+function validateCompaction(value: unknown): void {
+  if (value === undefined) return;
+  const field = "compaction";
+  const record = requirePlainObject(value, field);
+  rejectUnknownFields(record, new Set(["emergency_mode"]), field);
+  optionalEnum(record.emergency_mode, `${field}.emergency_mode`, ["always", "never"]);
+}
+
 function validateDaemon(value: unknown): void {
   if (value === undefined) return;
   const field = "daemon";
   const record = requirePlainObject(value, field);
-  rejectUnknownFields(record, new Set(["autostart"]), field);
+  rejectUnknownFields(record, new Set(["autostart", "agent_stop_timeout_ms"]), field);
   optionalBoolean(record.autostart, `${field}.autostart`);
+  optionalPositiveInteger(record.agent_stop_timeout_ms, `${field}.agent_stop_timeout_ms`);
+  if (typeof record.agent_stop_timeout_ms === "number" && record.agent_stop_timeout_ms > 2_147_483_647) {
+    throw new InvalidStrictConfigError(`${field}.agent_stop_timeout_ms`, "exceeds the maximum timer interval");
+  }
 }
 
 function validateGateway(value: unknown): void {
@@ -550,7 +592,7 @@ const ROOT_FIELD_VALIDATORS = {
   sandbox_mode: enumValidator("sandbox_mode", ["read-only", "workspace-write", "danger-full-access"]),
   sandbox: delegatedObjectValidator("sandbox"),
   shell_environment_policy: validateShellEnvironmentPolicy,
-  reasoning_effort: enumValidator("reasoning_effort", ["minimal", "low", "medium", "high", "xhigh", "none"]),
+  reasoning_effort: enumValidator("reasoning_effort", ["minimal", "low", "medium", "high", "xhigh", "max", "none"]),
   reasoning_summary: enumValidator("reasoning_summary", ["auto", "concise", "detailed", "none"]),
   approvals_reviewer: enumValidator("approvals_reviewer", ["user", "auto_review"]),
   model_verbosity: enumValidator("model_verbosity", ["low", "medium", "high"]),
@@ -580,7 +622,6 @@ const ROOT_FIELD_VALIDATORS = {
   statusLine: delegatedObjectValidator("statusLine"),
   outputStyle: fieldValidator("outputStyle", optionalString),
   attachments: validateAttachments,
-  buffer: delegatedObjectValidator("buffer"),
   tui: delegatedObjectValidator("tui"),
   autoFix: delegatedObjectValidator("autoFix"),
   fileSuggestion: delegatedObjectValidator("fileSuggestion"),
@@ -634,7 +675,12 @@ const ROOT_FIELD_VALIDATORS = {
   pluginTrustMessage: fieldValidator("pluginTrustMessage", optionalString),
   agent: delegatedObjectValidator("agent"),
   durableTurns: validateDurableTurns,
+  completion_gate: validateCompletionGate,
+  goal: validateGoal,
+  compaction: validateCompaction,
   stream_watchdog_timeout_ms: fieldValidator("stream_watchdog_timeout_ms", optionalNonNegativeInteger),
+  provider_outage_wait_ms: fieldValidator("provider_outage_wait_ms", optionalNonNegativeInteger),
+  provider_outage_retry_ms: fieldValidator("provider_outage_retry_ms", optionalPositiveInteger),
   max_output_tokens: fieldValidator("max_output_tokens", optionalPositiveInteger),
   capped_default_max_output_tokens: fieldValidator("capped_default_max_output_tokens", optionalBoolean),
   max_turns: fieldValidator("max_turns", optionalPositiveInteger),

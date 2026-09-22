@@ -31,8 +31,14 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars */
 
-import { dirname, isAbsolute, resolve } from "node:path";
+import { isWorkflowApprovalSession } from "../../permissions/approval-failure.js";
+import {
+  filesystemRootsForDispatch,
+  type FilesystemRootSessionLike,
+} from "../../tools/filesystem-dispatch-roots.js";
 import type { LLMToolCall } from "../../llm/types.js";
+import { signedSessionPlanFileArgs } from "../../agents/_deps/filesystem-args.js";
+import { sessionPlanFileAuthority } from "../../planning/session-plan-authority.js";
 import {
   getPlan,
   getPlanFilePath,
@@ -82,7 +88,6 @@ import {
   SESSION_AGENC_HOME_ARG,
   SESSION_ID_SIG_ARG,
   signSessionId,
-  withSignedAllowedRoots,
 } from "../../tools/system/filesystem.js";
 import {
   routerFromRegistry as realRouterFromRegistry,
@@ -111,42 +116,6 @@ interface ToolRegistryLike {
   dispatch(toolCall: LLMToolCall): Promise<ToolDispatchResultLike>;
 }
 
-const APPROVED_FILE_PATH_TOOLS = new Set([
-  "FileRead",
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit",
-]);
-
-function approvedFilePathForTool(
-  toolName: string,
-  args: Record<string, unknown>,
-): string | null {
-  if (!APPROVED_FILE_PATH_TOOLS.has(toolName)) return null;
-  const filePath = args["file_path"];
-  return typeof filePath === "string" && filePath.trim().length > 0
-    ? filePath
-    : null;
-}
-
-function withApprovedFilesystemRoot(
-  toolName: string,
-  args: Record<string, unknown>,
-): Record<string, unknown> {
-  const filePath = approvedFilePathForTool(toolName, args);
-  if (filePath === null) return args;
-
-  const cwd =
-    typeof args["cwd"] === "string" && args["cwd"].trim().length > 0
-      ? args["cwd"]
-      : process.cwd();
-  const resolvedPath = isAbsolute(filePath)
-    ? filePath
-    : resolve(cwd, filePath);
-  const approvedRoot = dirname(resolvedPath);
-  return withSignedAllowedRoots(args, [approvedRoot]);
-}
 
 // ─────────────────────────────────────────────────────────────────────
 // Re-exports (back-compat with previous stub surface)
@@ -450,7 +419,7 @@ function withPlanApprovalPreview(
   };
 }
 
-function approvalRejectedResult(err: ApprovalRejectedError): ToolDispatchResultLike {
+function approvalRejectedResult(err: ApprovalRejectedError, session?: object): ToolDispatchResultLike {
   const decision = reviewDecisionOpaqueString(err.decision);
   return {
     content: JSON.stringify({
@@ -458,7 +427,19 @@ function approvalRejectedResult(err: ApprovalRejectedError): ToolDispatchResultL
       approvalDecision: decision,
     }),
     isError: true,
-    ...(approvalDenialEndsTurn(err) ? { preventContinuation: true } : {}),
+    metadata: {
+      approvalFailure: {
+        decision: err.decision.kind,
+        source: err.source ?? "policy",
+        ...(err.decision.kind === "denied" && err.decision.reason !== undefined
+          ? { reason: err.decision.reason }
+          : {}),
+      },
+      ...(approvalDenialEndsTurn(err) ? { approvalDenied: true } : {}),
+    },
+    ...(approvalDenialEndsTurn(err) || isWorkflowApprovalSession(session)
+      ? { preventContinuation: true }
+      : {}),
   };
 }
 
@@ -540,8 +521,8 @@ export class StreamingToolExecutor {
 
     this.tools.push(tracked);
 
-    // Upstream agenc runtime does not surface routing classification as transcript
-    // warnings. Keep this path quiet; real failures are emitted where they
+    // Routing classification is not surfaced as a transcript warning.
+    // Keep this path quiet; real failures are emitted where they
     // happen (permission denial, hook errors, dispatch errors).
   }
 
@@ -937,7 +918,7 @@ export class StreamingToolExecutor {
                 message: `approval required for ${ctx.toolName} but no resolver is wired`,
               });
             },
-            dispatch: async (_sandbox, dispatchContext) => {
+            dispatch: async (sandbox, dispatchContext) => {
               if (tool.cancelBeforeDispatch) {
                 return buildTerminalToolResult({
                   toolCall: tool.toolCall,
@@ -963,9 +944,15 @@ export class StreamingToolExecutor {
                 sessionWithId.conversationId.length > 0
                   ? sessionWithId.conversationId
                   : null;
-              const dispatchArgs = dispatchContext.approvalResolved
-                ? withApprovedFilesystemRoot(tool.toolCall.name, effectiveArgs)
-                : effectiveArgs;
+              const dispatchArgs = filesystemRootsForDispatch(
+                tool.toolCall.name,
+                effectiveArgs,
+                {
+                  approvalResolved: dispatchContext.approvalResolved,
+                  sandboxMode: sandbox,
+                  session: session as FilesystemRootSessionLike | undefined,
+                },
+              );
               const dispatchCall: LLMToolCall = {
                 ...tool.toolCall,
                 // Re-stringify so the registry sees the (possibly)
@@ -975,6 +962,7 @@ export class StreamingToolExecutor {
                 arguments: JSON.stringify(dispatchArgs),
               };
               return dispatchWithInjectedArgs(this.registry, dispatchCall, {
+                ...signedSessionPlanFileArgs(sessionPlanFileAuthority(session)),
                 __onProgress: onProgress,
                 __abortSignal: this.abortSignal,
                 __callId: tool.toolCall.id,
@@ -991,15 +979,12 @@ export class StreamingToolExecutor {
             },
           });
         } catch (err) {
-          dispatchResult = {
-            content:
-              err instanceof ApprovalRejectedError
-                ? approvalRejectedResult(err).content
-                : err instanceof Error
-                  ? err.message
-                  : String(err),
-            isError: true,
-          };
+          dispatchResult = err instanceof ApprovalRejectedError
+            ? approvalRejectedResult(err, this.liveOptions?.session)
+            : {
+                content: err instanceof Error ? err.message : String(err),
+                isError: true,
+              };
         }
       }
 

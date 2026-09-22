@@ -1,18 +1,20 @@
 /**
  * Tool payload conversion for provider wire requests.
  *
- * Ports the TypeScript reference runtime's provider-tool shaping onto AgenC's
- * `LLMTool` catalog. The source runtime builds provider payloads from
- * prompt-derived tool descriptions; AgenC receives those descriptions on
- * `LLMTool.function.description` and preserves them across every wire format.
+ * Shapes AgenC's `LLMTool` catalog into provider payloads. Tool
+ * descriptions arrive on `LLMTool.function.description` and are preserved
+ * across every wire format.
  *
- * Shape differences from the reference runtime:
+ * Design notes:
  *   - AgenC's registry already exposes provider-ready JSON schemas, so this
  *     layer only normalizes provider envelopes and does not rebuild schemas.
  */
 
 import type { LLMTool } from "../types.js";
-import { encodeMcpToolNameForWire } from "./mcp-tool-naming.js";
+import {
+  createProviderToolNameWireLookup,
+  encodeMcpToolNameForWire,
+} from "./mcp-tool-naming.js";
 import { normalizeToolParamSchema } from "../../utils/toolParamSchema.js";
 
 type FunctionTool = {
@@ -155,6 +157,9 @@ export function toChatCompletionsTools(
   tools: readonly LLMTool[],
   opts?: { readonly grammarSafe?: boolean },
 ): FunctionTool[] {
+  createProviderToolNameWireLookup(
+    tools.map((tool) => tool.function.name),
+  );
   return tools.map((tool) => ({
     type: "function",
     function: {
@@ -173,6 +178,9 @@ export function toChatCompletionsTools(
 export function toOpenAIResponsesTools(
   tools: readonly LLMTool[],
 ): FlatFunctionTool[] {
+  createProviderToolNameWireLookup(
+    tools.map((tool) => tool.function.name),
+  );
   return tools.map((tool) => ({
     type: "function",
     name: toolName(tool),
@@ -190,6 +198,9 @@ export function toXaiResponsesTools(
 export function toAnthropicTools(
   tools: readonly LLMTool[],
 ): AnthropicTool[] {
+  createProviderToolNameWireLookup(
+    tools.map((tool) => tool.function.name),
+  );
   return tools.map((tool) => ({
     name: toolName(tool),
     description: toolDescription(tool),

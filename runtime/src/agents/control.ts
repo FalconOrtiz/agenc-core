@@ -1,7 +1,7 @@
 /**
  * AgentControl — subagent lifecycle + control plane.
  *
- * Port of reference runtime `core/src/agent/control.rs` (1,214 LOC). Covers: full
+ * Covers: full
  * lifecycle (spawn/interrupt/shutdown/resume), parent→child message
  * routing (assign_task / send_message / inter-agent communication),
  * metadata + subtree queries (list_agents / subtree descendants /
@@ -18,7 +18,6 @@
  *
  * Invariants wired:
  *   I-1  (MAX_AGENT_DEPTH=1) — spawn rejects `childDepth > cap`.
- *        Matches reference runtime's `DEFAULT_AGENT_MAX_DEPTH=1`.
  *   I-5  (bidirectional mailbox) — routing methods (assign_task /
  *        append_message / IAC / interrupt) go through the child's
  *        `downInbox` with `direction: 'down'`.
@@ -33,6 +32,7 @@
  */
 
 import { emitError, emitWarning } from "../session/event-log.js";
+import { childReadOnlyDelegation, normalizeReadOnlyDelegationConstraint } from "./readonly-delegation.js";
 import type { LLMMessage, LLMUsage } from "../llm/types.js";
 import { assertAgentInvocationChannelMessage } from "../contracts/agent-invocation-envelope.js";
 import type { ThreadSpawnEdgeStatus } from "../session/rollout-store.js";
@@ -244,22 +244,19 @@ export function isStrictAgentPathAncestor(
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Fork-mode + spawn option types (reference runtime `SpawnAgentForkMode` /
-// `SpawnAgentOptions`; `control.rs:46-55`).
+// Fork-mode + spawn option types
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Port of reference runtime `SpawnAgentForkMode` (`control.rs:46`). AgenC's
- * fork-context module owns the richer `ForkMode` used by delegate.ts;
- * this enum matches the narrower reference runtime spawn-entry shape.
+ * Fork mode accepted at the spawn entry point. AgenC's fork-context
+ * module owns the richer `ForkMode` used by delegate.ts; this enum is
+ * the narrower spawn-entry shape.
  */
 export type SpawnAgentForkMode =
   | { readonly kind: "full_history" }
   | { readonly kind: "last_n_turns"; readonly n: number };
 
-/**
- * Port of reference runtime `SpawnAgentOptions` (`control.rs:52`).
- */
+/** Options accepted by `spawnAgentWithMetadata`. */
 export interface SpawnAgentOptions {
   readonly threadId?: ThreadId;
   readonly roleName?: string;
@@ -276,13 +273,25 @@ export interface SpawnAgentOptions {
   readonly forkMode?: SpawnAgentForkMode;
 }
 
-/**
- * Port of reference runtime `ListedAgent` (`control.rs:64`).
- */
+/** One row returned by `listAgents`. */
 export interface ListedAgent {
   readonly agentName: string;
   readonly agentStatus: AgentStatus;
   readonly lastTaskMessage?: string;
+}
+
+/** Current native workers under one parent; closed handles are absent. */
+export interface NativeWorkerSnapshot {
+  readonly agentId: string;
+  readonly agentPath: string;
+  readonly nickname: string;
+  readonly role: string;
+  readonly prompt?: string;
+  readonly status: AgentStatus["status"];
+  readonly error?: string;
+  readonly toolUseCount: number;
+  readonly tokenCount: number;
+  readonly timing?: import("./status.js").NativeWorkerTiming;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -302,7 +311,7 @@ export interface LiveAgent {
   readonly downInbox: Mailbox;
   /** Per-agent AbortController — triggered by `interrupt()`. */
   readonly abortController: AbortController;
-  /** Cached metadata snapshot at spawn time (reference runtime `LiveAgent.metadata`). */
+  /** Cached metadata snapshot at spawn time. */
   readonly metadata: AgentMetadata;
   /** Live child transcript, updated by the child run loop. */
   readonly messages: LLMMessage[];
@@ -369,7 +378,7 @@ export class AgentControl {
   private readonly live = new Map<ThreadId, LiveAgent>();
   /** Cancellation tokens scoped to parents — I-32. */
   private readonly parentTokens = new Map<AgentPath, AbortController>();
-  /** Registered session-root thread id (reference runtime `register_session_root`). */
+  /** Registered session-root thread id (see `registerSessionRoot`). */
   private rootThreadId: ThreadId | undefined;
   /** Parent linkage: childId → parentId (for open_thread_spawn_children
    *  and subtree cascade, since we have no state-db in-tree yet). */
@@ -418,7 +427,7 @@ export class AgentControl {
   assertAgentMetadataRoleWorkspace(
     metadata: Pick<
       AgentMetadata,
-      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint"
+      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint" | "executionConstraint"
     >,
   ): string {
     const normalized = normalizeAgentRoleMetadata(metadata);
@@ -433,7 +442,7 @@ export class AgentControl {
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `spawn_agent_internal` (control.rs:~310).
+   * Spawn a child agent under `parentPath`.
    *
    * Lifecycle:
    *   1. I-1 depth check.
@@ -463,7 +472,7 @@ export class AgentControl {
     /** Fail-closed role identity for restart/rehydration spawns. */
     readonly expectedRoleProvenance?: Pick<
       AgentMetadata,
-      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint"
+      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint" | "executionConstraint"
     >;
   }): Promise<LiveAgent> {
     if (this.threadManager) {
@@ -484,7 +493,7 @@ export class AgentControl {
     readonly capacityOwnerId?: string;
     readonly expectedRoleProvenance?: Pick<
       AgentMetadata,
-      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint"
+      "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint" | "executionConstraint"
     >;
   }): Promise<LiveAgent> {
     const parentDepth = depthOfAgentPath(opts.parentPath);
@@ -516,6 +525,17 @@ export class AgentControl {
     const baseChildConfig = getChildBaseConfig(this.session) ?? {};
     void applyRoleToConfig(role, baseChildConfig);
     const roleFingerprint = this.roleCatalog.fingerprint(role);
+    const parentMetadata = this.registry.agentMetadataForThread(
+      this.registry.agentIdForPath(opts.parentPath) ?? this.session.conversationId,
+    );
+    const restoredConstraint = normalizeReadOnlyDelegationConstraint(
+      opts.expectedRoleProvenance?.executionConstraint,
+    );
+    const executionConstraint = childReadOnlyDelegation(
+      this.session,
+      role,
+      restoredConstraint ?? parentMetadata?.executionConstraint,
+    );
     if (
       expectedRoleProvenance !== undefined &&
       roleFingerprint !== expectedRoleProvenance.agentRoleFingerprint
@@ -657,6 +677,7 @@ export class AgentControl {
         role,
         roleWorkspaceId: this.roleWorkspace.id,
         roleFingerprint,
+        ...(executionConstraint !== undefined ? { executionConstraint } : {}),
         nickname,
         depth: childDepth,
         ...(opts.agentName !== undefined ? { agentName: opts.agentName } : {}),
@@ -932,7 +953,6 @@ export class AgentControl {
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `spawn_agent_with_metadata` (control.rs:170).
    * Delegates to `spawn()` but accepts the richer `SpawnAgentOptions`
    * surface (preset threadId / role / metadata / fork mode).
    */
@@ -976,7 +996,7 @@ export class AgentControl {
         spawnOpts as {
           expectedRoleProvenance?: Pick<
             AgentMetadata,
-            "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint"
+            "agentRole" | "agentRoleWorkspaceId" | "agentRoleFingerprint" | "executionConstraint"
           >;
         }
       ).expectedRoleProvenance = options.metadata;
@@ -990,9 +1010,8 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `spawn_forked_thread` (control.rs:328). Thin wrapper
-   * that requires a fork mode + parent-spawn-call id (matches the reference
-   * fatal guards at `control.rs:337` and `control.rs:342`).
+   * Thin wrapper over `spawnAgentWithMetadata` that requires a fork mode
+   * and a parent-spawn-call id; both are fatal when missing.
    * The actual rollout-truncation body lives in `fork-context.ts`.
    */
   async spawnForkedThread(
@@ -1010,11 +1029,11 @@ export class AgentControl {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // Parent → child routing (reference runtime control.rs:582/605/619)
+  // Parent → child routing
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime child-input routing (`control.rs:582`). Routes a user-input
+   * Routes a user-input
    * message to a live child via its `downInbox` with triggerTurn=true,
    * and records the preview for `ListedAgent.lastTaskMessage`.
    */
@@ -1084,8 +1103,7 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `append_message` (`control.rs:605`). Non-turn-
-   * triggering message append.
+   * Non-turn-triggering message append.
    */
   async appendMessage(threadId: ThreadId, message: string): Promise<void> {
     if (this.threadManager?.hasThread(threadId)) {
@@ -1198,9 +1216,8 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `send_inter_agent_communication`
-   * (`control.rs:619`). Generic parent→child IAC routing. Updates
-   * `lastTaskMessage` on success (matches reference runtime's registry update).
+   * Generic parent→child IAC routing. Updates `lastTaskMessage` on
+   * success.
    */
   async sendInterAgentCommunication(
     threadId: ThreadId,
@@ -1311,7 +1328,8 @@ export class AgentControl {
     if (!agent.abortController.signal.aborted) {
       agent.abortController.abort(reason);
     }
-    agent.status.markInterrupted(agent.agentId, reason);
+    const interruptedStatus = agent.status.value;
+    agent.status.markInterrupted("turnId" in interruptedStatus ? interruptedStatus.turnId : agent.agentId, reason);
 
     // Cascade to descendants.
     for (const descendant of this.descendantsOf(agent.agentPath)) {
@@ -1402,8 +1420,7 @@ export class AgentControl {
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `resume_agent_from_rollout`. T9 provides an
-   * in-memory rehydrate: given metadata for a previously known
+   * In-memory rehydrate: given metadata for a previously known
    * subagent path, rebuild a fresh `LiveAgent` handle with new
    * mailboxes/status/abort so a caller can reconnect.
    *
@@ -1556,16 +1573,13 @@ export class AgentControl {
   }
 
   // ─────────────────────────────────────────────────────────────────
-  // Rollout-driven resume (reference runtime `resume_agent_from_rollout`)
+  // Rollout-driven resume
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `resume_agent_from_rollout` (control.rs:406).
-   *
    * Rebuilds the root handle, then breadth-first reopens every tracked
    * open descendant below it from the rollout-store-owned edge index.
-   * Parent failures short-circuit their subtree, matching reference runtime's
-   * resume queue semantics.
+   * Parent failures short-circuit their subtree.
    */
   async resumeAgentFromRollout(opts: {
     readonly rootThreadId: ThreadId;
@@ -1642,9 +1656,8 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `resume_single_agent_from_rollout` public surface
-   * (control.rs:479). Alias of `resume()` — present so ports tracking
-   * the reference runtime name don't need to rename.
+   * Alias of `resume()` for callers that address a single agent by
+   * rollout metadata.
    */
   async resumeSingleAgentFromRollout(opts: {
     readonly parentPath: AgentPath;
@@ -1657,20 +1670,19 @@ export class AgentControl {
   // Metadata + subtree queries (Priority 2)
   // ─────────────────────────────────────────────────────────────────
 
-  /** Port of reference runtime `register_session_root` (`control.rs:721`). */
+  /** Registers the session-root thread id. */
   registerSessionRoot(threadId: ThreadId): void {
     this.rootThreadId = threadId;
     this.registry.registerRootThread(threadId);
   }
 
-  /** Port of reference runtime `get_agent_metadata` (`control.rs:731`). */
+  /** Looks up the metadata record for a thread id. */
   getAgentMetadata(threadId: ThreadId): AgentMetadata | undefined {
     return this.registry.agentMetadataForThread(threadId);
   }
 
   /**
-   * Port of reference runtime `list_live_agent_subtree_thread_ids`
-   * (`control.rs:735`). Returns `[root, ...descendants]`.
+   * Returns `[root, ...descendants]` for the live subtree under `rootThreadId`.
    */
   listLiveAgentSubtreeThreadIds(
     rootThreadId: ThreadId,
@@ -1680,7 +1692,7 @@ export class AgentControl {
     return [rootThreadId, ...this.liveThreadSpawnDescendants(rootThreadId)];
   }
 
-  /** Port of reference runtime `get_agent_config_snapshot` (`control.rs:744`). */
+  /** Returns the live agent's config snapshot, if any. */
   getAgentConfigSnapshot(
     threadId: ThreadId,
   ): Record<string, unknown> | undefined {
@@ -1735,7 +1747,7 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `resolve_agent_reference` (`control.rs:757`).
+   * Resolves an agent reference to a path.
    * Supports `@nickname`, `@/absolute/path`, and `@relative/path`.
    */
   resolveAgentReference(opts: {
@@ -1767,9 +1779,7 @@ export class AgentControl {
     throw new AgentReferenceUnresolvedError(opts.reference);
   }
 
-  /**
-   * Port of reference runtime `get_total_token_usage` (`control.rs:788`).
-   */
+  /** Sums token usage across every live agent. */
   getTotalTokenUsage(): {
     readonly inputTokens: number;
     readonly outputTokens: number;
@@ -1796,8 +1806,7 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `format_environment_context_subagents`
-   * (`control.rs:798`). Produces a textual subagent tree for
+   * Produces a textual subagent tree for
    * injection into the parent's prompt.
    */
   formatEnvironmentContextSubagents(parentThreadId: ThreadId): string {
@@ -1813,7 +1822,7 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `list_agents` (`control.rs:820`). Optional role +
+   * Lists agents with an optional role +
    * path-prefix filter. Includes root when no prefix is supplied or
    * the prefix matches the root.
    */
@@ -1865,12 +1874,41 @@ export class AgentControl {
     return result;
   }
 
+  snapshotNativeWorkers(parentThreadId: ThreadId): readonly NativeWorkerSnapshot[] {
+    const children = this.liveThreadSpawnChildren();
+    const pending = [parentThreadId];
+    const seen = new Set<ThreadId>(pending);
+    const result: NativeWorkerSnapshot[] = [];
+    for (let index = 0; index < pending.length; index++) {
+      for (const [id, metadata] of children.get(pending[index]!) ?? []) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const agent = this.live.get(id);
+        if (agent === undefined) continue;
+        pending.push(id);
+        const status = agent.status.value;
+        result.push({
+          agentId: id,
+          agentPath: agent.agentPath,
+          nickname: agent.nickname,
+          role: agent.role.name,
+          ...(metadata.lastTaskMessage !== undefined ? { prompt: metadata.lastTaskMessage } : {}),
+          status: status.status,
+          ...(status.status === "errored" ? { error: status.error } : {}),
+          toolUseCount: agent.toolCallCount,
+          tokenCount: agent.tokenUsage.totalTokens,
+          ...(agent.status.timing !== undefined ? { timing: { ...agent.status.timing } } : {}),
+        });
+      }
+    }
+    return result;
+  }
+
   // ─────────────────────────────────────────────────────────────────
   // Completion watcher (Priority 3)
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `maybe_start_completion_watcher` (`control.rs:899`).
    * Starts a detached watcher that waits for the child to reach a
    * terminal status, then fires an IAC back to the parent announcing
    * the completion. No-op when the parent is unknown.
@@ -2098,7 +2136,7 @@ export class AgentControl {
   // ─────────────────────────────────────────────────────────────────
 
   /**
-   * Port of reference runtime `prepare_thread_spawn` (`control.rs:975`). Reserves
+   * Reserves
    * the nickname and composes the child metadata without actually
    * spawning. Callers that want to preflight a spawn use this to see
    * the allocated path/nickname.
@@ -2153,7 +2191,6 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `open_thread_spawn_children` (`control.rs:1060`).
    * Returns live children of the given parent thread, sorted by path.
    */
   openThreadSpawnChildren(
@@ -2173,7 +2210,6 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `live_thread_spawn_children` (`control.rs:1070`).
    * Parent→children map for every live child.
    */
   liveThreadSpawnChildren(): ReadonlyMap<
@@ -2197,7 +2233,6 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `live_thread_spawn_descendants` (`control.rs:1137`).
    * Depth-first walk over the in-memory spawn tree rooted at
    * `rootThreadId`.
    */
@@ -2222,8 +2257,7 @@ export class AgentControl {
   }
 
   /**
-   * Port of reference runtime `persist_thread_spawn_edge_for_source`
-   * (`control.rs:1113`). Stores an open edge snapshot in the
+   * Stores an open edge snapshot in the
    * rollout-store-owned durable index for later resume/tree recovery.
    */
   private async persistThreadSpawnEdgeForSource(
@@ -2348,10 +2382,8 @@ export class AgentControl {
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Port of reference runtime `render_input_preview` (`control.rs:1187`). The reference form
- * form walks over `Op::UserInput` items; AgenC inputs are plain
- * strings at this boundary, so we preview the first line and truncate
- * to fit a registry `lastTaskMessage` cell.
+ * Inputs are plain strings at this boundary, so we preview the first
+ * line and truncate to fit a registry `lastTaskMessage` cell.
  */
 export function renderInputPreview(input: string): string {
   const firstLine = input.split(/\r?\n/, 1)[0] ?? "";
@@ -2378,6 +2410,8 @@ function assertSameAgentIdentity(
       normalizedActual.agentRoleWorkspaceId ||
     normalizedExpected.agentRoleFingerprint !==
       normalizedActual.agentRoleFingerprint ||
+    JSON.stringify(normalizedExpected.executionConstraint) !==
+      JSON.stringify(normalizedActual.executionConstraint) ||
     normalizedExpected.depth !== normalizedActual.depth
   ) {
     throw new InvalidAgentMetadataError(
@@ -2423,7 +2457,7 @@ function completionStatusKey(status: AgentStatus): string {
   }
 }
 
-/** Port of reference runtime `agent_matches_prefix` (`control.rs:1173`). */
+/** Whether `agentPath` sits at or below the given path prefix. */
 function agentMatchesPrefix(
   agentPath: AgentPath | undefined,
   prefix: AgentPath,

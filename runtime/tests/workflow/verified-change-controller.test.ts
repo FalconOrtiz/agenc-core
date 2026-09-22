@@ -1,9 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ExecutionAdmissionKernel } from "../../src/budget/execution-admission-kernel.js";
+import { WorkflowApprovalFailure } from "../../src/permissions/approval-failure.js";
+import type { PermissionMode } from "../../src/permissions/types.js";
 
 import {
+  resolveWorkflowPermissionMode,
   VerifiedChangeWorkflowController,
   WorkflowIntakeError,
   type WorkflowAgentSpawner,
@@ -15,7 +19,7 @@ import {
   type WorkflowStartParams,
   type WorkflowWorktreeBroker,
 } from "../../src/app-server/workflow/verified-change-controller.js";
-import { inspectWorkflowChildTerminal } from "../../src/app-server/workflow/child-terminals.js";
+import { inspectWorkflowChildTerminal, recordWorkflowChildTerminal } from "../../src/app-server/workflow/child-terminals.js";
 import { AdmissionDeniedError, type ExecutionAdmissionClient } from "../../src/budget/admission-client.js";
 import { M5WorkflowFailpointError } from "../../src/durability/failpoints.js";
 import type { AdmissionLease } from "../../src/budget/admission-types.js";
@@ -33,7 +37,10 @@ import {
   openStateDatabases,
   type StateSqliteDriver,
 } from "../../src/state/sqlite-driver.js";
-import type { ReviewerInvoker } from "../../src/workflow/independent-review.js";
+import {
+  ReviewInvocationError,
+  type ReviewerInvoker,
+} from "../../src/workflow/independent-review.js";
 import type {
   WorkflowCommandResult,
   WorkflowCommandRunner,
@@ -79,6 +86,7 @@ class TestJournal implements WorkflowRunJournal {
   constructor(
     private readonly repo: StateRunDurabilityRepository,
     readonly runId: string,
+    private readonly readPermissionMode?: () => PermissionMode | undefined,
   ) {
     this.sessionId = `${runId}-session`;
     this.repo.ensureInitialEpoch({
@@ -96,6 +104,10 @@ class TestJournal implements WorkflowRunJournal {
   #next(): { eventId: string; sequence: number } {
     this.#seq += 1;
     return { eventId: `evt-${this.runId}-${this.#seq}`, sequence: this.#seq };
+  }
+
+  get effectivePermissionMode(): PermissionMode | undefined {
+    return this.readPermissionMode?.();
   }
 
   appendIntent(input: Parameters<WorkflowRunJournal["appendIntent"]>[0]) {
@@ -437,6 +449,8 @@ class FakeReviewer implements ReviewerInvoker {
   readonly responses: string[] = [];
   /** Simulate a daemon death mid-review (before the reviewer settled). */
   onInvoke?: () => void;
+  /** Errors to throw instead of answering, in order (soak F76). */
+  readonly errors: Error[] = [];
 
   async invoke(input: {
     reviewerModel: string;
@@ -447,6 +461,8 @@ class FakeReviewer implements ReviewerInvoker {
       userMessage: input.userMessage,
     });
     this.onInvoke?.();
+    const error = this.errors.shift();
+    if (error !== undefined) throw error;
     return this.responses.shift() ?? APPROVING_REVIEW;
   }
 }
@@ -455,7 +471,7 @@ class FakeCommands implements WorkflowCommandRunner {
   readonly byScript = new Map<string, Partial<WorkflowCommandResult>>();
   readonly executed: string[] = [];
 
-  async run(input: { script: string }): Promise<WorkflowCommandResult> {
+  async run(input: Parameters<WorkflowCommandRunner["run"]>[0]): Promise<WorkflowCommandResult> {
     this.executed.push(input.script);
     return {
       exitCode: 0,
@@ -486,12 +502,23 @@ interface Harness {
   ledgers: Map<string, MemoryLedger>;
   warnings: string[];
   controller: VerifiedChangeWorkflowController;
+  /** Test seams: `failJournalOpenWith` makes the next journal open throw. */
+  hooks: {
+    failJournalOpenWith?: Error;
+    effectivePermissionMode?: PermissionMode;
+    currentPermissionMode?: PermissionMode;
+  };
   cleanup(): void;
 }
 
 const RUN_ID = "run-wf-1";
 
-function makeHarness(): Harness {
+function makeHarness(
+  options: {
+    readonly defaultReviewerModel?: () => string | undefined;
+    readonly admission?: () => ExecutionAdmissionClient;
+  } = {},
+): Harness {
   const home = mkdtempSync(join(tmpdir(), "agenc-m5-controller-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "agenc-m5-controller-cwd-"));
   mkdirSync(join(cwd, ".git"));
@@ -505,10 +532,20 @@ function makeHarness(): Harness {
   spawner.durableRepo = repo;
   const ledgers = new Map<string, MemoryLedger>();
   const warnings: string[] = [];
+  const hooks: Harness["hooks"] = {};
   const controller = new VerifiedChangeWorkflowController({
     durability: () => repo,
-    journal: { open: async (runId) => new TestJournal(repo, runId) },
+    journal: {
+      open: async (runId) => {
+        if (hooks.failJournalOpenWith !== undefined) {
+          throw hooks.failJournalOpenWith;
+        }
+        return new TestJournal(repo, runId, () => hooks.effectivePermissionMode);
+      },
+      currentPermissionMode: () => hooks.currentPermissionMode,
+    },
     admission: ({ runId }) => {
+      if (options.admission !== undefined) return options.admission();
       admission.scope.runId = runId;
       return admission;
     },
@@ -516,6 +553,9 @@ function makeHarness(): Harness {
     commands,
     spawner,
     reviewer,
+    ...(options.defaultReviewerModel !== undefined
+      ? { defaultReviewerModel: options.defaultReviewerModel }
+      : {}),
     evidenceLedger: async (spec) => {
       let ledger = ledgers.get(spec.runId);
       if (ledger === undefined) {
@@ -539,6 +579,7 @@ function makeHarness(): Harness {
     ledgers,
     warnings,
     controller,
+    hooks,
     cleanup: () => {
       driver.close();
       rmSync(home, { recursive: true, force: true });
@@ -575,6 +616,146 @@ let harness: Harness;
 
 beforeEach(() => {
   harness = makeHarness();
+});
+
+describe("verifier prompt", () => {
+  it("tells the verifier where scratch files may go", async () => {
+    // Soak F65: a verifier wrote fixtures to /tmp and the sandbox refused them.
+    await runToTerminal(harness);
+    const verify = harness.spawner.spawns.find((spawn) => spawn.kind === "verify_agent");
+    expect(verify?.prompt).toContain("under `tmp/` inside the worktree");
+    expect(verify?.prompt).toContain("refuses writes outside the workspace");
+  });
+});
+
+describe("retry prompts", () => {
+  it("carry the verifier's report into the re-implement and re-verify prompts", async () => {
+    // Soak F73: the implementer saw only `Agent verdict: FAIL` and changed
+    // nothing, and the second verifier re-derived the same defects from
+    // scratch. Attempt 1 fails on the agent's verdict alone.
+    const report =
+      "### Check: undo after a merge with duplicate ids\n" +
+      "undo restored one of two rows\n" +
+      "VERDICT: FAIL";
+    harness.spawner.queue("verify_agent", {
+      status: "completed",
+      finalMessage: report,
+      usage: DEFAULT_USAGE,
+    });
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+    const implementSpawns = harness.spawner.spawns.filter(
+      (spawn) => spawn.kind === "implement",
+    );
+    const verifySpawns = harness.spawner.spawns.filter(
+      (spawn) => spawn.kind === "verify_agent",
+    );
+    expect(implementSpawns).toHaveLength(2);
+    expect(verifySpawns).toHaveLength(2);
+    // A first attempt carries nothing: there is no report yet.
+    expect(implementSpawns[0].prompt).not.toContain("Verifier's report");
+    expect(verifySpawns[0].prompt).not.toContain("Previous verification attempt");
+    // The retry names the failures to fix.
+    expect(implementSpawns[1].prompt).toContain("Agent verdict: FAIL");
+    expect(implementSpawns[1].prompt).toContain("undo restored one of two rows");
+    expect(implementSpawns[1].prompt).toContain(
+      "Fix every failure reported above, then stop.",
+    );
+    // The second verifier re-checks the reported failures first.
+    expect(verifySpawns[1].prompt).toContain(
+      "## Previous verification attempt 1 (verdict FAIL)",
+    );
+    expect(verifySpawns[1].prompt).toContain("undo restored one of two rows");
+    expect(verifySpawns[1].prompt).toContain("Re-check every");
+  });
+});
+
+describe("permission mode at start", () => {
+  it("reports actual default separately from requested bypass and keeps the frozen spec unchanged", async () => {
+    harness.hooks.effectivePermissionMode = "default";
+    harness.hooks.currentPermissionMode = "default";
+    const result = await harness.controller.start(startParams(harness, { permissionMode: "bypassPermissions" }));
+    try {
+      expect(result.effectivePermissionMode).toBe("default");
+      expect(result.requestedPermissionMode).toBe("bypassPermissions");
+      expect(harness.controller.status(RUN_ID)).toMatchObject({
+        requestedPermissionMode: "bypassPermissions", effectivePermissionMode: "default",
+      });
+      harness.hooks.currentPermissionMode = "plan";
+      expect(harness.controller.status(RUN_ID)?.effectivePermissionMode).toBe("plan");
+      delete harness.hooks.currentPermissionMode;
+      expect(harness.controller.status(RUN_ID)?.effectivePermissionMode).toBeUndefined();
+    } finally {
+      await harness.controller.awaitRun(RUN_ID);
+    }
+    expect(harness.repo.getEffect(RUN_ID, "workflow.intake")?.evidence).toMatchObject({
+      spec: { permissionMode: "bypassPermissions" },
+    });
+    harness.hooks.currentPermissionMode = "bypassPermissions";
+    expect(harness.controller.status(RUN_ID)?.effectivePermissionMode).toBeUndefined();
+  });
+
+  it("reports trusted effective bypass and leaves unknown journal authority absent", async () => {
+    harness.hooks.effectivePermissionMode = "bypassPermissions";
+    const trusted = await harness.controller.start(startParams(harness, { permissionMode: "bypassPermissions" }));
+    try {
+      expect(trusted.effectivePermissionMode).toBe("bypassPermissions");
+    } finally {
+      await harness.controller.awaitRun(RUN_ID);
+    }
+    delete harness.hooks.effectivePermissionMode;
+    const unknown = await harness.controller.start(startParams(harness, { runId: RUN_ID + "-unknown", permissionMode: "bypassPermissions" }));
+    try {
+      expect(unknown.effectivePermissionMode).toBeUndefined();
+      expect(unknown.requestedPermissionMode).toBe("bypassPermissions");
+    } finally {
+      await harness.controller.awaitRun(unknown.runId);
+    }
+  });
+
+  it("preserves an explicit default mode and retains the omitted-mode default", () => {
+    expect(resolveWorkflowPermissionMode("default")).toBe("default");
+    expect(resolveWorkflowPermissionMode(undefined)).toBe("acceptEdits");
+    expect(resolveWorkflowPermissionMode("plan")).toBe("plan");
+    expect(resolveWorkflowPermissionMode("bypassPermissions")).toBe("bypassPermissions");
+  });
+
+  it("freezes explicit default without promoting or warning", async () => {
+    await runToTerminal(harness, { permissionMode: "default" });
+    expect(harness.warnings).toEqual([]);
+    expect(harness.repo.getEffect(RUN_ID, "workflow.intake")?.evidence).toMatchObject({
+      spec: { permissionMode: "default" },
+    });
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "completed" });
+  });
+});
+
+describe("reviewer model resolution at start", () => {
+  // Desktop soak, 2026-09-06: with neither `reviewerModel` nor `model` the
+  // spec froze the placeholder "default-reviewer", the provider answered 404,
+  // and a goal whose other stages had all committed ended unknown_outcome.
+  it("pins the daemon's default model when the caller names none", async () => {
+    const own = makeHarness({ defaultReviewerModel: () => "grok-4.6" });
+    await runToTerminal(own, { model: undefined, reviewerModel: undefined });
+    expect(own.reviewer.invocations[0]?.reviewerModel).toBe("grok-4.6");
+  });
+
+  it("prefers the caller's model over the daemon's default", async () => {
+    const own = makeHarness({ defaultReviewerModel: () => "grok-4.6" });
+    await runToTerminal(own, { model: "grok-4", reviewerModel: undefined });
+    expect(own.reviewer.invocations[0]?.reviewerModel).toBe("grok-4");
+  });
+
+  it("refuses a start that can name no reviewer model", async () => {
+    const own = makeHarness();
+    await expect(
+      own.controller.start(
+        startParams(own, { model: undefined, reviewerModel: undefined }),
+      ),
+    ).rejects.toThrow(/no reviewer model/);
+  });
 });
 
 afterEach(() => {
@@ -623,7 +804,7 @@ describe("VerifiedChangeWorkflowController — happy path", () => {
     });
     expect(terminal!.finalMessage).toContain(HEAD_COMMIT);
     expect(terminal!.finalMessage).toContain("Consider renaming");
-    expect(terminal!.usage).not.toBeNull();
+    expect(terminal!.usage).toBeNull();
 
     // Admission gated EVERY step, exactly once each.
     expect(harness.admission.acquired).toEqual([
@@ -703,6 +884,9 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     );
     expect(implementSpawns).toHaveLength(2);
     expect(implementSpawns[1].prompt).toContain("Previous verification failure");
+    // The verifier's own report travels too, whatever its verdict was.
+    expect(implementSpawns[1].prompt).toContain("### Verifier's report");
+    expect(implementSpawns[1].prompt).toContain("checked everything");
   });
 
   it("review_rejected on blocking findings, with the review durably committed", async () => {
@@ -844,9 +1028,88 @@ describe("VerifiedChangeWorkflowController — stop reasons", () => {
     expect(terminal.status).toBe("cancelled");
     expect(terminal.exitCode).toBe(1);
   });
+
+  it.each(["reject", "resolve"] as const)(
+    "cancels dispatched verification when the runner settles by %s",
+    async (settlement) => {
+      harness.cleanup();
+      let client: ExecutionAdmissionClient;
+      harness = makeHarness({ admission: () => client });
+      const kernel = new ExecutionAdmissionKernel({
+        agencHome: harness.home,
+        ownerId: "workflow-command-cancel-test",
+        ownerPid: process.pid,
+      });
+      const dispatched = Promise.withResolvers<void>();
+      let observedAbort = false;
+      const run = vi.spyOn(harness.commands, "run").mockImplementation(async (input) => {
+        const signal = (input as { signal?: AbortSignal }).signal;
+        dispatched.resolve();
+        return new Promise<WorkflowCommandResult>((resolve, reject) => {
+          const guard = setTimeout(() => reject(new Error("cancellation did not reach verification")), 500);
+          signal?.addEventListener("abort", () => {
+            clearTimeout(guard);
+            observedAbort = true;
+            if (settlement === "reject") reject(signal.reason);
+            else resolve({ exitCode: 0, stdout: new Uint8Array(), stderr: new Uint8Array(),
+              timedOut: false, truncated: false, durationMs: 1 });
+          }, { once: true });
+        });
+      });
+      try {
+        client = kernel.bindClient({ cwd: harness.cwd,
+          scope: { runId: RUN_ID, sessionId: RUN_ID, autonomous: true } });
+        const started = await harness.controller.start(startParams(harness, {
+          requiredVerification: [{ label: "running", script: "running-test" },
+            { label: "later", script: "must-not-run" }],
+        }));
+        await dispatched.promise;
+        // This is the real admission cancellation cascade used by run.cancel.
+        client.cancelRun("operator cancelled during command verification");
+        await harness.controller.awaitRun(started.runId);
+        expect(observedAbort).toBe(true);
+        expect(run).toHaveBeenCalledTimes(1);
+        expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "cancelled" });
+        expect(harness.repo.getEffect(RUN_ID, "workflow.verify.cmd.1")).toMatchObject({
+          outcome: "cancelled",
+          evidence: { failure: { reason: "cancelled_after_dispatch" } },
+        });
+        expect(harness.spawner.spawns.map((spawn) => spawn.kind)).toEqual(["plan", "implement"]);
+        expect(harness.worktrees.cleanups).toHaveLength(0);
+      } finally {
+        kernel.close();
+      }
+    },
+  );
 });
 
 describe("VerifiedChangeWorkflowController — prerequisite gating", () => {
+  it("does not retry a reviewer whose approval was permanently denied", async () => {
+    harness.reviewer.errors.push(new ReviewInvocationError("review failed", {
+      cause: new WorkflowApprovalFailure({ decision: "denied", source: "resolver" }),
+    }));
+    await runToTerminal(harness);
+    expect(harness.reviewer.invocations).toHaveLength(1);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "failed", stopReason: "policy_denied" });
+    expect(inspectWorkflowChildTerminal(harness.repo, `${RUN_ID}:review#1`)).toMatchObject({ status: "failed", stopReason: "policy_denied" });
+  });
+
+  it.each(["plan", "implement"] as const)("does not retry a permanent %s approval failure", async (kind) => {
+    harness.spawner.queue(kind, {
+      status: "failed",
+      finalMessage: "The required approval was denied.",
+      usage: DEFAULT_USAGE,
+      stopReason: "policy_denied",
+    });
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({
+      status: "failed",
+      stopReason: "policy_denied",
+    });
+    expect(harness.spawner.spawns.filter((spawn) => spawn.kind === kind)).toHaveLength(1);
+    expect(harness.commands.executed).toHaveLength(0);
+  });
+
   it("verify never starts when implement failed terminally", async () => {
     harness.spawner.queue("implement", {
       status: "failed",
@@ -873,6 +1136,23 @@ describe("VerifiedChangeWorkflowController — prerequisite gating", () => {
 });
 
 describe("VerifiedChangeWorkflowController — crash recovery (D3)", () => {
+  it("adopts a permanent child failure after a crash without spawning its stage again", async () => {
+    const outcome: WorkflowChildOutcome = {
+      status: "failed", stopReason: "policy_denied", finalMessage: "operator denied", usage: DEFAULT_USAGE,
+    };
+    harness.spawner.queue("plan", outcome);
+    armFailpoint("after_spawn_before_effect_result");
+    const started = await harness.controller.start(startParams(harness));
+    await expect(harness.controller.awaitRun(started.runId)).rejects.toThrow(/failpoint/);
+    disarmFailpoint();
+    recordWorkflowChildTerminal(harness.repo, `${RUN_ID}:plan#1`, outcome);
+    harness.spawner.inspections.clear();
+    await harness.controller.resumeOpenWorkflows();
+    await harness.controller.awaitRun(RUN_ID);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "failed", stopReason: "policy_denied" });
+    expect(harness.spawner.spawns.filter((spawn) => spawn.kind === "plan")).toHaveLength(1);
+  });
+
   it("an interrupted idempotent step re-executes under the same durable key", async () => {
     armFailpoint("before_worktree_provision");
     const started = await harness.controller.start(startParams(harness));
@@ -1162,8 +1442,55 @@ describe("VerifiedChangeWorkflowController — review-child adoption (A1 for the
   });
 });
 
+describe("VerifiedChangeWorkflowController — reviewer that never answered", () => {
+  // Soak F76: the reviewer's single model call got a 403 on a stale OAuth
+  // bearer; the error was rethrown untyped and the run died as
+  // unknown_outcome with an operator review pending. A read-only reviewer
+  // that settled without output is a known failure with a bounded retry.
+  it("a failed review invocation is a known failure that retries once", async () => {
+    harness.reviewer.errors.push(
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+    );
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
+    const first = harness.repo.getEffect(RUN_ID, "workflow.review");
+    expect(first?.outcome).toBe("failed");
+    expect(
+      harness.repo.getEffect(RUN_ID, "workflow.review#2")?.outcome,
+    ).toBe("committed");
+    // The failed attempt is durable as a FAILED review child terminal that
+    // names the cause, never as a pending unknown outcome.
+    expect(
+      harness.repo.getCurrentTerminalResult(`${RUN_ID}:review#1`),
+    ).toMatchObject({
+      status: "failed",
+      finalMessage: expect.stringContaining(
+        "grok authentication failed (HTTP 403)",
+      ),
+    });
+    expect(harness.reviewer.invocations).toHaveLength(2);
+  });
+
+  it("two failed invocations end the run failed, not unknown_outcome", async () => {
+    harness.reviewer.errors.push(
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+      new ReviewInvocationError("grok authentication failed (HTTP 403)"),
+    );
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({
+      status: "failed",
+      stopReason: "step_retries_exhausted",
+    });
+    expect(
+      harness.repo.listEffects(RUN_ID).filter((e) => e.outcome === "unknown_outcome"),
+    ).toHaveLength(0);
+  });
+});
+
 describe("VerifiedChangeWorkflowController — child usage rollup", () => {
-  it("the terminal usage reflects the children's reconciled sums exactly; holds are noted, never spent", async () => {
+  it("retains child evidence without presenting partial sums as canonical usage", async () => {
     harness.spawner.queue("plan", {
       status: "completed",
       finalMessage: "PLAN: make the edit",
@@ -1198,13 +1525,7 @@ describe("VerifiedChangeWorkflowController — child usage rollup", () => {
     await runToTerminal(harness);
     const terminal = harness.repo.getCurrentTerminalResult(RUN_ID)!;
     expect(terminal.status).toBe("completed");
-    // Exact reconciled sums: 10+100+7 / 5+50+3 / 0.25+0.5+0.125.
-    expect(terminal.usage).toEqual({
-      inputTokens: 117,
-      outputTokens: 58,
-      totalTokens: 175,
-      costUsd: 0.875,
-    });
+    expect(terminal.usage).toBeNull();
     // The durable child evidence carries the usage and NOTES the holds
     // (held_unknown spend is never summed into any total).
     const implement = harness.repo.getEffect(RUN_ID, "workflow.implement")!;
@@ -1220,7 +1541,7 @@ describe("VerifiedChangeWorkflowController — child usage rollup", () => {
     expect(child.usageHeldUnknown).toBe(2);
   });
 
-  it("adoption and replay carry durably recorded child usage into the post-restart terminal rollup", async () => {
+  it("adopts child evidence without fabricating usage when the canonical reader is absent", async () => {
     harness.spawner.queue("plan", {
       status: "completed",
       finalMessage: "PLAN: make the edit",
@@ -1273,13 +1594,175 @@ describe("VerifiedChangeWorkflowController — child usage rollup", () => {
 
     const terminal = harness.repo.getCurrentTerminalResult(RUN_ID)!;
     expect(terminal.status).toBe("completed");
-    // Replayed plan (10/5/0.25) + adopted implement (40/2/0.5) + fresh
-    // verify agent (7/3/0.125): the post-restart rollup keeps every child.
-    expect(terminal.usage).toEqual({
-      inputTokens: 57,
-      outputTokens: 10,
-      totalTokens: 67,
-      costUsd: 0.875,
+    expect(terminal.usage).toBeNull();
+  });
+});
+
+describe("VerifiedChangeWorkflowController — canonical capped accounting", () => {
+  it("admits all children under one cap and counts the reviewer once", async () => {
+    harness.cleanup();
+    let client: ExecutionAdmissionClient;
+    harness = makeHarness({ admission: () => client });
+    const kernel = new ExecutionAdmissionKernel({
+      agencHome: harness.home,
+      ownerId: "workflow-cap-test",
+      ownerPid: process.pid,
     });
+    try {
+      client = kernel.bindClient({
+        cwd: harness.cwd,
+        scope: { runId: RUN_ID, sessionId: RUN_ID, autonomous: true },
+        budget: { runMaxCostUsd: 1, runMaxTokens: 1000 },
+      });
+      const charges: string[] = [];
+      const chargeChild = async (childRunId: string): Promise<void> => {
+        const child = client.forSession({ runId: childRunId, sessionId: childRunId });
+        const lease = await child.acquire({
+          stepId: "model:1",
+          kind: "model_turn",
+          model: "test-model",
+          provider: "test-provider",
+          maxInputTokens: 10,
+          maxOutputTokens: 10,
+          maxCostUsd: 0.2,
+        });
+        child.markDispatched(lease.reservation.reservationId, { boundary: "provider_wire" });
+        child.reconcile(lease.reservation.reservationId, { inputTokens: 8, outputTokens: 2, costUsd: 0.1 });
+        expect(child.reconcile(lease.reservation.reservationId, { inputTokens: 8, outputTokens: 2, costUsd: 0.1 }).applied).toBe(false);
+        child.acknowledgeCompletion(lease.reservation.reservationId);
+        charges.push(childRunId);
+      };
+      const spawn = harness.spawner.spawn.bind(harness.spawner);
+      vi.spyOn(harness.spawner, "spawn").mockImplementation(async (input) => {
+        await chargeChild(input.childRunId);
+        return spawn(input);
+      });
+      const review = harness.reviewer.invoke.bind(harness.reviewer);
+      vi.spyOn(harness.reviewer, "invoke").mockImplementation(async (input) => {
+        await chargeChild(`${RUN_ID}:actual-review`);
+        return review(input);
+      });
+      await runToTerminal(harness, { budget: { maxCostUsd: 1, maxTokens: 1000 } });
+      expect(charges).toHaveLength(4);
+      const usage = { inputTokens: 32, outputTokens: 8, totalTokens: 40, costUsd: 0.4 };
+      expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "completed", usage });
+      expect(harness.ledgers.get(RUN_ID)?.records[0]?.usage).toEqual(usage);
+      expect(client.getUsageSummary?.()).toMatchObject({ ...usage, heldCostUsd: 0, hasUnknownCost: false });
+      const rows = harness.driver.state.prepare("SELECT reserved_tokens, reserved_cost_nanos, actual_cost_nanos FROM execution_admission_reservations WHERE run_id = ?").all(RUN_ID);
+      expect(rows.length).toBeGreaterThan(3);
+      for (const row of rows) expect(row).toEqual({ reserved_tokens: 0, reserved_cost_nanos: 0, actual_cost_nanos: 0 });
+    } finally {
+      kernel.close();
+    }
+  });
+
+  it("does not publish partial child rollups when canonical accounting fails", async () => {
+    Object.assign(harness.admission, { getUsageSummary: () => { throw new Error("canonical accounting unavailable"); } });
+    await runToTerminal(harness);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "failed", usage: null });
+    expect(harness.ledgers.get(RUN_ID)?.records).toHaveLength(0);
+    expect(harness.warnings.some((warning) => warning.includes("canonical usage is unavailable"))).toBe(true);
+  });
+
+  it("keeps unknown child holds after wrapper failure and persists them on close", async () => {
+    harness.cleanup();
+    let client: ExecutionAdmissionClient;
+    harness = makeHarness({ admission: () => client });
+    const kernel = new ExecutionAdmissionKernel({ agencHome: harness.home, ownerId: "workflow-unknown-test", ownerPid: process.pid });
+    try {
+      const bind = () => kernel.bindClient({ cwd: harness.cwd, scope: { runId: RUN_ID, sessionId: RUN_ID, autonomous: true }, budget: { runMaxCostUsd: 1 } });
+      client = bind();
+      vi.spyOn(harness.spawner, "spawn").mockImplementation(async (input) => {
+        const child = client.forSession({ runId: input.childRunId, sessionId: input.childRunId });
+        const lease = await child.acquire({ stepId: "model:unknown", kind: "model_turn", maxInputTokens: 10, maxOutputTokens: 10, maxCostUsd: 0.3 });
+        child.markDispatched(lease.reservation.reservationId, { boundary: "provider_wire" });
+        child.holdUnknown(lease.reservation.reservationId, "provider_disconnected");
+        child.acknowledgeCompletion(lease.reservation.reservationId);
+        return { status: "unknown_outcome", finalMessage: null, usage: null };
+      });
+      await runToTerminal(harness, { budget: { maxCostUsd: 1 } });
+      expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toMatchObject({ status: "unknown_outcome", usage: null });
+      expect(client.getUsageSummary?.()).toMatchObject({ costUsd: 0, heldCostUsd: 0.3, hasUnknownCost: true });
+      await expect(client.acquire({ stepId: "after-unknown", kind: "model_turn", maxInputTokens: 1, maxOutputTokens: 1, maxCostUsd: 0.8 })).rejects.toMatchObject({ reason: "budget_exceeded" });
+    } finally {
+      kernel.close();
+    }
+    const reopened = openStateDatabases({ cwd: harness.cwd, agencHome: harness.home });
+    try {
+      expect(reopened.state.prepare("SELECT status, reserved_cost_nanos FROM execution_admission_reservations WHERE run_id = ?").all(`${RUN_ID}:plan#1`)).toEqual([{ status: "held_unknown", reserved_cost_nanos: 300000000 }]);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+describe("VerifiedChangeWorkflowController — runs with no live pipeline", () => {
+  async function interruptBeforeWorktree(): Promise<void> {
+    armFailpoint("before_worktree_provision");
+    const started = await harness.controller.start(startParams(harness));
+    await expect(harness.controller.awaitRun(started.runId)).rejects.toThrow(
+      /failpoint/,
+    );
+    disarmFailpoint();
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)).toBeUndefined();
+  }
+
+  it("closes a run whose resume fails as failed instead of leaving it running", async () => {
+    await interruptBeforeWorktree();
+    harness.hooks.failJournalOpenWith = new Error(
+      `run ${RUN_ID} step workflow.plan already has a different effect intent`,
+    );
+    await expect(harness.controller.resumeOpenWorkflows()).resolves.toEqual([]);
+    const terminal = harness.repo.getCurrentTerminalResult(RUN_ID);
+    expect(terminal).toMatchObject({
+      status: "failed",
+      exitCode: 1,
+      stopReason: null,
+    });
+    expect(terminal?.finalMessage).toContain(
+      "workflow resume failed after a daemon restart",
+    );
+    expect(terminal?.finalMessage).toContain("different effect intent");
+    expect(
+      harness.warnings.some((w) =>
+        w.startsWith(`workflow resume failed for ${RUN_ID}:`),
+      ),
+    ).toBe(true);
+    // Terminal runs are skipped by the next sweep.
+    delete harness.hooks.failJournalOpenWith;
+    await expect(harness.controller.resumeOpenWorkflows()).resolves.toEqual([]);
+  });
+
+  it("cancelDetached closes a run with no live pipeline and reports everything else honestly", async () => {
+    await interruptBeforeWorktree();
+    expect(harness.controller.cancelDetached("run-unknown", "run.cancel")).toBe(
+      "not_a_workflow",
+    );
+    expect(harness.controller.cancelDetached(RUN_ID, "operator")).toBe(
+      "cancelled",
+    );
+    const terminal = harness.repo.getCurrentTerminalResult(RUN_ID);
+    expect(terminal).toMatchObject({
+      status: "cancelled",
+      exitCode: 1,
+      stopReason: null,
+    });
+    expect(terminal?.finalMessage).toContain("run.cancel (operator)");
+    expect(terminal?.finalMessage).toContain("no live pipeline");
+    expect(harness.controller.cancelDetached(RUN_ID, "operator")).toBe(
+      "already_terminal",
+    );
+    await expect(harness.controller.resumeOpenWorkflows()).resolves.toEqual([]);
+  });
+
+  it("cancelDetached leaves a live pipeline to the admission cascade", async () => {
+    const started = await harness.controller.start(startParams(harness));
+    expect(harness.controller.cancelDetached(started.runId, "operator")).toBe(
+      "live",
+    );
+    await harness.controller.awaitRun(started.runId);
+    expect(harness.repo.getCurrentTerminalResult(RUN_ID)?.status).toBe(
+      "completed",
+    );
   });
 });

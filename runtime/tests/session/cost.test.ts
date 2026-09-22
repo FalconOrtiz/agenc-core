@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   CostSidecar,
   computeUsdCostWithResolution,
@@ -207,10 +207,24 @@ describe("cost helpers", () => {
     for (const [provider, model] of Object.entries(
       BUILT_IN_PROVIDER_DEFAULT_MODELS,
     )) {
-      // Meta does not publish an authoritative per-token price for Muse Spark.
-      // Its separate regression below must remain unknown rather than turning
-      // a conservative fallback estimate into a claimed provider rate.
-      if (provider === "meta") continue;
+      // Meta and QwenCloud Token Plan do not expose a single authoritative
+      // per-token rate. Qwen PayGo pricing is model/region/tier dependent and
+      // is intentionally not guessed here. Ollama Cloud is the same shape: its
+      // published peak tariff is NOT MODELLED in this registry, and its
+      // built-in default model has no entry here at all, so any single
+      // per-token rate would misprice it. Their regressions below remain
+      // unknown rather than claiming the conservative fallback as a rate.
+      // The explicit regression after this test pins ollama-cloud as unknown
+      // and NOT free, so skipping it here cannot quietly become zero-rating.
+      if (
+        provider === "meta" ||
+        provider === "qwen" ||
+        provider === "qwen-token-plan" ||
+        provider === "zai-coding-plan" ||
+        provider === "ollama-cloud"
+      ) {
+        continue;
+      }
       const sidecar = new CostSidecar({
         defaultProvider: provider,
         defaultModel: model,
@@ -245,6 +259,36 @@ describe("cost helpers", () => {
     }
   });
 
+  // Skipping ollama-cloud above removes it from the known-price sweep. This
+  // pins what must stay true meanwhile: it resolves UNKNOWN, and it must never
+  // fall through to the local free-inference entry that #2537 closed off.
+  // When the peak tariff is modelled, replace this with a real rate assertion.
+  test("ollama-cloud stays unknown and never free while its tariff is unmodelled", () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS["ollama-cloud"]!;
+    const sidecar = new CostSidecar({
+      defaultProvider: "ollama-cloud",
+      defaultModel: model,
+    });
+    sidecar.onEvent({
+      id: "usage-ollama-cloud",
+      seq: 1,
+      msg: {
+        type: "token_count",
+        payload: {
+          promptTokens: 1000,
+          completionTokens: 500,
+          totalTokens: 1500,
+        },
+      },
+    });
+    const usage = sidecar.getPerModelUsage()[0]!;
+    expect(sidecar.hasUnknownModelCost()).toBe(true);
+    expect(computeUsdCostWithResolution(usage, DEFAULT_MODEL_COSTS).known).toBe(
+      false,
+    );
+    expect(resolveModelCostEntry(usage, DEFAULT_MODEL_COSTS)).toBeNull();
+  });
+
   test.each(BUILT_IN_PROVIDER_MODEL_CATALOG.meta)(
     "keeps Meta model %s pricing unknown without an authoritative rate",
     (model) => {
@@ -267,19 +311,127 @@ describe("cost helpers", () => {
     },
   );
 
+  test.each(
+    (["qwen", "qwen-token-plan"] as const).flatMap((provider) =>
+      BUILT_IN_PROVIDER_MODEL_CATALOG[provider].map((model) => [
+        provider,
+        model,
+      ] as const)
+    ),
+  )(
+    "keeps %s model %s pricing unknown without a stable authoritative rate",
+    (provider, model) => {
+      const usage = {
+        provider,
+        model,
+        inputTokens: 1_000,
+        outputTokens: 500,
+        cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0,
+        webSearchRequests: 0,
+        totalTokens: 1_500,
+        turns: 1,
+      };
+
+      expect(resolveModelCostEntry(usage, DEFAULT_MODEL_COSTS)).toBeNull();
+      expect(computeUsdCostWithResolution(usage, DEFAULT_MODEL_COSTS))
+        .toMatchObject({ known: false });
+    },
+  );
+
+  test("uses the current official Cerebras token rates", () => {
+    expect(DEFAULT_MODEL_COSTS["cerebras:gpt-oss-120b"]).toMatchObject({
+      inputUsdPer1K: 0.00035,
+      outputUsdPer1K: 0.00075,
+    });
+    expect(DEFAULT_MODEL_COSTS["cerebras:qwen-3.8-27b"]).toMatchObject({
+      inputUsdPer1K: 0.00099,
+      outputUsdPer1K: 0.00149,
+    });
+    expect(DEFAULT_MODEL_COSTS["cerebras:gemma-4-31b"]).toMatchObject({
+      inputUsdPer1K: 0.00099,
+      outputUsdPer1K: 0.00149,
+    });
+  });
+
+  test("uses the official Z.ai list token rates", () => {
+    expect(DEFAULT_MODEL_COSTS["zai:glm-5.3"]).toMatchObject({
+      inputUsdPer1K: 0.0014,
+      outputUsdPer1K: 0.0044,
+      cachedInputUsdPer1K: 0.00026,
+      cachedInputIncludedInInputTokens: true,
+    });
+    expect(DEFAULT_MODEL_COSTS["zai:glm-5.3-flash"]).toMatchObject({
+      inputUsdPer1K: 0.00015,
+      outputUsdPer1K: 0.0005,
+      cachedInputUsdPer1K: 0.00003,
+      cachedInputIncludedInInputTokens: true,
+    });
+    expect(DEFAULT_MODEL_COSTS["zai-coding-plan:glm-5.3"])
+      .toBeUndefined();
+    const codingPlan = new CostSidecar({
+      defaultProvider: "zai-coding-plan",
+      defaultModel: "glm-5.3",
+    });
+    codingPlan.onEvent({
+      id: "coding-plan-usage",
+      seq: 1,
+      msg: {
+        type: "token_count",
+        payload: {
+          promptTokens: 1_000,
+          completionTokens: 100,
+          totalTokens: 1_100,
+        },
+      },
+    });
+    expect(codingPlan.hasUnknownModelCost()).toBe(true);
+    expect(codingPlan.getUnknownCostModels())
+      .toContain("zai-coding-plan:glm-5.3");
+  });
+
+  test("uses the official Moonshot global Kimi token rates", () => {
+    expect(DEFAULT_MODEL_COSTS["kimi:kimi-k3"]).toMatchObject({
+      inputUsdPer1K: 0.003,
+      outputUsdPer1K: 0.015,
+      cachedInputUsdPer1K: 0.0003,
+      cachedInputIncludedInInputTokens: true,
+    });
+    expect(DEFAULT_MODEL_COSTS["kimi:kimi-k2.7-code"]).toMatchObject({
+      inputUsdPer1K: 0.00095,
+      outputUsdPer1K: 0.004,
+      cachedInputUsdPer1K: 0.00019,
+    });
+    expect(DEFAULT_MODEL_COSTS["kimi:kimi-k2.7-code-highspeed"])
+      .toMatchObject({
+        inputUsdPer1K: 0.0019,
+        outputUsdPer1K: 0.008,
+        cachedInputUsdPer1K: 0.00038,
+      });
+    expect(DEFAULT_MODEL_COSTS["kimi:kimi-k2.6"]).toMatchObject({
+      inputUsdPer1K: 0.00095,
+      outputUsdPer1K: 0.004,
+      cachedInputUsdPer1K: 0.00016,
+    });
+  });
+
   test("current DeepSeek and Mistral defaults use their official cached-token tiers", () => {
     expect(DEFAULT_MODEL_COSTS["deepseek:deepseek-v4-flash"]).toMatchObject({
-      inputUsdPer1K: 0.00014,
-      outputUsdPer1K: 0.00028,
-      cachedInputUsdPer1K: 0.0000028,
+      inputUsdPer1K: 0.0003,
+      outputUsdPer1K: 0.0012,
+      cachedInputUsdPer1K: 0.000006,
       cachedInputIncludedInInputTokens: true,
     });
     expect(DEFAULT_MODEL_COSTS["deepseek:deepseek-v4-pro"]).toMatchObject({
-      inputUsdPer1K: 0.000435,
-      outputUsdPer1K: 0.00087,
-      cachedInputUsdPer1K: 0.000003625,
+      inputUsdPer1K: 0.00132,
+      outputUsdPer1K: 0.00396,
+      cachedInputUsdPer1K: 0.000044,
       cachedInputIncludedInInputTokens: true,
     });
+    for (const model of ["deepseek-flash", "deepseek-v4-flash-vision-exp"]) {
+      expect(DEFAULT_MODEL_COSTS[`deepseek:${model}`]).toBe(DEFAULT_MODEL_COSTS["deepseek:deepseek-v4-flash"]);
+    }
     expect(DEFAULT_MODEL_COSTS["mistral:mistral-medium-latest"])
       .toMatchObject({
         inputUsdPer1K: 0.0015,
@@ -289,6 +441,15 @@ describe("cost helpers", () => {
       });
   });
 
+  test("Grok 4.7 uses the documented base token rates", () => {
+    const match = resolveModelCostEntry({ model: "grok-4.7", provider: "grok" }, DEFAULT_MODEL_COSTS);
+    expect(match?.entry).toMatchObject({
+      inputUsdPer1K: 0.002,
+      cachedInputUsdPer1K: 0.0005,
+      outputUsdPer1K: 0.006,
+    });
+  });
+
   test("default + catalog grok models price as known and non-reasoning ones are not charged the reasoning surcharge", () => {
     // grok-4.3 is the grok provider default (provider-info.ts). Both it and
     // grok-build-0.1 used to mis-resolve: grok-4.3 collapsed onto the
@@ -296,6 +457,7 @@ describe("cost helpers", () => {
     // DEFAULT_UNKNOWN_MODEL_COST. Since DEFAULT_MODEL_COSTS feeds dollar_cap
     // enforcement, mispricing here enforces budgets at the wrong threshold.
     const nonReasoningModels = [
+      "grok-4.7",
       "grok-4.6",
       "grok-4.5",
       "grok-4.3",
@@ -380,7 +542,6 @@ describe("cost helpers", () => {
 
   test("computeUsdCost prices cache writes and web search requests", () => {
     const usage = {
-      // branding-scan: allow documented Anthropic API model identifier
       model: "claude-sonnet-4-5",
       inputTokens: 1_000,
       outputTokens: 1_000,
@@ -488,7 +649,6 @@ describe("CostSidecar", () => {
   test("tracks cache writes and web search usage", () => {
     const sidecar = new CostSidecar({
       defaultProvider: "anthropic",
-      // branding-scan: allow documented Anthropic API model identifier
       defaultModel: "claude-sonnet-4-5",
     });
     sidecar.onEvent({
@@ -720,6 +880,21 @@ describe("CostSidecar", () => {
 
     expect(handlers).toHaveLength(0);
     expect(writes).toEqual(["\nlifecycle-summary\n"]);
+  });
+
+  test("exitSummary false registers no process exit hook and writes nothing on stop", async () => {
+    const on = vi.spyOn(process, "on");
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      const sidecar = new CostSidecar({ exitSummary: false });
+      sidecar.start();
+      expect(on.mock.calls.filter(([event]) => event === "exit")).toHaveLength(0);
+      await sidecar.stop();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      on.mockRestore();
+      write.mockRestore();
+    }
   });
 
   test("formatSummary produces one-line output", () => {

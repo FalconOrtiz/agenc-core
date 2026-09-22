@@ -585,7 +585,7 @@ async function submitToSession(
         throw new MailboxCapacityError(session.conversationId);
       }
       if (op.communication.triggerTurn) {
-        await session.submit("", { displayUserMessage: null });
+        await session.submitChildFollowup();
       }
       return session.conversationId;
     }
@@ -678,12 +678,14 @@ async function submitToLiveAgent(
         }
       }
       return live.agentId;
-    case "interrupt":
+    case "interrupt": {
       if (!live.abortController.signal.aborted) {
         live.abortController.abort(op.reason ?? "interrupt");
       }
-      live.status.markInterrupted(live.agentId, op.reason ?? "interrupt");
+      const interruptedStatus = live.status.value;
+      live.status.markInterrupted("turnId" in interruptedStatus ? interruptedStatus.turnId : live.agentId, op.reason ?? "interrupt");
       return live.agentId;
+    }
     case "shutdown":
       const reason = op.reason ?? "shutdown";
       live.upInbox.close(reason);

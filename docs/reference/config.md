@@ -76,6 +76,47 @@ it and recovery never writes bare mode into the session toggle.
 `--bare` also takes precedence over `runtimeOptions.allowUntrustedHooks`; an
 untrusted-command capability cannot lift hard hook suppression.
 
+## Interrupted runtime-state publication
+
+`RuntimeStateRepository` reconciles interrupted `state.json` publications before
+an initial read, update, or freshness reload. Recovery and normal updates use
+the same configuration authority lock. A process that dies while holding that
+lock can leave it unavailable until its existing 30-second stale interval
+expires. Do not remove the lock while another AgenC process is running.
+Lock contention during a freshness reload invalidates the cache. The next
+read retries recovery even if `state.json` has not emitted another change.
+
+Each replacement has a versioned transaction journal and matching temporary
+and quarantine filenames. The journal binds the prior and replacement file
+identities, modes, ownership, sizes, modification times, and SHA-256 digests.
+The journal and file data are synchronized before the prior canonical file is
+moved. The exclusive link at the canonical path is the commit point.
+
+Recovery restores the prior state if publication did not reach that point.
+If the canonical path contains the recorded replacement, recovery keeps it.
+Expected two-link stages must match their recorded canonical partner before
+cleanup. Recovery synchronizes the parent directory between namespace changes
+and retains the journal until the surviving canonical file is verified.
+Direct users of the low-level publication and recovery functions must hold
+the configuration authority lock themselves.
+
+Malformed or multiple transactions, changed artifacts, unexpected links, and
+legacy stages whose unrelated IDs cannot prove a transaction stop startup
+with a recovery error. An interrupted first publication with no committed
+state also requires operator recovery. None of these cases becomes an empty
+runtime state. Preserve the reported files and the AgenC home before any
+manual recovery. Do not delete a stage because its timestamp looks older.
+
+Directory synchronization support depends on the operating system and
+filesystem. An unsupported directory sync does not establish power-loss
+durability. A sync failure before publication stops the update; a failure
+after publication preserves artifacts not yet cleaned up and reports an
+indeterminate commit durability. See the [Node.js file synchronization contract](https://nodejs.org/download/release/v26.5.0/docs/api/fs.html#fsfsyncsyncfd).
+
+The canonical JSON schema remains `state_version = 1`. After successful
+cleanup, the prior release can read the document. Finish any pending
+transaction with this release before downgrading.
+
 ## Layer order
 
 Later layers win:
@@ -153,6 +194,12 @@ no default home, relocated home, or colliding directory still owns the record;
 keep those processes stopped until apply completes.
 
 Linux uses its bundled Secret Service helper to enumerate every collection.
+On a Linux host with no Secret Service at all (a container, a server, CI:
+no `libsecret-1.so.0`, or no session bus), the native backend is
+unavailable rather than unreadable. Reads then answer empty, with one
+warning line on stderr, so credentials from the environment and from
+`config.toml` keep working; saving or clearing a credential still fails with
+a clear message, and the destructive migration preconditions stay strict.
 Read, update, and delete refuse multiple records for the exact service/account
 identity; a single existing item is updated or deleted in its own collection.
 This replaces the mismatched all-collection lookup, default-collection store,
@@ -258,7 +305,7 @@ otherwise.
 | `model_provider` | `grok` |
 | `approval_policy` | `on-request` |
 | `sandbox_mode` | `workspace-write` |
-| `reasoning_effort` | `medium` |
+| `reasoning_effort` | `medium`; omitted for Gemini unless explicitly configured |
 | `approvals_reviewer` | `user` |
 | `agent_max_depth` | `1` |
 | `auth.backend` | `remote` |
@@ -268,6 +315,7 @@ otherwise.
 | `mcp.server.enabled` | `false` |
 | `mcp.server.transport` | `stdio` |
 | `daemon.autostart` | `true` |
+| `daemon.agent_stop_timeout_ms` | `30000` |
 | `gateway.defaultAgent` | `default` |
 | `gateway.hooks.enabled` | `false` |
 | `project_root_markers` | `.git`, `package.json`, `Cargo.toml`, `pyproject.toml` |
@@ -278,16 +326,6 @@ otherwise.
 | `providers.grok.enable_image_search` | `true` |
 | `providers.grok.enable_image_understanding` | `true` |
 | `providers.grok.enable_video_understanding` | `true` |
-| `buffer.provider` | `auto` |
-| `buffer.show_tabs` | `auto` |
-| `buffer.neovim.init` | `auto` |
-| `buffer.neovim.startup_timeout_ms` | `10000` |
-| `buffer.neovim.operation_timeout_ms` | `10000` |
-| `buffer.neovim.cleanup_timeout_ms` | `1000` |
-| `buffer.prediction.enabled` | `ask` |
-| `buffer.prediction.debounce_ms` | `160` |
-| `buffer.prediction.timeout_ms` | `2500` |
-| `buffer.prediction.max_output_tokens` | `256` |
 | `tui.theme` | `dark` |
 | `tui.showTurnDuration` | `true` |
 | `tui.terminalProgressBarEnabled` | `true` |
@@ -307,26 +345,121 @@ otherwise.
 | `agent.retention.snapshot_days` | `3` |
 | `agent.retention.snapshot_max_count` | `10000` |
 | `agent.retention.snapshot_max_bytes` | `67108864` |
+| `agent.retention.rollout_days` | `30` (0 keeps every session). Newest-rollout-mtime window; pending reviews and live locks keep the directory. Operator contract: [daemon.md](daemon.md#session-rollout-retention). |
+
+Session snapshots stay dirty until persistence succeeds. Failed writes retain
+their serialized payload and timestamp. New events remain pending for the next
+snapshot. Timer retries start at 250 ms and double to a 30-second cap; explicit
+and periodic flushes can also retry. A failed session or project does not block
+the remaining periodic writes. A retry verifies any existing database row,
+accepting identical content instead of inserting a duplicate or replacing
+different content. New pending
+write files carry this verification flag through startup replay. Older pending
+files keep their existing replay behavior, and older runtimes do not enforce the
+new flag. Finish pending recovery before downgrading.
+
+If a dirty session cannot be persisted during eviction, the policy refuses the
+new session rather than exceeding its tracking cap. A failed close retains the
+session and its database driver, stops timers, and reports a cleanup error. An
+in-process owner can repair storage and retry close. Daemon shutdown reports a
+nonzero exit status but does not wait indefinitely for storage repair. Memory
+cannot survive process exit; if storage failed before a recovery file became
+durable, shutdown or a forced kill can still lose that unpersisted state.
 
 `max_turns` is unset by default; an unset turn cap does not impose a
-synthetic stop. `stream_watchdog_timeout_ms` defaults to `600000` (ten
+synthetic stop. `completion_gate` defaults to `mode = "auto"` with
+`max_rounds = 3`: in a non-interactive session (`agenc -p`, a routine, an
+evaluation harness) the first tool-free final answer of a turn that used
+tools is not accepted; the runtime injects a durable `<completion_gate>`
+user message that quotes the task and asks for a checklist backed by
+executed checks. Acceptance requires each nonempty checked `- [x]` item
+outside code fences to have an associated successful tool result after the
+latest request. Association is token overlap between the item text and the
+tool name, arguments, or content — a successful unrelated FileRead does
+not verify a numerical claim. Unchecked `- [ ]` or malformed items prevent
+verification. Explicit `- [-]` unavailable claims get an investigation
+request every round and settle as `partial` with `unavailable_checks` only
+at the round cap. The gate does not accept a probe as proof of a missing
+capability, because a probe and the check itself are both runnable results
+associated with the same item and cannot be told apart structurally. A `- [-]` mark is not itself evidence: if the
+named check actually ran (numeric `exitCode`), the item is unmet, not
+unavailable. A tool error or an explicitly still-running command
+(`metadata.exitCode = null`) does not count as a successful check; a later
+associated successful result can supersede an earlier associated failure.
+The gate checks this structure, not whether the evidence proves every task
+requirement or whether the delivered work is correct, and a `verified`
+event is not a benchmark pass. A turn that never called a tool (a plain
+question) is not gated. At `max_rounds` an unmet answer is recorded as
+`exhausted`; an unavailable leftover is `partial`. Warnings
+`completion_gate_exhausted` and `completion_gate_partial` state that the
+final answer was not fully verified. The turn still completes with its
+existing stop reason and exit code; text-mode `agenc -p` prints the
+warning to stderr, and structured output includes the warning event.
+`mode = "never"` turns the gate off, `mode = "always"` applies it to
+interactive sessions too.
+`compaction` controls the degraded compaction ladder. When automatic
+compaction at the context limit declines to shrink the history (the
+summary would not save enough, or the summarizer failed), the runtime
+retries once with an aggressive summary that keeps no verbatim tail, and
+then, with `compaction.emergency_mode = "always"` (the default), commits a
+model-free emergency compaction: a runtime-written summary that names the
+original request, the latest assistant text and tool calls, and the
+dropped message count, through the same durable transaction as every
+other compaction. An `auto_compact_degraded` warning records each tier;
+`compact_ladder_exhausted` in the `compact_failed` message means every
+tier declined. The reactive path walks the same ladder: when a provider
+refuses a request at its context window and the standard collapse fails
+inside compaction's own bounds (a planner or output limit, a rejected or
+failed summary, the shrink floor), the runtime steps down to the aggressive
+summary and then the emergency compaction instead of ending the turn with
+tiers unused. Each step is an `auto_compact_degraded` warning prefixed
+`reactive_recovery/in_turn`; when every tier declines, a
+`context_collapse_ladder_exhausted` warning names each tier's reason and
+the turn ends with `prompt_too_long_exhausted`. Faults that leave the
+history state uncertain (a failed intent or commit, an interrupted
+recovery, an abort) still end the turn at once. `compaction.emergency_mode`
+accepts `always` (default) or `never`; `never` disables the model-free tier
+only, on both paths.
+
+Before any of that, a squeezed output reservation is reported once it
+falls below half of the requested maximum, whether the chat-completions
+provider shrank it to fit the estimated prompt or admission had already
+fitted it before dispatch: an `output_reservation_squeezed` warning names
+the granted and requested output tokens, the estimated prompt and the
+context window. On the admitted path the pre-admission ceiling travels
+with the request for this warning only; it never widens any limit. It repeats
+each time the remaining reservation halves and re-arms once a request fits
+again, so a long tool loop that is walking toward the context window is
+visible in the transcript and the rollout before the provider refuses a
+request. The fit itself is unchanged.
+`stream_watchdog_timeout_ms` defaults to `600000` (ten
 minutes of provider silence): the runtime warns at half that time and aborts
 the stream with a retryable `stream_idle` error at the deadline. Set it to
 `0` to permit provider silence indefinitely. The *default* applies to session
 turns only: a one-shot review delegate (`/review`, guardian approval review)
 carries its own deadline, so the ten-minute default is not layered on top of
 it. A value you configure yourself is still honoured inside a review delegate.
+
+`provider_outage_wait_ms` and `provider_outage_retry_ms` govern what happens
+after the fast reconnect ladder gives up on a transient provider error
+(connection refused or reset, a 5xx, a request timeout). Instead of ending the
+turn, the runtime waits `provider_outage_retry_ms` (30 s), then twice that,
+doubling up to ten times the base (5 min), and tries again until the waits
+would exceed `provider_outage_wait_ms` (30 min); each wait is announced by a
+`provider_outage_wait` warning event, and cancelling the turn ends it at once.
+A streamed tool call that makes a retry unsafe still ends the turn immediately.
 The guardian approval review behind a permission prompt runs under a
 ten-minute deadline of its own, so a dead provider socket expires that review
 instead of parking the approval. `[budget]`, `[heartbeat]`, `[browser]`, and
 `[transaction_guard]` apply their documented subsystem defaults when absent.
 
 On a keep-alive (interactive) session, hitting `max_turns`,
-`max_budget_usd`, the no-progress backstop, or `compact_failed` ends
-that **turn** only. Send another prompt; the session stays running.
-Daemon-backed one-shot agents (`--print` / `--no-tui`) report the terminal
-`turn_complete` and exit 0. The compatibility `runAgent` surface with
-`keepAlive: false` still reports failure. See
+`max_budget_usd`, the no-progress backstop, or `compact_failed` fails
+that turn only. An `empty_response` after the retry also fails the turn.
+Each emits canonical `turn_failed` with the stop reason as its code.
+Send another prompt; the session stays running. Daemon-backed one-shot
+agents (`--print` / `--no-tui`) exit 1. The compatibility `runAgent` surface
+with `keepAlive: false` also reports failure. See
 [daemon.md](daemon.md#interactive-session-survival). Compact skip:
 [daemon.md](daemon.md#compact-skip-stays-per-turn).
 
@@ -360,7 +493,7 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `reasoning_summary` | `auto`, `concise`, `detailed`, or `none`. |
 | `approvals_reviewer` | `user` or `auto_review`. |
 | `model_verbosity` | `low`, `medium`, or `high`. |
-| `service_tier` | `priority` or `flex`. |
+| `service_tier` | `priority` or `flex`. `priority` is the one "Fast" dial: OpenAI priority processing (`service_tier`, GPT-5 family and GPT-4.1/4o/o-series, 2x standard price) and Anthropic fast mode on Claude Opus 5 and Opus 4.8 (`speed: "fast"` plus the `fast-mode-2026-02-01` beta header, 2x price, research preview access from Anthropic). Providers and models without a fast tier ignore it; the model info `serviceTiers` list says which ones have it. |
 | `personality` | `none`, `friendly`, or `pragmatic`. |
 | `agent_max_threads` | Positive concurrent-agent thread cap. |
 | `agent_max_depth` | Non-negative subagent nesting cap. |
@@ -371,10 +504,24 @@ names; `[]` denotes an array entry. Open maps accept keys at the indicated
 | `max_output_tokens` | Positive global model-output limit. |
 | `capped_default_max_output_tokens` | Boolean capped-default/retry behavior. |
 | `max_turns` | Positive loop backstop. |
-| `max_budget_usd` | Positive session cost cap. |
+| `max_budget_usd` | Positive shared cost cap for the session and its child agents. |
 | `autonomous_mode` | Boolean autonomous runtime mode. |
 | `coordinator_mode` | Boolean coordinator-only main-session behavior. |
 | `stream_watchdog_timeout_ms` | Non-negative inter-chunk idle timeout; default `600000`, `0` disables. |
+| `provider_outage_wait_ms` | Non-negative total time a turn keeps waiting for a provider outage to end once the reconnect ladder is spent; default `1800000` (30 minutes), `0` ends the turn as soon as the ladder is exhausted. |
+| `provider_outage_retry_ms` | Positive first slow-retry delay during a provider outage, doubling up to ten times this value; default `30000`. |
+
+`max_budget_usd` limits the canonical admission ledger for the whole session,
+including concurrent child agents. Completed usage and outstanding reservations
+count against the same cap before new work starts. A stricter
+`agent.budget.dollar_cap` or enabled calendar budget still applies.
+
+Resuming a session preserves its recorded usage, reservations, and lowest bound
+cost cap. A lower configured cap tightens that limit; a higher or omitted cap
+does not increase the existing session's allowance. Start a new session to use
+a higher cap. Older sessions without a recorded cap acquire the configured
+limit on resume without resetting their spend. If existing usage and
+reservations already exceed the limit, new work is denied.
 
 Project-root discovery happens before project and local configuration can be
 loaded. Its marker authority is therefore limited to the built-in/plugin/user
@@ -391,7 +538,7 @@ from a late CLI layer is rejected.
 | --- | --- |
 | `autoUpdates`, `autoUpdatesChannel` | Update enablement and `latest`/`stable` channel. Absent enablement preserves the updater default. |
 | `respectGitignore`, `includeGitInstructions` | Git-aware discovery and instruction behavior. |
-| `transcriptPersistenceEnabled` | Persist session transcripts (default `true`). Retention is configured only by `agent.retention.rollout_days`. |
+| `transcriptPersistenceEnabled` | Persist session transcripts (default `true`). Retention: `agent.retention.rollout_days`, default 30 days; sessions whose newest rollout file is older than the window are deleted with their rollout files; 0 keeps every session. See [session rollout retention](daemon.md#session-rollout-retention). |
 | `outputStyle` | Named assistant response style. |
 | `defaultShell` | `bash` or `powershell`. |
 | `language` | Preferred response language. |
@@ -497,6 +644,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `providers.<provider>.web_search`, `providers.<provider>.x_search`, `providers.<provider>.code_execution` | Grok-only native web, X, and code capabilities; rejected on every other provider. |
 | `providers.<provider>.enable_image_search`, `providers.<provider>.enable_image_understanding`, `providers.<provider>.enable_video_understanding` | Grok-only native media capabilities; rejected on every other provider. |
 | `providers.<provider>.incremental_continuation` | Grok-only boolean opt-in (`AGENC_XAI_INCREMENTAL`) for Responses `previous_response_id` continuation on streaming turns; default off. |
+| `providers.<provider>.zero_data_retention` | OpenRouter-only boolean. Every request carries `provider.zdr = true`, so OpenRouter routes only to endpoints with a zero-data-retention policy and refuses a model that has none instead of serving it elsewhere. Rejected under every other provider table: those providers control retention per account, project or team on their own console (see [providers.md](providers.md#zero-data-retention)). |
 | `providers.<provider>.collections` | Grok-only native collection-search block. |
 | `providers.<provider>.collections.enabled`, `providers.<provider>.collections.max_num_results`, `providers.<provider>.collections.vector_store_ids` | Collection enablement, positive result cap, and vector-store ID list. |
 | `providers.<provider>.remote_mcp` | Grok-only server-side MCP block. |
@@ -547,6 +695,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `mcp_servers.<server>.command`, `mcp_servers.<server>.args`, `mcp_servers.<server>.cwd` | Stdio process launch fields. |
 | `mcp_servers.<server>.env`, `mcp_servers.<server>.env.<name>`, `mcp_servers.<server>.env_vars` | Literal environment map and inherited variable-name array. |
 | `mcp_servers.<server>.endpoint`, `mcp_servers.<server>.headers`, `mcp_servers.<server>.headers.<name>` | Remote URL and header map. |
+| `mcp_servers.<server>.oauth` | Public OAuth metadata for HTTP/SSE connections: `clientId`, `scopes`, `authServerMetadataUrl`, `callbackPort`, and `xaa`. Metadata URLs require HTTPS; callback ports range from 1024 to 65535. Credentials stay in native storage, and this block cannot accompany an `Authorization` header. |
 | `mcp_servers.<server>.enabled`, `mcp_servers.<server>.required`, `mcp_servers.<server>.timeout` | Enablement, required-startup policy, and timeout. |
 | `mcp_servers.<server>.default_tools_approval_mode` | Server-wide approval default. |
 | `mcp_servers.<server>.enabled_tools`, `mcp_servers.<server>.disabled_tools` | Tool arrays. |
@@ -598,7 +747,7 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 
 | Paths | Type / meaning |
 | --- | --- |
-| `lsp_servers`, `lsp_servers.<server>` | Named language server configs. |
+| `lsp_servers`, `lsp_servers.<server>` | Named language server configs. Without any, built-in profiles start `typescript-language-server`, `basedpyright-langserver`/`pyright-langserver`, `gopls` and `rust-analyzer` when the binary is on PATH (never from the workspace); a configured server that claims an extension replaces the matching profile. `AGENC_DISABLE_BUILTIN_LSP=1` turns the profiles off. |
 | `lsp_servers.<server>.command`, `lsp_servers.<server>.args`, `lsp_servers.<server>.workspaceFolder` | Launch command and workspace. |
 | `lsp_servers.<server>.env`, `lsp_servers.<server>.env.<name>` | String environment map. |
 | `lsp_servers.<server>.extensionToLanguage`, `lsp_servers.<server>.extensionToLanguage.<name>` | Required extension-to-language map. |
@@ -606,33 +755,47 @@ optional `headers`), `github` (`repo`, optional `ref`, `path`, `sparsePaths`),
 | `lsp_servers.<server>.startupTimeout`, `lsp_servers.<server>.maxRestarts` | Startup/restart limits. |
 | `attachments`, `attachments.allowedRoots` | Extra roots allowed for `@file` attachment reads. |
 
-### TUI, editor, commands, and presentation
+### TUI, commands, and presentation
 
 | Paths | Type / meaning |
 | --- | --- |
-| `tui`, `tui.vimMode` | TUI block and vim-keybinding switch. |
+| `tui` | TUI block. |
 | `tui.theme` | `auto`, `dark`, `light`, one of the daltonized palettes, or one of the ANSI palettes. |
 | `tui.showTurnDuration`, `tui.terminalProgressBarEnabled`, `tui.copyOnSelect` | Turn-duration display, terminal progress, and selection-copy switches. |
 | `tui.flickerFreeMode`, `tui.prStatusFooterEnabled` | Flicker reduction and pull-request footer switches. |
 | `tui.keybindings`, `tui.keybindings[]` | Ordered canonical keybinding override blocks. This is operator-only: user config may set it and the final managed layer may replace and lock the complete array; plugin/project/local layers are ignored with diagnostics. |
-| `tui.keybindings[].context` | Required registered TUI context such as `Chat`, `Global`, `Buffer`, or `BufferHost`. |
+| `tui.keybindings[].context` | Required registered TUI context such as `Chat` or `Global`. |
 | `tui.keybindings[].bindings` | Chord-to-action map. `command:<name>` is accepted only in `Chat`. |
 | `tui.keybindings[].bindings.<name>` | Operator-chosen chord mapped to a registered action or a `command:<name>` binding. |
 | `tui.keybindings[].unbind` | Chords to unbind explicitly. A chord cannot also occur in `bindings`, including through aliases. |
-| `buffer` | Embedded editor block. |
-| `buffer.provider` | `auto`, `neovim`, `inline`, or `external`. |
-| `buffer.show_tabs` | `auto`, `always`, or `never`. |
-| `buffer.neovim` | Neovim process block. |
-| `buffer.neovim.executable`, `buffer.neovim.init`, `buffer.neovim.discovery_timeout_ms` | Executable, `auto`/`user`/`clean` init, and discovery timeout. |
-| `buffer.neovim.startup_timeout_ms`, `buffer.neovim.operation_timeout_ms`, `buffer.neovim.cleanup_timeout_ms` | Process timeouts. |
-| `buffer.prediction` | Code prediction block. |
-| `buffer.prediction.enabled`, `buffer.prediction.debounce_ms`, `buffer.prediction.timeout_ms`, `buffer.prediction.max_output_tokens` | `ask`/`on`/`off` and limits. |
-| `buffer.prediction.provider`, `buffer.prediction.model` | Optional independent route. |
 | `statusLine`, `statusLine.type`, `statusLine.command`, `statusLine.padding` | Operator-owned status command; `type` is literal `command`. Project/local layers cannot install it. Execution follows session command-hook policy and `--bare` suppression. |
 | `fileSuggestion`, `fileSuggestion.type`, `fileSuggestion.command` | Operator-owned file suggestion command; `type` is literal `command`. Project/local layers cannot install it. Execution follows session command-hook policy and `--bare` suppression. |
 | `attribution`, `attribution.commit`, `attribution.pr` | Commit and pull-request attribution strings. |
 | `worktree`, `worktree.symlinkDirectories`, `worktree.sparsePaths` | Worktree directory/sparse-checkout arrays. |
 | `spinnerVerbs`, `spinnerVerbs.mode`, `spinnerVerbs.verbs` | `append`/`replace` verb customization. |
+
+Daemon-backed TUI status commands execute in the owning daemon session, using
+its operator configuration, workspace, shell environment, sandbox, and execution
+admission. The TUI cannot supply a command or override those permissions.
+Workspace trust, managed hook policy, disabled hooks, and `--bare` still apply.
+Commands have a five-second deadline including admission wait, accept at most
+64 KiB of input, and return at most 16 KiB of text. A session runs only one status
+command at a time. Cancelling a refresh or closing the session stops its process
+tree before releasing execution capacity. Before a live session exists, the
+custom status line remains unavailable; rendering never starts a model turn.
+An executing status command holds its workspace operation open until its
+process cleanup finishes.
+
+The daemon reports current context usage from its own token records. If no
+recent record is available, `context_window.current_usage`, both context
+percentages, and `exceeds_200k_tokens` are `null`. Clearing or replacing history
+invalidates that context sample without resetting cumulative spending.
+
+In the TUI, status-line commands receive shared session spending, including
+child agents, in `cost.total_cost_usd`. When `cost.has_unknown_cost` is true,
+that number is only the known subtotal; a pending initial snapshot also sets
+the flag. Child spending refreshes the status line without waiting for a new
+parent response.
 
 ```toml
 [tui]
@@ -657,10 +820,12 @@ keybinding file or watcher.
 | `autoMode`, `autoMode.allow`, `autoMode.soft_deny`, `autoMode.environment` | Classifier allow/soft-deny/environment arrays. |
 | `agent`, `agent.budget`, `agent.budget.token_cap`, `agent.budget.dollar_cap`, `agent.budget.wall_clock_seconds` | Per-run caps. |
 | `agent.retention`, `agent.retention.completed_days`, `agent.retention.failed_days`, `agent.retention.snapshot_days` | Retention days. |
-| `agent.retention.snapshot_max_count`, `agent.retention.snapshot_max_bytes`, `agent.retention.rollout_days` | Snapshot/rollout retention. |
+| `agent.retention.snapshot_max_count`, `agent.retention.snapshot_max_bytes`, `agent.retention.rollout_days` | Snapshot/rollout retention. `rollout_days` is the disk session-directory sweep (default 30; 0 disables). See [session rollout retention](daemon.md#session-rollout-retention). |
 | `durableTurns` | Durable-turn block. |
 | `durableTurns.checkpoint`, `durableTurns.checkpoint.enabled`, `durableTurns.checkpoint.minIntervalMs` | Checkpoint switch and throttle. `enabled` defaults to `true`. When false, restart reports `no-checkpoint` and opens a fresh turn. `minIntervalMs` throttles ordinary `iteration` and `postAssistant` writes. It does not defer the forced pre-admission checkpoint after `modelSampleOrdinal` advances. |
 | `durableTurns.resume`, `durableTurns.resume.onRestart` | Resume-on-restart switch. Default `true`. When false, startup opens a fresh turn with reason `disabled`. The removed `resume.policy` key is stripped on migrate; it is not an operator setting. |
+| `completion_gate`, `completion_gate.mode`, `completion_gate.max_rounds` | Non-interactive verification round. `mode` is `auto` (default: only sessions created with `runtimeOptions.nonInteractive`), `always`, or `never`; `max_rounds` is `1..10`, default `3`. See [Built-in defaults](#built-in-defaults). |
+| `goal`, `goal.max_rounds`, `goal.stall_rounds`, `goal.judge_model`, `goal.verify_timeout_ms` | Policy for `/goal`. `max_rounds` is how many continuations a goal may use before it stops as `budget_exhausted` (`1..100`, default `20`); `stall_rounds` is how many rounds in a row may end without a successful tool call before the goal stalls (default `3`); `judge_model` pins the independent reviewer's model (default: the session model); `verify_timeout_ms` bounds each verification command the runtime runs (default `600000`). See [goal.md](goal.md). |
 | `durableTurns.resume.requireLease`, `durableTurns.resume.buildPinning` | Lease and build-pinning guards. Both default `true`. Resume fail-closes when an enabled guard finds a lease or build-id mismatch. The switches enable or disable individual guards. They do not select an idempotent replay policy. |
 
 ### Gateway
@@ -688,6 +853,7 @@ environment ingress.
 | Paths | Type / meaning |
 | --- | --- |
 | `daemon`, `daemon.autostart` | Daemon block and automatic daemon startup. The local daemon transport is fixed by the platform runtime. |
+| `daemon.agent_stop_timeout_ms` | Graceful agent stop and previous-generation cleanup deadline in milliseconds (default `30000`, positive integer up to `2147483647`). A stop that exceeds this deadline aborts execution and allows up to `5000` ms for hard teardown before reporting failure. Restart the daemon after changing this setting. |
 | `browser` | Chromium execution policy. |
 | `browser.executable_path`, `browser.profile_dir` | Browser binary/profile paths. |
 | `browser.headless`, `browser.allow_private_network`, `browser.no_sandbox` | Security/runtime booleans. |

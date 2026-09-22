@@ -103,6 +103,22 @@ describe("secrets sanitizer", () => {
     expect(redacted).toContain("value=abcd1234EFGH5678ijkl9012MNOP3456qrst7890");
   });
 
+  it("redacts complete QwenCloud PayGo and Token Plan key shapes", () => {
+    const payGo = ["sk-ws-H", "WORK123", "ABCD", "a".repeat(64)].join(".");
+    const tokenPlan = ["sk-sp-H", "PLAN123", "WXYZ", "b".repeat(64)].join(".");
+
+    const redactedText = redactSecrets(`paygo=${payGo}\nplan=${tokenPlan}`);
+    expect(redactedText).not.toContain(payGo);
+    expect(redactedText).not.toContain(tokenPlan);
+    expect(redactedText.split(REDACTED_SECRET)).toHaveLength(3);
+
+    const redactedValue = redactSecretsInValue({ payGo, nested: { tokenPlan } });
+    expect(redactedValue).toEqual({
+      payGo: REDACTED_SECRET,
+      nested: { tokenPlan: REDACTED_SECRET },
+    });
+  });
+
   it("redacts AWS secret/access-key fields on the structured-object path", () => {
     const artifact = {
       credentials: {
@@ -255,5 +271,17 @@ describe("secrets sanitizer", () => {
     const plain = tempDir();
     const id = environmentIdFromCwd(plain);
     expect(id).toMatch(/^cwd-[a-f0-9]{12}$/);
+  });
+});
+
+describe("redaction is idempotent", () => {
+  it("leaves its own marker and already-redacted values unchanged", () => {
+    const once = redactSecretsInValue({
+      text: "xai-" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6" + " and sk-" + "abcdefghijklmnopqrstuvwxyz0123456789",
+      nested: ["gsk_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", { marker: REDACTED_SECRET }],
+    });
+    expect(JSON.stringify(once)).toContain(REDACTED_SECRET);
+    expect(redactSecretsInValue(once)).toEqual(once);
+    expect(redactSecretsInValue(JSON.stringify(once))).toBe(JSON.stringify(once));
   });
 });

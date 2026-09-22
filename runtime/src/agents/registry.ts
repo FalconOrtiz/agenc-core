@@ -1,7 +1,6 @@
 /**
  * AgentRegistry — in-memory slot + path tracking for subagents.
  *
- * Hand-port of reference runtime `core/src/agent/registry.rs` (344 LOC).
  * Owns:
  *   - Spawn-slot counter
  *   - `agentPath` → `AgentMetadata` map (hierarchical "/root/worker/sub")
@@ -10,7 +9,7 @@
  *
  * Invariants wired:
  *   I-37 (sibling `agentPath` collision) — `reserveAgentPath` returns
- *        `AgentPathExistsError` on collision. Mirrors reference runtime.
+ *        `AgentPathExistsError` on collision.
  *   I-63 (atomic slot acquisition) — slot counter increment/decrement
  *        happens under `AsyncLock<void>`. Concurrent spawns never
  *        both observe `count = N-1` and both increment to `N`.
@@ -19,6 +18,10 @@
  */
 
 import { AsyncLock } from "./_deps/async-lock.js";
+import {
+  normalizeReadOnlyDelegationConstraint,
+  type ReadOnlyDelegationConstraint,
+} from "./readonly-delegation.js";
 import {
   defaultAgentNicknameCandidates,
   formatNicknameWithSuffix,
@@ -36,6 +39,7 @@ export const ROOT_AGENT_PATH = "/root" as AgentPath;
 export const MEMORY_AGENT_PATH = "/morpheus" as AgentPath;
 
 export interface AgentMetadata {
+  readonly executionConstraint?: ReadOnlyDelegationConstraint;
   readonly agentId?: ThreadId;
   readonly agentPath?: AgentPath;
   readonly agentNickname?: string;
@@ -111,6 +115,7 @@ export function normalizeAgentMetadata(metadata: unknown): AgentMetadata {
     throw new InvalidAgentMetadataError("invalid agent metadata depth");
   }
   const roleMetadata = normalizeAgentRoleMetadata(record);
+  const executionConstraint = normalizeReadOnlyDelegationConstraint(record.executionConstraint);
   const agentId = optionalMetadataString(record.agentId, "agentId", true);
   const agentPath = optionalMetadataString(record.agentPath, "agentPath", true);
   const agentNickname = optionalMetadataString(
@@ -125,6 +130,7 @@ export function normalizeAgentMetadata(metadata: unknown): AgentMetadata {
   );
   return {
     depth: record.depth,
+    ...(executionConstraint !== undefined ? { executionConstraint } : {}),
     ...(agentId !== undefined ? { agentId } : {}),
     ...(agentPath !== undefined ? { agentPath } : {}),
     ...(agentNickname !== undefined ? { agentNickname } : {}),
@@ -206,7 +212,7 @@ export class AgentCapacityQueueFullError extends Error {
 /**
  * Opaque handle the caller must hold until spawn finalizes. On drop
  * (dispose), the reservation releases the slot — so failed spawns
- * don't leak counters. Matches reference runtime's `SpawnReservation` RAII.
+ * don't leak counters.
  */
 export class SpawnReservation {
   private released = false;
@@ -644,8 +650,8 @@ export class AgentRegistry {
   }
 
   /**
-   * Allocate a nickname for a freshly spawning child. Matches the reference
-   * candidate-pool semantics: use the role-specific pool when present,
+   * Allocate a nickname for a freshly spawning child. Candidate-pool
+   * semantics: use the role-specific pool when present,
    * otherwise use the shared `agent_names.txt` list, choose one currently
    * unused candidate, and advance the ordinal suffix after full exhaustion.
    * Nicknames stay reserved until the allocator exhausts a suffix cycle.
@@ -824,6 +830,7 @@ export function buildChildMetadata(opts: {
   readonly roleFingerprint: string;
   readonly nickname: string;
   readonly depth: number;
+  readonly executionConstraint?: ReadOnlyDelegationConstraint;
   readonly agentName?: string;
   readonly agentPath?: AgentPath;
 }): AgentMetadata {
@@ -841,6 +848,9 @@ export function buildChildMetadata(opts: {
     agentRole: opts.role.name,
     agentRoleWorkspaceId: opts.roleWorkspaceId,
     agentRoleFingerprint: opts.roleFingerprint,
+    ...(opts.executionConstraint !== undefined
+      ? { executionConstraint: normalizeReadOnlyDelegationConstraint(opts.executionConstraint) }
+      : {}),
     depth: opts.depth,
   };
 }

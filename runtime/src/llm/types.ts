@@ -50,6 +50,34 @@ export type LLMContentPart =
     };
 
 /**
+ * Canonical identity of the provider/model that produced opaque reasoning
+ * replay state. The state is only safe to echo back to this exact
+ * destination; it must never cross a provider or model boundary.
+ */
+export interface ProviderReasoningProvenance {
+  readonly provider: string;
+  readonly model: string;
+}
+
+/** Legacy unbound durable replay state; readable but never safe to replay. */
+export interface ProviderReasoningReplayV1 {
+  readonly version: 1;
+  readonly content: string;
+}
+
+/** Durable replay state bound to the exact provider/model that produced it. */
+export interface ProviderReasoningReplayV2 {
+  readonly version: 2;
+  readonly content: string;
+  readonly provider: string;
+  readonly model: string;
+}
+
+export type ProviderReasoningReplay =
+  | ProviderReasoningReplayV1
+  | ProviderReasoningReplayV2;
+
+/**
  * A single message in an LLM conversation.
  *
  * `content` may be a plain string or an array of content parts for multimodal
@@ -59,6 +87,14 @@ export type LLMContentPart =
 export interface LLMMessage {
   role: MessageRole;
   content: string | LLMContentPart[];
+  /**
+   * Opaque provider reasoning state required for same-provider tool-result
+   * replay. It is never rendered as assistant content and wire adapters must
+   * only forward it for providers whose protocol explicitly requires it.
+   */
+  providerReasoningContent?: string;
+  /** Origin of `providerReasoningContent`; required for provider replay. */
+  providerReasoningProvenance?: ProviderReasoningProvenance;
   /** Optional local phase metadata for runtime-side replay and completion logic. */
   phase?: LLMAssistantPhase;
   /**
@@ -67,6 +103,7 @@ export interface LLMMessage {
    */
   runtimeOnly?: {
     readonly mergeBoundary?: "user_context";
+    readonly permissionModeReminder?: "plan" | "plan_exit" | "auto" | "auto_exit";
     readonly excludeFromDurableHistory?: true;
     /**
      * For user messages: the event id of the `user_message` event
@@ -93,7 +130,8 @@ export interface LLMMessage {
       readonly kind:
         | "input_validation"
         | "mcp_tool_not_shell_command"
-        | "shell_workspace_write_policy";
+        | "shell_workspace_write_policy"
+        | "exec_detach_unavailable";
     };
     /**
      * Durable tool-result identity. This is runtime-only state: provider wire
@@ -349,6 +387,13 @@ export interface LLMProviderExecutionProfile {
   /** Whether request-scoped output-token limits reach the provider wire. */
   readonly supportsMaxOutputTokens: boolean;
   /**
+   * Extra context this provider reserves beyond prompt and output before it
+   * will accept a request. Preflight and admission must reserve the same room
+   * or they admit requests the provider then refuses at its own boundary.
+   * Declared only by providers whose request preparation actually enforces it.
+   */
+  readonly contextSafetyBufferTokens?: number;
+  /**
    * Opaque provider-owned handle that pins this exact routed execution for the
    * admitted wire attempt. The admission boundary copies it to
    * `LLMChatOptions.providerExecutionHandle`; callers must not inspect or
@@ -596,10 +641,24 @@ export type LLMToolChoice =
  */
 export interface LLMChatOptions {
   /**
+   * @internal UUID of one immutable sampling request, preserved across
+   * session reconnects. Only AgenC-managed adapters use it, as a transport
+   * idempotency header; it is never part of the model request body.
+   */
+  readonly managedRequestId?: string;
+  /**
    * @internal Admission-grade complete input count. Adapters may use this for
    * final wire fitting, but must never synthesize or increase it themselves.
    */
   readonly accountedInputTokens?: number;
+  /**
+   * @internal Pre-admission output ceiling, for warning only. Admission fits
+   * the reservation to the context window before dispatch, so an adapter
+   * otherwise sees only the already-fitted value and cannot tell a squeezed
+   * reservation from a request that only ever asked for that much. Never sent
+   * on the wire, and never used to widen any limit.
+   */
+  readonly requestedMaxOutputTokens?: number;
   /**
    * Runtime admission boundary: one provider wire attempt is permitted for
    * this logical call. Provider adapters must not perform continuation,
@@ -736,6 +795,12 @@ export interface LLMStoredResponseDeleteResult {
 export interface LLMResponse {
   content: string;
   toolCalls: LLMToolCall[];
+  /** Non-executable, bounded provider diagnostic for a fresh admitted correction. */
+  readonly toolCallRecovery?: {
+    readonly reason: "invalid_arguments" | "not_advertised";
+    readonly toolName: string;
+    readonly message: string;
+  };
   usage: LLMUsage;
   model: string;
   /** Provider-computed request diagnostics for this call. */
@@ -762,6 +827,10 @@ export interface LLMResponse {
     readonly redacted: boolean;
     readonly kind?: "thinking" | "reasoning_summary";
   }>;
+  /** Opaque reasoning state to preserve across a provider-managed tool loop. */
+  providerReasoningContent?: string;
+  /** Canonical origin that constrains where opaque reasoning may be replayed. */
+  providerReasoningProvenance?: ProviderReasoningProvenance;
   finishReason: "stop" | "tool_calls" | "length" | "content_filter" | "error";
   /** Underlying error when finishReason is "error". */
   error?: Error;
@@ -901,24 +970,6 @@ export interface LLMProviderSessionForkOptions {
   readonly sandboxExecutionBroker: SandboxExecutionBrokerLike;
 }
 
-/** Provider-native fill-in-the-middle request for editor prediction. */
-export interface LLMCodePredictionRequest {
-  readonly prefix: string;
-  readonly suffix: string;
-  readonly language?: string;
-  readonly path: string;
-  readonly cursor: {
-    readonly line: number;
-    readonly byteColumn: number;
-  };
-}
-
-export interface LLMCodePredictionResponse {
-  readonly text: string;
-  readonly model?: string;
-  readonly usage?: LLMUsage;
-}
-
 /**
  * Core LLM provider interface that all adapters implement
  */
@@ -937,14 +988,6 @@ export interface LLMProvider {
    * unconfigured streams remain unbounded.
    */
   readonly suggestedStreamIdleTimeoutMs?: number;
-  /**
-   * Optional low-latency fill-in-the-middle path. Implementations must remain
-   * tool-free and transcript-free; callers fall back to `chat` when absent.
-   */
-  predictCode?(
-    request: LLMCodePredictionRequest,
-    options?: LLMChatOptions,
-  ): Promise<LLMCodePredictionResponse>;
   chat(messages: LLMMessage[], options?: LLMChatOptions): Promise<LLMResponse>;
   chatStream(
     messages: LLMMessage[],
@@ -956,6 +999,15 @@ export interface LLMProvider {
   getExecutionProfile?(
     options?: LLMChatOptions,
   ): Promise<LLMProviderExecutionProfile>;
+  /**
+   * Pure, provider-owned view of the profiled wire request for token accounting.
+   * Must use the same pinned execution handle and projection as chat/chatStream;
+   * never execute requests or expand the caller's tool catalog here.
+   */
+  projectRequestForAccounting?(
+    messages: readonly LLMMessage[],
+    options: LLMChatOptions,
+  ): { readonly messages: readonly LLMMessage[]; readonly options: LLMChatOptions };
   /** Optional startup hook for providers with session/socket prewarm support. */
   prewarmStartup?(
     params: LLMProviderStartupPrewarmParams,

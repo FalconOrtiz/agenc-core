@@ -13,6 +13,16 @@ import { AnthropicProvider } from "./providers/anthropic/adapter.js";
 import { BedrockProvider } from "./providers/bedrock/index.js";
 import { DeepSeekProvider } from "./providers/deepseek/index.js";
 import { MetaProvider } from "./providers/meta/index.js";
+import { CerebrasProvider } from "./providers/cerebras/index.js";
+import {
+  ZaiCodingPlanProvider,
+  ZaiProvider,
+} from "./providers/zai/index.js";
+import { KimiProvider } from "./providers/kimi/index.js";
+import {
+  QwenProvider,
+  QwenTokenPlanProvider,
+} from "./providers/qwen/index.js";
 import { GeminiProvider } from "./providers/gemini/index.js";
 import { createGeminiEndpointPlan } from "./providers/gemini/endpoint-plan.js";
 import { GrokProvider } from "./providers/grok/adapter.js";
@@ -809,6 +819,111 @@ const PROVIDERS: readonly ProviderParityEntry[] = [
       }),
   },
   {
+    provider: "cerebras",
+    model: "gpt-oss-120b",
+    apiKey: "cerebras-test",
+    env: { CEREBRAS_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new CerebrasProvider({
+            apiKey: "cerebras-test",
+            model: "gpt-oss-120b",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("gpt-oss-120b", parityCase),
+      }),
+  },
+  {
+    provider: "zai",
+    model: "glm-5.3",
+    apiKey: "zai-test",
+    env: { ZAI_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new ZaiProvider({
+            apiKey: "zai-test",
+            model: "glm-5.3",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("glm-5.3", parityCase),
+      }),
+  },
+  {
+    provider: "zai-coding-plan",
+    model: "glm-5.3",
+    apiKey: "zai-coding-plan-test",
+    env: { ZAI_CODING_PLAN_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new ZaiCodingPlanProvider({
+            apiKey: "zai-coding-plan-test",
+            model: "glm-5.3",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("glm-5.3", parityCase),
+      }),
+  },
+  {
+    provider: "kimi",
+    model: "kimi-k3",
+    apiKey: "moonshot-test",
+    env: { MOONSHOT_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new KimiProvider({
+            apiKey: "moonshot-test",
+            model: "kimi-k3",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("kimi-k3", parityCase),
+      }),
+  },
+  {
+    provider: "qwen",
+    model: "qwen3.8-max",
+    apiKey: "sk-ws-test",
+    env: { DASHSCOPE_API_KEY: undefined, QWEN_API_KEY: undefined },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new QwenProvider({
+            apiKey: "sk-ws-test",
+            model: "qwen3.8-max",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("qwen3.8-max", parityCase),
+      }),
+  },
+  {
+    provider: "qwen-token-plan",
+    model: "qwen3.8-max",
+    apiKey: "sk-sp-test",
+    env: {
+      QWEN_TOKEN_PLAN_API_KEY: undefined,
+      DASHSCOPE_TOKEN_PLAN_API_KEY: undefined,
+    },
+    createHarness: (parityCase) =>
+      createFetchHarness({
+        factory: (fetchImpl) =>
+          new QwenTokenPlanProvider({
+            apiKey: "sk-sp-test",
+            model: "qwen3.8-max",
+            tools: parityCase.tools ? [...parityCase.tools] : [],
+            fetchImpl,
+          }),
+        payload: buildChatCompletionsPayload("qwen3.8-max", parityCase),
+      }),
+  },
+  {
     provider: "gemini",
     model: "gemini-2.5-pro",
     extra: {
@@ -959,7 +1074,15 @@ describe("provider parity", () => {
         provider: entry.provider,
         model: entry.model,
       });
-      const modelInfo = await manager.getModelInfo(entry.model);
+      const modelInfo = await manager.getModelInfo(
+        entry.provider === "qwen" ||
+          entry.provider === "qwen-token-plan" ||
+          entry.provider === "zai" ||
+          entry.provider === "zai-coding-plan" ||
+          entry.provider === "kimi"
+          ? `${entry.provider}:${entry.model}`
+          : entry.model,
+      );
 
       expect(readProviderIdentity(provider)).toBe(entry.provider);
       expect(provider.name).toBe(entry.provider);

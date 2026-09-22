@@ -15,10 +15,12 @@ import type {
 } from "../protocol/index.js";
 import type { AgenCStateAgentRunRecord } from "../../state/agent-runs.js";
 import {
+  type WorkflowDetachedCancelOutcome,
   VerifiedChangeWorkflowController,
   WorkflowIntakeError,
   type WorkflowStartParams,
 } from "./verified-change-controller.js";
+import { runWithBootstrapSessionScope } from "../../session/current-session.js";
 
 export type AgenCDaemonWorkflowStartErrorCode =
   | "INVALID_ARGUMENT"
@@ -77,6 +79,14 @@ export class DaemonWorkflowStartService {
     this.#now = options.now ?? (() => new Date());
   }
 
+  /** See VerifiedChangeWorkflowController.cancelDetached. */
+  cancelDetachedRun(params: {
+    readonly runId: string;
+    readonly reason: string;
+  }): WorkflowDetachedCancelOutcome {
+    return this.#options.controller.cancelDetached(params.runId, params.reason);
+  }
+
   async startRun(params: RunStartParams): Promise<RunStartResult> {
     const cwd = params.cwd ?? this.#options.primaryCwd;
     const repoPath = findGitRoot(cwd);
@@ -126,7 +136,16 @@ export class DaemonWorkflowStartService {
     };
     let started;
     try {
-      started = await this.#options.controller.start(startParams);
+      // A goal run is daemon work, not a turn of any session. Utilities on its
+      // path fall back to the ambient "current session", which refuses when
+      // the daemon tracks more than one session, as a desktop daemon always
+      // does: every run.start then failed with "Ambiguous runtime session".
+      // Inside this scope the fallback yields no session and the utilities
+      // use their environment defaults; the run's own sessions bind their
+      // scopes as they start.
+      started = await runWithBootstrapSessionScope(() =>
+        this.#options.controller.start(startParams),
+      );
     } catch (error) {
       if (error instanceof TypeError) {
         // Pre-intake parameter refusal (e.g. no verification commands):
@@ -170,6 +189,10 @@ export class DaemonWorkflowStartService {
     return {
       runId: started.runId,
       specDigest: started.specDigest,
+      requestedPermissionMode: started.requestedPermissionMode,
+      ...(started.effectivePermissionMode !== undefined
+        ? { effectivePermissionMode: started.effectivePermissionMode }
+        : {}),
       baseCommit: started.baseCommit,
       baseDirty: {
         dirty: started.baseDirty.dirty,

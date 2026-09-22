@@ -1,0 +1,613 @@
+/**
+ * Rollout journal scans: transcript reconstruction, transcript boundaries,
+ * persisted submissions and run epochs. Split out of
+ * background-agent-runner.ts as a pure move.
+ */
+
+import type { LocalRuntimeBootstrap } from "../../bin/bootstrap.js";
+import type { Event } from "../../session/event-log.js";
+import { classifyTurnTerminal, type TurnTerminal } from "../../contracts/turn-terminal.js";
+import type { RolloutItem } from "../../session/rollout-item.js";
+import { isAdmissionUsageSummary } from "../../session/usage-summary.js";
+import {
+  reconstructFromRollout,
+} from "../../session/rollout-reconstruction.js";
+import type {
+  JsonObject,
+  SessionTranscriptV2Event,
+  SessionTranscriptV2Result,
+  SessionTranscriptV2TurnResult,
+} from "../protocol/index.js";
+
+import {
+  positiveSequence,
+  assistantMessageId,
+  historyEpochForBoundary,
+  messageContentFingerprint,
+  canonicalEventId,
+  nonNegativeFinite,
+  isJsonObject,
+} from "./shared.js";
+import type { AgenCBackgroundAgentMessageTerminal } from "./shared.js";
+
+function historyEpochFromRollout(
+  items: readonly RolloutItem[],
+  runId: string,
+): string {
+  return historyEpochForBoundary(
+    runId,
+    latestTranscriptBoundary(items)?.id ?? "initial",
+  );
+}
+
+interface TranscriptBoundary {
+  readonly index: number;
+  readonly id: string;
+  readonly kind: "cleared" | "replaced";
+  readonly sequence?: number;
+}
+
+function latestTranscriptBoundary(
+  items: readonly RolloutItem[],
+): TranscriptBoundary | undefined {
+  let latest: TranscriptBoundary | undefined;
+  for (const [index, item] of items.entries()) {
+    if (
+      item.type === "event_msg" &&
+      (item.payload.msg.type === "history_cleared" ||
+        item.payload.msg.type === "transcript_epoch")
+    ) {
+      latest = {
+        index,
+        id: canonicalEventId(item.payload),
+        kind:
+          item.payload.msg.type === "history_cleared" ? "cleared" : "replaced",
+        ...(positiveSequence(item.payload.seq) !== undefined
+          ? { sequence: positiveSequence(item.payload.seq) }
+          : {}),
+      };
+      continue;
+    }
+    // Compaction is deliberately NOT a transcript boundary.
+    //
+    // It changes what the MODEL sees; the person reading the transcript still
+    // sent every earlier message and expects to find them. Treating a commit
+    // as a boundary truncated the reloaded transcript to the compacted view
+    // and rendered the summary itself as a user message: live, a 13-turn
+    // session came back as two turns after an app relaunch, because that
+    // rollout contained two compaction commits and no explicit epoch event.
+    //
+    // A user-facing reset still truncates, and is still the only thing that
+    // does: `history_cleared` and `transcript_epoch` above. A partial compact
+    // or a rewind that means to reset the transcript emits `transcript_epoch`
+    // alongside its `compacted` item, so those keep working unchanged.
+  }
+  return latest;
+}
+
+interface PersistedMessageSubmission {
+  readonly contentFingerprint: string;
+  readonly acceptedAt?: string;
+  readonly turnId?: string;
+  readonly terminal?: AgenCBackgroundAgentMessageTerminal;
+}
+
+function findPersistedMessageSubmission(
+  items: readonly RolloutItem[],
+  clientMessageId: string,
+): PersistedMessageSubmission | undefined {
+  let match: PersistedMessageSubmission | undefined;
+  for (const item of items) {
+    if (item.type !== "event_msg") continue;
+    const event = item.payload;
+    if (
+      match === undefined &&
+      ((event.msg.type === "user_message" &&
+        event.msg.payload.messageId === clientMessageId) ||
+        (event.msg.type === "message_submission" &&
+          event.msg.payload.messageId === clientMessageId))
+    ) {
+      const contentFingerprint =
+        event.msg.type === "message_submission"
+          ? event.msg.payload.contentFingerprint
+          : messageContentFingerprint(event.msg.payload.message);
+      const acceptedAt = event.msg.payload.acceptedAt;
+      match = {
+        contentFingerprint,
+        ...(acceptedAt !== undefined ? { acceptedAt } : {}),
+      };
+      continue;
+    }
+    if (match === undefined) continue;
+    // A user_message starts the next admitted submission. Never let a
+    // crash-tail retry inherit that later submission's turn_started or
+    // terminal outcome.
+    if (
+      event.msg.type === "user_message" ||
+      event.msg.type === "message_submission"
+    ) {
+      return match;
+    }
+    if (event.msg.type === "turn_started" && match.turnId === undefined) {
+      match = { ...match, turnId: event.msg.payload.turnId };
+      continue;
+    }
+    if (match.turnId === undefined) continue;
+    const terminal = messageTerminalFromEvent(event.msg, match.turnId);
+    if (terminal !== undefined) {
+      return { ...match, terminal };
+    }
+  }
+  return match;
+}
+
+function messageTerminalFromEvent(
+  event: Event["msg"],
+  expectedTurnId: string | undefined,
+): AgenCBackgroundAgentMessageTerminal | undefined {
+  const terminal = classifyTurnTerminal(event, { expectedTurnId, legacyJournal: true });
+  return terminal === undefined ? undefined : {
+    code: terminal.code,
+    ...(terminal.message !== undefined ? { message: terminal.message } : {}),
+  };
+}
+
+interface MutableTranscriptV2Message extends JsonObject {
+  messageId: string;
+  commitEventId: string;
+  role: "user" | "assistant";
+  text: string;
+  turnId?: string;
+  clientMessageId?: string;
+  committedSequence: number;
+}
+
+/** Running totals for the turn currently open in the canonical scan. */
+interface OpenTurnAccumulator {
+  startedAt?: number;
+  sawUsage: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  model?: string;
+  provider?: string;
+}
+
+/**
+ * A turn's terminal row: timing from the terminal event itself (falling back
+ * to the started/completed stamps for rollouts written before `durationMs`),
+ * usage summed from the token_count events the turn enclosed.
+ */
+function closedTurnResult(
+  turnId: string,
+  sequence: number,
+  terminal: TurnTerminal,
+  open: OpenTurnAccumulator,
+): SessionTranscriptV2TurnResult {
+  let durationMs = terminal.durationMs;
+  if (durationMs === undefined && terminal.completedAt !== undefined && open.startedAt !== undefined) {
+    durationMs = nonNegativeFinite(terminal.completedAt - open.startedAt);
+  }
+  return {
+    turnId,
+    committedSequence: sequence,
+    outcome: terminal.outcome,
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(open.sawUsage
+      ? {
+          inputTokens: open.inputTokens,
+          outputTokens: open.outputTokens,
+          totalTokens: open.totalTokens,
+        }
+      : {}),
+    ...(open.model !== undefined ? { model: open.model } : {}),
+    ...(open.provider !== undefined ? { provider: open.provider } : {}),
+  };
+}
+
+function transcriptNoticesFromRollout(
+  items: readonly RolloutItem[],
+  boundaryIndex: number,
+  runId: string,
+): readonly SessionTranscriptV2Event[] {
+  const notices: SessionTranscriptV2Event[] = [];
+  let usageNotice: SessionTranscriptV2Event | undefined;
+  let usageSequence = -1;
+  const seenEventIds = new Set<string>();
+  const closedTurnIds = new Set<string>();
+  let currentTurnId: string | undefined;
+  for (const [index, item] of items.entries()) {
+    if (item.type !== "event_msg") continue;
+    const event = item.payload;
+    const committedSequence = positiveSequence(event.seq) ?? 0;
+    const eventId = event.eventId ?? (committedSequence > 0
+      ? canonicalEventId(event)
+      : `legacy-notice:${index}:${event.id}`);
+    if (seenEventIds.has(eventId)) continue;
+    seenEventIds.add(eventId);
+    if (event.msg.type === "session_usage") {
+      const summary = event.msg.payload;
+      if (!isAdmissionUsageSummary(summary)) {
+        throw new Error("Canonical session usage payload is invalid");
+      }
+      if (summary.runId === runId && summary.sequence > usageSequence) {
+        usageSequence = summary.sequence;
+        usageNotice = {
+          eventId, committedSequence, type: "session_usage",
+          payload: {
+            ...summary,
+            models: summary.models.map((model) => ({ ...model })),
+            agents: summary.agents.map((agent) => ({ ...agent })),
+          },
+        };
+      }
+      continue;
+    }
+    if (event.msg.type === "token_count") {
+      notices.push({ eventId, committedSequence, type: "token_count", payload: { ...event.msg.payload } });
+      continue;
+    }
+    if (index <= boundaryIndex) continue;
+    if (event.msg.type === "turn_started") {
+      currentTurnId = event.msg.payload.turnId;
+      continue;
+    }
+    const terminal = classifyTurnTerminal(event.msg, {
+      expectedTurnId: currentTurnId,
+      legacyJournal: true,
+    });
+    if (terminal === undefined) continue;
+    const turnId = terminal.turnId ?? currentTurnId;
+    if (turnId !== undefined && closedTurnIds.has(turnId)) continue;
+    if (turnId !== undefined) closedTurnIds.add(turnId);
+    currentTurnId = undefined;
+    if (terminal.outcome === "errored") {
+      notices.push({
+        eventId, committedSequence, type: "turn_failed",
+        payload: { turnId, code: terminal.failureCode, message: terminal.message ?? "" },
+      });
+    } else if (terminal.outcome === "aborted") {
+      notices.push({
+        eventId, committedSequence, type: "turn_aborted",
+        payload: { ...(turnId !== undefined ? { turnId } : {}), ...(terminal.message !== undefined ? { reason: terminal.message } : {}) },
+      });
+    }
+  }
+  if (usageNotice !== undefined) notices.push(usageNotice);
+  return notices;
+}
+
+/**
+ * `activeTurn` names the turn the runtime is executing now. Its client
+ * message id may be unknown to the caller (a turn continued after a daemon
+ * restart); the rollout's own open turn supplies it when the ids match.
+ */
+export function sessionTranscriptV2FromRollout(
+  items: readonly RolloutItem[],
+  sessionId: string,
+  runId: string,
+  activeTurn?: { readonly turnId: string; readonly clientMessageId?: string },
+): SessionTranscriptV2Result {
+  const boundary = latestTranscriptBoundary(items);
+  const boundaryIndex = boundary?.index ?? -1;
+  const boundaryId = boundary?.id ?? "initial";
+  let asOfSequence = 0;
+  // The latest runtime-settings event decides plan mode. Reporting it from
+  // this pass spares clients a second walk over the same history: the desktop
+  // used to page the whole run journal through run.replay on every transcript
+  // open just to recover this one boolean, ~45 s on a 22k-event session.
+  let planMode:
+    | { readonly active: boolean; readonly sequence: number }
+    | undefined;
+  for (const item of items) {
+    if (item.type !== "event_msg") continue;
+    const event = item.payload;
+    if (
+      event.seq !== undefined &&
+      Number.isSafeInteger(event.seq) &&
+      event.seq > asOfSequence
+    ) {
+      asOfSequence = event.seq;
+    }
+    if (
+      event.msg.type === "run_runtime_settings_changed" &&
+      event.seq !== undefined &&
+      Number.isSafeInteger(event.seq) &&
+      typeof event.msg.payload.permissionMode === "string" &&
+      (planMode === undefined || event.seq > planMode.sequence)
+    ) {
+      planMode = {
+        active: event.msg.payload.permissionMode === "plan",
+        sequence: event.seq,
+      };
+    }
+  }
+
+  const messages: MutableTranscriptV2Message[] = [];
+  const turnResults: SessionTranscriptV2TurnResult[] = [];
+  let currentTurnId: string | undefined;
+  let currentClientMessageId: string | undefined;
+  let openTurn: OpenTurnAccumulator | undefined;
+  let pendingUserIndex: number | undefined;
+  let pendingClientMessageId: string | undefined;
+  const assistantOrdinals = new Map<string, number>();
+
+  if (boundary?.kind === "replaced") {
+    const replacement = reconstructFromRollout(
+      items.slice(0, boundary.index + 1),
+    ).history;
+    const replacementSequence =
+      boundary.sequence ?? maxEventSequence(items.slice(0, boundary.index + 1));
+    let ordinal = 0;
+    for (const item of replacement) {
+      if (item.role !== "user" && item.role !== "assistant") continue;
+      const text = responseItemDisplayText(item.content);
+      if (text.length === 0) continue;
+      const messageId = `replacement:${boundary.id}:${ordinal}`;
+      messages.push({
+        messageId,
+        commitEventId: messageId,
+        role: item.role,
+        text,
+        committedSequence: replacementSequence,
+      });
+      ordinal += 1;
+    }
+  }
+
+  const transcriptStartIndex = boundaryIndex + 1;
+  const firstCanonicalTranscriptIndex = items.findIndex(
+    (item, index) =>
+      index >= transcriptStartIndex &&
+      item.type === "event_msg" &&
+      (item.payload.msg.type === "user_message" ||
+        item.payload.msg.type === "message_submission" ||
+        item.payload.msg.type === "agent_message"),
+  );
+  const legacyEndIndex =
+    firstCanonicalTranscriptIndex < 0
+      ? items.length
+      : firstCanonicalTranscriptIndex;
+  let legacyOrdinal = 0;
+  for (let index = transcriptStartIndex; index < legacyEndIndex; index += 1) {
+    const item = items[index]!;
+    if (item.type !== "response_item") continue;
+    if (item.payload.role !== "user" && item.payload.role !== "assistant") {
+      continue;
+    }
+    const text = responseItemDisplayText(item.payload.content);
+    if (text.length === 0) continue;
+    const messageId = `legacy:${boundaryId}:${legacyOrdinal}`;
+    messages.push({
+      messageId,
+      commitEventId: messageId,
+      role: item.payload.role,
+      text,
+      committedSequence: 0,
+    });
+    legacyOrdinal += 1;
+  }
+
+  // Scan canonical turn context from the epoch boundary, not merely from the
+  // first visible transcript row. Hidden-user submissions deliberately have
+  // no user_message, so their preceding turn_started is the only durable
+  // source for the assistant message identity.
+  for (let index = transcriptStartIndex; index < items.length; index += 1) {
+    const item = items[index]!;
+    if (item.type !== "event_msg") continue;
+    const event = item.payload;
+    const sequence = positiveSequence(event.seq);
+    if (sequence === undefined) continue;
+    if (event.msg.type === "message_submission") {
+      pendingUserIndex = undefined;
+      pendingClientMessageId = event.msg.payload.messageId;
+      continue;
+    }
+    if (event.msg.type === "user_message") {
+      const text =
+        event.msg.payload.displayText ??
+        unknownMessageContentDisplayText(event.msg.payload.message);
+      if (text.length === 0) continue;
+      const commitEventId = canonicalEventId(event);
+      const clientMessageId = event.msg.payload.messageId;
+      messages.push({
+        messageId: clientMessageId ?? `message:${commitEventId}`,
+        commitEventId,
+        role: "user",
+        text,
+        ...(clientMessageId !== undefined ? { clientMessageId } : {}),
+        committedSequence: sequence,
+      });
+      pendingUserIndex = messages.length - 1;
+      pendingClientMessageId = clientMessageId;
+      continue;
+    }
+    if (event.msg.type === "turn_started") {
+      currentTurnId = event.msg.payload.turnId;
+      if (pendingUserIndex !== undefined) {
+        messages[pendingUserIndex]!.turnId = currentTurnId;
+        pendingUserIndex = undefined;
+      }
+      currentClientMessageId = pendingClientMessageId;
+      pendingClientMessageId = undefined;
+      // A dangling previous turn has no terminal event and therefore no
+      // result row; the fresh accumulator simply replaces it.
+      const startedAt = nonNegativeFinite(event.msg.payload.startedAt);
+      openTurn = {
+        sawUsage: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+      };
+      continue;
+    }
+    if (event.msg.type === "token_count") {
+      if (currentTurnId === undefined || openTurn === undefined) continue;
+      const payload = event.msg.payload;
+      const input = nonNegativeFinite(payload.promptTokens);
+      const output = nonNegativeFinite(payload.completionTokens);
+      const total = nonNegativeFinite(payload.totalTokens);
+      if (input === undefined && output === undefined && total === undefined) {
+        continue;
+      }
+      openTurn.sawUsage = true;
+      openTurn.inputTokens += input ?? 0;
+      openTurn.outputTokens += output ?? 0;
+      openTurn.totalTokens += total ?? 0;
+      if (typeof payload.model === "string" && payload.model.length > 0) {
+        openTurn.model = payload.model;
+      }
+      if (typeof payload.provider === "string" && payload.provider.length > 0) {
+        openTurn.provider = payload.provider;
+      }
+      continue;
+    }
+    if (event.msg.type === "agent_message") {
+      const commitEventId = canonicalEventId(event);
+      const correlationId = currentTurnId ?? commitEventId;
+      const ordinal = assistantOrdinals.get(correlationId) ?? 0;
+      assistantOrdinals.set(correlationId, ordinal + 1);
+      const text = event.msg.payload.message;
+      // Empty durable commits are not transcript rows, but they still occupy
+      // an ordinal because the live identity allocator observes them.
+      if (text.length === 0) continue;
+      messages.push({
+        messageId:
+          currentTurnId === undefined
+            ? `assistant:${commitEventId}`
+            : assistantMessageId(currentTurnId, ordinal),
+        commitEventId,
+        role: "assistant",
+        text,
+        ...(currentTurnId !== undefined ? { turnId: currentTurnId } : {}),
+        ...(currentClientMessageId !== undefined
+          ? { clientMessageId: currentClientMessageId }
+          : {}),
+        committedSequence: sequence,
+      });
+      continue;
+    }
+    const terminal = classifyTurnTerminal(event.msg, {
+      expectedTurnId: currentTurnId,
+      legacyJournal: true,
+    });
+    if (terminal !== undefined) {
+      if (currentTurnId === undefined && pendingUserIndex !== undefined) {
+        continue;
+      }
+      if (currentTurnId !== undefined && openTurn !== undefined) {
+        turnResults.push(
+          closedTurnResult(currentTurnId, sequence, terminal, openTurn),
+        );
+      }
+      currentTurnId = undefined;
+      currentClientMessageId = undefined;
+      openTurn = undefined;
+    }
+  }
+
+  const liveTurn =
+    activeTurn === undefined ||
+    activeTurn.clientMessageId !== undefined ||
+    currentTurnId !== activeTurn.turnId ||
+    currentClientMessageId === undefined
+      ? activeTurn
+      : { turnId: activeTurn.turnId, clientMessageId: currentClientMessageId };
+  return {
+    schemaVersion: 2,
+    sessionId,
+    runId,
+    historyEpoch: historyEpochForBoundary(runId, boundaryId),
+    asOfSequence,
+    messages,
+    events: transcriptNoticesFromRollout(items, boundaryIndex, runId),
+    ...(liveTurn !== undefined ? { activeTurn: liveTurn } : {}),
+    ...(turnResults.length > 0 ? { turnResults } : {}),
+    ...(planMode !== undefined
+      ? {
+          planModeActive: planMode.active,
+          planModeSequence: planMode.sequence,
+        }
+      : {}),
+  };
+}
+
+function maxEventSequence(items: readonly RolloutItem[]): number {
+  let max = 0;
+  for (const item of items) {
+    if (item.type !== "event_msg") continue;
+    const sequence = positiveSequence(item.payload.seq);
+    if (sequence !== undefined) max = Math.max(max, sequence);
+  }
+  return max;
+}
+
+function responseItemDisplayText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) =>
+      isJsonObject(part) && typeof part.text === "string" ? part.text : "",
+    )
+    .join("");
+}
+
+function unknownMessageContentDisplayText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!isJsonObject(part)) return "";
+      if (typeof part.text === "string") return part.text;
+      if (part.type === "image") return "[image]";
+      if (part.type === "document") return "[document]";
+      return "";
+    })
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+function currentRunEpochFromRollout(
+  bootstrap: LocalRuntimeBootstrap,
+  runId: string,
+): number {
+  let epoch = 1;
+  try {
+    const items = bootstrap.rolloutStore.readAll() as ReadonlyArray<{
+      readonly type?: unknown;
+      readonly payload?: {
+        readonly msg?: {
+          readonly type?: unknown;
+          readonly payload?: {
+            readonly runId?: unknown;
+            readonly epoch?: unknown;
+          };
+        };
+      };
+    }>;
+    for (const item of items) {
+      if (
+        item.type !== "event_msg" ||
+        item.payload?.msg?.type !== "run_reopened" ||
+        item.payload.msg.payload?.runId !== runId
+      ) {
+        continue;
+      }
+      const reopenedEpoch = positiveSequence(item.payload.msg.payload.epoch);
+      if (reopenedEpoch !== undefined && reopenedEpoch > epoch) {
+        epoch = reopenedEpoch;
+      }
+    }
+  } catch {
+    // A new run has no reopen record. Read failures are surfaced when the
+    // terminal append itself tries to commit; epoch 1 is the only safe default.
+  }
+  return epoch;
+}
+
+export {
+  historyEpochFromRollout,
+  findPersistedMessageSubmission,
+  currentRunEpochFromRollout,
+};

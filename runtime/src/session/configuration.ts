@@ -1,6 +1,8 @@
 import { resolve } from "node:path";
 
 import type { AgenCConfig } from "../config/schema.js";
+import { resolveReasoningEffort } from "../llm/reasoning-effort.js";
+import { normalizeProviderIdentity } from "../provider-identity.js";
 import { resolveApprovalPolicy } from "../permissions/approval-policy.js";
 import type { ToolPermissionContext } from "../permissions/types.js";
 import type { SandboxExecutionBrokerAuthority } from "../sandbox/execution-broker.js";
@@ -198,6 +200,19 @@ export function sessionConfigurationFromAgenCConfig(params: {
   readonly provider?: string;
   readonly projectTrust?: "trusted" | "untrusted";
 }): SessionConfiguration {
+  const effort = resolveReasoningEffort({
+    provider: params.provider ?? params.config.model_provider,
+    model: params.model,
+  });
+  // Older Claude configuration used max as the persisted xhigh alias even
+  // when the API accepted literal max. Keep that seed distinct from a new
+  // literal session.applyConfig choice; only the newer full ladder opts in.
+  const legacyAnthropicEffort = normalizeProviderIdentity(
+    params.provider ?? params.config.model_provider,
+    "configured reasoning effort",
+  ) === "anthropic" && !effort.registered && !effort.levels.includes("xhigh");
+  const supportsLiteralMax = effort.levels.includes("max") && !legacyAnthropicEffort;
+  const configuredEffort = params.config.reasoning_effort;
   const configPolicy = approvalPolicyValueFromAgenCConfig(
     params.config.approval_policy,
   );
@@ -250,13 +265,14 @@ export function sessionConfigurationFromAgenCConfig(params: {
       // Seed the session's effort from canonical config so the turn context,
       // the provider request, and `run_runtime_settings_changed` all report
       // the configured tier instead of `null` while the wire silently falls
-      // back to a settings read. `max` is the persisted alias of `xhigh`.
-      ...(params.config.reasoning_effort !== undefined
+      // back to a settings read. Keep legacy max -> xhigh compatibility only
+      // for older Claude configuration and models without a literal max tier.
+      ...(configuredEffort !== undefined
         ? {
             reasoningEffort:
-              params.config.reasoning_effort === "max"
+              configuredEffort === "max" && !supportsLiteralMax
                 ? "xhigh"
-                : params.config.reasoning_effort,
+                : configuredEffort,
           }
         : {}),
     },

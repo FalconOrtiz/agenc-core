@@ -1,7 +1,6 @@
 // biome-ignore-all assist/source/organizeImports: internal-only import markers must not be reordered
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
-import { resolveAntModel } from './model/antModels.js'
 import { getModelCapability } from './model/modelCapabilities.js'
 import {
   ESCALATED_MAX_OUTPUT_TOKENS,
@@ -42,7 +41,7 @@ const MAX_OUTPUT_TOKENS_UPPER_LIMIT = 64_000
 // tokens, so 32k/64k defaults over-reserve 8-16× slot capacity. With the cap
 // enabled, <1% of requests hit the limit; those get one clean retry at 64k
 // (see query.ts max_output_tokens_escalate). Cap is applied in
-// agenc.ts:getMaxOutputTokensForModel to avoid the growthbook→betas→context
+// agenc.ts:getMaxOutputTokensForModel to avoid the betas→context
 // import cycle.
 export const ESCALATED_MAX_TOKENS = ESCALATED_MAX_OUTPUT_TOKENS
 
@@ -151,14 +150,11 @@ export function getContextWindowForModelForContext(
   context: ContextWindowProviderContext,
 ): number {
   const { environment, provider } = context
-  // Allow override via environment variable (internal-only)
+  // Allow override via environment variable.
   // This takes precedence over all other context window resolution, including 1M detection,
   // so users can cap the effective context window for local decisions (auto-compact, etc.)
   // while still using a 1M-capable endpoint.
-  if (
-    environment.USER_TYPE === 'ant' &&
-    environment.AGENC_MAX_CONTEXT_TOKENS
-  ) {
+  if (environment.AGENC_MAX_CONTEXT_TOKENS) {
     const override = parseInt(
       environment.AGENC_MAX_CONTEXT_TOKENS,
       10,
@@ -180,8 +176,14 @@ export function getContextWindowForModelForContext(
   // model context windows. When the model resolves to a catalog entry (e.g.
   // grok-* and registered openai models), use that value so the TUI resolver
   // agrees with the grok adapter path (kills the 2M-vs-1M grok-4.3 mismatch).
-  const catalogContextWindow = resolveCatalogContextWindow(model)
+  const catalogContextWindow = resolveCatalogContextWindow(model, provider)
   if (catalogContextWindow !== undefined) {
+    if (
+      catalogContextWindow > MODEL_CONTEXT_WINDOW_DEFAULT &&
+      is1mContextDisabledIn(environment)
+    ) {
+      return MODEL_CONTEXT_WINDOW_DEFAULT
+    }
     return catalogContextWindow
   }
 
@@ -216,12 +218,6 @@ export function getContextWindowForModelForContext(
     return cap.max_input_tokens
   }
 
-  if (environment.USER_TYPE === 'ant') {
-    const antModel = resolveAntModel(model)
-    if (antModel?.contextWindow) {
-      return antModel.contextWindow
-    }
-  }
   return MODEL_CONTEXT_WINDOW_DEFAULT
 }
 
@@ -231,12 +227,22 @@ export function getContextWindowForModelForContext(
  * registry migration covers, and limiting the lookup keeps openai/anthropic
  * TUI resolution behavior unchanged for models still resolved elsewhere.
  */
-function resolveCatalogContextWindow(model: string): number | undefined {
-  const normalized = model.trim().toLowerCase()
-  if (!normalized.startsWith('grok-')) {
+function resolveCatalogContextWindow(
+  model: string,
+  provider: string,
+): number | undefined {
+  const normalizedProvider = provider.trim().toLowerCase()
+  if (
+    normalizedProvider !== 'grok' &&
+    normalizedProvider !== 'zai' &&
+    normalizedProvider !== 'zai-coding-plan' &&
+    normalizedProvider !== 'kimi' &&
+    normalizedProvider !== 'minimax'
+  ) {
     return undefined
   }
-  return resolveModelCatalogMetadata({ provider: 'grok', model })?.contextWindow
+  return resolveModelCatalogMetadata({ provider: normalizedProvider, model })
+    ?.contextWindow
 }
 
 /**
@@ -292,12 +298,28 @@ export function getModelMaxOutputTokensForContext(
   let defaultTokens: number
   let upperLimit: number
 
-  if (environment.USER_TYPE === 'ant') {
-    const antModel = resolveAntModel(model.toLowerCase())
-    if (antModel) {
-      defaultTokens = antModel.defaultMaxTokens ?? MAX_OUTPUT_TOKENS_DEFAULT
-      upperLimit = antModel.upperMaxTokensLimit ?? MAX_OUTPUT_TOKENS_UPPER_LIMIT
-      return { default: defaultTokens, upperLimit }
+  const normalizedProvider = provider.trim().toLowerCase()
+  if (
+    normalizedProvider === 'zai' ||
+    normalizedProvider === 'zai-coding-plan' ||
+    normalizedProvider === 'kimi' ||
+    normalizedProvider === 'minimax'
+  ) {
+    const catalog = resolveModelCatalogMetadata({ provider: normalizedProvider, model })
+    if (catalog?.maxOutputTokens !== undefined) {
+      return {
+        default: catalog.maxOutputTokens,
+        upperLimit:
+          catalog.maxOutputTokensUpperLimit ?? catalog.maxOutputTokens,
+      }
+    }
+    if (
+      normalizedProvider === 'kimi' &&
+      /^kimi-k2\.(?:7-code(?:-highspeed)?|6)$/u.test(model.trim().toLowerCase())
+    ) {
+      // This is an AgenC reservation/safety policy, not a published Moonshot
+      // model maximum. The native catalog intentionally leaves the max unset.
+      return { default: 32_768, upperLimit: MAX_OUTPUT_TOKENS_UPPER_LIMIT }
     }
   }
 

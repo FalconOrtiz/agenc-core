@@ -59,17 +59,61 @@ function offlineFetchFixture(): typeof fetch {
     .mockRejectedValue(new Error("offline bootstrap fixture"));
 }
 
-async function installBootstrapProviderStub(): Promise<void> {
+async function installBootstrapProviderStub() {
   const providerModule = await import("../llm/provider.js");
   const chat = vi.fn().mockResolvedValue({
     content: "ok",
     toolCalls: [],
     usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
   });
-  vi.spyOn(providerModule, "createProvider").mockReturnValue({
+  return vi.spyOn(providerModule, "createProvider").mockReturnValue({
     name: "stub",
     chat,
   } as never);
+}
+
+async function captureQwenProviderExtra(
+  fetchImpl?: typeof fetch,
+): Promise<Record<string, unknown>> {
+  const [home, workspace] = await Promise.all([
+    mkdtemp(join(tmpdir(), "agenc-bootstrap-home-")),
+    mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-")),
+  ]);
+  const createProviderSpy = await installBootstrapProviderStub();
+  vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+
+  let shutdown: (() => Promise<void>) | null = null;
+  try {
+    const boot = await bootstrapLocalRuntimeSession({
+      ...(fetchImpl === undefined ? {} : { fetchImpl }),
+      env: {
+        ...process.env,
+        AGENC_HOME: home,
+        AGENC_MODEL: "qwen3.8-max",
+        AGENC_PROVIDER: "qwen",
+        AGENC_WORKSPACE: workspace,
+        HOME: home,
+        QWEN_API_KEY: "qwen-test-key",
+      },
+      argv: ["node", "agenc", "--provider", "qwen"],
+    });
+    shutdown = boot.shutdown;
+
+    const qwenCall = createProviderSpy.mock.calls.find(
+      ([providerName]) => providerName === "qwen",
+    );
+    expect(qwenCall).toBeDefined();
+    return (
+      (qwenCall?.[1] as { extra?: Record<string, unknown> } | undefined)
+        ?.extra ?? {}
+    );
+  } finally {
+    await shutdown?.().catch(() => undefined);
+    await Promise.all([
+      rm(home, { recursive: true, force: true }),
+      rm(workspace, { recursive: true, force: true }),
+    ]);
+  }
 }
 
 function clearProcessEnv(keys: readonly string[]): () => void {
@@ -619,6 +663,8 @@ describe("bootstrapLocalRuntimeSession", () => {
       shutdown = boot.shutdown;
 
       expect(boot.agencHome).toBe(home);
+      expect(boot.initialState.sessionConfiguration.permissionInstructionsDeferred).toBe(true);
+      expect(boot.initialState.sessionConfiguration.baseInstructions).not.toContain("# Permission Mode:");
       expect(
         boot.initialState.sessionConfiguration.baseInstructions,
       ).toContain(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
@@ -796,6 +842,18 @@ describe("bootstrapLocalRuntimeSession", () => {
           { turnId: "turn-1", lastAgentMessage: "done" },
           firstEventSequence + 5,
         ),
+        rolloutEvent(
+          "failed-turn-start",
+          "turn_started",
+          { turnId: "turn-2" },
+          firstEventSequence + 6,
+        ),
+        rolloutEvent(
+          "failed-turn-end",
+          "turn_failed",
+          { turnId: "turn-2", code: "provider_error", message: "provider failed" },
+          firstEventSequence + 7,
+        ),
       ]) {
         first.rolloutStore.appendRollout(event);
       }
@@ -836,11 +894,14 @@ describe("bootstrapLocalRuntimeSession", () => {
           "assistant_thinking_block_stop",
           "agent_thinking",
           "turn_complete",
+          "turn_failed",
         ]),
       );
       const transcript = adaptTranscriptEvents(
         initialTranscriptEvents as Parameters<typeof adaptTranscriptEvents>[0],
       );
+      expect(transcript.isStreaming).toBe(false);
+      expect(JSON.stringify(transcript.messages)).toContain("provider failed");
       expect(
         transcript.messages.some(
           (message) =>
@@ -2117,6 +2178,17 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
+  it("does not promote ambient fetch into a provider transport override", async () => {
+    expect(await captureQwenProviderExtra()).not.toHaveProperty("fetchImpl");
+  });
+
+  it("preserves a caller-provided provider transport override", async () => {
+    const fetchImpl = offlineFetchFixture();
+    expect((await captureQwenProviderExtra(fetchImpl)).fetchImpl).toBe(
+      fetchImpl,
+    );
+  });
+
   it("keeps Gemini environment keys out of explicit factory precedence", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -2279,7 +2351,6 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
-  // branding-scan: allow real provider identifier in test title
   it("classifies no-key generic OpenAI-compatible startup as local no-auth", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -2417,7 +2488,6 @@ describe("bootstrapLocalRuntimeSession", () => {
     }
   });
 
-  // branding-scan: allow real provider identifier in test title
   it("uses an explicit OpenAI-compatible key without probing native BYOK secure storage", async () => {
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -4253,8 +4323,7 @@ required = true
 
   it("enforces the runtime bootstrap step ordering invariant", async () => {
     // Asserts the concrete step order the bin bootstrap is required to
-    // follow, mirroring upstream agenc runtime
-    // `core/src/session/session.rs:814-908, 931-942`:
+    // follow:
     //
     //   1. Session construction (Session instance exists).
     //   2. Rollout store mounted on the session.
@@ -4273,9 +4342,9 @@ required = true
     //      `runStartupPrewarm`).
     //
     // Steps 5 (SessionConfigured) and 6/7 (sidecar start + MCP start)
-    // specifically follow the upstream rule "Dispatch the
-    // SessionConfiguredEvent first and then report any errors"
-    // (session.rs:814) — the emit must precede the real MCP manager
+    // specifically follow the rule "Dispatch the
+    // SessionConfiguredEvent first and then report any errors":
+    // the emit must precede the real MCP manager
     // wiring.
     const home = await mkdtemp(join(tmpdir(), "agenc-bootstrap-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "agenc-bootstrap-ws-"));
@@ -4377,7 +4446,7 @@ required = true
 
       const idx = (label: string): number => ordering.indexOf(label);
 
-      // The recorded step order must match the upstream agenc runtime
+      // The recorded step order must match the bootstrap
       // contract: each step happens strictly before the next. Every
       // label must have been recorded (index >= 0).
       const mountIdx = idx("rollout_store_mounted");

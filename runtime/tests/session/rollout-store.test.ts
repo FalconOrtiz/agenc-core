@@ -21,6 +21,7 @@ import type { Session } from "./session.js";
 import type { AgentMetadata } from "../agents/registry.js";
 import { upsertAgentRun } from "../state/agent-runs.js";
 import { createOperatorEffectReviewResolution } from "../state/effect-review.js";
+import { StateRunDurabilityRepository } from "../../src/state/run-durability.js";
 import {
   openStateDatabases,
   resolveStateDatabasePaths,
@@ -30,6 +31,15 @@ import { RolloutStore } from "./rollout-store.js";
 import { getProjectDir, getSessionDir } from "./session-store.js";
 
 const TEST_RUN_TIMESTAMP = "2026-08-03T00:00:00.000Z";
+/**
+ * The two disk registries a validated rollout prefix owns while it is held. A
+ * store holds one prefix per shape of bookkeeping question, up to the
+ * scanner's own limit of two.
+ */
+const scanRegistryEntries = [
+  expect.stringMatching(/^agenc-c2-payloads-/u),
+  expect.stringMatching(/^agenc-recovery-identities-/u),
+];
 
 let agencHome = "";
 let originalAgencHome = "";
@@ -44,6 +54,7 @@ function openStore(opts: {
   sessionTempRoot?: string;
 }): RolloutStore {
   const store = new RolloutStore({
+    agencHome,
     cwd: opts.cwd,
     sessionId: opts.sessionId,
     agencVersion: "0.2.0",
@@ -69,7 +80,7 @@ function openStore(opts: {
 }
 
 function seedRunningAgentRun(cwd: string, runId: string): void {
-  const driver = openStateDatabases({ cwd });
+  const driver = openStateDatabases({ cwd, agencHome });
   try {
     upsertAgentRun(driver, {
       id: runId,
@@ -235,6 +246,7 @@ describe("RolloutStore temporary authority", () => {
     expect(
       () =>
         new RolloutStore({
+          agencHome,
           cwd: agencHome,
           sessionId: "relative-temp-root",
           agencVersion: "0.2.0",
@@ -269,8 +281,10 @@ describe("RolloutStore temporary authority", () => {
       });
       expect(storeA.sessionTempRoot).toBe(rootA);
       expect(storeB.sessionTempRoot).toBe(rootB);
-      expect(readdirSync(rootA)).toEqual([]);
-      expect(readdirSync(rootB)).toEqual([]);
+      // An open store keeps the registries of the rollout prefix it validated,
+      // and keeps them under the root it captured rather than an ambient one.
+      expect(readdirSync(rootA).sort()).toEqual(scanRegistryEntries);
+      expect(readdirSync(rootB).sort()).toEqual(scanRegistryEntries);
     } finally {
       storeA?.close();
       storeB?.close();
@@ -278,6 +292,48 @@ describe("RolloutStore temporary authority", () => {
       rmSync(cwdA, { recursive: true, force: true });
       rmSync(cwdB, { recursive: true, force: true });
     }
+    expect(readdirSync(rootA)).toEqual([]);
+    expect(readdirSync(rootB)).toEqual([]);
+  });
+
+  it("holds at most the two rollout prefixes its bookkeeping asks about", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-prefix-cwd-"));
+    const root = join(agencHome, "session-temp-prefixes");
+    let store: RolloutStore | undefined;
+    try {
+      // Opening reconciles compactions, which is one shape of question.
+      store = openStore({
+        cwd,
+        sessionId: "prefix-lifetime",
+        sessionTempRoot: root,
+      });
+      expect(readdirSync(root).sort()).toEqual(scanRegistryEntries);
+
+      for (let index = 0; index < 32; index += 1) {
+        store.appendRollout({
+          type: "response_item",
+          payload: { role: "user", content: `prefix-lifetime-${index}` },
+        });
+      }
+      store.flushDurable();
+
+      // Preparing a compaction source is the other shape: it reduces active
+      // history, so it cannot answer from the prefix that does not.
+      store.prepareSource("prefix-lifetime-attempt", []);
+      expect(readdirSync(root).sort()).toEqual([
+        expect.stringMatching(/^agenc-c2-payloads-/u),
+        expect.stringMatching(/^agenc-c2-payloads-/u),
+        expect.stringMatching(/^agenc-recovery-identities-/u),
+        expect.stringMatching(/^agenc-recovery-identities-/u),
+      ]);
+
+      store.prepareSource("prefix-lifetime-attempt-2", []);
+      expect(readdirSync(root)).toHaveLength(4);
+    } finally {
+      store?.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    expect(readdirSync(root)).toEqual([]);
   });
 });
 
@@ -628,7 +684,7 @@ describe("RolloutStore thread-spawn edges", () => {
       });
       try {
         expect(resumed.runEpoch).toBe(2);
-        const driver = openStateDatabases({ cwd });
+        const driver = openStateDatabases({ cwd, agencHome });
         try {
           const row = driver
             .prepareState<
@@ -672,7 +728,7 @@ describe("RolloutStore thread-spawn edges", () => {
       });
       try {
         expect(resumed.runEpoch).toBe(2);
-        const driver = openStateDatabases({ cwd });
+        const driver = openStateDatabases({ cwd, agencHome });
         try {
           const row = driver
             .prepareState<
@@ -816,7 +872,7 @@ describe("RolloutStore thread-spawn edges", () => {
       });
       try {
         expect(resumed.runEpoch).toBe(2);
-        const driver = openStateDatabases({ cwd });
+        const driver = openStateDatabases({ cwd, agencHome });
         try {
           const row = driver
             .prepareState<
@@ -961,6 +1017,7 @@ describe("RolloutStore thread-spawn edges", () => {
       renameSync(normalPath, recoveryPath);
 
       const resumed = new RolloutStore({
+        agencHome,
         cwd,
         sessionId,
         agencVersion: "0.2.0",
@@ -1157,7 +1214,7 @@ describe("RolloutStore thread-spawn edges", () => {
       });
       original.close();
 
-      const raw = new Database(resolveStateDatabasePaths({ cwd }).stateDbPath);
+      const raw = new Database(resolveStateDatabasePaths({ cwd, agencHome }).stateDbPath);
       try {
         raw
           .prepare(
@@ -1196,7 +1253,7 @@ describe("RolloutStore thread-spawn edges", () => {
       });
       original.close();
 
-      const raw = new Database(resolveStateDatabasePaths({ cwd }).stateDbPath);
+      const raw = new Database(resolveStateDatabasePaths({ cwd, agencHome }).stateDbPath);
       try {
         expect(() =>
           raw
@@ -1260,7 +1317,7 @@ describe("RolloutStore thread-spawn edges", () => {
         },
       });
 
-      const paths = resolveStateDatabasePaths({ cwd });
+      const paths = resolveStateDatabasePaths({ cwd, agencHome });
       const raw = new Database(paths.stateDbPath);
       try {
         const before = raw
@@ -1681,7 +1738,7 @@ describe("RolloutStore thread-spawn edges", () => {
   it("imports obvious legacy snapshots with implicit open status", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
     const sessionId = "thread-spawn-legacy";
-    const sessionDir = getSessionDir(cwd, sessionId);
+    const sessionDir = getSessionDir(cwd, sessionId, undefined, agencHome);
     mkdirSync(sessionDir, { recursive: true });
     writeFileSync(
       join(sessionDir, "thread-spawn-edges.json"),
@@ -1715,7 +1772,7 @@ describe("RolloutStore thread-spawn edges", () => {
   it("backs up corrupt snapshots and starts with an empty graph", () => {
     const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
     const sessionId = "thread-spawn-corrupt";
-    const sessionDir = getSessionDir(cwd, sessionId);
+    const sessionDir = getSessionDir(cwd, sessionId, undefined, agencHome);
     const snapshotPath = join(sessionDir, "thread-spawn-edges.json");
     mkdirSync(sessionDir, { recursive: true });
     writeFileSync(snapshotPath, "{not-json", "utf8");
@@ -1723,7 +1780,7 @@ describe("RolloutStore thread-spawn edges", () => {
     const store = openStore({ cwd, sessionId, resume: true });
     try {
       expect(store.listThreadSpawnChildren("root-1")).toEqual([]);
-      const corruptDir = join(getProjectDir(cwd), "state-corrupt");
+      const corruptDir = join(getProjectDir(cwd, undefined, agencHome), "state-corrupt");
       const backups = readdirSync(corruptDir).filter(
         (entry) =>
           entry.startsWith("thread-spawn-edges-") && entry.endsWith(".json"),
@@ -1739,6 +1796,72 @@ describe("RolloutStore thread-spawn edges", () => {
         status: "open",
       });
       expect(existsSync(snapshotPath)).toBe(true);
+    } finally {
+      store.close();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("RolloutStore effect_intent childRunId", () => {
+  it("projects the journaled childRunId and accepts a legacy replay that lacks it", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-rollout-store-cwd-"));
+    const sessionId = "workflow-child-run-id";
+    const childRunId = `${sessionId}:plan#1`;
+    const store = openStore({ cwd, sessionId });
+    const payload = {
+      formatVersion: 2 as const,
+      minimumReaderRuntime: "0.14.0",
+      runId: sessionId,
+      stepId: "workflow.plan",
+      callId: "workflow.plan",
+      toolName: "workflow.plan",
+      recoveryCategory: "side-effecting" as const,
+      intentDigest: "digest-plan",
+      attempt: 1,
+      recordedAt: "2026-08-19T00:00:00.000Z",
+      childRunId,
+    };
+    const intent: Event = {
+      eventId: "event:1",
+      id: "event:1",
+      seq: 1,
+      msg: { type: "effect_intent", payload },
+    };
+    try {
+      expect(store.append(intent, { durable: true })).toBe(true);
+      store.recordEffectEvent(intent);
+      const driver = openStateDatabases({ cwd, agencHome });
+      try {
+        const repo = new StateRunDurabilityRepository(driver);
+        expect(repo.getEffect(sessionId, "workflow.plan")?.childRunId).toBe(
+          childRunId,
+        );
+      } finally {
+        driver.close();
+      }
+      // A rollout written before effect_intent carried childRunId replays the
+      // same event without it; the live projection row must not conflict.
+      const { childRunId: _dropped, ...legacyPayload } = payload;
+      expect(() =>
+        store.recordEffectEvent(
+          { ...intent, msg: { type: "effect_intent", payload: legacyPayload } },
+          { epoch: 1, canonicalReplay: true },
+        ),
+      ).not.toThrow();
+      // Anything else that differs is still the conflict it always was.
+      expect(() =>
+        store.recordEffectEvent(
+          {
+            ...intent,
+            msg: {
+              type: "effect_intent",
+              payload: { ...legacyPayload, intentDigest: "digest-other" },
+            },
+          },
+          { epoch: 1, canonicalReplay: true },
+        ),
+      ).toThrow(/different effect intent/);
     } finally {
       store.close();
       rmSync(cwd, { recursive: true, force: true });

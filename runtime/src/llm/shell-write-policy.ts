@@ -2,9 +2,11 @@ import { homedir, tmpdir } from "node:os";
 import { basename, relative, resolve as resolvePath, sep } from "node:path";
 
 import {
-  SHELL_COMMAND_SEPARATORS,
-  tokenizeShellCommand,
-} from "./_deps/command-line.js";
+  getShellRedirectOperator,
+  isShellCommandSeparator,
+  lexShellCommand,
+  type ShellToken,
+} from "../utils/shell/command-line.js";
 
 const SHELL_WORKSPACE_WRITE_TOOL_NAMES = new Set([
   "exec_command",
@@ -18,28 +20,6 @@ const SHELL_WRAPPER_COMMANDS = new Set([
   "sh",
   "zsh",
 ]);
-const ALL_REDIRECT_OPERATORS = new Set([
-  ">",
-  ">>",
-  ">|",
-  "<",
-  "<<",
-  "<<-",
-  "<>",
-  ">&",
-  "<&",
-  "&>",
-  "&>>",
-]);
-// The tokenizer keeps a file-descriptor prefix glued to its operator
-// (`2>`, `2>>`, `2>&`, `0<`). The prefix does not change what the
-// redirection writes to, so classification looks at the bare operator.
-const FD_PREFIXED_REDIRECT_RE = /^\d+(>>|>&|>\||<<-|<<|<&|<>|>|<)$/;
-
-function redirectOperator(token: string): string | undefined {
-  if (ALL_REDIRECT_OPERATORS.has(token)) return token;
-  return FD_PREFIXED_REDIRECT_RE.exec(token)?.[1];
-}
 const WRITE_REDIRECT_OPERATORS = new Set([
   ">",
   ">>",
@@ -47,6 +27,7 @@ const WRITE_REDIRECT_OPERATORS = new Set([
   ">&",
   "&>",
   "&>>",
+  "<>",
 ]);
 const WORKSPACE_GENERATED_ROOTS = new Set([
   "build",
@@ -131,6 +112,7 @@ export interface ShellWorkspaceWritePolicyInput {
   readonly toolName: string;
   readonly args: Record<string, unknown>;
   readonly workspaceRoot?: string;
+  readonly validationPhase?: "preflight" | "execution";
   /**
    * Whether this call may remove or move files that already exist in the
    * workspace: true when the session's permission mode allows edits without
@@ -141,6 +123,26 @@ export interface ShellWorkspaceWritePolicyInput {
   readonly allowWorkspaceDeletions?: boolean;
   /** Extra roots (the AgenC home) that a shell command may never remove. */
   readonly protectedRoots?: readonly string[];
+  /**
+   * Directories the user added with `--add-dir` or approved during the
+   * session. A shell command may remove or move files under them the way it
+   * may inside the workspace: without a prompt when `allowWorkspaceDeletions`
+   * is set, otherwise after approval. Content writes there were never
+   * refused, since they are outside the workspace.
+   */
+  readonly additionalRoots?: readonly string[];
+  /**
+   * The session bypasses approvals and runs without a sandbox
+   * (`--dangerously-bypass-approvals-and-sandbox`, or bypassPermissions on a
+   * host that cannot sandbox). Nothing but this policy would gate a shell
+   * mutation, and the user chose that, so the guards that exist only to route
+   * a mutation through a prompt or the sandbox are lifted: a command whose
+   * write targets cannot be determined runs, and removals outside the
+   * workspace are allowed. Workspace content writes still belong to Edit and
+   * Write, and the protected roots (`/`, the home, `.git`, `.agenc`, the
+   * AgenC home, shell and git config files) stay refused.
+   */
+  readonly bypassesApprovalsAndSandbox?: boolean;
 }
 
 interface ShellMove {
@@ -267,18 +269,17 @@ function workspaceRelation(
   return "inside";
 }
 
-function stripRedirections(tokens: readonly string[]): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (!token) continue;
-    if (redirectOperator(token) !== undefined) {
-      i += 1;
+function stripRedirections(tokens: readonly ShellToken[]): ShellToken[] {
+  const output: ShellToken[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (getShellRedirectOperator(token) !== undefined) {
+      index += 1;
       continue;
     }
-    out.push(token);
+    output.push(token);
   }
-  return out;
+  return output;
 }
 
 function extractWrappedShellCommand(args: readonly string[]): string | undefined {
@@ -512,41 +513,39 @@ function collectDirectCommandWriteTargets(params: {
 }
 
 function collectRedirectionTargets(
-  tokens: readonly string[],
+  tokens: readonly ShellToken[],
   cwd: string,
 ): ShellWriteTargetCollection {
   const collection = emptyTargetCollection();
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    const operator = token === undefined ? undefined : redirectOperator(token);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const operator = getShellRedirectOperator(tokens[index]!);
     if (operator === undefined || !WRITE_REDIRECT_OPERATORS.has(operator)) {
       continue;
     }
-    const next = tokens[i + 1];
+    const next = tokens[index + 1];
     if (
-      !next ||
-      SHELL_COMMAND_SEPARATORS.has(next) ||
-      redirectOperator(next) !== undefined
+      next?.kind !== "word" ||
+      next.value.length === 0
     ) {
       collection.indeterminate = true;
       continue;
     }
     if (
       operator === ">&" &&
-      (/^\d+$/.test(next) || /^&\d+$/.test(next))
+      (/^\d+-?$/.test(next.value) || next.value === "-")
     ) {
       continue;
     }
-    if (isSafePseudoDevicePath(next)) {
+    if (isSafePseudoDevicePath(next.value)) {
       continue;
     }
-    mergeTargetCollections(collection, normalizeConcreteTargetPath(next, cwd));
+    mergeTargetCollections(collection, normalizeConcreteTargetPath(next.value, cwd));
   }
   return collection;
 }
 
 function collectSegmentCommandWriteTargets(
-  segment: readonly string[],
+  segment: readonly ShellToken[],
   cwd: string,
 ): ShellWriteTargetCollection {
   const stripped = stripRedirections(segment);
@@ -556,17 +555,18 @@ function collectSegmentCommandWriteTargets(
   let commandIndex = 0;
   while (
     commandIndex < stripped.length &&
-    ENV_ASSIGNMENT_RE.test(stripped[commandIndex] ?? "")
+    ENV_ASSIGNMENT_RE.test(stripped[commandIndex]?.value ?? "")
   ) {
     commandIndex += 1;
   }
   const command = stripped[commandIndex];
-  if (!command) {
+  if (command === undefined || command.value.length === 0) {
     return emptyTargetCollection();
   }
+  if (command.requiresExpansion) return indeterminateTargetCollection();
   return collectDirectCommandWriteTargets({
-    command,
-    args: stripped.slice(commandIndex + 1),
+    command: command.value,
+    args: stripped.slice(commandIndex + 1).map((token) => token.value),
     cwd,
   });
 }
@@ -575,9 +575,10 @@ function collectShellCommandWriteTargets(
   commandLine: string,
   cwd: string,
 ): ShellWriteTargetCollection {
-  const tokens = tokenizeShellCommand(commandLine);
-  const collection = collectRedirectionTargets(tokens, cwd);
-  let segment: string[] = [];
+  const parsed = lexShellCommand(commandLine);
+  const collection = collectRedirectionTargets(parsed.tokens, cwd);
+  collection.indeterminate ||= parsed.malformed || parsed.hasCommandSubstitution;
+  let segment: ShellToken[] = [];
   const flushSegment = (): void => {
     mergeTargetCollections(
       collection,
@@ -585,8 +586,8 @@ function collectShellCommandWriteTargets(
     );
     segment = [];
   };
-  for (const token of tokens) {
-    if (SHELL_COMMAND_SEPARATORS.has(token)) {
+  for (const token of parsed.tokens) {
+    if (isShellCommandSeparator(token)) {
       flushSegment();
       continue;
     }
@@ -652,21 +653,42 @@ function isProtectedDeletionPath(
   return PROTECTED_DELETION_FILES.has(basename(absolutePath));
 }
 
+interface DeletionPolicyScope {
+  readonly workspaceRoot: string;
+  readonly protectedRoots: readonly string[];
+  readonly additionalRoots: readonly string[];
+  readonly allowWorkspaceDeletions: boolean;
+  readonly bypassesApprovalsAndSandbox: boolean;
+}
+
 function classifyDeletionTarget(
   absolutePath: string,
-  workspaceRoot: string,
-  protectedRoots: readonly string[],
-  allowWorkspaceDeletions: boolean,
+  scope: DeletionPolicyScope,
 ):
   | { readonly kind: "allowed"; readonly inWorkspace: boolean }
   | { readonly kind: "blocked"; readonly reason: DeletionBlockReason } {
+  const { workspaceRoot, protectedRoots, allowWorkspaceDeletions } = scope;
   if (isProtectedDeletionPath(absolutePath, workspaceRoot, protectedRoots)) {
     return { kind: "blocked", reason: "protected" };
   }
   if (workspaceRelation(workspaceRoot, absolutePath) === "outside") {
-    return isUnderTempRoot(absolutePath)
-      ? { kind: "allowed", inWorkspace: false }
-      : { kind: "blocked", reason: "outside" };
+    if (isUnderTempRoot(absolutePath) || scope.bypassesApprovalsAndSandbox) {
+      return { kind: "allowed", inWorkspace: false };
+    }
+    // An added directory is a root the user granted, so a removal there is
+    // the workspace class of mutation (prompt-free or approved), never the
+    // "ask the user to remove it themselves" refusal. It is still not a
+    // workspace path: the file-history sidecar does not back it up.
+    if (
+      scope.additionalRoots.some(
+        (root) => workspaceRelation(root, absolutePath) === "inside",
+      )
+    ) {
+      return allowWorkspaceDeletions
+        ? { kind: "allowed", inWorkspace: false }
+        : { kind: "blocked", reason: "needs_approval" };
+    }
+    return { kind: "blocked", reason: "outside" };
   }
   if (isWorkspaceGeneratedOutputPath(workspaceRoot, absolutePath)) {
     return { kind: "allowed", inWorkspace: true };
@@ -800,16 +822,22 @@ export function classifyShellWorkspaceWritePolicy(
   const deletionTargets: string[] = [];
   const blockedDeletions: string[] = [];
   const deletionReasons = new Set<DeletionBlockReason>();
+  const bypassesApprovalsAndSandbox = params.bypassesApprovalsAndSandbox === true;
+  const deletionScope: DeletionPolicyScope = {
+    workspaceRoot,
+    protectedRoots: params.protectedRoots ?? [],
+    additionalRoots: (params.additionalRoots ?? []).map((root) => resolvePath(root)),
+    allowWorkspaceDeletions: params.allowWorkspaceDeletions === true,
+    bypassesApprovalsAndSandbox,
+  };
   for (const target of removals) {
-    const verdict = classifyDeletionTarget(
-      target,
-      workspaceRoot,
-      params.protectedRoots ?? [],
-      params.allowWorkspaceDeletions === true,
-    );
+    const verdict = classifyDeletionTarget(target, deletionScope);
     if (verdict.kind === "allowed") {
       if (verdict.inWorkspace) deletionTargets.push(target);
     } else {
+      if (params.validationPhase === "preflight" && verdict.reason === "needs_approval") {
+        continue;
+      }
       blockedDeletions.push(target);
       deletionReasons.add(verdict.reason);
     }
@@ -822,7 +850,11 @@ export function classifyShellWorkspaceWritePolicy(
   if (blockedDeletions.length > 0) {
     messages.push(buildDeletionPolicyMessage(deletionReasons, blockedDeletions));
   }
-  if (collected.indeterminate) {
+  // With approvals bypassed and no sandbox, an unresolvable target no longer
+  // has a prompt or a kernel boundary to be routed to; refusing it only made
+  // the model rewrite `echo "$(id)"` and `for f in *; do ... done` until they
+  // parsed. The decision still reports `indeterminate` for callers.
+  if (collected.indeterminate && !bypassesApprovalsAndSandbox) {
     messages.push(buildIndeterminatePolicyMessage(observedTargets));
   }
 

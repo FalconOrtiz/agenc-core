@@ -11,6 +11,7 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   AGENC_SDK_DAEMON_PROTOCOL_VERSION,
   AGENC_SDK_JSON_RPC_VERSION,
@@ -18,8 +19,8 @@ import {
   type AgencDaemonErrorObject,
   type AgencDaemonMethod,
   type AgencDaemonRequest,
+  type AgencRequestParams,
   type AgencDaemonResponse,
-  type AgencParamsByMethod,
   type AgencResultByMethod,
   type AgentAttachResult,
   type AgentCreateParams,
@@ -49,6 +50,7 @@ import {
   type SessionTranscriptResult,
   type SessionTranscriptV2Result,
 } from "./protocol.js";
+import { AGENC_DAEMON_CLIENT_ENV_KEYS } from "./protocol-wire.generated.js";
 import {
   promptEventFromNotification,
   sessionIdFromNotification,
@@ -69,6 +71,7 @@ import type {
 function safeSdkRuntimeOptions(
   pluginStorageRoot: string,
   dangerouslyBypassApprovalsAndSandbox: boolean,
+  deadline: { readonly deadlineAt?: number; readonly deadlineReserveMs?: number } = {},
 ) {
   return Object.freeze({
     simpleMode: false,
@@ -77,9 +80,42 @@ function safeSdkRuntimeOptions(
     remoteMode: false,
     pluginStorageRoot,
     allowUntrustedHooks: false,
+    ...(deadline.deadlineAt !== undefined ? { deadlineAt: deadline.deadlineAt } : {}),
+    ...(deadline.deadlineReserveMs !== undefined
+      ? { deadlineReserveMs: deadline.deadlineReserveMs }
+      : {}),
   });
 }
 const AGENT_ATTACH_RUNTIME_AUTHORITY_PROTOCOL_MINOR = 8;
+
+const DYNAMIC_CLIENT_CREDENTIAL_ENV_KEY = /^AGENC_CREDENTIAL_[A-Z0-9_]+$/u;
+
+/**
+ * The client-owned environment a new session may use, taken from this
+ * process's environment: the daemon's allowlist (`AGENC_DAEMON_CLIENT_ENV_KEYS`,
+ * provider keys such as `DEEPSEEK_API_KEY`, model selection, proxy and TLS
+ * settings) plus any `AGENC_CREDENTIAL_*` remote MCP bearer. Keys that are
+ * absent or blank are not sent; the daemon treats them as explicit clears, so
+ * a session never inherits credentials from the daemon process or from
+ * another client. This is what `agenc -p` forwards, so an embedder that
+ * exports `DEEPSEEK_API_KEY` gets the same provider access as the CLI.
+ */
+export function collectClientEnvOverrides(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, string> {
+  const overrides: Record<string, string> = {};
+  const keys = new Set<string>(AGENC_DAEMON_CLIENT_ENV_KEYS);
+  for (const key of Object.keys(env)) {
+    if (DYNAMIC_CLIENT_CREDENTIAL_ENV_KEY.test(key)) keys.add(key);
+  }
+  for (const key of [...keys].sort((left, right) => left.localeCompare(right))) {
+    const value = env[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      overrides[key] = value;
+    }
+  }
+  return overrides;
+}
 
 /**
  * Minimal transport contract. The runtime's
@@ -263,6 +299,35 @@ export interface AgencCreateSessionParams extends SessionCreateParams {
    * Existing sessions retain the authority captured when they were created.
    */
   readonly dangerouslyBypassApprovalsAndSandbox?: boolean;
+  /**
+   * Disable approval prompts but keep the OS sandbox: the session starts in
+   * `bypassPermissions` mode with the daemon's configured sandbox policy.
+   * Mirrors the CLI `--bypass-approvals` flag. Conflicts with a different
+   * explicit `permissionMode`.
+   */
+  readonly bypassApprovals?: boolean;
+  /** Session-wide permission mode for the spawned agent (`agent.create`). */
+  readonly permissionMode?: AgentCreateParams["permissionMode"];
+  /** Model override for the spawned agent (`agent.create`). */
+  readonly model?: string;
+  /** Provider override for the spawned agent (`agent.create`). */
+  readonly provider?: string;
+  /**
+   * Environment forwarded to the daemon for this session (`agent.create`
+   * `envOverrides`). Omit to forward this process's allowlisted environment
+   * (see `collectClientEnvOverrides`), the same ingress `agenc -p` uses; pass
+   * `{}` to forward nothing.
+   */
+  readonly envOverrides?: Readonly<Record<string, string>>;
+  /**
+   * Absolute instant (epoch ms) the session's run must end by, as
+   * `agenc -p --deadline` sets it. The model is told its remaining budget,
+   * asked to finish in the reserve before it, and a turn still running at
+   * the deadline ends with the bounded stop `deadline_reached`.
+   */
+  readonly deadlineAt?: number;
+  /** Reserve before `deadlineAt` in ms (default: the CLI computes 10 % clamped to 5-30 min). */
+  readonly deadlineReserveMs?: number;
 }
 
 export interface AgencPromptOptions {
@@ -800,6 +865,7 @@ export class AgencClient {
     string,
     { readonly clientMessageId: string; turnId?: string }
   >();
+  readonly #closeListeners = new Set<(error: Error) => void>();
   #initializeResult: InitializeResult | undefined;
   #negotiatedClientProtocolVersion: string | undefined;
   #initialized = false;
@@ -891,7 +957,7 @@ export class AgencClient {
 
   async request<Method extends AgencDaemonMethod>(
     method: Method,
-    params?: AgencParamsByMethod[Method],
+    ...[params]: AgencRequestParams<NoInfer<Method>>
   ): Promise<AgencResultByMethod[Method]> {
     if (this.#closed) throw new Error("AgenC SDK client is closed");
     if (
@@ -907,12 +973,27 @@ export class AgencClient {
       );
     }
     const id = this.#createRequestId();
-    const request: AgencDaemonRequest<Method> =
+    // The public signature checks the method's payload and optionality. TS
+    // cannot carry that correlation through construction of this envelope.
+    const request = (
       params === undefined
         ? { jsonrpc: AGENC_SDK_JSON_RPC_VERSION, id, method }
-        : { jsonrpc: AGENC_SDK_JSON_RPC_VERSION, id, method, params };
-    const response = await this.#transport.request(request);
-    return parseResponse(response, method, id);
+        : { jsonrpc: AGENC_SDK_JSON_RPC_VERSION, id, method, params }
+    ) as AgencDaemonRequest<Method>;
+    let rejectOnClose!: (error: Error) => void;
+    const closed = new Promise<never>((_resolve, reject) => {
+      rejectOnClose = reject;
+    });
+    this.#closeListeners.add(rejectOnClose);
+    try {
+      const response = await Promise.race([
+        this.#transport.request(request),
+        closed,
+      ]);
+      return parseResponse(response, method, id);
+    } finally {
+      this.#closeListeners.delete(rejectOnClose);
+    }
   }
 
   async initialize(params: InitializeParams = {}): Promise<InitializeResult> {
@@ -963,10 +1044,30 @@ export class AgencClient {
     const {
       pluginStorageRoot: requestedPluginStorageRoot,
       dangerouslyBypassApprovalsAndSandbox = false,
+      bypassApprovals = false,
+      permissionMode: explicitPermissionMode,
+      model,
+      provider,
+      envOverrides: requestedEnvOverrides,
       initialPrompt,
       metadata,
+      deadlineAt,
+      deadlineReserveMs,
       ...sessionParams
     } = params;
+    if (
+      bypassApprovals &&
+      explicitPermissionMode !== undefined &&
+      explicitPermissionMode !== "bypassPermissions"
+    ) {
+      throw new Error(
+        `AgencClient.createSession: bypassApprovals conflicts with permissionMode "${explicitPermissionMode}"; pass one of them`,
+      );
+    }
+    const permissionMode = bypassApprovals
+      ? ("bypassPermissions" as const)
+      : explicitPermissionMode;
+    const envOverrides = requestedEnvOverrides ?? collectClientEnvOverrides();
     const pluginStorageRoot = normalizePluginStorageRoot(
       requestedPluginStorageRoot,
     );
@@ -1003,9 +1104,19 @@ export class AgencClient {
       cwd,
       initialContent: initialPrompt === undefined ? [] : initialPrompt,
       ...(metadata !== undefined ? { metadata } : {}),
+      ...(permissionMode !== undefined ? { permissionMode } : {}),
+      ...(model !== undefined && model.length > 0 ? { model } : {}),
+      ...(provider !== undefined && provider.length > 0 ? { provider } : {}),
+      ...(Object.keys(envOverrides).length > 0
+        ? { envOverrides: { ...envOverrides } }
+        : {}),
       runtimeOptions: safeSdkRuntimeOptions(
         pluginStorageRoot,
         dangerouslyBypassApprovalsAndSandbox,
+        {
+          ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+          ...(deadlineReserveMs !== undefined ? { deadlineReserveMs } : {}),
+        },
       ),
     } as AgentCreateParams);
     try {
@@ -1093,7 +1204,13 @@ export class AgencClient {
 
   /** Replay a bounded page of the canonical run journal. */
   replayRun(params: RunReplayParams): Promise<RunReplayResult> {
-    return this.request("run.replay", params);
+    // Compatibility adapter: the generic wire result has a flat event array.
+    // This helper retains the source-specific M3/M4 event union, including
+    // admission events from older daemons without a category field. The
+    // replay attachment validates the page and events before consuming them.
+    return this.request("run.replay", params).then(
+      (result) => result as RunReplayResult,
+    );
   }
 
   /**
@@ -1168,6 +1285,7 @@ export class AgencClient {
     content: MessageContent,
     options: AgencPromptOptions = {},
   ): AgencPromptRun {
+    if (this.#closed) throw new Error("AgenC SDK client is closed");
     const clientMessageId = normalizeClientMessageId(options.clientMessageId);
     const existingRun = this.#activePromptRuns.get(sessionId);
     if (existingRun !== undefined) {
@@ -1196,7 +1314,14 @@ export class AgencClient {
     let lastCommittedMessage = "";
     let finishing = false;
     let submissionDispatched = false;
+    let submissionValidated = false;
     let submissionObserved = false;
+    let dispatchedContent: MessageContent | undefined;
+    let provisionalTerminal: {
+      code: number;
+      message?: string;
+      turnId?: string;
+    } | undefined;
     let cancelBeforeDispatchReason: string | undefined;
     let deferredCancellationReason: string | undefined;
     let cancellationPromise: Promise<void> | undefined;
@@ -1204,6 +1329,8 @@ export class AgencClient {
 
     const flushDeferredCancellation = (): Promise<void> => {
       if (
+        finishing ||
+        provisionalTerminal !== undefined ||
         cancellationPromise !== undefined ||
         deferredCancellationReason === undefined ||
         !submissionObserved ||
@@ -1222,6 +1349,7 @@ export class AgencClient {
     };
 
     const requestScopedCancellation = (reason: string): Promise<void> => {
+      if (finishing || provisionalTerminal !== undefined) return Promise.resolve();
       if (!submissionDispatched) {
         cancelBeforeDispatchReason = reason;
         return Promise.resolve();
@@ -1246,6 +1374,7 @@ export class AgencClient {
       finishing = true;
       unsubscribe();
       removeAbortListener();
+      this.#closeListeners.delete(fail);
       releaseReservation();
       let usageFields: Pick<AgencPromptResult, "usage"> = {};
       if (options.includeUsage !== false) {
@@ -1291,6 +1420,7 @@ export class AgencClient {
           };
         }
       }
+      if (finishing || provisionalTerminal !== undefined) return;
       try {
         if (decision.behavior === "allow") {
           await this.request("tool.approve", {
@@ -1323,7 +1453,7 @@ export class AgencClient {
       } catch {
         return;
       }
-      if (response === null) return;
+      if (response === null || finishing || provisionalTerminal !== undefined) return;
       try {
         await this.request("elicitation.respond", {
           sessionId,
@@ -1340,10 +1470,25 @@ export class AgencClient {
     };
 
     const unsubscribe = this.onSessionNotification(sessionId, (message) => {
+      // session.attach replays prior submissions before message.send can
+      // validate this one's content and identity. Replay is not its admission.
+      if (finishing || provisionalTerminal !== undefined || !submissionDispatched) {
+        return;
+      }
       const observedClientMessageId =
         userMessageClientMessageIdFromNotification(message);
       if (!submissionObserved) {
         if (observedClientMessageId !== clientMessageId) return;
+        // A delayed replay can arrive after dispatch. The durable marker's
+        // original content must agree before its turn can own our callbacks.
+        const marker = nestedSessionEventFromNotification(message);
+        if (
+          isJsonObject(marker?.payload) &&
+          marker.payload.message !== undefined &&
+          !isDeepStrictEqual(marker.payload.message, dispatchedContent)
+        ) {
+          return;
+        }
         submissionObserved = true;
       } else if (
         observedClientMessageId !== null &&
@@ -1398,9 +1543,31 @@ export class AgencClient {
           void respondToElicitation(event);
         }
       }
-      const terminal = terminalStatusFromNotification(message);
-      if (terminal !== null) void finish(terminal);
+      const terminal = terminalStatusFromNotification(message, reservation.turnId);
+      if (terminal !== null) {
+        // message.send validates the submission independently of session
+        // notifications. A replayed terminal cannot override its rejection.
+        if (submissionValidated) {
+          void finish(terminal);
+        } else {
+          provisionalTerminal = {
+            ...terminal,
+            ...(reservation.turnId === undefined ? {} : { turnId: reservation.turnId }),
+          };
+        }
+      }
     });
+
+    const fail = (error: unknown): void => {
+      if (finishing) return;
+      finishing = true;
+      unsubscribe();
+      removeAbortListener();
+      this.#closeListeners.delete(fail);
+      releaseReservation();
+      channel.fail(error instanceof Error ? error : new Error(String(error)));
+    };
+    this.#closeListeners.add(fail);
 
     if (options.signal !== undefined) {
       const signal = options.signal;
@@ -1430,16 +1597,20 @@ export class AgencClient {
       }
       await this.#attachSession(sessionId);
       throwIfPromptCancelledBeforeDispatch(cancelBeforeDispatchReason);
+      // Compare against exactly what JSON transports send, independently of
+      // caller object prototypes, omitted undefined fields, or later mutation.
+      dispatchedContent = JSON.parse(JSON.stringify(content)) as MessageContent;
       submissionDispatched = true;
       const sendResult = await this.request("message.send", {
         sessionId,
-        content,
+        content: dispatchedContent,
         clientMessageId,
         ...(options.ifBusy !== undefined ? { ifBusy: options.ifBusy } : {}),
         ...(options.metadata !== undefined
           ? { metadata: options.metadata }
           : {}),
       });
+      submissionValidated = true;
       if (sendResult.turnId !== undefined) {
         reservation.turnId = sendResult.turnId;
         void flushDeferredCancellation().catch(() => {});
@@ -1476,12 +1647,20 @@ export class AgencClient {
               ? { message: lastCommittedMessage }
               : {}),
         });
+      } else if (
+        !finishing &&
+        provisionalTerminal !== undefined &&
+        (sendResult.turnId === undefined ||
+          sendResult.turnId === provisionalTerminal.turnId)
+      ) {
+        void finish(provisionalTerminal);
       } else if (sendResult.terminal !== undefined && !finishing) {
         // The RPC result is the authoritative terminal fallback when a live
         // notification was lost or filtered during reconnect. Legacy daemons
         // omit this field, so their behavior remains notification-driven.
         void finish(sendResult.terminal);
       }
+      provisionalTerminal = undefined;
       return {
         messageId: sendResult.messageId,
         clientMessageId,
@@ -1490,12 +1669,7 @@ export class AgencClient {
           : {}),
       };
     })();
-    accepted.catch((error: unknown) => {
-      unsubscribe();
-      removeAbortListener();
-      releaseReservation();
-      channel.fail(error instanceof Error ? error : new Error(String(error)));
-    });
+    accepted.catch(fail);
 
     return {
       sessionId,
@@ -1511,6 +1685,9 @@ export class AgencClient {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    const error = new Error("AgenC SDK client is closed");
+    for (const listener of this.#closeListeners) listener(error);
+    this.#closeListeners.clear();
     this.#notificationListeners.clear();
     this.#sessionListeners.clear();
     this.#activePromptRuns.clear();

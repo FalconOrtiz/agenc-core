@@ -12,6 +12,8 @@
  */
 
 import type { Tool, ToolResult } from "../types.js";
+import { validationErrorToolResult } from "../results.js";
+import { strictArgsRefusal } from "../strict-args.js";
 import { SESSION_ID_ARG } from "../system/filesystem.js";
 import { sharedServer } from "../concurrency.js";
 
@@ -57,6 +59,21 @@ export function taskTextResult(
   };
 }
 
+/**
+ * A refusal made before the tool touched anything. Without the disposition a
+ * bare error from a mutating Task* tool is filed as an unknown outcome and
+ * gates the whole session behind /resolve (#2190).
+ */
+export function taskValidationResult(
+  content: string,
+  codeModeResult?: unknown,
+): ToolResult {
+  return {
+    ...validationErrorToolResult("tool:tasks:validation", content),
+    ...(codeModeResult !== undefined ? { codeModeResult } : {}),
+  };
+}
+
 export function taskStrictArgs(
   args: Record<string, unknown>,
   opts: {
@@ -64,30 +81,11 @@ export function taskStrictArgs(
     readonly required?: ReadonlyArray<string>;
   },
 ): ToolResult | null {
-  const allowed = new Set<string>([
-    ...opts.allowed,
-    "__callId",
-    SESSION_ID_ARG,
-  ]);
-  for (const key of Object.keys(args)) {
-    if (!allowed.has(key)) {
-      return taskTextResult(
-        `unknown field \`${key}\``,
-        { error: `unknown field \`${key}\`` },
-        true,
-      );
-    }
-  }
-  for (const key of opts.required ?? []) {
-    if (typeof args[key] !== "string" || args[key].trim().length === 0) {
-      return taskTextResult(
-        `${key} is required`,
-        { error: `${key} is required` },
-        true,
-      );
-    }
-  }
-  return null;
+  return strictArgsRefusal(
+    args,
+    { ...opts, injected: ["__callId", SESSION_ID_ARG] },
+    (message) => taskValidationResult(message, { error: message }),
+  );
 }
 
 export function stringValue(value: unknown): string | undefined {

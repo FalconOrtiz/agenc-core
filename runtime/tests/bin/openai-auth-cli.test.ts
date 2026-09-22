@@ -52,6 +52,23 @@ function captureIo() {
 }
 
 describe('headless OpenAI auth CLI', () => {
+  test('reports the selected API key independently from a stored OAuth sign-in and never exports tokens', async () => {
+    mocks.read.mockReturnValue({ accessToken: 'private-oauth-token', accountId: 'account', authMode: 'chatgpt' })
+    const capture = captureIo()
+    await runOpenAiAuthCli({ kind: 'status', json: true }, { home, environment: { OPENAI_AUTH_MODE: 'api-key', OPENAI_API_KEY: 'private-api-key' } }, capture.io)
+    expect(JSON.parse(capture.stdout()).authSelection).toEqual({ version: 1, preference: 'api-key', effectiveMode: 'api-key', available: { oauth: true, apiKey: true } })
+    expect(capture.stdout()).not.toContain('private-')
+    expect(mocks.clear).not.toHaveBeenCalled()
+    expect(mocks.browserLogin).not.toHaveBeenCalled()
+  })
+
+  test('reports unavailable OAuth instead of treating a stored platform API key as subscription auth', async () => {
+    mocks.read.mockReturnValue({ apiKey: 'stored-platform-key', authMode: 'apiKey' })
+    const capture = captureIo()
+    await runOpenAiAuthCli({ kind: 'status', json: true }, { home, environment: { OPENAI_AUTH_MODE: 'oauth' } }, capture.io)
+    expect(JSON.parse(capture.stdout()).authSelection).toEqual({ version: 1, preference: 'oauth', effectiveMode: null, available: { oauth: false, apiKey: true } })
+  })
+
   beforeEach(() => {
     mocks.read.mockReset()
     mocks.clear.mockReset()

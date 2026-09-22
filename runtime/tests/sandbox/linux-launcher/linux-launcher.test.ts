@@ -105,6 +105,23 @@ describe("Linux sandbox launcher", () => {
     ).toThrow(/cannot be combined/u);
   });
 
+  it("preserves precise inherited cwd identity and rejects malformed wire authority", () => {
+    const identity = { path: "/workspace", dev: "9007199254740993", ino: "18446744073709551615", mode: "16832" };
+    const args = (value: unknown, inherited = true) => [
+      ...(inherited ? ["--inherited-readonly-command-cwd"] : []),
+      "--permission-profile", JSON.stringify(workspaceWriteProfile("/workspace", "disabled")),
+      "--session-temp-root", os.tmpdir(),
+      "--bound-readonly-cwd-identity", JSON.stringify(value), "--", "/bin/true",
+    ];
+    expect(parseLinuxSandboxLauncherArgs(args(identity)).boundReadOnlyCwd).toEqual(identity);
+    for (const invalid of [
+      { ...identity, dev: 9007199254740993 }, { ...identity, ino: "01" },
+      { ...identity, mode: "-1" }, { ...identity, path: "relative" },
+      { ...identity, path: "/workspace/../outside" }, { ...identity, extra: true },
+    ]) expect(() => parseLinuxSandboxLauncherArgs(args(invalid))).toThrow("invalid inherited cwd identity");
+    expect(() => parseLinuxSandboxLauncherArgs(args(identity, false))).toThrow("bound cwd identity requires inherited read-only cwd");
+  });
+
   it("rejects malformed handoff input", () => {
     expect(() => parseLinuxSandboxLauncherArgs([])).toThrow(LinuxSandboxCliError);
     expect(() =>
@@ -384,6 +401,9 @@ describe("Linux sandbox launcher", () => {
 
   it("maps restricted filesystem policy to writable, readonly, and masked bwrap mounts", () => {
     const root = withTempDir("agenc-linux-launcher-fs-");
+    // Own the repository metadata fixture; an ambient ancestor repository
+    // must not decide whether this root has a protected .git path.
+    fs.mkdirSync(path.join(root, ".git"));
     const secret = path.join(root, "token.secret");
     const otherSecret = path.join(root, "other.token");
     fs.writeFileSync(secret, "sensitive");
@@ -416,6 +436,220 @@ describe("Linux sandbox launcher", () => {
     expect(args).toContain(otherSecret);
     expect(args).toContain(path.join(root, ".git"));
     expect(args).toContain("--unshare-net");
+  });
+
+  it("scaffolds narrow aliases before host mounts without binding their parents", () => {
+    const root = withTempDir("agenc-linux-alias-plan-");
+    const parent = path.join(root, "real");
+    const workspace = path.join(parent, "project");
+    fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
+    fs.symlinkSync(parent, path.join(root, "alias"), "dir");
+    fs.symlinkSync("alias", path.join(root, "chain"), "dir");
+    const logical = path.join(root, "chain", "project");
+    const args = createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "path", path: logical }, access: "write" },
+    ], { includePlatformDefaults: false }), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    }).args;
+    expect(args.slice(2, 4)).toEqual(["--tmpfs", "/"]);
+    expect(args.indexOf("--symlink")).toBeLessThan(args.indexOf("--ro-bind"));
+    expect(args.some((flag, index) => flag === "--bind" && args[index + 2] === workspace)).toBe(true);
+    expect(bindModeForDestination(args, parent)).toBeUndefined();
+    expect(bindModeForDestination(args, root)).toBeUndefined();
+    expect(bindModeForDestination(args, "/")).toBeUndefined();
+    expect(sliceAfter(args, "--chdir")).toEqual([workspace, "--"]);
+  });
+
+  it.each(["read", "none"] as const)("refuses mixed-spelling %s restrictions that would be overwritten by an aliased mount", (access) => {
+    const root = withTempDir("agenc-linux-mixed-alias-policy-");
+    const workspace = path.join(root, "real", "project");
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.symlinkSync(path.join(root, "real"), path.join(root, "alias"), "dir");
+    const logical = path.join(root, "alias", "project");
+    const protectedPath = path.join(workspace, "protected.txt");
+    fs.writeFileSync(protectedPath, "protected");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "path", path: logical }, access: "write" },
+      { path: { kind: "path", path: protectedPath }, access },
+    ]), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    })).toThrow(/differently spelled restriction/u);
+    expect(fs.readFileSync(protectedPath, "utf8")).toBe("protected");
+  });
+
+  it.each((["read", "none"] as const).flatMap((access) =>
+    (["alias", "canonical"] as const).map((spelling) => ({ access, spelling })),
+  ))("rejects a $access carveout crossing a writable symlink below an aliased root ($spelling)", ({ access, spelling }) => {
+    const root = withTempDir("agenc-linux-hostile-alias-policy-");
+    const workspace = path.join(root, "real", "project");
+    const outside = path.join(root, "outside");
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.mkdirSync(outside);
+    fs.symlinkSync(path.join(root, "real"), path.join(root, "alias"), "dir");
+    fs.symlinkSync(outside, path.join(workspace, "protected"), "dir");
+    const logical = path.join(root, "alias", "project");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "path", path: logical }, access: "write" },
+      { path: { kind: "path", path: path.join(spelling === "alias" ? logical : workspace, "protected") }, access },
+    ]), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    })).toThrow(/crossing writable symlink/u);
+  });
+
+  it("rejects a canonical deny glob crossing a writable symlink below an aliased root", () => {
+    const root = withTempDir("agenc-linux-alias-glob-");
+    const workspace = path.join(root, "real", "project");
+    fs.mkdirSync(workspace, { recursive: true });
+    const outside = path.join(root, "outside.key");
+    fs.writeFileSync(outside, "secret");
+    fs.symlinkSync(path.join(root, "real"), path.join(root, "alias"), "dir");
+    fs.symlinkSync(outside, path.join(workspace, "protected.key"));
+    const logical = path.join(root, "alias", "project");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "path", path: logical }, access: "write" },
+      { path: { kind: "glob", pattern: path.join(workspace, "*.key") }, access: "none" },
+    ]), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    })).toThrow(/crossing writable symlink/u);
+  });
+
+  it("keeps protected-create monitoring on the same physical workspace as the mount", () => {
+    const root = withTempDir("agenc-linux-alias-monitor-");
+    const parent = path.join(root, "real");
+    const workspace = path.join(parent, "child");
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.mkdirSync(path.join(parent, ".git"));
+    fs.symlinkSync(parent, path.join(root, "alias"), "dir");
+    const logical = path.join(root, "alias", "child");
+    const plan = createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "path", path: logical }, access: "write" },
+    ]), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    });
+    expect(plan.protectedCreateTargets).toContain(path.join(workspace, ".git"));
+    expect(plan.protectedCreateTargets).not.toContain(path.join(logical, ".git"));
+  });
+
+  it.each([false, true])("refuses a replaceable alias before planning metadata mounts (narrow=%s)", (narrow) => {
+    const root = withTempDir("agenc-linux-mutable-alias-");
+    const holder = path.join(root, "holder");
+    const real = path.join(root, "real");
+    const workspace = path.join(real, "project");
+    fs.mkdirSync(holder);
+    fs.mkdirSync(path.join(workspace, ".git"), { recursive: true });
+    fs.symlinkSync(real, path.join(holder, "alias"), "dir");
+    const logical = path.join(holder, "alias", "project");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      ...(!narrow ? [{ path: { kind: "special" as const, value: { kind: "root" as const } }, access: "read" as const }] : []),
+      { path: { kind: "path", path: holder }, access: "write" },
+      { path: { kind: "path", path: logical }, access: "write" },
+    ], { includePlatformDefaults: false }), logical, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+    })).toThrow(/alias inside writable authority/u);
+  });
+
+  it.each(["command-cwd", "policy-cwd", "read-only-bind"] as const)("checks mutable aliases used only by %s", (surface) => {
+    const root = withTempDir("agenc-linux-alias-surfaces-");
+    const holder = path.join(root, "holder");
+    const real = path.join(root, "real");
+    const workspace = path.join(real, "project");
+    fs.mkdirSync(holder);
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.symlinkSync(real, path.join(holder, "alias"), "dir");
+    const logical = path.join(holder, "alias", "project");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "special", value: { kind: "root" } }, access: "read" },
+      { path: { kind: "path", path: holder }, access: "write" },
+    ]), surface === "policy-cwd" ? logical : workspace, surface === "command-cwd" ? logical : workspace, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+      ...(surface === "read-only-bind" ? { extraReadOnlyBindRoots: [logical] } : {}),
+    })).toThrow(/alias inside writable authority/u);
+  });
+
+  it.each([false, true])("checks physical writable authority across different spellings (extra=%s)", (extra) => {
+    const root = withTempDir("agenc-linux-alias-authorities-");
+    const holderParent = path.join(root, "holder-real");
+    const holder = path.join(holderParent, "shared");
+    const real = path.join(root, "real");
+    const workspace = path.join(real, "project");
+    fs.mkdirSync(holder, { recursive: true });
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.symlinkSync(holderParent, path.join(root, "holder-spelling"), "dir");
+    fs.symlinkSync(real, path.join(holder, "alias"), "dir");
+    const writable = path.join(root, "holder-spelling", "shared");
+    const logical = path.join(holder, "alias", "project");
+    expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+      { path: { kind: "special", value: { kind: "root" } }, access: "read" },
+      ...(!extra ? [{ path: { kind: "path" as const, path: writable }, access: "write" as const }] : []),
+    ]), workspace, logical, {
+      mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+      ...(extra ? { extraWritableBindRoots: [writable] } : {}),
+    })).toThrow(/alias inside writable authority/u);
+  });
+
+  it.each([false, true])("refuses an alias that changes between filesystem observations (narrow=%s)", (narrow) => {
+    const root = withTempDir("agenc-linux-alias-observations-");
+    const workspace = path.join(root, "workspace");
+    const first = path.join(root, "first");
+    const second = path.join(root, "second");
+    const alias = path.join(root, "alias");
+    for (const directory of [workspace, first, second]) fs.mkdirSync(directory);
+    fs.symlinkSync(first, alias, "dir");
+    const originalReadlink = fs.readlinkSync;
+    let changed = false;
+    const readlink = vi.spyOn(fs, "readlinkSync").mockImplementation(((...args: Parameters<typeof fs.readlinkSync>) => {
+      const result = originalReadlink(...args);
+      if (args[0] === alias && !changed) {
+        changed = true;
+        fs.unlinkSync(alias);
+        fs.symlinkSync(second, alias, "dir");
+      }
+      return result;
+    }) as typeof fs.readlinkSync);
+    try {
+      expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+        ...(!narrow ? [{ path: { kind: "special" as const, value: { kind: "root" as const } }, access: "read" as const }] : []),
+        { path: { kind: "path", path: workspace }, access: "write" },
+      ], { includePlatformDefaults: false }), workspace, workspace, {
+        mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+        extraReadOnlyBindRoots: [alias],
+      })).toThrow(/alias changed while planning/u);
+      expect(changed).toBe(true);
+    } finally {
+      readlink.mockRestore();
+    }
+  });
+
+  it.each(["overlap", "disjoint"] as const)("refuses a retained read-root retarget before the final mount snapshot (%s)", (targetKind) => {
+    const root = withTempDir("agenc-narrow-cwd-alias-snapshot-");
+    const workspace = path.join(root, "workspace");
+    const retained = path.join(root, "retained");
+    const outside = path.join(root, "outside");
+    for (const directory of [workspace, retained, outside]) fs.mkdirSync(directory);
+    const identity = fs.statSync(workspace, { bigint: true });
+    const originalExists = fs.existsSync;
+    let changed = false;
+    const exists = vi.spyOn(fs, "existsSync").mockImplementation((target => {
+      const result = originalExists(target);
+      if (String(target) === retained && !changed) {
+        changed = true;
+        fs.renameSync(retained, path.join(root, "retained-old"));
+        fs.symlinkSync(targetKind === "overlap" ? workspace : outside, retained, "dir");
+      }
+      return result;
+    }) as typeof fs.existsSync);
+    try {
+      expect(() => createBwrapCommandArgs(["/bin/true"], restrictedFileSystemPolicy([
+        { path: { kind: "path", path: INHERITED_CWD_SANDBOX_PATH }, access: "read" },
+        ...(targetKind === "disjoint" ? [{ path: { kind: "path" as const, path: retained }, access: "read" as const }] : []),
+      ], { includePlatformDefaults: false }), INHERITED_CWD_SANDBOX_PATH, INHERITED_CWD_SANDBOX_PATH, {
+        mountProc: false, networkMode: "isolated", sessionTempRoot: TEST_SESSION_TEMP_ROOT,
+        inheritedReadOnlyCwd: true,
+        boundReadOnlyCwd: { path: workspace, dev: String(identity.dev), ino: String(identity.ino), mode: String(identity.mode) },
+        ...(targetKind === "overlap" ? { extraReadOnlyBindRoots: [retained] } : {}),
+      })).toThrow(/overlapping public read mount|aliased read root/u);
+      expect(changed).toBe(true);
+    } finally { exists.mockRestore(); }
   });
 
   it("binds tmpdir specials to each explicit session root outside ambient context", () => {
@@ -691,6 +925,15 @@ describe("Linux sandbox launcher", () => {
     expect(() =>
       createNetworkSeccompProgram("restricted", "ppc64" as NodeJS.Architecture),
     ).toThrow(/does not support/u);
+  });
+
+  it.each([
+    { arch: "x64" as const, shutdown: 48, denied: [42, 43, 288, 49, 50, 44, 307, 299, 54] },
+    { arch: "arm64" as const, shutdown: 210, denied: [203, 202, 242, 200, 201, 206, 269, 243, 208] },
+  ])("allows socket shutdown without opening connectivity on $arch", ({ arch, shutdown, denied }) => {
+    const restrictedDenied = deniedSyscalls(createNetworkSeccompProgram("restricted", arch));
+    expect(restrictedDenied).not.toContain(shutdown);
+    expect(restrictedDenied).toEqual(expect.arrayContaining(denied));
   });
 
   it("isolates seccomp and proxy artifacts across two explicit session temp roots", async () => {

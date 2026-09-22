@@ -16,6 +16,7 @@ function makeSession() {
     conversationId: "root-thread",
     agentStatus: { value: { status: "pending_init" } },
     submit: vi.fn(async () => {}),
+    submitChildFollowup: vi.fn(async () => true),
     shutdown: vi.fn(async () => {}),
     abortTerminal: vi.fn(),
     abortAllTasks: vi.fn(async () => {}),
@@ -65,6 +66,20 @@ function makeLive(
 }
 
 describe("ThreadManager", () => {
+  it("keeps the actual executing turn's interval when a child is interrupted through sendOp", async () => {
+    const manager = new ThreadManager(makeSession());
+    const live = makeLive();
+    manager.registerLiveAgent(live);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    try {
+      live.status.markRunning("executing-turn");
+      clock.mockReturnValue(130_000);
+      await manager.sendOp(live.agentId, { type: "interrupt", reason: "user_cancel" });
+      expect(live.status.value).toMatchObject({ status: "interrupted", turnId: "executing-turn" });
+      expect(live.status.timing).toEqual({ turnId: "executing-turn", startedAt: 100_000, endedAt: 130_000 });
+    } finally { clock.mockRestore(); }
+  });
+
   it("registers a root session and routes user input ops", async () => {
     const session = makeSession();
     const manager = new ThreadManager(session);
@@ -170,9 +185,8 @@ describe("ThreadManager", () => {
       direction: "up",
       metadata: { kind: "inter_agent_communication" },
     });
-    expect(session.submit).toHaveBeenCalledWith("", {
-      displayUserMessage: null,
-    });
+    expect(session.submitChildFollowup).toHaveBeenCalledOnce();
+    expect(session.submit).not.toHaveBeenCalled();
   });
 
   it("owns agent spawning when bound to AgentControl", async () => {

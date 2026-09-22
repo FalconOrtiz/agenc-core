@@ -46,7 +46,7 @@ defaults to `https://id.agenc.ag` (`AGENC_BACKEND_URL`).
 ```bash
 agenc remote on        # pair (first run shows code + QR) and keep the host reachable
 agenc remote status    # pair.json fields only; does not probe a live bridge
-agenc remote off       # delete pair.json; does not stop a running `on` process
+agenc remote off       # revoke local bridges and remove pair.json
 ```
 
 ## Device pairing flow
@@ -114,11 +114,15 @@ Inside `agenc`:
 - `/remote on` — pairing code + QR on a persistent surface that auto-closes on
   connect; starts the bridge. Reuses an existing pairing if already linked.
 - `/remote status` — whether a phone is linked.
-- `/remote off` — delete `pair.json`. The silent TUI bridge keeps running
-  until the session ends.
+- `/remote off` — revoke local bridges and delete `pair.json`. Bridges observe a
+  shared stop marker before forwarding frames; pending reconnects cannot revive
+  access after revocation.
 
 The bridge runs **silent** inside the TUI (raw stdout would corrupt Ink) and
 never calls `process.exit` (that would kill the session).
+
+Browser and private-owner Telegram Connections use separate daemon-managed
+services with explicit scoped approval. See [Managed Connections](connections-core.md).
 
 ## Session model
 

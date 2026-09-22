@@ -14,15 +14,17 @@
  */
 
 import { resolveAgencHome } from "../config/env.js";
+import { canonicalizeHomePath } from "../config/home.js";
 import { loadCanonicalConfig } from "../config/repository.js";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { gatewayConfigFromCanonical } from "../gateway/config.js";
 import { PairingStore } from "../gateway/pairing.js";
 import { startGateway } from "../gateway/run.js";
 import type { GatewayConfig } from "../gateway/types.js";
+import { escapeXml } from "../utils/xml.js";
 
 export type AgenCGatewayCliCommand =
   | {
@@ -329,7 +331,7 @@ export async function runAgenCGatewayCli(
       return 0;
     }
     case "pairing-pending": {
-      const pending = store.listPending();
+      const pending = await store.listPending();
       if (command.json) {
         stdout(JSON.stringify(pending, null, 2));
         return 0;
@@ -346,12 +348,12 @@ export async function runAgenCGatewayCli(
       return 0;
     }
     case "pairing-approve": {
-      store.approve(command.channelId, command.peerId);
+      await store.approve(command.channelId, command.peerId);
       stdout(`Approved ${command.peerId} on ${command.channelId}.`);
       return 0;
     }
     case "pairing-revoke": {
-      const removed = store.revoke(command.channelId, command.peerId);
+      const removed = await store.revoke(command.channelId, command.peerId);
       if (removed) {
         stdout(`Revoked ${command.peerId} on ${command.channelId}.`);
         return 0;
@@ -362,6 +364,38 @@ export async function runAgenCGatewayCli(
       return 1;
     }
   }
+}
+
+function assertServiceHomeText(home: string): void {
+  if (!isServiceTextRepresentable(home)) {
+    throw new Error("Cannot install gateway service: AGENC_HOME contains control characters or invalid Unicode");
+  }
+}
+
+function isServiceTextRepresentable(text: string): boolean {
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    if (
+      codePoint < 0x20 ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      (codePoint >= 0xd800 && codePoint <= 0xdfff) ||
+      (codePoint >= 0xfdd0 && codePoint <= 0xfdef) ||
+      (codePoint & 0xfffe) === 0xfffe
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function assertServicePath(path: string | undefined, label: string): asserts path is string {
+  if (typeof path !== "string" || !posix.isAbsolute(path) || path.endsWith("/") || !isServiceTextRepresentable(path)) {
+    throw new Error(`Cannot install gateway service: ${label} must be an absolute file path without control characters or invalid Unicode`);
+  }
+}
+
+function quoteSystemdValue(value: string): string {
+  return JSON.stringify(value).replaceAll("%", "%%");
 }
 
 // ---------------------------------------------------------------------------
@@ -386,9 +420,20 @@ export async function installGatewayService(options: {
   readonly runCommand?: (cmd: string, args: readonly string[]) => boolean;
 }): Promise<number> {
   const platform = options.platform ?? process.platform;
+  if (platform !== "linux" && platform !== "darwin") {
+    options.stderr(
+      `install-service supports linux (systemd --user) and macOS (launchd); on ${platform} run the gateway directly: agenc gateway run`,
+    );
+    return 1;
+  }
   const home = options.home ?? homedir();
+  assertServiceHomeText(options.agencHome);
+  const agencHome = canonicalizeHomePath(options.agencHome);
+  assertServiceHomeText(agencHome);
   const nodeBin = options.execPath ?? process.execPath;
   const entry = options.entryPath ?? process.argv[1];
+  assertServicePath(nodeBin, "Node executable");
+  assertServicePath(entry, "CLI entrypoint");
   const run =
     options.runCommand ??
     ((cmd: string, args: readonly string[]): boolean =>
@@ -408,7 +453,8 @@ export async function installGatewayService(options: {
         "",
         "[Service]",
         "Type=simple",
-        `ExecStart=${nodeBin} ${entry} gateway run`,
+        `Environment=${quoteSystemdValue("AGENC_HOME=" + agencHome)}`,
+        `ExecStart=:/usr/bin/env ${["--", nodeBin, entry, "gateway", "run"].map(quoteSystemdValue).join(" ")}`,
         "Restart=on-failure",
         "RestartSec=5",
         "",
@@ -434,9 +480,7 @@ export async function installGatewayService(options: {
     options.stderr("  systemctl --user daemon-reload");
     options.stderr("  systemctl --user enable --now agenc-gateway");
     return 1;
-  }
-
-  if (platform === "darwin") {
+  } else {
     const agentsDir = join(home, "Library", "LaunchAgents");
     const plistPath = join(agentsDir, "dev.agenc.gateway.plist");
     mkdirSync(agentsDir, { recursive: true });
@@ -449,10 +493,15 @@ export async function installGatewayService(options: {
         "<dict>",
         "  <key>Label</key>",
         "  <string>dev.agenc.gateway</string>",
+        "  <key>EnvironmentVariables</key>",
+        "  <dict>",
+        "    <key>AGENC_HOME</key>",
+        `    <string>${escapeXml(agencHome)}</string>`,
+        "  </dict>",
         "  <key>ProgramArguments</key>",
         "  <array>",
-        `    <string>${nodeBin}</string>`,
-        `    <string>${entry}</string>`,
+        `    <string>${escapeXml(nodeBin)}</string>`,
+        `    <string>${escapeXml(entry)}</string>`,
         "    <string>gateway</string>",
         "    <string>run</string>",
         "  </array>",
@@ -475,9 +524,4 @@ export async function installGatewayService(options: {
     options.stderr(`  launchctl load -w ${plistPath}`);
     return 1;
   }
-
-  options.stderr(
-    `install-service supports linux (systemd --user) and macOS (launchd); on ${platform} run the gateway directly: agenc gateway run`,
-  );
-  return 1;
 }

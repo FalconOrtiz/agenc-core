@@ -61,6 +61,19 @@ async function loadCredentialModules() {
   return { providerOptions, openAiCredentials, xaiCredentials };
 }
 
+function managedAuthBackend() {
+  return {
+    kind: "local" as const,
+    login: vi.fn(),
+    logout: vi.fn(),
+    whoami: vi.fn(),
+    vendKey: vi.fn(),
+    inferAgencModel: vi.fn(),
+    getLlmUsage: vi.fn(),
+    getSubscriptionTier: vi.fn(),
+  };
+}
+
 beforeEach(async () => {
   testRoot = await mkdtemp(
     join(tmpdir(), "agenc-provider-credential-authority-"),
@@ -79,6 +92,117 @@ afterEach(async () => {
 });
 
 describe("provider credential authority", () => {
+  test.each(["openai", "grok"] as const)("%s selects API billing without deleting a stored OAuth sign-in", async (provider) => {
+    const home = await createHome(`choice-${provider}`);
+    const { providerOptions, openAiCredentials, xaiCredentials } = await loadCredentialModules();
+    openAiCredentials.saveOpenAiOauthCredentials(home, { accessToken: "openai-oauth", accountId: "account" });
+    xaiCredentials.saveXaiOauthCredentials(home, { accessToken: "xai-oauth" });
+    const environment = { OPENAI_AUTH_MODE: "api-key", GROK_AUTH_MODE: "api-key", OPENAI_API_KEY: "openai-byok", XAI_API_KEY: "xai-byok" };
+    const result = providerOptions.resolveProviderCredentialAuthority(provider, { credentialHome: home }, environment);
+    expect(result.credential).toMatchObject({ status: "ready", mode: "api-key", source: "environment" });
+    expect(result.factoryOptions.apiKey).toBe(provider === "openai" ? "openai-byok" : "xai-byok");
+    expect(result.factoryOptions.extra?.oauth).toBeUndefined();
+    expect(openAiCredentials.readOpenAiOauthCredentials(home)?.accessToken).toBe("openai-oauth");
+    expect(xaiCredentials.readXaiOauthCredentials(home)?.accessToken).toBe("xai-oauth");
+  });
+
+  test.each(["openai", "grok"] as const)("%s selects OAuth even when a factory/environment API key is present", async (provider) => {
+    const home = await createHome(`oauth-${provider}`);
+    const { providerOptions, openAiCredentials, xaiCredentials } = await loadCredentialModules();
+    openAiCredentials.saveOpenAiOauthCredentials(home, { accessToken: "openai-oauth", accountId: "account" });
+    xaiCredentials.saveXaiOauthCredentials(home, { accessToken: "xai-oauth" });
+    const result = providerOptions.resolveProviderCredentialAuthority(provider, { credentialHome: home, apiKey: "factory-byok" },
+      { OPENAI_AUTH_MODE: "oauth", GROK_AUTH_MODE: "oauth", OPENAI_API_KEY: "env-key", XAI_API_KEY: "env-key" });
+    expect(result.credential).toMatchObject({ status: "ready", mode: provider === "openai" ? "openai-oauth" : "xai-oauth" });
+    expect(result.factoryOptions.apiKey).toBe(provider === "openai" ? undefined : "xai-oauth");
+    if (provider === "openai") expect(result.factoryOptions).toMatchObject({ baseURL: "https://chatgpt.com/backend-api/codex", extra: { authMode: "oauth" } });
+  });
+
+  test.each(["openai", "grok"] as const)("%s never falls back to paid API credentials when selected OAuth is absent", async (provider) => {
+    const home = await createHome(`absent-${provider}`);
+    const { providerOptions } = await loadCredentialModules();
+    const readSavedApiKey = vi.fn(async () => "saved-paid-key");
+    const authBackend = managedAuthBackend();
+    const result = await providerOptions.resolveProviderRuntimeAuthority(provider, { credentialHome: home, apiKey: "factory-paid-key" },
+      { OPENAI_AUTH_MODE: "oauth", GROK_AUTH_MODE: "oauth", OPENAI_API_KEY: "env-paid-key", XAI_API_KEY: "env-paid-key" }, { readSavedApiKey, managedKeysEnabled: true, authBackend, sessionId: "oauth-selection", subscriptionTier: "pro" });
+    expect(result.credential).toMatchObject({ status: "missing", reason: "mode-required" });
+    expect(result.factoryOptions.apiKey).toBeUndefined();
+    expect(result.managedCredential).toBe(false);
+    expect(readSavedApiKey).not.toHaveBeenCalled();
+    expect(authBackend.vendKey).not.toHaveBeenCalled();
+  });
+
+  test.each(["openai", "grok"] as const)("%s never substitutes managed credentials for explicit API-key mode", async (provider) => {
+    const home = await createHome(`managed-blocked-${provider}`);
+    const { providerOptions } = await loadCredentialModules();
+    const authBackend = managedAuthBackend();
+    const readSavedApiKey = vi.fn(async () => undefined);
+    const result = await providerOptions.resolveProviderRuntimeAuthority(
+      provider,
+      { credentialHome: home },
+      { OPENAI_AUTH_MODE: "api-key", GROK_AUTH_MODE: "api-key" },
+      { readSavedApiKey, managedKeysEnabled: true, authBackend, sessionId: "api-selection", subscriptionTier: "pro" },
+    );
+
+    expect(result.credential.status).toBe("missing");
+    expect(result.managedCredential).toBe(false);
+    expect(readSavedApiKey).toHaveBeenCalledExactlyOnceWith(provider);
+    expect(authBackend.vendKey).not.toHaveBeenCalled();
+  });
+
+  test.each(["openai", "grok"] as const)("%s never substitutes OAuth when explicit API mode has no key", async (provider) => {
+    const home = await createHome(`missing-key-${provider}`);
+    const { providerOptions, openAiCredentials, xaiCredentials } = await loadCredentialModules();
+    openAiCredentials.saveOpenAiOauthCredentials(home, { accessToken: "openai-oauth", accountId: "account" });
+    xaiCredentials.saveXaiOauthCredentials(home, { accessToken: "xai-oauth" });
+    const result = providerOptions.resolveProviderCredentialAuthority(provider, { credentialHome: home }, { OPENAI_AUTH_MODE: "api-key", GROK_AUTH_MODE: "api-key" });
+    expect(result.credential.status).toBe("missing");
+    expect(result.factoryOptions.apiKey).toBeUndefined();
+    expect(result.factoryOptions.extra?.oauth).toBeUndefined();
+  });
+
+  test("preserves per-session auth snapshots when a future session chooses another method", async () => {
+    const home = await createHome("frozen-auth");
+    const { providerOptions, openAiCredentials } = await loadCredentialModules();
+    openAiCredentials.saveOpenAiOauthCredentials(home, { accessToken: "oauth-token", accountId: "account" });
+    const { collectDaemonClientEnvOverrides, mergeDaemonClientEnvironment } = await import("../../src/app-server/client-env-snapshot.js");
+    const environment = { OPENAI_AUTH_MODE: "oauth", OPENAI_API_KEY: "byok" };
+    const original = providerOptions.snapshotProviderEnvironment(mergeDaemonClientEnvironment({}, collectDaemonClientEnvOverrides(environment))!);
+    environment.OPENAI_AUTH_MODE = "api-key";
+    const future = providerOptions.snapshotProviderEnvironment(mergeDaemonClientEnvironment({}, collectDaemonClientEnvOverrides(environment))!);
+    expect(providerOptions.resolveProviderCredentialAuthority("openai", { credentialHome: home }, original).credential).toMatchObject({ mode: "openai-oauth" });
+    expect(providerOptions.resolveProviderCredentialAuthority("openai", { credentialHome: home }, future).credential).toMatchObject({ mode: "api-key" });
+    expect(original.OPENAI_AUTH_MODE).toBe("oauth");
+    expect(Object.isFrozen(original)).toBe(true);
+  });
+
+  test("Grok media credential discovery follows explicit auth selection", async () => {
+    const home = await createHome("grok-media");
+    const { xaiCredentials } = await loadCredentialModules();
+    xaiCredentials.saveXaiOauthCredentials(home, { accessToken: "oauth-token" });
+    const media = await import("../../src/llm/xai-capability-config.js");
+    expect(media.resolveXaiBearerToken(home, { GROK_AUTH_MODE: "api-key", XAI_API_KEY: "byok" })).toBe("byok");
+    expect(media.resolveXaiBearerToken(home, { GROK_AUTH_MODE: "oauth", XAI_API_KEY: "byok" })).toBe("oauth-token");
+    expect(media.hasXaiCredentials(home, { GROK_AUTH_MODE: "api-key" })).toBe(false);
+  });
+
+  test("rejects invalid auth intent and conflicting OpenAI OAuth factory state", async () => {
+    const { providerOptions } = await loadCredentialModules();
+    expect(() => providerOptions.resolveProviderCredentialAuthority("openai", {}, { OPENAI_AUTH_MODE: "typo" })).toThrow("OPENAI_AUTH_MODE must be");
+    expect(() => providerOptions.resolveProviderCredentialAuthority("openai", { extra: { authMode: "oauth" } }, { OPENAI_AUTH_MODE: "api-key" })).toThrow("conflicts with OAuth");
+  });
+
+  test("does not let explicit Grok API mode fall back to a composer CLI cached login", async () => {
+    const home = await createHome("composer-selection");
+    const { providerOptions, xaiCredentials } = await loadCredentialModules();
+    xaiCredentials.saveXaiOauthCredentials(home, { accessToken: "oauth-token" });
+    const missing = providerOptions.resolveProviderCredentialAuthority("grok", { credentialHome: home, model: "grok-composer-1" }, { GROK_AUTH_MODE: "api-key" });
+    expect(missing.credential.status).toBe("missing");
+    const available = providerOptions.resolveProviderCredentialAuthority("grok", { credentialHome: home, model: "grok-composer-1" }, { GROK_AUTH_MODE: "api-key", XAI_API_KEY: "byok" });
+    expect(available.credential).toMatchObject({ mode: "api-key", status: "ready" });
+    expect(available.factoryOptions.apiKey).toBe("byok");
+  });
+
   test("uses Grok OAuth from the exact HomeContext when the environment omits AGENC_HOME", async () => {
     const selectedHome = await createHome("selected");
     const otherHome = await createHome("other");
@@ -380,8 +504,8 @@ describe("provider credential authority", () => {
     expect(
       openAiCredentials.saveOpenAiOauthCredentials(home, {
         apiKey: "stored-openai-platform-key",
-      }).success,
-    ).toBe(true);
+      }),
+    ).toMatchObject({ success: true });
 
     const resolved = providerOptions.resolveProviderCredentialAuthority(
       "openai",
@@ -514,6 +638,61 @@ describe("provider credential authority", () => {
           source: "saved-byok",
         },
       },
+    });
+  });
+
+  test("resolves saved Gemini BYOK in explicit API-key mode without losing provenance", async () => {
+    const { providerOptions } = await loadCredentialModules();
+    const readSavedApiKey = vi.fn(async () => "saved-gemini-key");
+
+    const resolved = await providerOptions.resolveProviderRuntimeAuthority(
+      "gemini",
+      { model: "gemini-2.5-pro" },
+      { GEMINI_AUTH_MODE: "api-key" },
+      { readSavedApiKey },
+    );
+
+    expect(readSavedApiKey).toHaveBeenCalledExactlyOnceWith("gemini");
+    expect(resolved.credential).toMatchObject({
+      status: "ready",
+      mode: "api-key",
+      source: "saved-byok",
+    });
+    expect(resolved.managedCredential).toBe(false);
+    expect(resolved.factoryOptions.apiKey).toBeUndefined();
+    expect(resolved.factoryOptions.extra).toMatchObject({
+      gemini: {
+        credentialPlan: {
+          kind: "api-key",
+          credential: "saved-gemini-key",
+          source: "saved-byok",
+        },
+      },
+    });
+  });
+
+  test.each(["access-token", "adc"] as const)("does not replace Gemini %s mode with saved BYOK", async (mode) => {
+    const { providerOptions } = await loadCredentialModules();
+    const readSavedApiKey = vi.fn(async () => "wrong-mode-saved-key");
+    const resolved = await providerOptions.resolveProviderRuntimeAuthority(
+      "gemini",
+      { model: "gemini-2.5-pro" },
+      {
+        GEMINI_AUTH_MODE: mode,
+        GOOGLE_CLOUD_PROJECT: "gemini-project",
+        GOOGLE_CLOUD_LOCATION: "us-central1",
+      },
+      { readSavedApiKey },
+    );
+
+    expect(resolved.credential).toMatchObject({
+      status: "missing",
+      reason: "mode-required",
+    });
+    expect(resolved.managedCredential).toBe(false);
+    expect(resolved.factoryOptions.apiKey).toBeUndefined();
+    expect(resolved.factoryOptions.extra).toMatchObject({
+      gemini: { credentialPlan: { kind: "none", mode } },
     });
   });
 

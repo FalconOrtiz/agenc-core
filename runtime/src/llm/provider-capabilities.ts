@@ -4,6 +4,7 @@ import type {
 } from "./types.js";
 import { LLMProviderError } from "./errors.js";
 import { normalizeProviderIdentity } from "../provider-identity.js";
+import { resolveModelCapabilityHints } from "./registry/model-catalog.js";
 import {
   isStructuredOutputRequested,
   resolveProviderStructuredOutputMode,
@@ -99,19 +100,36 @@ export function assertProviderStructuredOutputCompatibility(input: {
       400,
     );
   }
-  if (
-    normalizeProviderIdentity(
-      input.providerName,
-      "structured-output provider capability",
-    ) === "grok" &&
-    input.toolsRequested
-  ) {
+  const provider = normalizeProviderIdentity(
+    input.providerName,
+    "structured-output provider capability",
+  );
+  if (provider === "grok" && input.toolsRequested) {
     assertXaiStructuredOutputToolCompatibility({
       providerName: input.providerName,
       model: input.model,
       structuredOutputRequested: true,
       toolsRequested: true,
     });
+  }
+  if (provider === "cerebras" && input.toolsRequested) {
+    throw new LLMProviderError(
+      input.providerName,
+      "Cerebras does not support combining structured outputs with function tools",
+      400,
+    );
+  }
+  if (
+    provider === "kimi" &&
+    input.toolsRequested &&
+    resolveModelCapabilityHints({ provider, model: input.model })
+      ?.supportsStructuredOutputWithTools !== true
+  ) {
+    throw new LLMProviderError(
+      input.providerName,
+      "Kimi structured outputs with function tools are not enabled without a verified combined wire contract",
+      400,
+    );
   }
 }
 

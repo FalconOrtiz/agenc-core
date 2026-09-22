@@ -154,6 +154,14 @@ function resolvePluginMcpEnvironmentWithIssues(
   return {
     server: {
       ...server,
+      ...(server.oauth === undefined ? {} : {
+        oauth: {
+          ...server.oauth,
+          ...(server.oauth.clientId === undefined ? {} : {
+            clientId: resolveServerString(plugin, server.oauth.clientId, options, issues, userConfig),
+          }),
+        },
+      }),
       ...(server.command !== undefined
         ? {
             command: resolveServerString(
@@ -264,8 +272,17 @@ function addPluginScopeToServers(
   options: PluginMcpRegistrationOptions,
 ): Readonly<Record<string, McpServerConfig>> {
   const scoped: Record<string, McpServerConfig> = {};
+  const scopedCounts = new Map<string, number>();
+  for (const name of Object.keys(servers)) {
+    const scopedName = pluginScopedServerIdentifier(plugin.id, name);
+    scopedCounts.set(scopedName, (scopedCounts.get(scopedName) ?? 0) + 1);
+  }
   for (const [name, server] of Object.entries(servers)) {
     const scopedName = pluginScopedServerIdentifier(plugin.id, name);
+    if (scopedCounts.get(scopedName)! > 1) {
+      options.errors?.push({ type: "mcp", source: `plugin:${plugin.id}`, plugin: plugin.id, message: "Plugin MCP server names have an ambiguous runtime identity." });
+      continue;
+    }
     const userConfig = schemaOwnedServerUserConfig(plugin, name);
     const resolved = resolvePluginMcpEnvironmentWithIssues(
       plugin,

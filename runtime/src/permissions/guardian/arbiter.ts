@@ -1,10 +1,6 @@
 /**
  * Guardian approval arbiter.
  *
- * Source parity:
- * - core/src/guardian/approval_request.rs
- * - core/src/guardian/review.rs
- *
  * This is the single approval-request entry point for tool dispatch. It owns
  * hook routing, automatic guardian review, user prompt fallback, stale-turn
  * checks, and session approval-cache writes.
@@ -12,7 +8,11 @@
  * @module
  */
 
-import type { Event, EventLog } from "../../session/event-log.js";
+import type {
+  Event,
+  EventLog,
+  FileWriteApprovalPreview,
+} from "../../session/event-log.js";
 import { isHookExecutionSuppressed } from "../../hooks/runtime-policy.js";
 import { asRecord } from "../../utils/record.js";
 import { nonEmptyString as stringValue } from "../../utils/stringUtils.js";
@@ -243,6 +243,8 @@ export function defaultExecApprovalRequirement(
 export interface ApprovalCtx {
   readonly invocation: ToolInvocation;
   readonly callId: string;
+  /** Canonical identity of this permission occurrence, not the tool invocation. */
+  readonly requestEventId?: string;
   readonly toolName: string;
   readonly turnId: string;
   /** True when the resolver is also the tool's per-call input channel. */
@@ -262,6 +264,7 @@ export interface ApprovalCtx {
   readonly availableDecisions?: readonly AvailableApprovalDecision[];
   readonly planContent?: string;
   readonly planFilePath?: string;
+  readonly fileWritePreview?: FileWriteApprovalPreview;
 }
 
 export interface ApprovalResolver {
@@ -346,6 +349,7 @@ export interface ApprovalRequestFn {
     readonly args: Record<string, unknown>;
     readonly currentTurnId: string;
     readonly signal: AbortSignal;
+    readonly requestEventId?: string;
   }): Promise<ModalDecision>;
 }
 
@@ -452,7 +456,21 @@ export function requestApproval(
 async function resolveAndJournalApproval(
   opts: RequestApprovalOpts,
 ): Promise<RequestApprovalResult> {
+  if (opts.ctx.toolName === "Write") {
+    const { buildFileWriteApprovalPreview } =
+      await import("../file-write-preview.js");
+    const fileWritePreview = await buildFileWriteApprovalPreview(
+      opts.ctx.invocation,
+      opts.args ?? approvalInputFromInvocation(opts.ctx.invocation),
+    );
+    opts = { ...opts, ctx: { ...opts.ctx, fileWritePreview } };
+  }
   const journal = beginDurableApprovalJournal(opts);
+  if (journal !== null) {
+    // The durable receipt, never a caller-supplied ID, binds the answer to the
+    // exact scope/input that was journaled for this occurrence.
+    opts = { ...opts, ctx: { ...opts.ctx, requestEventId: journal.requestEventId } };
+  }
   const result = await resolveApproval(opts);
   if (journal !== null) {
     appendDurableApprovalDecision(opts.ctx, journal, result);
@@ -535,7 +553,8 @@ async function resolveApproval(
     !requiresUserInteraction &&
     opts.guardianApprovalReviewer !== undefined &&
     shouldRouteApprovalToGuardian(opts.ctx);
-  if (shouldUseGuardian || opts.resolver) {
+  const defer = opts.ctx.invocation.session.services.deferInteractiveApprovals;
+  if (shouldUseGuardian || opts.resolver || defer !== undefined) {
     if (!activeApprovalTurnStillMatches(opts.ctx, opts.getActiveTurnId)) {
       return {
         decision: { kind: "abort" },
@@ -589,6 +608,11 @@ async function resolveApproval(
               : {}),
         };
       }
+      if (defer !== undefined) {
+        defer(opts.ctx.toolName);
+        return { decision: { kind: "abort" }, source: "aborted",
+          reason: "background_maintenance_requires_approval" };
+      }
       const decision = await opts.resolver!.request({
         ...opts.ctx,
         ...(signal !== undefined ? { signal } : {}),
@@ -596,7 +620,13 @@ async function resolveApproval(
       if (!activeApprovalTurnStillMatches(opts.ctx, opts.getActiveTurnId)) {
         throw new ModalApprovalError("stale_modal_decision");
       }
-      return { decision, source: "resolver" };
+      return {
+        decision,
+        source: "resolver",
+        ...(decision.kind === "denied" && decision.reason !== undefined
+          ? { reason: decision.reason }
+          : {}),
+      };
     };
     const fetchDecision = async (): Promise<ReviewDecision> => {
       fetchedResult = await fetchApprovalResult();
@@ -692,6 +722,9 @@ function beginDurableApprovalJournal(
           input,
           ...(planContent !== undefined ? { planContent } : {}),
           ...(planFilePath !== undefined ? { planFilePath } : {}),
+          ...(opts.ctx.fileWritePreview !== undefined
+            ? { fileWritePreview: opts.ctx.fileWritePreview }
+            : {}),
           recordedAt: new Date().toISOString(),
         },
       },
@@ -1027,6 +1060,13 @@ export async function requestToolUserApproval(
   }
 
   const requestEvent = emitApprovalPromptEvents(opts);
+  const requestEventId = requestEvent === null
+    ? undefined
+    : canonicalApprovalCoordinates(
+        requestEvent,
+        opts.callId ?? opts.subId ?? "approval",
+        "request",
+      ).requestEventId;
   const approvalCache =
     opts.tool.requiresUserInteraction?.() === true
       ? null
@@ -1050,7 +1090,10 @@ export async function requestToolUserApproval(
       opts.signal.addEventListener("abort", onAbort, { once: true });
       let requestPromise: Promise<ModalDecision>;
       try {
-        requestPromise = opts.request(opts);
+        requestPromise = opts.request({
+          ...opts,
+          ...(requestEventId !== undefined ? { requestEventId } : {}),
+        });
       } catch {
         opts.signal.removeEventListener("abort", onAbort);
         resolve({

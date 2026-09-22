@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { serializeProcessBrokerPayload } from "./process-broker-protocol.js";
 
 import {
   resolveTrustedWindowsSystemExecutable,
@@ -354,7 +355,7 @@ timer = setInterval(() => {
 }, 25);
 `;
 
-const POSIX_PROCESS_GATE_SCRIPT = String.raw`
+export const POSIX_PROCESS_GATE_SCRIPT = String.raw`
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
@@ -367,11 +368,42 @@ function fail(message, exitCode = 125) {
   }
 }
 
+// The handoff is one JSON document followed by a newline. Read until that
+// terminator (or end-of-file, for an older owner) with blocking reads. On
+// darwin a socketpair's end-of-file raced the child's first read and was
+// lost about one spawn in two hundred; the child then sat in readFileSync
+// forever and the owner timed it out with nothing to show for it.
 let config;
 try {
-  const encoded = fs.readFileSync(3, 'utf8');
+  const chunk = Buffer.alloc(65536);
+  const parts = [];
+  let totalBytes = 0;
+  let terminated = false;
+  while (!terminated) {
+    let bytes;
+    try {
+      bytes = fs.readSync(3, chunk, 0, chunk.length, null);
+    } catch (error) {
+      if (error && (error.code === 'EAGAIN' || error.code === 'EWOULDBLOCK')) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        continue;
+      }
+      throw error;
+    }
+    if (bytes === 0) break;
+    totalBytes += bytes;
+    if (totalBytes > 2 * 1024 * 1024) throw new Error('oversized containment handoff');
+    const part = Buffer.from(chunk.subarray(0, bytes));
+    const newline = part.indexOf(0x0a);
+    if (newline === -1) {
+      parts.push(part);
+    } else {
+      parts.push(part.subarray(0, newline));
+      terminated = true;
+    }
+  }
   fs.closeSync(3);
-  config = JSON.parse(encoded);
+  config = JSON.parse(Buffer.concat(parts).toString('utf8'));
 } catch {
   fail('invalid containment handoff');
 }
@@ -523,13 +555,41 @@ export interface ContainedProcessSpawnOptions {
   readonly linuxContainment?: "auto" | "subreaper";
 }
 
+/** What `terminateProcessTreeAndWait` found when it went to stop a tree. */
+export interface TerminateProcessTreeOutcome {
+  /**
+   * True when processes the command had left behind (a shell `&` job, nohup,
+   * setsid, or a daemon that forked away from its leader) were stopped:
+   * either the tree still had a live member when cleanup began, or the
+   * Linux subreaper broker reports that it stopped residual descendants
+   * itself when the leader exited. False when the tree was already gone on
+   * its own. The Windows `taskkill` path cannot tell the two apart and
+   * reports false.
+   */
+  readonly residualProcessesTerminated: boolean;
+}
+
+const TREE_ALREADY_GONE: TerminateProcessTreeOutcome = Object.freeze({
+  residualProcessesTerminated: false,
+});
+const RESIDUE_TERMINATED: TerminateProcessTreeOutcome = Object.freeze({
+  residualProcessesTerminated: true,
+});
+
 export interface TerminateProcessTreeOptions {
   readonly terminateGraceMs?: number;
   readonly killGraceMs?: number;
   readonly label?: string;
 }
 
-function serializePosixProcessGatePayload(
+/**
+ * One JSON document plus a newline terminator. JSON.stringify never emits a
+ * raw newline, so the terminator is unambiguous, and the gate stops reading
+ * at it instead of waiting for an end-of-file that darwin socketpairs
+ * occasionally fail to deliver (see the gate script). Exported for the test
+ * that drives the gate script directly.
+ */
+export function serializePosixProcessGatePayload(
   program: string,
   args: readonly string[],
   options: ContainedProcessSpawnOptions,
@@ -538,12 +598,16 @@ function serializePosixProcessGatePayload(
   for (const [name, value] of Object.entries(options.env)) {
     if (value !== undefined) environment.push([name, String(value)]);
   }
-  return JSON.stringify({
+  const payload = `${JSON.stringify({
     program,
     argv0: options.argv0 ?? program,
     args,
     environment,
-  });
+  })}\n`;
+  if (Buffer.byteLength(payload) > 2 * 1024 * 1024) {
+    throw new Error("process gate payload exceeds 2 MiB");
+  }
+  return payload;
 }
 
 function trustedPosixBootstrapEnvironment(
@@ -648,13 +712,14 @@ function spawnLinuxSubreaperContainedProcess(
   options: ContainedProcessSpawnOptions,
 ): ChildProcessWithoutNullStreams {
   const brokerPath = resolveLinuxSubreaperBroker();
+  const payload = serializeProcessBrokerPayload(program, args, options);
   const child = spawn(
     brokerPath,
-    [program, options.argv0 ?? program, ...args],
+    [],
     {
       cwd: options.cwd,
-      env: options.env,
-      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      env: trustedPosixBootstrapEnvironment(),
+      stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
       detached: true,
       windowsHide: true,
     },
@@ -734,6 +799,20 @@ function spawnLinuxSubreaperContainedProcess(
     boundary.processClosed = true;
     boundary.closed = boundary.statusClosed;
   });
+  const bootstrap = child.stdio[4] as Writable | null;
+  if (bootstrap === null || typeof bootstrap?.end !== "function") {
+    nativeKill("SIGKILL");
+    throw new Error("Linux process containment broker bootstrap FD is unavailable");
+  }
+  bootstrap.on("error", (error) => {
+    // A failed preflight can close FD 4 before the owner writes. The status
+    // channel establishes whether launch and cleanup occurred; don't replace
+    // its deterministic failure with a scheduling-dependent pipe error.
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPIPE" || code === "ECONNRESET") return;
+    boundary.protocolError ??= toError(error);
+  });
+  bootstrap.end(payload);
   return child;
 }
 
@@ -2031,10 +2110,22 @@ export async function terminateProcessTreeAndWait(
   child: ProcessTreeChild,
   options: TerminateProcessTreeOptions = {},
 ): Promise<void> {
+  await terminateProcessTreeAndReport(child, options);
+}
+
+/**
+ * `terminateProcessTreeAndWait` that also says whether it found anything to
+ * stop. The unified exec manager uses it to tell the model when a command
+ * left processes behind that the containment then ended.
+ */
+export async function terminateProcessTreeAndReport(
+  child: ProcessTreeChild,
+  options: TerminateProcessTreeOptions = {},
+): Promise<TerminateProcessTreeOutcome> {
   // Never pass an invalid synthetic root to taskkill, a Job Object, a cgroup,
   // process-table discovery, or POSIX negative-PID signalling.
   if (child.pid !== undefined && child.pid <= 1) {
-    if (!isProcessTreeAlive(child)) return;
+    if (!isProcessTreeAlive(child)) return TREE_ALREADY_GONE;
     safeKill(child, "SIGTERM");
     if (
       await waitForProcessTreeExit(
@@ -2042,7 +2133,7 @@ export async function terminateProcessTreeAndWait(
         options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS,
       )
     ) {
-      return;
+      return RESIDUE_TERMINATED;
     }
     safeKill(child, "SIGKILL");
     if (
@@ -2051,14 +2142,14 @@ export async function terminateProcessTreeAndWait(
         options.killGraceMs ?? DEFAULT_SETTLE_BACKSTOP_MS,
       )
     ) {
-      return;
+      return RESIDUE_TERMINATED;
     }
     throw new Error(
       `${options.label ?? "process"} invalid process root survived forced shutdown`,
     );
   }
   if (windowsJobBoundaries.has(child)) {
-    if (!isProcessTreeAlive(child)) return;
+    if (!isProcessTreeAlive(child)) return TREE_ALREADY_GONE;
     safeKill(child, "SIGTERM");
     if (
       await waitForProcessTreeExit(
@@ -2066,7 +2157,7 @@ export async function terminateProcessTreeAndWait(
         options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS,
       )
     ) {
-      return;
+      return RESIDUE_TERMINATED;
     }
     safeKill(child, "SIGKILL");
     if (
@@ -2075,7 +2166,7 @@ export async function terminateProcessTreeAndWait(
         options.killGraceMs ?? DEFAULT_SETTLE_BACKSTOP_MS,
       )
     ) {
-      return;
+      return RESIDUE_TERMINATED;
     }
     throw new Error(
       `${options.label ?? "process"} Windows Job Object broker survived forced shutdown`,
@@ -2088,7 +2179,7 @@ export async function terminateProcessTreeAndWait(
   // infer tree cleanup from the leader alone.
   if (process.platform === "win32" && child.pid !== undefined) {
     await terminateWindowsProcessTree(child.pid, options);
-    return;
+    return TREE_ALREADY_GONE;
   }
   if (!linuxCgroupBoundaries.has(child)) {
     captureProcessTreeDescendants(child);
@@ -2096,7 +2187,12 @@ export async function terminateProcessTreeAndWait(
   if (!isProcessTreeAlive(child)) {
     assertObservedBoundarySnapshotUsable(child, options.label ?? "process");
     await releaseLinuxCgroupBoundary(child);
-    return;
+    // The subreaper broker stops orphaned descendants on its own when the
+    // leader exits and has closed by the time settlement looks, so the tree
+    // reads as gone here; its residual flag is the record that it did.
+    return linuxSubreaperBoundaries.get(child)?.residual === true
+      ? RESIDUE_TERMINATED
+      : TREE_ALREADY_GONE;
   }
   signalProcessTree(child, "SIGTERM");
   if (
@@ -2107,7 +2203,7 @@ export async function terminateProcessTreeAndWait(
   ) {
     assertObservedBoundarySnapshotUsable(child, options.label ?? "process");
     await releaseLinuxCgroupBoundary(child);
-    return;
+    return RESIDUE_TERMINATED;
   }
   signalProcessTree(child, "SIGKILL");
   if (
@@ -2118,7 +2214,7 @@ export async function terminateProcessTreeAndWait(
   ) {
     assertObservedBoundarySnapshotUsable(child, options.label ?? "process");
     await releaseLinuxCgroupBoundary(child);
-    return;
+    return RESIDUE_TERMINATED;
   }
   const survivors = liveOwnedBoundaryPids(child)
     .filter((pid) => pid !== child.pid)

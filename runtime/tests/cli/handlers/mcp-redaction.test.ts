@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { resolveHomeContext } from "../../config/home.js";
 import { ConfigStore } from "../../config/store.js";
+import type { SecureStorageData } from "../../../src/utils/secureStorage/index.js";
 
 const TEST_HOME_CONTEXT = resolveHomeContext(
   { AGENC_HOME: "/tmp/agenc-mcp-cli-redaction-test" },
@@ -18,12 +19,21 @@ vi.mock("bun:bundle", () => ({ feature: () => false }));
 const mcpState = vi.hoisted(() => ({
   server: undefined as unknown,
 }));
+const credentials = vi.hoisted(() => new Map<string, SecureStorageData>());
 
-vi.mock("../../services/mcp/auth.js", () => ({
-  clearMcpClientConfig: vi.fn(),
-  clearServerTokensFromSecureStorage: vi.fn(),
+vi.mock("../../utils/secureStorage/native.js", () => ({
+  readNativeSecureStorage: (home: { path: string }) => structuredClone(credentials.get(home.path) ?? {}),
+  readNativeSecureStorageFresh: (home: { path: string }) => structuredClone(credentials.get(home.path) ?? {}),
+  updateNativeSecureStorage: (home: { path: string }, update: (value: SecureStorageData) => SecureStorageData) => {
+    const previous = structuredClone(credentials.get(home.path) ?? {});
+    const written = update(previous);
+    credentials.set(home.path, structuredClone(written));
+    return { previous, written };
+  },
+}));
+vi.mock("../../services/mcp/auth.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../../../src/services/mcp/auth.js")>(),
   readClientSecret: vi.fn(),
-  saveMcpClientSecret: vi.fn(),
 }));
 vi.mock("../../services/mcp/client.js", () => ({
   connectToServer: vi.fn(async () => ({ type: "failed" })),
@@ -72,11 +82,15 @@ vi.mock("../exit.js", () => ({
 
 import { addMcpConfig } from "../../services/mcp/config.js";
 import { ensureConfigScope } from "../../services/mcp/utils.js";
+import { AgenCAuthProvider, getServerKey, readClientSecret } from "../../services/mcp/auth.js";
+import { McpServerConfigSchema } from "../../../src/services/mcp/types.js";
+import { cliOk, cliError } from "../exit.js";
 import { mcpAddJsonHandler, mcpGetHandler } from "./mcp.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
+  credentials.clear();
   mcpState.server = undefined;
 });
 
@@ -89,6 +103,69 @@ function captureConsole(): string[] {
 }
 
 describe("MCP CLI redaction", () => {
+  test.each(["http", "sse"] as const)("add-json stores %s client secrets under the complete normalized OAuth identity", async (type) => {
+    const input = {
+      type,
+      url: "https://mcp.example.test/mcp",
+      headers: { "X-Tenant": "fixture-tenant" },
+      oauth: {
+        clientId: "fixture-public-client",
+        scopes: ["read"],
+        callbackPort: 3118,
+        authServerMetadataUrl: "https://auth.example.test/metadata",
+        ignoredMetadata: "not-part-of-the-normalized-identity",
+      },
+      enabled: false,
+      enabled_tools: ["read_document"],
+    };
+    const config = McpServerConfigSchema().parse(input);
+    if (config.type !== "http" && config.type !== "sse") throw new Error("Expected a remote fixture");
+    const secret = "fixture-only-client-secret";
+    vi.mocked(readClientSecret).mockResolvedValueOnce(secret);
+
+    await mcpAddJsonHandler("static-client", JSON.stringify(input), {
+      authority: TEST_AUTHORITY,
+      environment: {},
+      clientSecret: true,
+    });
+
+    expect(await new AgenCAuthProvider(TEST_HOME_CONTEXT, "static-client", config).clientInformation()).toEqual({
+      client_id: input.oauth.clientId,
+      client_secret: secret,
+    });
+    expect(addMcpConfig).toHaveBeenCalledWith("static-client", config, "user", TEST_AUTHORITY);
+    expect(Object.keys(credentials.get(TEST_HOME_CONTEXT.path)?.mcpOAuthClientConfig ?? {})).toEqual([getServerKey("static-client", config)]);
+    for (const changed of [
+      { ...config, headers: { "X-Tenant": "other-tenant" } },
+      { ...config, oauth: { ...config.oauth, clientId: "other-client" } },
+      { ...config, oauth: { ...config.oauth, scopes: ["write"] } },
+    ]) {
+      expect((await new AgenCAuthProvider(TEST_HOME_CONTEXT, "static-client", changed).clientInformation())?.client_secret).toBeUndefined();
+    }
+    expect(JSON.stringify(vi.mocked(addMcpConfig).mock.calls)).not.toContain(secret);
+    expect(JSON.stringify([vi.mocked(cliOk).mock.calls, vi.mocked(cliError).mock.calls])).not.toContain(secret);
+  });
+
+  test("add-json cancellation writes neither configuration nor client credentials", async () => {
+    vi.mocked(readClientSecret).mockRejectedValueOnce(new Error("Cancelled"));
+    await expect(mcpAddJsonHandler("static-client", JSON.stringify({
+      type: "http", url: "https://mcp.example.test/mcp", oauth: { clientId: "fixture-client" },
+    }), { authority: TEST_AUTHORITY, environment: {}, clientSecret: true })).rejects.toThrow("Cancelled");
+    expect(addMcpConfig).not.toHaveBeenCalled();
+    expect(credentials.size).toBe(0);
+  });
+
+  test("add-json rejects invalid configuration without prompting or echoing input", async () => {
+    const privateInput = "fixture-private-invalid-value";
+    await expect(mcpAddJsonHandler("static-client", JSON.stringify({
+      type: "http", url: { privateInput }, oauth: { clientId: "fixture-client" },
+    }), { authority: TEST_AUTHORITY, environment: {}, clientSecret: true })).rejects.toThrow("Invalid MCP server configuration.");
+    expect(readClientSecret).not.toHaveBeenCalled();
+    expect(addMcpConfig).not.toHaveBeenCalled();
+    expect(credentials.size).toBe(0);
+    expect(JSON.stringify(vi.mocked(cliError).mock.calls)).not.toContain(privateInput);
+  });
+
   test("mcp add-json defaults to user scope", async () => {
     await mcpAddJsonHandler(
       "game-helper",

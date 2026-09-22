@@ -87,6 +87,9 @@ import { isSafeSessionIdSegment } from "./session-store.js";
 import { AgenCDaemonRunInspectionService } from "../app-server/run-inspection.js";
 import { resolveStateDatabasePaths } from "../state/sqlite-driver.js";
 import { resolveAgentRuntimeOptions } from "./runtime-options.js";
+import { LiveApprovalBroker } from "../app-server/live-approval-broker.js";
+import { isApprovalSessionOwnedBy, observeChildApprovalSessions } from "../agents/child-approval-context.js";
+import { isWorkflowApprovalSession } from "../permissions/approval-failure.js";
 
 const TEST_REVIEW_CHILD_SESSION_ID =
   "review-70258a22d095bbaef7e15b5457a92c30c382f5bd2e4af2c54fcbf2e2e4da8a2d";
@@ -652,6 +655,7 @@ describe("review delegate spawn admission", () => {
     expect(thread.childSession.services.executionAdmission).toBe(
       admission.child,
     );
+    expect(thread.childSession.fileReadScope).toBe(session.fileReadScope);
     expect(admission.child.scope.runId).toBe(TEST_REVIEW_CHILD_SESSION_ID);
     expect(thread.childSession.rolloutStore).not.toBeNull();
     expect(admission.voidReservation).not.toHaveBeenCalled();
@@ -677,6 +681,9 @@ describe("review delegate spawn admission", () => {
       { cwd },
     );
     mountTestRollout(session);
+    const workspaceId = resolveStateDatabasePaths({ cwd, agencHome: requireTestConfigHome(session) }).projectDir;
+    Object.assign(admission.client.scope, { workspaceId });
+    Object.assign(admission.child.scope, { workspaceId });
     const req = mkOneShotRequest(session);
 
     await expect(
@@ -1071,6 +1078,7 @@ describe("runAgenCReviewOneShot happy-path review", () => {
     );
 
     expect(thread.childSession.services.mcpManager).not.toBe(parentMcpManager);
+    expect(Object.isFrozen(thread.childSession.services.mcpManager)).toBe(true);
     expect(thread.childSession.services.mcpManager.getTools?.()).toEqual([]);
     expect(thread.childSession.services.registry.tools).toEqual([]);
     expect(
@@ -1579,6 +1587,39 @@ describe("runAgenCReviewOneShot + runReview timeout", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("runAgenCReviewOneShot reviewer-model validation", () => {
+  it("registers the real workflow reviewer before sampling and revokes it on close", async () => {
+    let child: Session | undefined;
+    let samples = 0;
+    const provider = mkScriptedProvider({
+      content: JSON.stringify({ findings: [], overallCorrectness: "correct", overallExplanation: "checked", overallConfidenceScore: 0.9 }),
+      onChat: () => {
+        samples += 1;
+        expect(child).toBeDefined();
+        expect(isWorkflowApprovalSession(child)).toBe(true);
+        expect(isApprovalSessionOwnedBy(child!, session)).toBe(true);
+      },
+    });
+    const session = mkSession(provider);
+    const broker = new LiveApprovalBroker();
+    const unregister = broker.register(session, { workflow: true, isActive: () => true });
+    const unsubscribe = observeChildApprovalSessions(session, (created) => {
+      child = created;
+      return () => {};
+    });
+    try {
+      const outcome = await runAgenCReviewOneShot(session, mkOneShotRequest(session));
+      expect(outcome.verdict).toBe("pass");
+      expect(child).toBeDefined();
+      expect(samples).toBe(1);
+      expect(isApprovalSessionOwnedBy(child!, session)).toBe(false);
+      expect(isWorkflowApprovalSession(child)).toBe(false);
+    } finally {
+      unsubscribe();
+      unregister();
+      await session.shutdown();
+    }
+  });
+
   it("raises ReviewerModelMismatchError for an empty reviewer model slug", async () => {
     const provider = mkScriptedProvider({ content: "ok" });
     const session = mkSession(provider);

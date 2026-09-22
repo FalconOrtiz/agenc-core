@@ -3,7 +3,7 @@
  * guarantees, flock acquisition, atomic write-then-rename, and the
  * per-turn `toolResultBytes` index used by compaction.
  *
- * On-disk layout (per `docs/plan/agenc runtime-inventory.md §8`):
+ * On-disk layout:
  *
  *   ~/.agenc/projects/<slug>/
  *     sessions/<sessionId>/
@@ -79,6 +79,7 @@ import {
   sep,
 } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { projectStorageKey } from "../utils/project-storage-key.js";
 import {
   MAX_RECOVERY_CANONICAL_LINE_BYTES,
   RECOVERY_SCAN_CHUNK_BYTES,
@@ -242,9 +243,7 @@ class AppendRollbackError extends Error {
 // ─────────────────────────────────────────────────────────────────────
 
 export function slugifyCwd(cwd: string): string {
-  const base = cwd.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
-  return `${base.slice(0, 40) || "root"}-${hash}`;
+  return projectStorageKey(cwd);
 }
 
 export function getAgencHomeDir(agencHome?: string): string {
@@ -850,7 +849,7 @@ function processIsAlive(pid: number): boolean {
  *      durable. On ext4 (and most journalled Linux filesystems) a
  *      file fsync does NOT imply directory-entry durability — the
  *      rename is a directory operation and needs its own fsync on
- *      the parent. See agenc runtime pattern in
+ *      the parent. See
  *      `runtime/src/session/rollout-store.ts:238-251`
  *      (`persistThreadSpawnEdgesSnapshot`) which follows the same
  *      sequence for the thread-spawn-edges snapshot.
@@ -1470,6 +1469,8 @@ export class SessionStore {
    */
   private flushDepth = 0;
   private readonly deferredFlushDiagnostics: SessionStoreDiagnostic[] = [];
+  /** Best-effort mirror notification after rollout bytes are appended. */
+  private onRolloutCommitted?: (rolloutPath: string) => void;
   /**
    * I-38 async fsync retries currently in flight. Tracked so `close()`
    * can wait for them to settle (or so tests can await completion).
@@ -1870,6 +1871,12 @@ export class SessionStore {
     }
   }
 
+  setOnRolloutCommitted(
+    listener: ((rolloutPath: string) => void) | undefined,
+  ): void {
+    this.onRolloutCommitted = listener;
+  }
+
   private emitDiagnostic(d: SessionStoreDiagnostic): void {
     if (this.flushDepth > 0) {
       this.deferredFlushDiagnostics.push(d);
@@ -2057,53 +2064,26 @@ export class SessionStore {
     }
     this.flushDepth += 1;
     try {
-      // I-83 suspend detection: if the batch was open for > 10s (e.g.
-      // system suspend/resume gap), emit TWO marker events (warning +
-      // sentinel system_resumed_from) AHEAD of the pending batch.
-      // The markers are informational warnings (non-state-mutating in the
-      // reducer); the queued durable response_item / session_state lines
-      // that straddle the suspend window MUST be preserved and flushed,
-      // not discarded — dropping them permanently loses in-flight history.
+      // I-83 suspend detection: if the batch was open for > 10s (e.g. a
+      // host suspend/resume gap), record the window as a diagnostic. The
+      // queued durable response_item / session_state lines that straddle
+      // the window MUST be preserved and flushed, not discarded — dropping
+      // them permanently loses in-flight history.
+      //
+      // The window is NOT written here as a raw rollout row. Rows appended
+      // outside the EventLog carry no `seq`, and the canonical journal must
+      // be entirely sequenced or entirely legacy: one unsequenced row makes
+      // every later validation of that rollout fail
+      // ("canonical journal mixes sequenced and legacy events"), which
+      // refuses compaction for the rest of the session and ends the turn at
+      // the context limit. The diagnostic below reaches the rollout through
+      // the session's own emit path, properly stamped.
       if (
         this.batchOpenedAtMs !== null &&
         monotonicMs() - this.batchOpenedAtMs > I83_SUSPEND_DETECTION_MS
       ) {
         const durationMs = Math.round(monotonicMs() - this.batchOpenedAtMs);
         this.batchOpenedAtMs = null;
-        // Prepend the two I-83 marker events so the log shows (a) the
-        // operator-visible warning and (b) a structural sentinel the
-        // reducer can reason about, while the original pending items
-        // remain queued behind them.
-        const warning: RolloutItem = {
-          type: "event_msg",
-          payload: {
-            id: "system",
-            msg: {
-              type: "warning",
-              payload: {
-                cause: "event_log_batch_delayed",
-                message: `event-log batch delayed ${durationMs}ms (I-83)`,
-              },
-            },
-          },
-        };
-        // Sentinel encoded as a warning with cause=system_resumed_from
-        // so it round-trips through the 24-variant EventMsg union
-        // without adding a new variant.
-        const sentinel: RolloutItem = {
-          type: "event_msg",
-          payload: {
-            id: "system",
-            msg: {
-              type: "warning",
-              payload: {
-                cause: "system_resumed_from",
-                message: `${durationMs}`,
-              },
-            },
-          },
-        };
-        this.pending = [warning, sentinel, ...this.pending];
         this.emitDiagnostic({
           at: Date.now(),
           level: "warning",
@@ -2187,6 +2167,12 @@ export class SessionStore {
         }
         this.fileSize += Buffer.byteLength(lines, "utf8");
         this.trajectoryExport.writeItems(toWrite);
+        try {
+          this.onRolloutCommitted?.(this.rolloutPath);
+        } catch {
+          // The rollout is already appended. A mirror callback cannot make this
+          // canonical flush fail or cause its items to be re-queued.
+        }
       } catch (err) {
         const safeToRequeue = !(err instanceof AppendRollbackError);
         if (!routeToDegraded(err, safeToRequeue)) {
@@ -3238,7 +3224,6 @@ export class SessionStore {
    * rollout find the session metadata even after many compacts have
    * pushed the original header out of that window.
    *
-   * Port of agenc `sessionStorage.ts::reAppendSessionMetadata`.
    * Idempotent; safe to call multiple times. No-op if no session_meta
    * has been written yet (shouldn't happen post-open).
    *

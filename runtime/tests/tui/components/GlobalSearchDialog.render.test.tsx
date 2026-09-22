@@ -246,6 +246,28 @@ describe('GlobalSearchDialog render and interactions', () => {
     resetHarness()
   })
 
+  it('ignores invalid JSON line numbers without losing valid matches', async () => {
+    const rendered = await renderDialog()
+    try {
+      const invalidLines = [true, '12', [12], { toString: 0, valueOf: 0 }].map((lineNumber, index) =>
+        JSON.stringify({
+          type: 'match',
+          data: {
+            path: { text: `invalid-${index}.ts` },
+            line_number: lineNumber,
+            lines: { text: 'needle' },
+          },
+        }),
+      )
+      await searchFor('needle', [jsonMatchLine('valid.ts', 9, 'needle'), ...invalidLines])
+      await waitFor(() => pickerProps().matchLabel === '1 matches', 'Valid match was not retained')
+      expect(pickerProps().items).toEqual([{ file: 'valid.ts', line: 9, text: 'needle' }])
+      expect(harness.logError).not.toHaveBeenCalled()
+    } finally {
+      await rendered.dispose()
+    }
+  })
+
   it('renders the initial picker state and cancel wiring', async () => {
     const rendered = await renderDialog()
 

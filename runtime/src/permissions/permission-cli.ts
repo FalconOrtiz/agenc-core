@@ -9,6 +9,7 @@
 
 import { cwd as processCwd } from "node:process";
 import { resolveHomeContext } from "../config/home.js";
+import { FILE_READ_TOOL_NAME } from "../tools/FileReadTool/prompt.js";
 import {
   createAgenCJsonLineDaemonRequestClient,
   defaultEnsureDaemonReady,
@@ -40,6 +41,7 @@ import {
 } from "./types.js";
 import { parseRuleString, serializeRuleValue } from "./rules.js";
 import { permissionGrantsFromToolPermissionContext } from "./permission-grants.js";
+import { formatPendingToolApprovals } from "./pending-approval-display.js";
 
 export type AgenCPermissionsCliCommand =
   | {
@@ -114,6 +116,10 @@ const APPROVE_SCOPES: readonly ApprovalScope[] = Object.freeze([
 ] as const);
 
 export function formatAgenCPermissionsCliHelpText(): string {
+  const readRule = serializeRuleValue({
+    toolName: FILE_READ_TOOL_NAME,
+    ruleContent: "./src/**",
+  });
   return [
     "Usage: agenc permissions <command>",
     "",
@@ -126,7 +132,7 @@ export function formatAgenCPermissionsCliHelpText(): string {
     "",
     "Examples:",
     "  agenc permissions list",
-    "  agenc permissions approve --persist user 'Read(./src/**)'",
+    `  agenc permissions approve --persist user '${readRule}'`,
     "  agenc permissions approve --session session_123 call_456",
     "  agenc permissions revoke --session session_123 call_456",
   ].join("\n");
@@ -179,13 +185,14 @@ export async function runAgenCPermissionsCli(
 export function formatAgenCPermissionGrantList(
   result: PermissionListResult,
 ): string {
-  if (result.permissions.length === 0) return "No permissions";
-  return [
+  const grants = result.permissions.length === 0 ? "No permissions" : [
     ["id", "subject", "action", "scope", "granted_at", "expires_at"].join(
       "\t",
     ),
     ...result.permissions.map(formatPermissionGrantRow),
   ].join("\n");
+  const pending = formatPendingToolApprovals(result.pendingRequests ?? []);
+  return pending.length === 0 ? grants : `${grants}\n\n${pending}`;
 }
 
 function parseListArgs(

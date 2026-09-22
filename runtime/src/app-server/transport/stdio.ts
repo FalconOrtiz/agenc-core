@@ -12,24 +12,17 @@
  */
 
 import { Buffer } from "node:buffer";
-import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import type { JsonObject, JsonValue } from "../protocol/index.js";
 import {
   daemonOverloadErrorResponse,
+  isDaemonPreemptiveMessage,
   isDaemonPriorityMessage,
   maxQueuedRequestsFromOptions,
 } from "../overload.js";
 import { isRecord } from "../../utils/record.js";
+import { BoundedJsonLineReader } from "../../utils/bounded-json-lines.js";
 
-/**
- * Default upper bound on a single unterminated input line, matching the
- * websocket transport's default max payload. A peer that streams bytes
- * without ever emitting a newline would otherwise grow the readline
- * internal buffer (and daemon memory) unbounded; the transport tracks the
- * bytes seen since the last newline and tears the connection down once this
- * cap is exceeded, treating it as a fatal framing violation.
- */
 export const AGENC_STDIO_DEFAULT_MAX_LINE_BYTES = 16 * 1024 * 1024;
 
 export interface AgenCStdioTransportOptions {
@@ -54,8 +47,13 @@ export class AgenCStdioTransport {
   // Priority requests may bypass a streaming turn, but never the initialize
   // request that authenticates and establishes connection state.
   #initializeBarrier: Promise<void> = Promise.resolve();
+  // Repeated initialize frames must not move controls behind a running turn.
+  #hasInitializeBarrier = false;
+  // Reserve decision/cancellation capacity separately from health/status work.
+  // Both are bounded before initialize can release dispatcher admission.
+  readonly #queuedPriorityMessages = { priority: 0, control: 0 };
   #queuedNormalMessages = 0;
-  #reader: Interface | null = null;
+  #reader: BoundedJsonLineReader | null = null;
 
   constructor(options: AgenCStdioTransportOptions) {
     this.#options = options;
@@ -66,50 +64,19 @@ export class AgenCStdioTransport {
       throw new Error("AgenC stdio transport is already started");
     }
 
-    const reader = createInterface({
+    const reader = new BoundedJsonLineReader({
       input: this.#options.input,
-      crlfDelay: Infinity,
-      terminal: false,
+      maxLineBytes:
+        this.#options.maxLineBytes ?? AGENC_STDIO_DEFAULT_MAX_LINE_BYTES,
+      onLine: (line) => this.#handleLine(line),
+      onError: (error) => this.#options.onError?.(error, ""),
+      onClose: () => {
+        this.#reader = null;
+        this.#options.onClose?.();
+      },
     });
     this.#reader = reader;
-
-    // Node's readline does not enforce a maximum line length, so a peer that
-    // streams bytes without ever emitting a newline would grow the internal
-    // line buffer (and daemon memory) unbounded. Track the number of bytes
-    // accumulated since the last newline and tear the connection down once it
-    // exceeds the cap, mirroring the websocket transport's maxPayload bound.
-    const maxLineBytes =
-      this.#options.maxLineBytes ?? AGENC_STDIO_DEFAULT_MAX_LINE_BYTES;
-    let unterminatedBytes = 0;
-    const onData = (chunk: Buffer | string): void => {
-      const data =
-        typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
-      const lastNewline = data.lastIndexOf(0x0a);
-      if (lastNewline === -1) {
-        unterminatedBytes += data.length;
-      } else {
-        unterminatedBytes = data.length - lastNewline - 1;
-      }
-      if (unterminatedBytes > maxLineBytes) {
-        this.#options.onError?.(
-          new RangeError(
-            `AgenC stdio transport line exceeded ${maxLineBytes} bytes without a newline`,
-          ),
-          "",
-        );
-        this.#options.input.destroy();
-      }
-    };
-    this.#options.input.on("data", onData);
-
-    reader.on("line", (line) => {
-      this.#handleLine(line);
-    });
-    reader.once("close", () => {
-      this.#options.input.off("data", onData);
-      this.#reader = null;
-      this.#options.onClose?.();
-    });
+    reader.start();
   }
 
   async send(message: JsonValue): Promise<void> {
@@ -134,6 +101,15 @@ export class AgenCStdioTransport {
     }
 
     if (isDaemonPriorityMessage(message)) {
+      const lane = isDaemonPreemptiveMessage(message) ? "control" : "priority";
+      const maxQueuedRequests = maxQueuedRequestsFromOptions(this.#options);
+      if (this.#queuedPriorityMessages[lane] >= maxQueuedRequests) {
+        void this.send(daemonOverloadErrorResponse(
+          message, "TOO_MANY_QUEUED_REQUESTS", { maxQueuedRequests, lane },
+        )).catch((error) => this.#options.onError?.(asError(error), line));
+        return;
+      }
+      this.#queuedPriorityMessages[lane] += 1;
       // Control-plane requests must NOT queue behind a full model stream.
       // Dispatch them off-chain while keeping ordinary, order-dependent work
       // FIFO. The promise is still tracked so close() drains it.
@@ -146,8 +122,14 @@ export class AgenCStdioTransport {
         .catch((error) => {
           this.#options.onError?.(asError(error), line);
         });
+      if (message.method === "agent.create") {
+        // Create can start during a stream, but a later attach must still
+        // wait for its session to exist.
+        this.#dispatchChain = Promise.all([this.#dispatchChain, pending]).then(() => {});
+      }
       this.#pendingMessages.add(pending);
       pending.finally(() => {
+        this.#queuedPriorityMessages[lane] -= 1;
         this.#pendingMessages.delete(pending);
       });
       return;
@@ -186,7 +168,8 @@ export class AgenCStdioTransport {
         }
       },
     ));
-    if (message.method === "initialize") {
+    if (message.method === "initialize" && !this.#hasInitializeBarrier) {
+      this.#hasInitializeBarrier = true;
       this.#initializeBarrier = pending;
     }
     this.#pendingMessages.add(pending);

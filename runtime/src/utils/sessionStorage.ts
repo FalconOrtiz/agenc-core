@@ -79,7 +79,7 @@ import { getBranch } from './git.js'
 import { gracefulShutdownSync, isShuttingDown } from './gracefulShutdown.js'
 import { logError } from './log.js'
 import { extractTag, isCompactBoundaryMessage } from './messages.js'
-import { sanitizePath } from './path.js'
+import { projectStorageKey } from './project-storage-key.js'
 import { unescapeXml } from './xml.js'
 import {
   extractJsonStringField,
@@ -514,7 +514,7 @@ export function getNodeEnv(): string {
 
 // exported for testing
 export function getUserType(): string {
-  return process.env.USER_TYPE || 'external'
+  return 'external'
 }
 
 function getEntrypoint(): string | undefined {
@@ -525,13 +525,8 @@ export function isCustomTitleEnabled(): boolean {
   return true
 }
 
-// Memoized per canonical home + cwd: a daemon can host the same checkout in
-// multiple isolated session homes.
-export const getProjectDir = memoize(
-  (projectDir: string): string =>
-    join(getProjectsDir(), sanitizePath(projectDir)),
-  (projectDir: string) => `${getAgenCHomeDir()}\u0000${projectDir}`,
-)
+export const getProjectDir = (projectDir: string): string =>
+  join(getProjectsDir(), projectStorageKey(projectDir))
 
 let project: Project | null = null
 let cleanupRegistered = false
@@ -2603,11 +2598,11 @@ function recoverOrphanedParallelToolResults(
 /**
  * Find the latest turn_duration checkpoint in the reconstructed chain and
  * compare its recorded messageCount against the chain's position at that
- * point. Emits tengu_resume_consistency_delta for BigQuery monitoring of
+ * point. Records the resume consistency delta for monitoring of
  * write→load round-trip drift — the class of bugs where snip/compact/
  * parallel-TR operations mutate in-memory but the parentUuid walk on disk
- * reconstructs a different set (adamr-20260320-165831: 397K displayed →
- * 1.65M actual on resume).
+ * reconstructs a different set (one case: 397K displayed, 1.65M actual on
+ * resume).
  *
  * delta > 0: resume loaded MORE than in-session (the usual failure mode)
  * delta < 0: resume loaded FEWER (chain truncation — #22453 class)
@@ -2988,7 +2983,6 @@ export async function saveCustomTitle(
  * - CAS semantics: VS Code's `onlyIfNoCustomTitle` check scans for the
  *   `customTitle` field only, so AI can overwrite its own previous AI
  *   title but never a user title.
- * - Metrics: `tengu_session_renamed` is not fired for AI titles.
  *
  * Because the entry is never re-appended, it scrolls out of the 64KB tail
  * window once enough messages accumulate. Readers (`readLiteMetadata`,
@@ -4463,23 +4457,10 @@ async function getStatOnlyLogsForWorktrees(
     return getSessionFilesLite(projectDir, undefined, cwd)
   }
 
-  // On Windows, drive letter case can differ between git worktree list
-  // output (e.g. C:/Users/...) and how paths were stored in project
-  // directories (e.g. c:/Users/...). Use case-insensitive comparison.
-  const caseInsensitive = process.platform === 'win32'
-
-  // Sort worktree paths by sanitized prefix length (longest first) so
-  // more specific matches take priority over shorter ones. Without this,
-  // a short prefix like -code-myrepo could match -code-myrepo-worktree1
-  // before the longer, more specific prefix gets a chance.
-  const indexed = worktreePaths.map(wt => {
-    const sanitized = sanitizePath(wt)
-    return {
-      path: wt,
-      prefix: caseInsensitive ? sanitized.toLowerCase() : sanitized,
-    }
-  })
-  indexed.sort((a, b) => b.prefix.length - a.prefix.length)
+  const indexed = [getOriginalCwd(), ...worktreePaths].map(worktree => ({
+    path: worktree,
+    key: projectStorageKey(worktree),
+  }))
 
   const allLogs: LogOption[] = []
   const seenDirs = new Set<string>()
@@ -4498,11 +4479,11 @@ async function getStatOnlyLogsForWorktrees(
 
   for (const dirent of allDirents) {
     if (!dirent.isDirectory()) continue
-    const dirName = caseInsensitive ? dirent.name.toLowerCase() : dirent.name
+    const dirName = dirent.name
     if (seenDirs.has(dirName)) continue
 
-    for (const { path: wtPath, prefix } of indexed) {
-      if (dirName === prefix || dirName.startsWith(prefix + '-')) {
+    for (const { path: wtPath, key } of indexed) {
+      if (dirName === key) {
         seenDirs.add(dirName)
         allLogs.push(
           ...(await getSessionFilesLite(
@@ -4691,11 +4672,11 @@ export async function loadAllSubagentTranscriptsFromDisk(): Promise<{
 // without awaiting recordTranscript's return value (race-free hint tracking).
 export function isLoggableMessage(m: Message): boolean {
   if (m.type === 'progress') return false
-  // IMPORTANT: We deliberately filter out most attachments for non-ants because
-  // they have sensitive info for training that we don't want exposed to the public.
-  // When enabled, we allow hook_additional_context through since it contains
-  // user-configured hook output that is useful for session context on resume.
-  if (m.type === 'attachment' && getUserType() !== 'ant') {
+  // IMPORTANT: most attachments are deliberately kept out of the transcript
+  // because they can carry sensitive material. When enabled, we allow
+  // hook_additional_context through since it contains user-configured hook
+  // output that is useful for session context on resume.
+  if (m.type === 'attachment') {
     if (
       m.attachment.type === 'hook_additional_context' &&
       isEnvTruthy(process.env.AGENC_SAVE_HOOK_ADDITIONAL_CONTEXT)

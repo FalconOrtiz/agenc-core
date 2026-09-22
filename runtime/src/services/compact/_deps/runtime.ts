@@ -59,6 +59,7 @@ export function lookupContextWindowForModel(model: string | undefined): number {
 export function estimateMessagesTokens(
   messages: readonly RuntimeMessage[],
   context?: CompactContext,
+  options: { readonly inputOnly?: boolean } = {},
 ): number {
   const provider = context?.provider?.name ?? "unknown";
   const model = context?.options?.mainLoopModel ?? "unknown";
@@ -112,7 +113,7 @@ export function estimateMessagesTokens(
   if (!result.admissible) {
     return context?.options?.contextWindowTokens ?? Number.MAX_SAFE_INTEGER;
   }
-  return result.totalTokens;
+  return options.inputOnly === true ? result.inputTokens : result.totalTokens;
 }
 
 export function messageText(message: RuntimeMessage): string {
@@ -187,6 +188,19 @@ function toAccountingMessage(message: RuntimeMessage): LLMMessage {
       : {}),
     ...(message.runtimeOnly !== undefined
       ? { runtimeOnly: { ...message.runtimeOnly } }
+      : {}),
+    // Admission accounts the original LLMMessage, so every field it charges must
+    // survive this projection or the auto-compaction gate measures less than
+    // admission will (#2520). `phase` is an open string here and a two-value
+    // union on LLMMessage, so it is narrowed rather than cast.
+    ...(message.providerReasoningContent !== undefined
+      ? { providerReasoningContent: message.providerReasoningContent }
+      : {}),
+    ...(message.providerReasoningProvenance !== undefined
+      ? { providerReasoningProvenance: message.providerReasoningProvenance }
+      : {}),
+    ...(message.phase === "commentary" || message.phase === "final_answer"
+      ? { phase: message.phase }
       : {}),
   };
 }

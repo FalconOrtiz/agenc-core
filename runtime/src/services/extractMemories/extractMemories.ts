@@ -7,12 +7,21 @@
  *     is the count of model-visible messages processed. If compaction shrinks
  *     the visible history, the next extraction falls back to the retained
  *     visible messages instead of permanently disabling extraction.
+ *   - The eligible-turn cadence and that cursor are persisted per (session,
+ *     memory root) as the session's memory-extraction slot and seeded back
+ *     into a new lane, so a daemon restart continues the wait instead of
+ *     beginning it again.
  *   - Child tool access is enforced by a `ChildToolPolicy` layered inside
  *     `run-agent.ts`, not by the older `canUseTool` hook, and the child only
  *     ever sees the read/write file tools through `toolAllowlist`.
  *   - Every gate that stops a run and every failed run emits a `warning`
  *     event (`memory_extraction_skipped` / `memory_extraction_failed`) so the
  *     reason is visible in the session log instead of being swallowed.
+ *   - Skill candidates ride the same child run: the prompt asks the reviewer
+ *     for at most two draft skills, answered as a fenced block in its final
+ *     reply, and `skills/skill-candidates.ts` validates and writes them as
+ *     inactive drafts under `<AGENC_HOME>/skill-candidates`. No second
+ *     scheduler, no extra model call.
  *
  * Scope boundaries:
  *   - remote feature-service lookups, team-memory routing, and shell access.
@@ -23,8 +32,14 @@ import type { LLMMessage } from "../../llm/types.js";
 import {
   cloneLlmMessageSnapshot as cloneMessage,
 } from "../../llm/content-conversion.js";
-import type { Session } from "../../session/session.js";
+import type { Session, SessionServices } from "../../session/session.js";
 import type { TurnContext } from "../../session/turn-context.js";
+import { resolveHomeContext } from "../../config/home.js";
+import {
+  isSkillCandidatesDisabledByEnv,
+  parseSkillCandidateProposals,
+  writeSkillCandidates,
+} from "../../skills/skill-candidates.js";
 import type { CompletedToolResultRecord } from "../../session/turn-state.js";
 import type {
   ChildToolPolicy,
@@ -34,6 +49,12 @@ import type {
 import type { delegate as delegateFn } from "../../agents/delegate.js";
 import type { ensureAgentControl as ensureAgentControlFn } from "../../bin/delegate-tool.js";
 import { withSignedAllowedRoots } from "../../agents/_deps/filesystem-args.js";
+import { canWritePathWithCwd } from "../../sandbox/engine/index.js";
+import {
+  agencHomeCarveOutAllowsWrite,
+  permissionProfileForLiveSandboxPolicies,
+} from "../../tools/runtimes/sandboxing.js";
+import { isDurableMemoryWritePath } from "../../permissions/path-validation.js";
 import type { AgentPath } from "../../agents/registry.js";
 import {
   createMemoryExtractionTriggerState,
@@ -46,6 +67,11 @@ import {
   shouldDeferForEligibleTurnCadence,
   type MemoryExtractionTriggerState,
 } from "../../memory/extraction-triggers.js";
+import {
+  persistMemoryExtractionState,
+  readMemoryExtractionState,
+  type SessionMemoryExtractionState,
+} from "../../session/memory-extraction-state.js";
 import {
   formatMemoryManifest,
   scanForSecrets,
@@ -60,7 +86,10 @@ import {
   type MemoryPathEnv,
   type ResolveAutoMemoryDirectoryOptions,
 } from "./memory-paths.js";
-import { buildExtractAutoOnlyPrompt } from "./prompts.js";
+import {
+  buildExtractAutoOnlyPrompt,
+  buildSkillCandidatesPromptSection,
+} from "./prompts.js";
 
 const READ_TOOL_NAMES = new Set(["FileRead", "Grep", "Glob"]);
 const WRITE_TOOL_NAMES = new Set(["Edit", "MultiEdit", "Write"]);
@@ -77,12 +106,25 @@ export const MEMORY_EXTRACTION_TOOL_ALLOWLIST: readonly string[] = [
 export const MEMORY_EXTRACTION_AGENT_NAME = "memory_extraction";
 
 const DEFAULT_MAX_TURNS = 5;
+/**
+ * Visible messages one extraction run may cover. The child has
+ * DEFAULT_MAX_TURNS tool rounds; a run that failed on N messages was handed N
+ * plus everything new the next time, so a long session's extraction never
+ * completed again (backlog 6, 20, 25, 31 messages across four failed runs in
+ * one soak session). A bounded batch drains over several runs instead.
+ */
+const MAX_EXTRACTION_BATCH_MESSAGES = 12;
+/** Failed runs on the same batch before it is dropped so the lane recovers. */
+const MAX_FAILED_RUNS_PER_BATCH = 2;
 const MAX_EXTRACTION_LANES = 256;
 
 type ExtractionWarningCause =
   | "memory_extraction_skipped"
   | "memory_extraction_failed"
-  | "memory_extraction_denied_read";
+  | "memory_extraction_denied_read"
+  | "memory_extraction_state_not_persisted"
+  | "skill_candidate_proposed"
+  | "skill_candidate_skipped";
 
 /**
  * Record why an extraction run stopped. Warning causes outside the TUI's
@@ -137,8 +179,13 @@ export interface ExtractMemoriesChildRequest {
 }
 
 export interface ExtractMemoriesChildResult {
-  readonly outcome: RunAgentResult["outcome"] | "rejected";
+  readonly outcome: RunAgentResult["outcome"] | "rejected" | "deferred";
   readonly error?: unknown;
+  /**
+   * The child's final reply. Memory lands on disk through the tool policy;
+   * this text is read only for the optional `skill-candidates` block.
+   */
+  readonly finalMessage?: string;
 }
 
 export interface ExtractMemoriesDependencies {
@@ -155,6 +202,20 @@ export interface ExtractMemoriesDependencies {
   readonly minEligibleTurns?: number;
   readonly delegateFn?: typeof delegateFn;
   readonly ensureAgentControl?: typeof ensureAgentControlFn;
+  /**
+   * AgenC home that receives skill-candidate drafts. Defaults to the
+   * session's config-store home, then the home resolver. An injected
+   * `env` that names no `AGENC_HOME` turns proposals off instead of falling
+   * back to the process user's home.
+   */
+  readonly skillCandidatesHome?: string;
+  /**
+   * Names a proposal must not duplicate. Defaults to the session's skills
+   * manager plus the bundled registry.
+   */
+  readonly listInstalledSkillNames?: (
+    session: Session,
+  ) => Promise<readonly string[]>;
 }
 
 interface QueuedExtraction {
@@ -165,14 +226,21 @@ interface QueuedExtraction {
 interface VisibleRange {
   readonly visibleMessages: readonly LLMMessage[];
   readonly unprocessedMessages: readonly LLMMessage[];
+  readonly unprocessedVisibleCount: number;
   readonly currentVisibleCount: number;
 }
 
 interface ExtractionLane {
   trigger: MemoryExtractionTriggerState;
   inProgress: boolean;
+  /** Consecutive failed runs on the current batch. */
+  failedRuns: number;
   lastAccessedAt: number;
   pendingContext: QueuedExtraction | undefined;
+  /** The persisted cadence was read once, before the lane's first decision. */
+  restored: boolean;
+  /** Last cadence written for this lane, so unchanged state is not rewritten. */
+  persisted: SessionMemoryExtractionState | undefined;
 }
 
 interface ChildWriteTracker {
@@ -470,6 +538,7 @@ async function defaultRunChild(
       : import("../../agents/delegate.js"),
   ]);
   const { control, registry } = ensureAgentControl(request.session);
+  let deferredTool: string | undefined;
   const outcome = await delegate({
     parent: request.session,
     parentPath: "/root" as AgentPath,
@@ -483,6 +552,7 @@ async function defaultRunChild(
     runInBackground: false,
     forceSynchronous: true,
     silent: true,
+    deferInteractiveApprovals: (toolName) => { deferredTool = toolName; },
     // The catalog is filtered before the path policy runs, so the child
     // never sees shell, network, or agent tools it would only be denied.
     toolAllowlist: MEMORY_EXTRACTION_TOOL_ALLOWLIST,
@@ -494,6 +564,9 @@ async function defaultRunChild(
     },
   });
 
+  if (deferredTool !== undefined) {
+    return { outcome: "deferred", error: `approval required for ${deferredTool}` };
+  }
   if (outcome.kind === "rejected") {
     return { outcome: "rejected", error: outcome.reason };
   }
@@ -503,7 +576,141 @@ async function defaultRunChild(
   return {
     outcome: outcome.result.outcome,
     ...(outcome.result.error !== undefined ? { error: outcome.result.error } : {}),
+    ...(outcome.result.finalMessage !== undefined
+      ? { finalMessage: outcome.result.finalMessage }
+      : {}),
   };
+}
+
+interface SkillCandidateContext {
+  readonly agencHome: string;
+  readonly installedSkillNames: readonly string[];
+}
+
+function resolveSkillCandidatesHome(
+  session: Session,
+  deps: ExtractMemoriesDependencies,
+): string | undefined {
+  if (deps.skillCandidatesHome !== undefined) return deps.skillCandidatesHome;
+  const storeHome = (session.services as Partial<SessionServices> | undefined)
+    ?.configStore?.homeContext.path;
+  if (typeof storeHome === "string" && storeHome.length > 0) return storeHome;
+  const env = deps.env;
+  try {
+    const home = resolveHomeContext(env ?? process.env);
+    // An injected environment that names no home turns proposals off instead
+    // of falling back to the default home; the resolver's provenance says
+    // which, so no code here reads the variable itself.
+    if (env !== undefined && home.isDefault) return undefined;
+    return home.path;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The names an accepted draft would collide with: what the session's skills
+ * manager serves (every root, plugins included) plus the bundled registry.
+ */
+async function defaultInstalledSkillNames(
+  session: Session,
+): Promise<readonly string[]> {
+  const names = new Set<string>();
+  const manager = (session.services as Partial<SessionServices> | undefined)
+    ?.skillsManager;
+  if (manager !== undefined) {
+    const outcome = await manager.skillsForConfig(
+      (session as Partial<Pick<Session, "config">>).config ?? {},
+      null,
+    );
+    for (const skill of outcome.availableSkills ?? []) names.add(skill.name);
+  }
+  const { getBundledSkills } = await import("../../skills/bundledSkills.js");
+  for (const command of getBundledSkills()) names.add(command.name);
+  return [...names];
+}
+
+/**
+ * Where drafts go and what they must not duplicate, or undefined when
+ * proposals are off: `AGENC_SKILL_CANDIDATES=0`, or no AgenC home is known.
+ */
+async function resolveSkillCandidateContext(
+  session: Session,
+  deps: ExtractMemoriesDependencies,
+): Promise<SkillCandidateContext | undefined> {
+  if (isSkillCandidatesDisabledByEnv(deps.env)) return undefined;
+  const agencHome = resolveSkillCandidatesHome(session, deps);
+  if (agencHome === undefined) return undefined;
+  let installedSkillNames: readonly string[] = [];
+  try {
+    installedSkillNames = await (
+      deps.listInstalledSkillNames ?? defaultInstalledSkillNames
+    )(session);
+  } catch (error) {
+    // The writer still refuses names that exist as drafts, and accept
+    // re-checks the full inventory; a failed lookup only weakens the prompt.
+    emitExtractionWarning(
+      session,
+      "skill_candidate_skipped",
+      `installed skill names unavailable, proposals are deduped at accept time: ${errorText(error)}`,
+    );
+  }
+  return { agencHome, installedSkillNames };
+}
+
+/**
+ * Turn the child's `skill-candidates` block into drafts on disk. Runs only
+ * after a completed extraction, and every outcome is reported through the
+ * same warning channel as the extraction itself.
+ */
+async function proposeSkillCandidates(
+  context: ExtractMemoriesContext,
+  skillCandidates: SkillCandidateContext,
+  finalMessage: string | undefined,
+): Promise<void> {
+  const session = context.session;
+  const parsed = parseSkillCandidateProposals(finalMessage);
+  for (const reason of parsed.dropped) {
+    emitExtractionWarning(session, "skill_candidate_skipped", reason);
+  }
+  if (parsed.candidates.length === 0) return;
+  const sessionId = (session as { readonly conversationId?: unknown })
+    .conversationId;
+  const conversationId = (context.ctx as { readonly conversationId?: unknown })
+    .conversationId;
+  const model = (
+    session as { readonly modelInfo?: { readonly slug?: unknown } }
+  ).modelInfo?.slug;
+  const result = await writeSkillCandidates({
+    agencHome: skillCandidates.agencHome,
+    candidates: parsed.candidates,
+    installedSkillNames: skillCandidates.installedSkillNames,
+    provenance: {
+      ...(typeof sessionId === "string" && sessionId.length > 0
+        ? { sessionId }
+        : {}),
+      ...(typeof conversationId === "string" && conversationId.length > 0
+        ? { conversationId }
+        : {}),
+      ...(typeof model === "string" && model.length > 0 ? { model } : {}),
+    },
+  });
+  for (const skipped of result.skipped) {
+    emitExtractionWarning(
+      session,
+      "skill_candidate_skipped",
+      `${skipped.slug}: ${skipped.reason}`,
+    );
+  }
+  if (result.written.length > 0) {
+    emitExtractionWarning(
+      session,
+      "skill_candidate_proposed",
+      `draft skill${result.written.length === 1 ? "" : "s"} written for review: ${result.written
+        .map((entry) => entry.slug)
+        .join(", ")} (agenc skills candidates list)`,
+    );
+  }
 }
 
 export function initExtractMemories(
@@ -539,8 +746,11 @@ export function initExtractMemories(
     const created: ExtractionLane = {
       trigger: createMemoryExtractionTriggerState(),
       inProgress: false,
+      failedRuns: 0,
       lastAccessedAt: Date.now(),
       pendingContext: undefined,
+      restored: false,
+      persisted: undefined,
     };
     lanes.set(key, created);
     return created;
@@ -557,6 +767,65 @@ export function initExtractMemories(
     }
   }
 
+  /**
+   * Seed a new lane from the session's persisted cadence before its first
+   * decision. The value is the process-local mirror that persistLane keeps
+   * and that the resume path fills from the rollout; a session with nothing
+   * persisted, or a test double without session state, starts at zero as
+   * before.
+   */
+  async function restoreLane(
+    lane: ExtractionLane,
+    session: Session,
+    memoryDir: string,
+  ): Promise<void> {
+    if (lane.restored) return;
+    lane.restored = true;
+    const persisted = await readMemoryExtractionState(
+      session,
+      memoryRoot(memoryDir),
+    );
+    if (persisted === undefined) return;
+    lane.trigger.processedVisibleCount = persisted.processedVisibleCount;
+    lane.trigger.turnsSinceLastExtraction = persisted.turnsSinceLastExtraction;
+    lane.persisted = persisted;
+  }
+
+  /**
+   * Write the lane's cadence after a decision changed it. Writes go to the
+   * session state mirror and the rollout; a failure is reported and costs at
+   * most one further cadence after a restart, never the turn.
+   */
+  async function persistLane(
+    lane: ExtractionLane,
+    session: Session,
+    memoryDir: string,
+  ): Promise<void> {
+    const next: SessionMemoryExtractionState = {
+      memoryRoot: memoryRoot(memoryDir),
+      processedVisibleCount: lane.trigger.processedVisibleCount,
+      turnsSinceLastExtraction: lane.trigger.turnsSinceLastExtraction,
+    };
+    const last = lane.persisted;
+    if (
+      last !== undefined &&
+      last.processedVisibleCount === next.processedVisibleCount &&
+      last.turnsSinceLastExtraction === next.turnsSinceLastExtraction
+    ) {
+      return;
+    }
+    try {
+      await persistMemoryExtractionState(session, next);
+      lane.persisted = next;
+    } catch (error) {
+      emitExtractionWarning(
+        session,
+        "memory_extraction_state_not_persisted",
+        `cadence state not written; a restart may wait a further cadence: ${errorText(error)}`,
+      );
+    }
+  }
+
   async function runExtraction(
     queued: QueuedExtraction,
     memoryDir: string,
@@ -568,8 +837,16 @@ export function initExtractMemories(
     const range: VisibleRange = memoryExtractionVisibleRange(
       queued.context.messages,
       lane.trigger.processedVisibleCount,
+      MAX_EXTRACTION_BATCH_MESSAGES,
     );
-    const newMessageCount = range.unprocessedMessages.length;
+    // The cursor restarts at zero when the visible history shrank (a reset).
+    const batchStart =
+      range.currentVisibleCount < lane.trigger.processedVisibleCount
+        ? 0
+        : lane.trigger.processedVisibleCount;
+    const batch = range.unprocessedMessages;
+    const newMessageCount = range.unprocessedVisibleCount;
+    const batchEnd = batchStart + newMessageCount;
     if (newMessageCount === 0) {
       emitExtractionWarning(
         session,
@@ -581,14 +858,15 @@ export function initExtractMemories(
 
     if (
       hasSuccessfulMemoryWrite({
-        messages: range.unprocessedMessages,
+        messages: batch,
         completedToolResults: queued.context.completedToolResults,
         writeToolNames: WRITE_TOOL_NAMES,
         resolveMemoryPath: (value) =>
           resolveDirectMemoryWritePath(value, memoryDir),
       })
     ) {
-      lane.trigger.processedVisibleCount = range.currentVisibleCount;
+      lane.trigger.processedVisibleCount = batchEnd;
+      lane.failedRuns = 0;
       emitExtractionWarning(
         session,
         "memory_extraction_skipped",
@@ -611,6 +889,32 @@ export function initExtractMemories(
       return;
     }
 
+    const ctx = queued.context.ctx;
+    const profile = permissionProfileForLiveSandboxPolicies(
+      ctx.sandboxPolicy.value,
+      ctx.cwd,
+      ctx.fileSystemSandboxPolicy,
+      ctx.networkSandboxPolicy,
+    );
+    const sessionTempRoot = session.services.runtimeOptions.sessionTempRoot;
+    if (ctx.sandboxPolicy.value === "read_only" || (
+      !canWritePathWithCwd(profile.fileSystem, memoryDir, ctx.cwd, sessionTempRoot) &&
+      // The file tools may write the durable memory roots under
+      // workspace_write; the extractor's Write calls go through the same
+      // runtime sandbox check, so admit exactly what it admits.
+      !(isDurableMemoryWritePath(memoryDir) &&
+        agencHomeCarveOutAllowsWrite(profile.fileSystem, memoryDir, ctx.cwd, sessionTempRoot))
+    )) {
+      // A child path allowlist cannot grant filesystem authority. Do not
+      // spend provider turns retrying writes the inherited sandbox denies.
+      // As with approval deferral, retire this batch without requesting input.
+      lane.trigger.processedVisibleCount = batchEnd;
+      lane.failedRuns = 0;
+      emitExtractionWarning(session, "memory_extraction_skipped",
+        "memory directory is not writable under the current sandbox; background memory stopped before dispatch");
+      return;
+    }
+
     const tracker = createChildWriteTracker(memoryDir);
     const existingMemories = formatMemoryManifest(
       await (deps.scanMemoryFiles ?? scanMemoryFiles)(
@@ -618,18 +922,32 @@ export function initExtractMemories(
         queued.context.signal,
       ),
     );
-    const prompt = buildExtractAutoOnlyPrompt(
-      newMessageCount,
-      existingMemories,
-      deps.omitIndexFile ?? false,
-      memoryDir,
-      readOnlyMemoryRoots[0],
-    );
+    // Skill candidates ride this same child run: one more thing the reviewer
+    // looks for, answered in its final reply, never a second scheduler.
+    const skillCandidates = await resolveSkillCandidateContext(session, deps);
+    const prompt = [
+      buildExtractAutoOnlyPrompt(
+        newMessageCount,
+        existingMemories,
+        deps.omitIndexFile ?? false,
+        memoryDir,
+        readOnlyMemoryRoots[0],
+      ),
+      ...(skillCandidates === undefined
+        ? []
+        : [
+            "",
+            buildSkillCandidatesPromptSection(
+              skillCandidates.installedSkillNames,
+            ),
+          ]),
+    ].join("\n");
     const maxTurns = deps.maxTurns ?? DEFAULT_MAX_TURNS;
     const childResult = await (deps.runChild ??
       ((request) => defaultRunChild(request, maxTurns, deps)))({
       session: queued.context.session,
-      messages: queued.context.messages,
+      // The batch, not the whole history: the child's work stays bounded.
+      messages: batch,
       prompt,
       memoryDir,
       toolPolicy: createAutoMemoryToolPolicy(memoryDir, readOnlyMemoryRoots),
@@ -637,6 +955,15 @@ export function initExtractMemories(
       onProgress: (event) => tracker.onProgress(event),
     });
 
+    if (childResult.outcome === "deferred") {
+      // Do not repeatedly spend model turns on a batch requiring a human grant.
+      // The next foreground turn remains usable; diagnostics stay in its log.
+      lane.trigger.processedVisibleCount = batchEnd;
+      lane.failedRuns = 0;
+      emitExtractionWarning(session, "memory_extraction_skipped",
+        `${errorText(childResult.error)}; background memory stopped without requesting input`);
+      return;
+    }
     if (
       childResult.outcome !== "completed" ||
       tracker.policyDeniedWrite ||
@@ -653,6 +980,19 @@ export function initExtractMemories(
       } else {
         detail = "a memory write failed";
       }
+      lane.failedRuns += 1;
+      if (lane.failedRuns >= MAX_FAILED_RUNS_PER_BATCH) {
+        // The same batch failed twice; move past it so the lane recovers.
+        lane.trigger.processedVisibleCount = batchEnd;
+        lane.failedRuns = 0;
+        emitExtractionWarning(
+          session,
+          "memory_extraction_failed",
+          detail + "; dropped " + newMessageCount + " message(s) after " +
+            MAX_FAILED_RUNS_PER_BATCH + " failed runs on the same batch",
+        );
+        return;
+      }
       emitExtractionWarning(
         session,
         "memory_extraction_failed",
@@ -668,12 +1008,30 @@ export function initExtractMemories(
         `child tool policy denied ${tracker.deniedReads} read(s) outside the memory directory; the extraction completed`,
       );
     }
-    lane.trigger.processedVisibleCount = range.currentVisibleCount;
+    lane.trigger.processedVisibleCount = batchEnd;
+    lane.failedRuns = 0;
     const savedPaths = [...tracker.savedPaths].filter(
       (path) => basename(path) !== AUTO_MEMORY_INDEX_FILE,
     );
     if (savedPaths.length > 0) {
       queued.appendSavedMemories?.(savedPaths);
+    }
+    if (skillCandidates !== undefined) {
+      try {
+        await proposeSkillCandidates(
+          queued.context,
+          skillCandidates,
+          childResult.finalMessage,
+        );
+      } catch (error) {
+        // The extraction itself succeeded and advanced; a draft that could
+        // not be written is a note, not a reason to re-run the child.
+        emitExtractionWarning(
+          session,
+          "skill_candidate_skipped",
+          `draft not written: ${errorText(error)}`,
+        );
+      }
     }
   }
 
@@ -698,7 +1056,7 @@ export function initExtractMemories(
       ...(appendSavedMemories !== undefined ? { appendSavedMemories } : {}),
     };
     const pathResult = await (deps.resolveMemoryDirectory ?? resolveAutoMemoryDirectory)({
-      env: deps.env,
+      env: queued.context.session.services.userShell?.childEnvironment ?? deps.env,
       cwd: queued.context.ctx.cwd,
       configStore: queued.context.session.services?.configStore,
       runtimeOptions: queued.context.session.services.runtimeOptions,
@@ -709,7 +1067,7 @@ export function initExtractMemories(
     // duplicating what is already there; it still writes only to this
     // session's project root.
     const globalMemoryRoot = await resolveGlobalMemoryDirectory({
-      env: deps.env,
+      env: queued.context.session.services.userShell?.childEnvironment ?? deps.env,
       cwd: queued.context.ctx.cwd,
       configStore: queued.context.session.services?.configStore,
       runtimeOptions: queued.context.session.services.runtimeOptions,
@@ -736,6 +1094,10 @@ export function initExtractMemories(
     lane.inProgress = true;
     try {
       try {
+        // A lane created after a restart, or after the lane map pruned it,
+        // continues from the persisted cadence. This runs under the
+        // in-progress guard so a concurrent request queues behind it.
+        await restoreLane(lane, queued.context.session, memoryDir);
         await runExtraction(queued, memoryDir, lane, false, readOnlyMemoryRoots);
       } catch (error) {
         // Best effort: extraction failures must never break the user turn,
@@ -746,6 +1108,7 @@ export function initExtractMemories(
           errorText(error),
         );
       }
+      await persistLane(lane, queued.context.session, memoryDir);
       while (lane.pendingContext) {
         const trailing = lane.pendingContext;
         lane.pendingContext = undefined;
@@ -758,6 +1121,7 @@ export function initExtractMemories(
             `trailing run: ${errorText(error)}`,
           );
         }
+        await persistLane(lane, trailing.context.session, memoryDir);
       }
     } finally {
       lane.inProgress = false;

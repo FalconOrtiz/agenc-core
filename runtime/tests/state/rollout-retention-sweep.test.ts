@@ -19,6 +19,7 @@ import { SessionLock, SessionLockedError } from "../session/session-store.js";
 import { backfillProjectRollouts } from "./backfill.js";
 import { pruneRolloutSessions } from "./pruning.js";
 import { StateRunDurabilityRepository } from "./run-durability.js";
+import { seedPendingEffectReview } from "./helpers/effect-review-fixture.js";
 import { AgenCSessionSnapshotPolicy } from "./snapshot-policy.js";
 import { recoverCanonicalRunJournalForRun } from "./startup-run-journal-recovery.js";
 import { openStateDatabases, type StateSqliteDriver } from "./sqlite-driver.js";
@@ -178,6 +179,25 @@ describe("pruneRolloutSessions", () => {
     });
     expect(released.prunedSessionIds).toEqual([sessionId]);
     expect(existsSync(sourcePath)).toBe(false);
+  });
+
+  // #2238: a run with an effect still under review needs its journal as
+  // evidence, and startup recovery refuses to start when the review has none.
+  it("keeps a session whose run has an effect still under review", () => {
+    const reviewed = "thread-pending-review";
+    const reviewedPath = seedSession(reviewed, 60);
+    const plain = "thread-old-plain";
+    const plainPath = seedSession(plain, 60);
+    seedPendingEffectReview(driver, reviewed, NOW);
+
+    const report = pruneRolloutSessions(driver, {
+      sessionsDir: join(driver.projectDir, "sessions"),
+      retention_days: 30,
+      now: () => NOW,
+    });
+    expect(report.prunedSessionIds).toEqual([plain]);
+    expect(existsSync(plainPath)).toBe(false);
+    expect(existsSync(reviewedPath)).toBe(true);
   });
 
   it("deletes an old session + its mirror rows, keeps recent and active", () => {
@@ -633,6 +653,45 @@ describe("AgenCSessionSnapshotPolicy rollout sweep timer", () => {
     expect(existsSync(activePath)).toBe(true);
     expect(mirrorRowCountForSource(oldPath)).toBe(0);
     expect(mirrorRowCountForSource(activePath)).toBe(2);
+  });
+
+  it("reports the sessions it deleted, and stays silent when it deleted nothing", () => {
+    // The sweep is irreversible and unattended, and every install that never
+    // set `rollout_days` is opted in by upgrading (#2235). What it removed has
+    // to be recoverable from the log, not only from the disk it just cleared.
+    const oldPath = seedSession("thread-old", 60);
+    seedSession("thread-active", 90);
+    const sessionsDir = join(driver.projectDir, "sessions");
+    const reports: { prunedSessions: number; prunedSessionIds: readonly string[] }[] = [];
+
+    let tick: (() => void) | undefined;
+    const policy = new AgenCSessionSnapshotPolicy(driver, {
+      now: () => NOW,
+      rolloutRetention: { retention_days: 30 },
+      rolloutSessionsDir: sessionsDir,
+      activeSessionId: "thread-active",
+      onRolloutPruneReport: (report) => reports.push(report),
+      setInterval: (callback) => {
+        tick = callback;
+        return { unref: vi.fn() };
+      },
+      clearInterval: vi.fn(),
+    });
+
+    policy.startPeriodic();
+    tick?.();
+
+    expect(existsSync(oldPath)).toBe(false);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]?.prunedSessions).toBe(1);
+    // Named, not just counted: "which of my sessions went" is the question.
+    expect(reports[0]?.prunedSessionIds).toContain("thread-old");
+    expect(reports[0]?.prunedSessionIds).not.toContain("thread-active");
+
+    // A second sweep removes nothing, so it must not announce anything.
+    tick?.();
+    policy.stopPeriodic();
+    expect(reports).toHaveLength(1);
   });
 
   it("never sweeps when no rollout retention window is configured", () => {

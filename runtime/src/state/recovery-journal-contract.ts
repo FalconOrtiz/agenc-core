@@ -1,3 +1,4 @@
+import { runtimeSettingsEqual } from "./runtime-settings-snapshot.js";
 import { createHash, type Hash } from "node:crypto";
 import {
   parseRolloutLine,
@@ -29,6 +30,8 @@ import {
 } from "../services/compact/transaction-types.js";
 import {
   canonicalizeJson,
+  canonicalizeSourceJson,
+  digestSourceWithDomain,
   digestWithDomain,
 } from "../services/compact/summary-v1.js";
 import {
@@ -304,6 +307,27 @@ export class StrictCanonicalJournalValidator {
     if (this.#finished)
       throw new Error("canonical journal validator is closed");
     this.#finished = true;
+    return this.#seal(this.#sourceHash.digest("hex"));
+  }
+
+  /**
+   * The same proof `finish` returns, computed over everything pushed so far
+   * while the validator stays open. A reader that already validated a prefix
+   * of an append-only journal can prove the prefix, then push only the bytes
+   * appended since instead of replaying the file from zero.
+   *
+   * Unlike `finish`, a rejected snapshot leaves the validator open and
+   * callable again: a record cut in half by the prefix boundary, or a
+   * compaction chunk chain the appended bytes go on to complete, is a
+   * legitimate state for a reader that has not reached the end of the file.
+   */
+  snapshot(): StrictCanonicalJournal {
+    if (this.#finished)
+      throw new Error("canonical journal validator is closed");
+    return this.#seal(this.#sourceHash.copy().digest("hex"));
+  }
+
+  #seal(sourceSha256: string): StrictCanonicalJournal {
     if (this.#pendingByteLength > 0) {
       this.#fail(
         "unterminated_record",
@@ -314,7 +338,6 @@ export class StrictCanonicalJournalValidator {
         },
       );
     }
-    const sourceSha256 = this.#sourceHash.digest("hex");
     if (
       this.#options.trustedSourceSha256 !== undefined &&
       sourceSha256 !== this.#options.trustedSourceSha256
@@ -590,11 +613,19 @@ export class StrictCanonicalJournalValidator {
         current.lastPayloadKind === undefined
           ? undefined
           : chunks.get(current.lastPayloadKind);
+      // A bundle's chunks must be written back to back: switching kind while
+      // the previous kind is still incomplete, or resuming a kind after
+      // another kind was written, is a break. A kind's own next chunk is not
+      // (it is checked against the chain below). The earlier form failed
+      // every second chunk of the same kind, so any bundle over one canonical
+      // line (4 MiB; a screenshot-heavy source history) could never commit:
+      // "durable compaction commit failed" with this as the hidden cause
+      // (Terminal-Bench `layout-config-recreation2__RtxCUzj`, #2499).
+      const switchedKind =
+        current.lastPayloadKind !== undefined && current.lastPayloadKind !== kind;
       if (
-        previousKindState?.complete === false ||
-        (current.lastPayloadKind !== undefined &&
-          current.lastPayloadKind !== kind &&
-          existing !== undefined)
+        switchedKind &&
+        (previousKindState?.complete === false || existing !== undefined)
       ) {
         this.#fail(
           "identity_conflict",
@@ -700,8 +731,8 @@ export class StrictCanonicalJournalValidator {
         const sourceAuthorityMatches = persistedManifestCommit
           ? canonicalizeJson(source.active_history_refs_manifest) ===
             canonicalizeJson(intentSource.active_history_refs_manifest)
-          : canonicalizeJson(source.active_history_refs) ===
-            canonicalizeJson(intentSource.active_history_refs);
+          : canonicalizeSourceJson(source.active_history_refs) ===
+            canonicalizeSourceJson(intentSource.active_history_refs);
         if (!sourceAuthorityMatches) {
           this.#fail(
             "identity_conflict",
@@ -776,7 +807,7 @@ export class StrictCanonicalJournalValidator {
         item.type === "compaction_failed" ? "failed" : "committed";
       if (item.type === "compaction_committed") {
         if (payload.final_summary_manifest === undefined) {
-          current.commitSha256 = digestWithDomain(
+          current.commitSha256 = digestSourceWithDomain(
             COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
             payload,
           );
@@ -1880,30 +1911,6 @@ function validBoundedSettingString(value: unknown, maxBytes: number): boolean {
     typeof value === "string" &&
     value.trim().length > 0 &&
     Buffer.byteLength(value, "utf8") <= maxBytes
-  );
-}
-
-function runtimeSettingsEqual(
-  left: RunRuntimeSettingsSnapshot,
-  right: RunRuntimeSettingsSnapshot,
-): boolean {
-  return (
-    left.permissionMode === right.permissionMode &&
-    left.prePlanMode === right.prePlanMode &&
-    left.autoModeActive === right.autoModeActive &&
-    left.autoModeAvailable === right.autoModeAvailable &&
-    left.bypassPermissionsModeAvailable ===
-      right.bypassPermissionsModeAvailable &&
-    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
-    left.bypassPermissionsConsentWorkspace ===
-      right.bypassPermissionsConsentWorkspace &&
-    left.model === right.model &&
-    left.provider === right.provider &&
-    left.profile === right.profile &&
-    left.reasoningEffort === right.reasoningEffort &&
-    left.modelVerbosity === right.modelVerbosity &&
-    left.serviceTier === right.serviceTier &&
-    left.hooksDisabled === right.hooksDisabled
   );
 }
 

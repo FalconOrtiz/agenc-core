@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   parseSdkGeneratedTypesMode,
   synchronizeTranscriptV2Generated,
+  synchronizeTurnTerminalGenerated,
 } from "../../scripts/check-sdk-generated-types.mjs";
 
 const temporaryRoots: string[] = [];
@@ -85,6 +86,11 @@ export interface SessionTranscriptV2TurnResult extends JsonObject {
   readonly outcome: "completed" | "aborted";
 }
 
+export interface SessionTranscriptV2Event extends JsonObject {
+  readonly eventId: string;
+  readonly type: "token_count" | "turn_failed" | "turn_aborted";
+}
+
 export interface SessionTranscriptV2Result extends JsonObject {
   readonly messages: readonly SessionTranscriptV2Message[];
 }
@@ -121,10 +127,36 @@ async function createCanonicalFixture() {
 }
 
 describe("SDK generated transcript v2 script", () => {
+  it("checks the terminal classifier implementation as well as its types", async () => {
+    const source = "export const terminalCode = 1;\n";
+    const fixture = await createFixture(source);
+    const options = {
+      canonicalPath: fixture.protocolPath,
+      generatedPath: fixture.generatedPath,
+    };
+    expect(await synchronizeTurnTerminalGenerated(options)).toMatchObject({
+      changed: false, matches: false,
+    });
+    expect(await readFile(fixture.generatedPath, "utf8")).toBe("stale generated output\n");
+    expect(await synchronizeTurnTerminalGenerated({ ...options, write: true })).toMatchObject({
+      changed: true, matches: true,
+    });
+    expect(await readFile(fixture.generatedPath, "utf8")).toBe(source);
+    expect(await synchronizeTurnTerminalGenerated({ ...options, write: true })).toMatchObject({
+      changed: false, matches: true,
+    });
+    await writeFile(fixture.generatedPath, source.replace("= 1", "= 0"));
+    expect(await synchronizeTurnTerminalGenerated(options)).toMatchObject({
+      changed: false, matches: false,
+    });
+    expect(await readFile(fixture.generatedPath, "utf8")).toBe(source.replace("= 1", "= 0"));
+  });
+
   it("keeps check mode as the default and requires an explicit write flag", () => {
     expect(parseSdkGeneratedTypesMode([])).toBe("check");
     expect(parseSdkGeneratedTypesMode(["--write"])).toBe("write");
-    expect(() => parseSdkGeneratedTypesMode(["--check"])).toThrow(/usage/);
+    expect(parseSdkGeneratedTypesMode(["--check"])).toBe("check");
+    expect(() => parseSdkGeneratedTypesMode(["--check", "--write"])).toThrow(/usage/);
     expect(() => parseSdkGeneratedTypesMode(["--write", "extra"])).toThrow(
       /usage/,
     );

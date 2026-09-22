@@ -4,6 +4,7 @@
  * @module
  */
 
+import { concurrentChatFetch } from "./providers/concurrent-chat-fetch.js";
 import type {
   AuthBackend,
   AuthSubscriptionTier,
@@ -49,6 +50,17 @@ import { OpenRouterProvider } from "./providers/openrouter/index.js";
 import { GroqProvider } from "./providers/groq/index.js";
 import { DeepSeekProvider } from "./providers/deepseek/index.js";
 import { MetaProvider } from "./providers/meta/index.js";
+import { OllamaCloudProvider } from "./providers/ollama-cloud/index.js";
+import { CerebrasProvider } from "./providers/cerebras/index.js";
+import {
+  ZaiCodingPlanProvider,
+  ZaiProvider,
+} from "./providers/zai/index.js";
+import { KimiProvider } from "./providers/kimi/index.js";
+import {
+  QwenProvider,
+  QwenTokenPlanProvider,
+} from "./providers/qwen/index.js";
 import { MistralProvider } from "./providers/mistral/index.js";
 import { NvidiaNimProvider } from "./providers/nvidia-nim/index.js";
 import { MiniMaxProvider } from "./providers/minimax/index.js";
@@ -71,7 +83,7 @@ import {
 export { resolveBuiltInProviderSlug } from "./registry/provider-info.js";
 import {
   forceRefreshXaiOauthCredentials,
-  isXaiOauthBearer,
+  readXaiOauthAccessToken,
   xaiOauthRequiresRelogin,
 } from "../utils/xaiOauthCredentials.js";
 import { isTrustedXaiOauthInferenceBaseUrl } from "../services/xai/oauth.js";
@@ -134,6 +146,8 @@ export type ProviderRuntimeExtra = Partial<
   readonly gemini?: GeminiRuntimeOptions;
   /** Grok-only opt-in for streaming previous_response_id continuation. */
   readonly incrementalContinuation?: boolean;
+  /** OpenRouter: route only to zero-data-retention endpoints (`provider.zdr`). */
+  readonly zeroDataRetention?: boolean;
   readonly grokAcp?: {
     readonly binaryPath?: string;
     readonly allowPermissions?: boolean;
@@ -202,6 +216,7 @@ const PROVIDER_RUNTIME_EXTRA_KEYS = [
   "contextManagement",
   "contextWindowTokens",
   "parallelToolCalls",
+  "incrementalContinuation",
   "visionModel",
   "webSearch",
   "searchMode",
@@ -1155,6 +1170,9 @@ function readRuntimeExtra(
     ...(readBoolean(extra, "incrementalContinuation") !== undefined
       ? { incrementalContinuation: readBoolean(extra, "incrementalContinuation") }
       : {}),
+    ...(readBoolean(extra, "zeroDataRetention") !== undefined
+      ? { zeroDataRetention: readBoolean(extra, "zeroDataRetention") }
+      : {}),
     ...(readString(extra, "visionModel") !== undefined
       ? { visionModel: readString(extra, "visionModel") }
       : {}),
@@ -1314,6 +1332,13 @@ function buildOpenAICompatibleProvider(
     | "groq"
     | "deepseek"
     | "meta"
+    | "ollama-cloud"
+    | "cerebras"
+    | "zai"
+    | "zai-coding-plan"
+    | "kimi"
+    | "qwen"
+    | "qwen-token-plan"
     | "mistral"
     | "nvidia-nim"
     | "minimax"
@@ -1364,9 +1389,13 @@ function buildOpenAICompatibleProvider(
     tools: opts.tools ? [...opts.tools] : undefined,
     baseURL,
     useResponsesApi,
+    ...(extra.managedCredential === true ? { managedRequestId: true } : {}),
     ...(extra.store !== undefined ? { store: extra.store } : {}),
     ...(extra.contextWindowTokens !== undefined
       ? { contextWindowTokens: extra.contextWindowTokens }
+      : {}),
+    ...(extra.zeroDataRetention !== undefined
+      ? { zeroDataRetention: extra.zeroDataRetention }
       : {}),
     ...(extra.authMode ? { authMode: extra.authMode } : {}),
     ...(oauthConfig ? { oauth: oauthConfig } : {}),
@@ -1422,13 +1451,18 @@ function buildManagedGatewayProvider(
     model,
     providerName: provider,
     apiKeyEnvLabel: "AgenC subscription",
+    managedRequestId: true,
     tools: opts.tools ? [...opts.tools] : undefined,
     useResponsesApi: false,
     ...(extra.contextWindowTokens !== undefined
       ? { contextWindowTokens: extra.contextWindowTokens }
       : {}),
     ...(extra.defaultHeaders ? { defaultHeaders: extra.defaultHeaders } : {}),
-    ...(extra.fetchImpl ? { fetchImpl: extra.fetchImpl } : {}),
+    ...(extra.fetchImpl
+      ? { fetchImpl: extra.fetchImpl }
+      : provider === "openrouter" && model.startsWith("openrouter/deepseek/") && typeof Bun === "undefined"
+        ? { fetchImpl: concurrentChatFetch() }
+        : {}),
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   };
   const providerInstance = new OpenAIProvider(cfg);
@@ -1596,14 +1630,23 @@ export function createProvider(
           },
         });
       }
-      // /grok-login OAuth ALWAYS wins over env/factory BYOK. Signing in with
-      // X means subscription access; leftover XAI_API_KEY must not shadow it.
+      // Unless the captured selection explicitly requests API-key billing,
+      // signing in with X wins over leftover environment/factory API keys.
       // Bearer refreshes via the adapter's I-14 401-recovery hook.
       const factoryApiKey = resolveFactoryApiKey(opts);
-      const usesXaiOauth =
-        opts.credentialHome !== undefined &&
-        isXaiOauthBearer(opts.credentialHome, factoryApiKey);
-      const apiKey = factoryApiKey ?? requireFactoryApiKey("grok", opts);
+      // The stored grant wins whenever it exists, here and not only in the
+      // option resolver upstream. Soak F76: a provider re-created from
+      // another instance's recorded factory options carries that instance's
+      // bearer snapshot; once the stored grant has been refreshed the
+      // snapshot no longer matches, and treating it as an API key sends a
+      // dead token with no refresh path (xAI answers 403).
+      const storedOauthBearer =
+        extra.authMode !== "api_key" && opts.credentialHome !== undefined
+          ? readXaiOauthAccessToken(opts.credentialHome)
+          : undefined;
+      const usesXaiOauth = storedOauthBearer !== undefined;
+      const apiKey =
+        storedOauthBearer ?? factoryApiKey ?? requireFactoryApiKey("grok", opts);
       const model = requireModel("grok", opts.model, defaultModelFor("grok"));
       const cfg: GrokProviderConfig = {
         ...buildCommonConfig(extra),
@@ -1689,7 +1732,17 @@ export function createProvider(
           },
         });
       }
-      return markFactoryProvider(grokProvider, {
+      const storedExtra = readProviderRuntimeExtra({
+        ...(cfg as unknown as Record<string, unknown>),
+        ...(extra.authMode !== undefined ? { authMode: extra.authMode } : {}),
+      });
+      // Recreate through the factory so child sessions own both continuation
+      // state and the OAuth refresh callback bound to their provider instance.
+      const sessionProvider = Object.assign(grokProvider, {
+        forkForSession: () =>
+          createProvider("grok", readProviderFactoryOptions(grokProvider)),
+      });
+      return markFactoryProvider(sessionProvider, {
         provider: "grok",
         options: {
           ...(opts.credentialHome !== undefined
@@ -1699,15 +1752,7 @@ export function createProvider(
           ...(cfg.baseURL !== undefined ? { baseURL: cfg.baseURL } : {}),
           model,
           ...(cfg.timeoutMs !== undefined ? { timeoutMs: cfg.timeoutMs } : {}),
-          ...(readProviderRuntimeExtra(
-            cfg as unknown as Record<string, unknown>,
-          )
-            ? {
-                extra: readProviderRuntimeExtra(
-                  cfg as unknown as Record<string, unknown>,
-                ),
-              }
-            : {}),
+          ...(storedExtra !== undefined ? { extra: storedExtra } : {}),
         },
       });
     }
@@ -1907,6 +1952,48 @@ export function createProvider(
         apiKeyMode: "required",
         useResponsesApi: false,
         providerCtor: MetaProvider,
+      });
+    case "ollama-cloud":
+      return buildOpenAICompatibleProvider("ollama-cloud", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: OllamaCloudProvider,
+      });
+    case "cerebras":
+      return buildOpenAICompatibleProvider("cerebras", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: CerebrasProvider,
+      });
+    case "zai":
+      return buildOpenAICompatibleProvider("zai", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: ZaiProvider,
+      });
+    case "zai-coding-plan":
+      return buildOpenAICompatibleProvider("zai-coding-plan", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: ZaiCodingPlanProvider,
+      });
+    case "kimi":
+      return buildOpenAICompatibleProvider("kimi", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: KimiProvider,
+      });
+    case "qwen":
+      return buildOpenAICompatibleProvider("qwen", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: QwenProvider,
+      });
+    case "qwen-token-plan":
+      return buildOpenAICompatibleProvider("qwen-token-plan", opts, {
+        apiKeyMode: "required",
+        useResponsesApi: false,
+        providerCtor: QwenTokenPlanProvider,
       });
     case "mistral":
       return buildOpenAICompatibleProvider("mistral", opts, {

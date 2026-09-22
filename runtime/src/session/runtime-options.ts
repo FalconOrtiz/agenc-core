@@ -28,7 +28,7 @@ import { normalizeExactAbsolutePath } from "../utils/path-authority.js";
  * daemon's process-global environment after a session has been created.
  */
 export interface AgentRuntimeOptions {
-  readonly [key: string]: boolean | string | readonly string[] | undefined;
+  readonly [key: string]: boolean | string | number | readonly string[] | undefined;
   readonly simpleMode: boolean;
   /**
    * Immutable startup authority selected only by
@@ -38,6 +38,12 @@ export interface AgentRuntimeOptions {
    * the configured OS sandbox.
    */
   readonly dangerouslyBypassApprovalsAndSandbox: boolean;
+  /**
+   * No human can answer this session: one-shot `agenc -p` and headless
+   * continue/resume. Tools that exist only to ask a person (AskUserQuestion)
+   * are hidden from the model instead of being offered and then auto-denied.
+   */
+  readonly nonInteractive: boolean;
   readonly stdinDataMode: boolean;
   readonly remoteMode: boolean;
   readonly remoteMemoryRoot?: string;
@@ -48,6 +54,16 @@ export interface AgentRuntimeOptions {
   readonly sessionTempRoot: string;
   readonly pluginStorageRoot: string;
   readonly allowUntrustedHooks: boolean;
+  /**
+   * Absolute instant (epoch ms) this run must end by (`agenc -p --deadline`,
+   * #2503). The model is told its remaining budget, a reserve before it asks
+   * the model to save its best verified state and finish, and the turn ends
+   * `deadline_reached` when it passes. A budget input, not a clock the model
+   * reasons about (I-82).
+   */
+  readonly deadlineAt?: number;
+  /** How long before {@link deadlineAt} the reserve starts, in ms. */
+  readonly deadlineReserveMs?: number;
 }
 
 /** Immutable command policy captured from one client environment at ingress. */
@@ -350,6 +366,7 @@ function resolveAgentRuntimeOptionsAtIngress(
     simpleMode: overrides.simpleMode ?? false,
     dangerouslyBypassApprovalsAndSandbox:
       overrides.dangerouslyBypassApprovalsAndSandbox ?? false,
+    nonInteractive: overrides.nonInteractive ?? false,
     stdinDataMode:
       overrides.stdinDataMode ??
       parseBoolean(env, "AGENC_USE_DATA_STDIN", false),
@@ -424,8 +441,43 @@ function resolveAgentRuntimeOptionsAtIngress(
     allowUntrustedHooks:
       overrides.allowUntrustedHooks ??
       parseBoolean(env, "AGENC_ALLOW_UNTRUSTED_HOOKS", false),
+    ...runDeadlineOptions(overrides),
   };
   return Object.freeze(resolved);
+}
+
+function positiveSafeInteger(value: unknown, key: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new AgentRuntimeOptionsError(
+      `runtimeOptions.${key} must be a positive integer`,
+    );
+  }
+  return value;
+}
+
+/** `deadlineAt` / `deadlineReserveMs` (#2503); the reserve needs a deadline. */
+function runDeadlineOptions(
+  overrides: Partial<AgentRuntimeOptions>,
+): Pick<AgentRuntimeOptions, "deadlineAt" | "deadlineReserveMs"> {
+  if (overrides.deadlineAt === undefined) {
+    if (overrides.deadlineReserveMs !== undefined) {
+      throw new AgentRuntimeOptionsError(
+        "runtimeOptions.deadlineReserveMs requires runtimeOptions.deadlineAt",
+      );
+    }
+    return {};
+  }
+  return {
+    deadlineAt: positiveSafeInteger(overrides.deadlineAt, "deadlineAt"),
+    ...(overrides.deadlineReserveMs !== undefined
+      ? {
+          deadlineReserveMs: positiveSafeInteger(
+            overrides.deadlineReserveMs,
+            "deadlineReserveMs",
+          ),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -497,6 +549,7 @@ export function validateAgentRuntimeOptions(
   const allowed = new Set([
     "simpleMode",
     "dangerouslyBypassApprovalsAndSandbox",
+    "nonInteractive",
     "stdinDataMode",
     "remoteMode",
     "remoteMemoryRoot",
@@ -507,6 +560,8 @@ export function validateAgentRuntimeOptions(
     "sessionTempRoot",
     "pluginStorageRoot",
     "allowUntrustedHooks",
+    "deadlineAt",
+    "deadlineReserveMs",
   ]);
   if (Object.prototype.hasOwnProperty.call(input, "pluginZipCache")) {
     throw new AgentRuntimeOptionsError(
@@ -531,6 +586,14 @@ export function validateAgentRuntimeOptions(
   ) {
     throw new AgentRuntimeOptionsError(
       "runtimeOptions.dangerouslyBypassApprovalsAndSandbox must be boolean",
+    );
+  }
+  if (
+    input.nonInteractive !== undefined &&
+    typeof input.nonInteractive !== "boolean"
+  ) {
+    throw new AgentRuntimeOptionsError(
+      "runtimeOptions.nonInteractive must be boolean",
     );
   }
   if (typeof input.stdinDataMode !== "boolean") {

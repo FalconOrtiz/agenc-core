@@ -2,7 +2,9 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 
 import {
   getContextWindowForModel,
+  getContextWindowForModelForContext,
   getModelMaxOutputTokens,
+  getModelMaxOutputTokensForContext,
 } from '../../src/utils/context.ts'
 import { runWithStartupProviderSelection } from '../../src/utils/model/providers.ts'
 
@@ -51,8 +53,8 @@ providerTest('deepseek-v4-flash uses provider-specific context and output caps',
 
   expect(getContextWindowForModel('deepseek-v4-flash')).toBe(1_048_576)
   expect(getModelMaxOutputTokens('deepseek-v4-flash')).toEqual({
-    default: 262_144,
-    upperLimit: 262_144,
+    default: 384_000,
+    upperLimit: 384_000,
   })
 })
 
@@ -89,6 +91,18 @@ providerTest('gpt-5.4 family uses provider-specific context and output caps', ()
   expect(getModelMaxOutputTokens('gpt-5.4-nano')).toEqual({
     default: 128_000,
     upperLimit: 128_000,
+  })
+})
+
+providerTest('MiniMax-M3 carries its 1M window on the openai-compatible table', () => {
+  process.env.AGENC_PROVIDER = 'openai'
+  delete process.env.AGENC_MAX_OUTPUT_TOKENS
+  delete process.env.OPENAI_MODEL
+
+  expect(getContextWindowForModel('MiniMax-M3')).toBe(1_000_000)
+  expect(getModelMaxOutputTokens('MiniMax-M3')).toEqual({
+    default: 131_072,
+    upperLimit: 131_072,
   })
 })
 
@@ -272,4 +286,64 @@ providerTest('lowercase GLM aliases keep conservative output caps', () => {
     default: 16_384,
     upperLimit: 16_384,
   })
+})
+
+providerTest('native Z.ai GLM-5.3 models use their catalog limits', () => {
+  const context = {
+    provider: 'zai',
+    environment: {},
+  }
+  for (const model of ['glm-5.3', 'glm-5.3-flash']) {
+    expect(getContextWindowForModelForContext(model, context)).toBe(1_000_000)
+    expect(getModelMaxOutputTokensForContext(model, context)).toEqual({
+      default: 131_072,
+      upperLimit: 131_072,
+    })
+  }
+})
+
+providerTest('native Z.AI Coding Plan uses its own catalog limits', () => {
+  const context = {
+    provider: 'zai-coding-plan',
+    environment: {},
+  }
+  for (const model of ['glm-5.3', 'glm-5.3-flash']) {
+    expect(getContextWindowForModelForContext(model, context)).toBe(1_000_000)
+    expect(getModelMaxOutputTokensForContext(model, context)).toEqual({
+      default: 131_072,
+      upperLimit: 131_072,
+    })
+  }
+})
+
+providerTest('native Kimi uses official context and operational output reservations', () => {
+  const context = {
+    provider: 'kimi',
+    environment: {},
+  }
+  expect(getContextWindowForModelForContext('kimi-k3', context)).toBe(1_048_576)
+  expect(getModelMaxOutputTokensForContext('kimi-k3', context)).toEqual({
+    default: 131_072,
+    upperLimit: 1_048_576,
+  })
+  for (const model of [
+    'kimi-k2.7-code',
+    'kimi-k2.7-code-highspeed',
+    'kimi-k2.6',
+  ]) {
+    expect(getContextWindowForModelForContext(model, context)).toBe(262_144)
+    expect(getModelMaxOutputTokensForContext(model, context)).toEqual({
+      default: 32_768,
+      upperLimit: 64_000,
+    })
+  }
+})
+
+providerTest('native Z.ai respects the administrative 1M context disable switch', () => {
+  const context = {
+    provider: 'zai',
+    environment: { AGENC_DISABLE_1M_CONTEXT: '1' },
+  }
+
+  expect(getContextWindowForModelForContext('glm-5.3', context)).toBe(200_000)
 })

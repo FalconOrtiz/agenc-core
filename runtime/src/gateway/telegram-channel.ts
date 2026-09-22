@@ -29,6 +29,7 @@ export interface TelegramUpdate {
 }
 
 export interface TelegramMessage {
+  readonly date?: number;
   readonly message_id: number;
   readonly message_thread_id?: number;
   readonly from?: {

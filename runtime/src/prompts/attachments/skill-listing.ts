@@ -3,8 +3,12 @@ import type { AttachmentProducer } from "./orchestrator.js";
 import { SKILL_LISTING_REMINDER_HEADER } from "./messages.js";
 import {
   buildSkillListingWithinBudget,
+  rankSkillsForRequest,
   type SkillListingEntry,
 } from "../../skills/local-loader.js";
+
+/** Relevance lines per root-human turn, small enough to keep in the prompt. */
+const RELEVANCE_LIMIT = 12;
 
 function messageCarriesText(message: LLMMessage, needle: string): boolean {
   if (typeof message.content === "string") {
@@ -45,24 +49,28 @@ async function bundledRegistrySkills(): Promise<readonly SkillListingEntry[]> {
 }
 
 /**
- * Attachment messages are not persisted into canonical history: every
- * sampling request re-projects `messagesForQuery` from `state.messages`,
- * so a listing emitted on the previous request is gone by the next one.
- * The gate is therefore an absence check against the request's own
- * messages, not a cross-turn hash: the listing is emitted on every request
- * unless this request already carries it. Inserted right after the leading
- * system prefix, it lands at a byte-stable position inside the cached prefix.
+ * The listing is emitted once per session and then retained in the projection
+ * (session/attachment-retention.ts), so the absence check against the
+ * request's messages holds across turns and the listing's bytes stay in the
+ * cached prefix. Later human turns can get one relevance block instead. Tool
+ * continuations must not drain another batch of matching skills on each sample.
+ * An absent listing is restored even after compaction or durable resume, when
+ * the in-memory ledger and authoritative root-human provenance may be absent.
  */
-export const skillListingProducer: AttachmentProducer = async (opts) => {
+export const skillListingProducer: AttachmentProducer = async (opts, tracking) => {
   if (opts.subagentDepth > 0) return [];
   if (!opts.skillsManager) return [];
-  if (
-    opts.messages.some((message) =>
-      messageCarriesText(message, SKILL_LISTING_REMINDER_HEADER),
-    )
-  ) {
-    return [];
-  }
+  if (opts.signal.aborted) return [];
+  const listingPresent = opts.messages.some((message) =>
+    messageCarriesText(message, SKILL_LISTING_REMINDER_HEADER),
+  );
+  const provenance = opts.turnProvenance;
+  const rootHumanTurn = provenance?.rootHumanTurn;
+  const rootTurnId = provenance?.turnId && rootHumanTurn?.turnId === provenance.turnId
+    ? provenance.turnId
+    : undefined;
+  if (listingPresent && (rootTurnId === undefined ||
+    tracking.lastSkillListingRootTurnId === rootTurnId)) return [];
 
   const outcome = await opts.skillsManager.skillsForConfig(opts.config ?? {}, null);
   const skills = outcome.availableSkills ?? [];
@@ -75,13 +83,31 @@ export const skillListingProducer: AttachmentProducer = async (opts) => {
   const bundled = (await bundledRegistrySkills()).filter(
     (skill) => !known.has(skill.name),
   );
-  const { listing, stats } = buildSkillListingWithinBudget(
-    [...skills, ...bundled],
+  if (opts.signal.aborted) return [];
+  const catalog = [...skills, ...bundled];
+  if (listingPresent) {
+    // Recheck after awaiting catalog loading: concurrent preparations of one
+    // human turn may have claimed its evaluation while this one was waiting.
+    if (rootTurnId === undefined || tracking.lastSkillListingRootTurnId === rootTurnId) return [];
+    tracking.lastSkillListingRootTurnId = rootTurnId;
+    const relevant = rankSkillsForRequest(
+      catalog,
+      rootHumanTurn!.text,
+      tracking.listedSkillNames,
+      RELEVANCE_LIMIT,
+    );
+    if (relevant.lines.length === 0) return [];
+    for (const name of relevant.names) tracking.listedSkillNames.add(name);
+    return [{ kind: "skill_relevance", content: relevant.lines.join("\n") }];
+  }
+  const { listing, stats, listedNames } = buildSkillListingWithinBudget(
+    catalog,
     opts.contextWindowTokens,
     // What the user just asked for decides which skills get the budget when
     // the installed catalog does not fit.
     opts.userInput,
   );
+  for (const name of listedNames) tracking.listedSkillNames.add(name);
   // What the model was shown is otherwise unrecoverable: the listing is an
   // attachment, so it never reaches the rollout, and the provider trace keeps
   // no message bodies. A run where the model ignored every skill could not be
@@ -102,6 +128,7 @@ export const skillListingProducer: AttachmentProducer = async (opts) => {
     });
   }
   if (listing.length === 0) return [];
+  if (rootTurnId !== undefined) tracking.lastSkillListingRootTurnId = rootTurnId;
 
   return [
     {

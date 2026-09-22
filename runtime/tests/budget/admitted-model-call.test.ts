@@ -1,16 +1,18 @@
 import { describe, expect, test, vi } from "vitest";
 
-import { runAdmittedModelCall } from "../../src/budget/admitted-model-call.js";
+import { fitOutputReservationToContext, runAdmittedModelCall } from "../../src/budget/admitted-model-call.js";
 import type {
   AdmissionAcquireInput,
   ExecutionAdmissionClient,
 } from "../../src/budget/admission-client.js";
 import { AdmissionDeniedError } from "../../src/budget/admission-client.js";
+import { LLMManagedAdmissionError, LLMManagedUsagePendingError } from "../../src/llm/errors.js";
 import type { AdmissionLease } from "../../src/budget/admission-types.js";
 import type { AuthBackend } from "../../src/auth/backend.js";
 import { AgenCProvider } from "../../src/llm/providers/agenc/index.js";
+import { OllamaProvider } from "../../src/llm/providers/ollama/adapter.js";
 import { FACTORY_PROVIDER_STATE } from "../../src/llm/provider.js";
-import type { ProviderTokenCountCapability } from "../../src/llm/token-accounting.js";
+import type { ProviderTokenCountCapability, TokenAccountingRequest } from "../../src/llm/token-accounting.js";
 import type {
   LLMChatOptions,
   LLMProvider,
@@ -164,6 +166,79 @@ function callOptions(
 }
 
 describe("runAdmittedModelCall", () => {
+  test("counts Ollama's pinned text protocol before acquiring the actual wire lease", async () => {
+    const state = harness({ maxTokens: 4_096, hasHardTokenCap: true });
+    const tools = [{ type: "function" as const, function: { name: "FileRead", description: "read", parameters: { type: "object" } } }];
+    const provider = new OllamaProvider({ model: "deepseek-r1:7b", numCtx: 4_096, tools });
+    const wire = vi.fn(async (_params: Record<string, unknown>) => response({ model: "deepseek-r1:7b" }));
+    const countTokens = vi.fn(async (request: TokenAccountingRequest) => {
+      expect(request.options.tools).toEqual([]);
+      expect(request.options.systemPrompt).toContain(JSON.stringify(tools));
+      expect(request.options.systemPrompt).toContain("Tool calling protocol");
+      expect(wire).not.toHaveBeenCalled();
+      return { inputTokens: 200, complete: true, confidence: "exact" as const, countedComponents: ["system", "messages", "tools", "provider_framing"] as const };
+    });
+    Object.assign(provider, {
+      client: { show: async () => ({ capabilities: ["completion", "thinking"] }), chat: wire, list: async () => ({ models: [] }) },
+      tokenCountCapability: { capabilityVersion: "ollama-text-protocol-v1", adapterRevision: "test", configurationRevision: "text", countTokens },
+    });
+    await runAdmittedModelCall({
+      session: state.session, provider, messages: [{ role: "user", content: "hello" }],
+      options: { tools, maxOutputTokens: 512 }, stepId: "ollama-projection:1", model: "deepseek-r1:7b", providerName: "ollama",
+      invoke: options => provider.chat([{ role: "user", content: "hello" }], options),
+    });
+    expect(countTokens).toHaveBeenCalledOnce();
+    expect(state.acquire.mock.calls[0]?.[0]).toMatchObject({ maxInputTokens: 200, maxOutputTokens: 512 });
+    expect(wire).toHaveBeenCalledOnce();
+    expect(wire.mock.calls[0]?.[0]).not.toHaveProperty("tools");
+  });
+  test.each([
+    { input: 14_451, requested: 16_384, admitted: 16_384 },
+    { input: 14_800, requested: 16_384, admitted: 16_329 },
+    { input: 30_105, requested: 16_384, admitted: 1_024 },
+    { input: 30_106, requested: 16_384, admitted: undefined },
+    { input: 30_617, requested: 512, admitted: 512 },
+    { input: 30_618, requested: 512, admitted: undefined },
+  ])("shares exact output-fit policy with preflight for $input input and $requested output", async ({ input, requested, admitted }) => {
+    const state = harness({ maxTokens: 31_129, hasHardTokenCap: true });
+    Object.assign(state.provider, {
+      tokenCountCapability: {
+        capabilityVersion: "shared-context-fit",
+        adapterRevision: "1",
+        configurationRevision: `${input}-${requested}`,
+        countTokens: async () => ({
+          inputTokens: input,
+          complete: true,
+          confidence: "exact" as const,
+          countedComponents: ["system", "messages", "tools", "provider_framing"] as const,
+        }),
+      },
+    });
+    expect(fitOutputReservationToContext({
+      admissible: true, inputTokens: input, totalTokens: input + requested,
+    }, 31_129, requested)).toBe(admitted);
+    const invoke = vi.fn(async () => response());
+    const call = callOptions(state, { contextWindowTokens: 31_129, maxOutputTokens: requested }, invoke);
+    if (admitted === undefined) {
+      await expect(call).rejects.toMatchObject({ reason: "context_window_exceeded" });
+      expect(invoke).not.toHaveBeenCalled();
+    } else {
+      await call;
+      expect(state.acquire).toHaveBeenCalledWith(expect.objectContaining({
+        maxInputTokens: input,
+        maxOutputTokens: admitted,
+      }), undefined);
+      expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ maxOutputTokens: admitted }));
+      expect(input + admitted).toBeLessThanOrEqual(31_129);
+    }
+  });
+
+  test("context-fit preflight cannot authorize uncertain token accounting", () => {
+    expect(fitOutputReservationToContext({
+      admissible: false, inputTokens: 100, totalTokens: 200,
+    }, 31_129, 100)).toBeUndefined();
+  });
+
   test("accounts for canonical Gemini cached content before admission", async () => {
     const state = harness({});
     const countTokens = vi.fn(async (request) => {
@@ -791,6 +866,30 @@ describe("runAdmittedModelCall", () => {
     );
   });
 
+  test.each(["capacity", "insufficient_credits", "credits_unavailable"] as const)("settles zero only for a managed gateway no-dispatch receipt: %s", async (reason) => {
+    const state = harness({});
+    const error = new LLMManagedAdmissionError(reason);
+    await expect(runAdmittedModelCall({session:state.session,provider:state.provider,messages:[],
+      options:{maxOutputTokens:200},stepId:"managed-rejected",model:"grok-4.5",providerName:"agenc",
+      invoke:async()=>{throw error;},
+    })).rejects.toBe(error);
+    expect(state.reconcile).toHaveBeenCalledWith("reservation-1",{inputTokens:0,outputTokens:0,costUsd:0});
+    expect(state.holdUnknown).not.toHaveBeenCalled();
+    expect(state.acknowledgeCompletion).toHaveBeenCalledOnce();
+  });
+
+  test("preserves the credit hold for a recorded managed failure", async () => {
+    const state = harness({});
+    const error = new LLMManagedUsagePendingError();
+    await expect(runAdmittedModelCall({session:state.session,provider:state.provider,messages:[],
+      options:{maxOutputTokens:200},stepId:"managed-pending",model:"grok-4.5",providerName:"agenc",
+      invoke:async()=>{throw error;},
+    })).rejects.toBe(error);
+    expect(state.reconcile).not.toHaveBeenCalled();
+    expect(state.holdUnknown).toHaveBeenCalledWith("reservation-1", "provider_call_failed_after_dispatch");
+    expect(state.acknowledgeCompletion).toHaveBeenCalledOnce();
+  });
+
   test("keeps the full reservation held when provider pricing is unknown", async () => {
     const state = harness({});
 
@@ -1101,5 +1200,60 @@ describe("runAdmittedModelCall local providers (#1752)", () => {
       | undefined;
     expect(acquireInput?.denialReason).toBeUndefined();
     expect(state.reconcile).toHaveBeenCalled();
+  });
+});
+
+// Terminal-Bench 4.0, 2026-09-14: DeepSeek reported 27% more prompt tokens than the fallback estimated, and the next
+// admitted request kept its full output reservation past the context window.
+describe("runAdmittedModelCall provider-usage calibration", () => {
+  const messages = [{ role: "user" as const, content: `photonic geometry ${"x ".repeat(20_000)}` }];
+
+  async function admittedCall(
+    state: ReturnType<typeof harness>,
+    contextWindowTokens: number,
+    reportedPromptTokens: (admittedInputTokens: number) => number = (input) => input,
+  ): Promise<{ input: number; output: number | undefined }> {
+    let output: number | undefined;
+    await runAdmittedModelCall({
+      session: state.session,
+      provider: state.provider,
+      messages,
+      options: { maxOutputTokens: 4_096, contextWindowTokens },
+      stepId: `model:calibration:${state.acquire.mock.calls.length + 1}`,
+      model: "grok-4.5",
+      providerName: "grok",
+      invoke: async (options) => {
+        output = options.maxOutputTokens;
+        const promptTokens = reportedPromptTokens(state.acquire.mock.calls.at(-1)![0].maxInputTokens);
+        return response({
+          usage: {
+            promptTokens,
+            completionTokens: 50,
+            totalTokens: promptTokens + 50,
+            availability: "reported",
+            provenance: "provider",
+            cachedInputTokens: 0,
+            reasoningOutputTokens: 0,
+            webSearchRequests: 0,
+          },
+        });
+      },
+    });
+    return { input: state.acquire.mock.calls.at(-1)![0].maxInputTokens, output };
+  }
+
+  test("a reported undercount clamps the next admitted output reservation in the same conversation only", async () => {
+    const state = harness({});
+    Object.assign(state.session, { conversationId: "calibration-undercount" });
+    const first = await admittedCall(state, 1_048_576, (input) => Math.ceil(input * 1.271));
+    const factor = Math.ceil(first.input * 1.271) / first.input;
+    const calibrated = Math.ceil(first.input * factor * 1.02);
+    const window = calibrated + 2_048;
+
+    expect(await admittedCall(state, window)).toEqual({ input: calibrated, output: 2_048 });
+
+    const control = harness({});
+    Object.assign(control.session, { conversationId: "calibration-control" });
+    expect(await admittedCall(control, window)).toEqual({ input: first.input, output: 4_096 });
   });
 });

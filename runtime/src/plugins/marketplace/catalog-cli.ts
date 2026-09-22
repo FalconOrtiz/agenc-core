@@ -19,6 +19,7 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { normalizeSkillDisplayName, skillDisplayNameFromMarkdown } from "../skill-display-metadata.js";
 
 import {
   findInstallableMarketplacePlugin,
@@ -50,9 +51,23 @@ export const OFFICIAL_MARKETPLACE_URL =
   "https://agenc.tech/plugins/marketplace.json";
 
 /**
- * Register the official marketplace when the profile has none. Returns
- * true when it was added. Never throws: an offline first run must still
- * produce a catalog (an empty one), not a hard CLI failure.
+ * How long a cached copy of the official marketplace is served before it is
+ * fetched again.
+ *
+ * The marketplace was installed once, on first use, and then read from disk
+ * forever. A home that installed it on Sep 10 had a manifest with 5 plugins
+ * while the live one listed 11, and the desktop's Plugins pane, which is built
+ * from this catalog, showed the 5. Nothing refreshed it: the only way to see a
+ * plugin published after install was to remove and re-add the marketplace by
+ * hand. An hour keeps the pane current without a fetch on every open.
+ */
+export const OFFICIAL_MARKETPLACE_REFRESH_MS = 60 * 60_000;
+
+/**
+ * Register the official marketplace when the profile has none, and fetch it
+ * again once the cached copy is older than the refresh window. Returns true
+ * when it was added or refreshed. Never throws: an offline first run must
+ * still produce a catalog (an empty one), not a hard CLI failure.
  */
 export async function ensureOfficialMarketplace(
   options: MarketplaceOperationOptions,
@@ -64,13 +79,21 @@ export async function ensureOfficialMarketplace(
 ): Promise<boolean> {
   if (options.env?.AGENC_SKIP_OFFICIAL_MARKETPLACE === "1") return false;
   const index = await readMarketplaceIndex(options);
-  if (Object.keys(index.marketplaces).length > 0) return false;
+  const official = index.marketplaces[OFFICIAL_MARKETPLACE_NAME];
+  const hasAny = Object.keys(index.marketplaces).length > 0;
+  // A manifest older than the window is fetched again in place. Failure keeps
+  // the cached copy: a stale catalog is a catalog, an empty one is an outage.
+  const stale =
+    official !== undefined &&
+    (options.now ?? (() => new Date()))().getTime() - Date.parse(official.updatedAt) >
+      OFFICIAL_MARKETPLACE_REFRESH_MS;
+  if (hasAny && !stale) return false;
   try {
     await addMarketplace({
       ...options,
       source: OFFICIAL_MARKETPLACE_URL,
       name: OFFICIAL_MARKETPLACE_NAME,
-      force: false,
+      force: stale,
     });
     return true;
   } catch {
@@ -249,6 +272,7 @@ async function fetchBounded(
  */
 interface MarketplaceComponentRow {
   readonly name: string;
+  readonly displayName?: string;
   readonly description?: string;
 }
 
@@ -271,6 +295,8 @@ const CARD_LIST_MAX = 12;
 const CARD_PROMPT_MAX = 4;
 const CARD_SKILLS_MAX = 8;
 const SKILL_PREFETCH_MAX_BYTES = 32 * 1024;
+// Older sidecars did not retain skill display labels, even for the same source SHA.
+const CARD_METADATA_VERSION = 1;
 
 function cardString(value: unknown, maxLength: number): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -329,8 +355,13 @@ function cardComponentRows(value: unknown): readonly MarketplaceComponentRow[] |
     const raw = entry as Record<string, unknown>;
     const name = cardString(raw.name, CARD_DISPLAY_NAME_MAX);
     if (name === undefined) return [];
+    const displayName = normalizeSkillDisplayName(raw.displayName);
     const description = cardString(raw.description, CARD_DESCRIPTION_MAX);
-    return [{ name, ...(description !== undefined ? { description } : {}) }];
+    return [{
+      name,
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(description !== undefined ? { description } : {}),
+    }];
   }).slice(0, CARD_LIST_MAX);
   return rows.length > 0 ? rows : undefined;
 }
@@ -339,29 +370,38 @@ async function prefetchSkillRows(
   fetcher: Fetcher,
   source: MarketplacePlugin["source"],
   declaredSkills: unknown,
-): Promise<readonly MarketplaceComponentRow[] | undefined> {
+): Promise<{ readonly rows: readonly MarketplaceComponentRow[]; readonly complete: boolean } | undefined> {
   if (!Array.isArray(declaredSkills)) return undefined;
   const rows: MarketplaceComponentRow[] = [];
+  let complete = true;
   for (const declared of declaredSkills.slice(0, CARD_SKILLS_MAX)) {
     if (typeof declared !== "string" || declared.length === 0) continue;
     const clean = declared.replace(/^\.\//u, "").replace(/\/+$/u, "");
     const name = clean.split("/").pop();
     if (name === undefined || name.length === 0) continue;
     let description: string | undefined;
+    let displayName: string | undefined;
     const skillUrl = pinnedRawUrl(source, `${clean}/SKILL.md`);
     if (skillUrl !== undefined) {
       const bytes = await fetchBounded(fetcher, skillUrl, SKILL_PREFETCH_MAX_BYTES);
       if (bytes !== undefined) {
         const head = Buffer.from(bytes).toString("utf8");
+        displayName = skillDisplayNameFromMarkdown(head);
         const match = /^description:\s*(.+)$/mu.exec(head);
         if (match?.[1] !== undefined) {
           description = match[1].trim().slice(0, CARD_DESCRIPTION_MAX);
         }
+      } else {
+        complete = false;
       }
     }
-    rows.push({ name, ...(description !== undefined ? { description } : {}) });
+    rows.push({
+      name,
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(description !== undefined ? { description } : {}),
+    });
   }
-  return rows.length > 0 ? rows : undefined;
+  return rows.length > 0 ? { rows, complete } : undefined;
 }
 
 function metaFromSidecar(value: unknown, logoPath: string | undefined): PrefetchedCardMeta {
@@ -397,6 +437,7 @@ async function prefetchPinnedCardMeta(
   if (manifestUrl === undefined) return undefined;
   const cacheRoot = logoCacheRoot(options);
   const key = createHash("sha256").update(manifestUrl).digest("hex").slice(0, 24);
+  let staleCached: PrefetchedCardMeta | undefined;
   try {
     const cachedRaw: unknown = JSON.parse(
       await readFile(join(cacheRoot, `${key}.meta.json`), "utf8"),
@@ -416,7 +457,9 @@ async function prefetchPinnedCardMeta(
           // Meta survives a pruned logo file.
         }
       }
-      return metaFromSidecar(cached, logoPath);
+      const metadata = metaFromSidecar(cached, logoPath);
+      if (cached.cardMetadataVersion === CARD_METADATA_VERSION) return metadata;
+      staleCached = metadata;
     }
   } catch {
     // Not cached yet.
@@ -426,16 +469,16 @@ async function prefetchPinnedCardMeta(
     manifestUrl,
     MANIFEST_PREFETCH_MAX_BYTES,
   );
-  if (manifestBytes === undefined) return undefined;
+  if (manifestBytes === undefined) return staleCached;
   let manifest: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(
       Buffer.from(manifestBytes).toString("utf8"),
     );
-    if (typeof parsed !== "object" || parsed === null) return undefined;
+    if (typeof parsed !== "object" || parsed === null) return staleCached;
     manifest = parsed as Record<string, unknown>;
   } catch {
-    return undefined;
+    return staleCached;
   }
   const surface = cardInterface(manifest.interface);
   const description = cardString(manifest.description, CARD_DESCRIPTION_MAX);
@@ -454,7 +497,8 @@ async function prefetchPinnedCardMeta(
           ),
         )
       : undefined;
-  const skills = await prefetchSkillRows(fetcher, plugin.source, manifest.skills);
+  const skillMetadata = await prefetchSkillRows(fetcher, plugin.source, manifest.skills);
+  const skills = skillMetadata?.rows;
   const declaredLogo =
     typeof manifest.interface === "object" && manifest.interface !== null
       ? ((manifest.interface as { logo?: unknown }).logo)
@@ -486,6 +530,9 @@ async function prefetchPinnedCardMeta(
     }
   }
   const sidecar = {
+    // Retry incomplete skill reads on the next catalog request; do not freeze a
+    // transient fetch failure into a current-version, permanently unlabeled card.
+    ...(skillMetadata?.complete !== false ? { cardMetadataVersion: CARD_METADATA_VERSION } : {}),
     ...(surface?.displayName !== undefined
       ? { displayName: surface.displayName }
       : {}),
@@ -720,4 +767,3 @@ export async function resolveMarketplaceInstallTarget(
 export function installRequiresSignature(record: MarketplaceRecord): boolean {
   return record.sourceType !== "local";
 }
-

@@ -12,6 +12,7 @@
 // unknown top-level keys before normalization.
 
 import { isAbsolute } from "node:path";
+import { assertMcpOAuthHttpsUrl, validateMcpOAuthConfig, type McpOAuthConfig } from "./mcp-oauth.js";
 import {
   MarketplaceSourceSchema,
   type MarketplaceSource,
@@ -203,12 +204,10 @@ export interface AgentRunRetentionConfig {
   readonly snapshot_days?: number;
   readonly snapshot_max_count?: number;
   readonly snapshot_max_bytes?: number;
-  // Rollout/session disk retention window (days). Lights up the reserved
-  // `agent.retention.rollout_days` retention intent: when set, the daemon's
-  // throttled sweep deletes session dirs + their rollout JSONL + the
-  // thread_rollout_items mirror rows once their newest rollout is older than
-  // this many days. Unset → DISABLED (no pruning; the conservative default,
-  // since this deletes user data).
+  // Rollout/session disk retention window (days). The daemon's throttled
+  // sweep deletes session dirs + their rollout JSONL + the thread_rollout_items
+  // mirror rows once their newest rollout is older than this many days.
+  // Default 30 (#2228); 0 disables the sweep and keeps every session forever.
   readonly rollout_days?: number;
 }
 
@@ -245,6 +244,43 @@ export interface DurableTurnsResumeConfig {
 export interface DurableTurnsConfig {
   readonly checkpoint?: DurableTurnsCheckpointConfig;
   readonly resume?: DurableTurnsResumeConfig;
+}
+
+/**
+ * Completion gate for sessions nobody reviews while they run: the first
+ * final answer of a tool-using turn is not accepted until a verification
+ * round backed by executed tool calls.
+ */
+export interface CompletionGateConfig {
+  /** `auto` (default): only non-interactive sessions such as `agenc -p`. */
+  readonly mode?: "auto" | "always" | "never";
+  /** Verification prompts per turn; default 3, at most 10. */
+  readonly max_rounds?: number;
+}
+
+/**
+ * `/goal`: the session keeps working until the runtime's own verification and
+ * an independent reviewer agree the goal is met. See docs/reference/goal.md.
+ */
+export interface GoalConfig {
+  /** Continuations a goal may use before it stops as budget_exhausted; default 20, at most 100. */
+  readonly max_rounds?: number;
+  /** Consecutive rounds without a successful tool call before the goal stalls; default 3. */
+  readonly stall_rounds?: number;
+  /** Model for the independent goal reviewer; defaults to the session model. */
+  readonly judge_model?: string;
+  /** Per-command verification timeout in milliseconds; default 600000. */
+  readonly verify_timeout_ms?: number;
+}
+
+/**
+ * Degraded compaction ladder (#2497). When the standard auto-compaction
+ * declines to shrink the context, the runtime retries with a more
+ * aggressive summary and finally a model-free emergency compaction.
+ */
+export interface CompactionConfig {
+  /** `always` (default) runs the model-free emergency tier; `never` disables it. */
+  readonly emergency_mode?: "always" | "never";
 }
 
 export interface HookCommand {
@@ -284,6 +320,7 @@ export type HookEventName = (typeof HOOK_EVENT_NAMES)[number];
 export type McpTransport = "stdio" | "sse" | "http" | "websocket";
 
 export interface McpServerConfig {
+  readonly oauth?: McpOAuthConfig;
   readonly command?: string;
   readonly args?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
@@ -357,6 +394,7 @@ export type ProtocolConfig =
 
 export interface DaemonConfig {
   readonly autostart?: boolean;
+  readonly agent_stop_timeout_ms?: number;
 }
 
 export type GatewayDmPolicy = "pairing" | "allowlist" | "open" | "disabled";
@@ -492,7 +530,6 @@ export interface TuiKeybindingConfig {
 }
 
 export interface TuiConfig {
-  readonly vimMode?: boolean;
   readonly theme?: TuiThemeSetting;
   readonly showTurnDuration?: boolean;
   readonly terminalProgressBarEnabled?: boolean;
@@ -511,45 +548,6 @@ export interface TeammatesConfig {
   /** "inherit" follows the leader model; absent uses the built-in teammate default. */
   readonly defaultModel?: string;
   readonly preferTmuxOverIterm2?: boolean;
-}
-
-export type BufferProviderMode = "auto" | "neovim" | "inline" | "external";
-export type BufferTabsMode = "auto" | "always" | "never";
-export type BufferNeovimInitMode = "auto" | "user" | "clean";
-export type BufferPredictionEnabledMode = "ask" | "on" | "off";
-
-export interface BufferNeovimConfig {
-  readonly executable?: string;
-  readonly init?: BufferNeovimInitMode;
-  readonly discovery_timeout_ms?: number;
-  readonly startup_timeout_ms?: number;
-  readonly operation_timeout_ms?: number;
-  readonly cleanup_timeout_ms?: number;
-}
-
-/**
- * Low-latency, transcript-free code prediction for the embedded editor.
- *
- * `ask` is the safe default: the TUI must obtain one-time user consent before
- * sending source context. Provider/model are optional owner-selected route
- * overrides; when omitted the prediction service independently clones the
- * active session route. RPC callers cannot override these trusted settings.
- */
-export interface BufferPredictionConfig {
-  readonly enabled?: BufferPredictionEnabledMode;
-  readonly debounce_ms?: number;
-  readonly timeout_ms?: number;
-  readonly max_output_tokens?: number;
-  readonly provider?: string;
-  readonly model?: string;
-}
-
-/** Embedded editor configuration for the TUI BUFFER workspace. */
-export interface BufferConfig {
-  readonly provider?: BufferProviderMode;
-  readonly show_tabs?: BufferTabsMode;
-  readonly neovim?: BufferNeovimConfig;
-  readonly prediction?: BufferPredictionConfig;
 }
 
 /**
@@ -611,6 +609,15 @@ export interface ProviderFallbackConfig {
 export interface ProviderConfig {
   readonly base_url?: string;
   readonly default_model?: string;
+  /**
+   * Request-level zero data retention. Accepted only under
+   * `providers.openrouter`: every request carries `provider.zdr = true`, so
+   * OpenRouter routes only to endpoints with a zero-data-retention policy
+   * and a model without one is refused instead of silently falling back.
+   * Other providers control retention per account, project or team on their
+   * own console and reject this field (see docs/reference/providers.md).
+   */
+  readonly zero_data_retention?: boolean;
   readonly context_window_tokens?: number;
   readonly max_output_tokens?: number;
   /**
@@ -840,7 +847,6 @@ export interface AgenCConfig {
   /** Named assistant response style. Terminal colors live under `[tui]`. */
   readonly outputStyle?: string;
   readonly attachments?: AttachmentsConfig;
-  readonly buffer?: BufferConfig;
   readonly tui?: TuiConfig;
   readonly autoFix?: AutoFixInputConfig;
   readonly fileSuggestion?: FileSuggestionConfig;
@@ -899,7 +905,12 @@ export interface AgenCConfig {
   // ── AgenC-specific additions ──────────────────────────────────────
   readonly agent?: AgentConfig;
   readonly durableTurns?: DurableTurnsConfig;
+  readonly completion_gate?: CompletionGateConfig;
+  readonly goal?: GoalConfig;
+  readonly compaction?: CompactionConfig;
   readonly stream_watchdog_timeout_ms?: number;
+  readonly provider_outage_wait_ms?: number;
+  readonly provider_outage_retry_ms?: number;
   readonly max_output_tokens?: number;
   readonly capped_default_max_output_tokens?: boolean;
   readonly max_turns?: number;
@@ -985,7 +996,6 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
   "statusLine",
   "outputStyle",
   "attachments",
-  "buffer",
   "tui",
   "autoFix",
   "fileSuggestion",
@@ -1038,6 +1048,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
   "pluginTrustMessage",
   "agent",
   "stream_watchdog_timeout_ms",
+  "provider_outage_wait_ms",
+  "provider_outage_retry_ms",
   "max_output_tokens",
   "capped_default_max_output_tokens",
   "max_turns",
@@ -1049,6 +1061,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
   "browser",
   "heartbeat",
   "durableTurns",
+  "completion_gate",
+  "goal",
+  "compaction",
   "_unknown",
 ]);
 
@@ -1061,6 +1076,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = Object.freeze([
  * set `stream_watchdog_timeout_ms = 0` to disable it.
  */
 export const DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS = 600_000;
+/** Total time a turn keeps waiting for a provider outage to end (30 min). */
+export const DEFAULT_PROVIDER_OUTAGE_WAIT_MS = 1_800_000;
+/** First slow-retry delay after the reconnect ladder is spent (30 s). */
+export const DEFAULT_PROVIDER_OUTAGE_RETRY_MS = 30_000;
 
 export function defaultConfig(): AgenCConfig {
   return Object.freeze({
@@ -1115,6 +1134,12 @@ export function defaultConfig(): AgenCConfig {
     // provider stream otherwise hangs the turn until the user cancels;
     // `0` disables the deadline for operators who need unbounded silence.
     stream_watchdog_timeout_ms: DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS,
+    // A provider that is down for minutes is not the turn's fault (#2212).
+    // Once the fast reconnect ladder is spent, the turn waits with a slow
+    // backoff (30 s doubling to 5 min) and tries again for up to this long;
+    // `0` ends the turn as soon as the ladder is exhausted.
+    provider_outage_wait_ms: DEFAULT_PROVIDER_OUTAGE_WAIT_MS,
+    provider_outage_retry_ms: DEFAULT_PROVIDER_OUTAGE_RETRY_MS,
     // No default turn cap. Interactive / long-running agents stop on the
     // model’s own stop signal (or explicit cancel / budget). Operators who
     // want a runaway-loop backstop can set `max_turns` (or its documented env
@@ -1122,22 +1147,6 @@ export function defaultConfig(): AgenCConfig {
     // max_turns intentionally unset.
     // `autoUpdates` is intentionally not defaulted. An absent operator setting
     // means enabled; every consumer reads the effective ConfigStore snapshot.
-    buffer: Object.freeze({
-      provider: "auto",
-      show_tabs: "auto",
-      neovim: Object.freeze({
-        init: "auto",
-        startup_timeout_ms: 10_000,
-        operation_timeout_ms: 10_000,
-        cleanup_timeout_ms: 1_000,
-      }) as BufferNeovimConfig,
-      prediction: Object.freeze({
-        enabled: "ask",
-        debounce_ms: 160,
-        timeout_ms: 2_500,
-        max_output_tokens: 256,
-      }) as BufferPredictionConfig,
-    }) as BufferConfig,
     tui: Object.freeze({
       theme: "dark",
       showTurnDuration: true,
@@ -1173,6 +1182,10 @@ export function defaultConfig(): AgenCConfig {
         snapshot_days: 3,
         snapshot_max_count: 10_000,
         snapshot_max_bytes: 67_108_864,
+        // Sessions untouched for a month are pruned with their rollout files
+        // and mirror rows; without a window a project's state database grows
+        // without bound (693 MB in two days of soak, #2228). 0 keeps forever.
+        rollout_days: 30,
       }) as AgentRunRetentionConfig,
     }) as AgentConfig,
   } satisfies AgenCConfig);
@@ -1338,12 +1351,6 @@ export class InvalidMcpConfigError extends InvalidNamedConfigError {
 export class InvalidProtocolConfigError extends InvalidNamedConfigError {
   constructor(field: string, detail: string) {
     super("protocol", "InvalidProtocolConfigError", field, detail);
-  }
-}
-
-export class InvalidBufferConfigError extends InvalidNamedConfigError {
-  constructor(field: string, detail: string) {
-    super("buffer", "InvalidBufferConfigError", field, detail);
   }
 }
 
@@ -1554,6 +1561,12 @@ const PROVIDER_KEYS: ReadonlySet<string> = new Set([
   "collections",
   "remote_mcp",
   "incremental_continuation",
+  "zero_data_retention",
+]);
+
+/** Providers whose API takes a per-request zero-data-retention control. */
+const REQUEST_LEVEL_ZERO_DATA_RETENTION_PROVIDERS: ReadonlySet<string> = new Set([
+  "openrouter",
 ]);
 
 const GROK_CAPABILITY_BOOLEAN_KEYS = Object.freeze([
@@ -1948,6 +1961,20 @@ function validateSingleProviderConfig(
   );
   if (fallback !== undefined) out.fallback = fallback;
   Object.assign(out, validateGrokCapabilities(record, providerId));
+  const zeroDataRetention = optionalBoolean(
+    record.zero_data_retention,
+    fieldPath(providerId, "zero_data_retention"),
+    (field, detail) => new InvalidProviderConfigError(field, detail),
+  );
+  if (zeroDataRetention !== undefined) {
+    if (!REQUEST_LEVEL_ZERO_DATA_RETENTION_PROVIDERS.has(providerId)) {
+      throw new InvalidProviderConfigError(
+        fieldPath(providerId, "zero_data_retention"),
+        "request-level zero data retention is supported only under providers.openrouter; this provider controls retention at the account, project or team level",
+      );
+    }
+    out.zero_data_retention = zeroDataRetention;
+  }
   return Object.freeze(out as ProviderConfig);
 }
 
@@ -2391,6 +2418,7 @@ export function validateProtocolConfig(
 }
 
 const EXTERNAL_MCP_SERVER_KEYS: ReadonlySet<string> = new Set([
+  "oauth",
   "command",
   "args",
   "env",
@@ -2500,6 +2528,12 @@ function validateExternalMcpServerConfig(
       );
     }
     out.transport = record.transport;
+  }
+  if (record.oauth !== undefined) {
+    out.oauth = validateMcpOAuthConfig(record.oauth);
+    if (out.transport !== "http" && out.transport !== "sse") throw makeError(`${serverName}.oauth`, "OAuth requires HTTP or SSE transport");
+    assertMcpOAuthHttpsUrl(out.endpoint ?? "");
+    if (Object.keys(out.headers ?? {}).some((key) => key.toLowerCase() === "authorization")) throw makeError(`${serverName}.oauth`, "OAuth cannot be combined with an Authorization header");
   }
   for (const key of ["enabled", "required"] as const) {
     const value = optionalBoolean(record[key], `${serverName}.${key}`, makeError);
@@ -3355,7 +3389,7 @@ export function validateProfilesConfig(
     validateEnumValue(
       profile.reasoning_effort,
       `${name}.reasoning_effort`,
-      ["minimal", "low", "medium", "high", "xhigh", "none"],
+      ["minimal", "low", "medium", "high", "xhigh", "max", "none"],
       makeError,
     );
     validateEnumValue(
@@ -3490,10 +3524,6 @@ export function validateAgenCConfigBlocks(config: AgenCConfig): AgenCConfig {
   }
   if (config.tui !== undefined) {
     out.tui = validateTuiConfig(config.tui);
-    changed = true;
-  }
-  if (config.buffer !== undefined) {
-    out.buffer = validateBufferConfig(config.buffer);
     changed = true;
   }
   if (config.browser !== undefined) {
@@ -3659,7 +3689,6 @@ export function validateTuiConfig(raw: unknown): TuiConfig | undefined {
   rejectUnknownFields(
     raw,
     new Set([
-      "vimMode",
       "theme",
       "showTurnDuration",
       "terminalProgressBarEnabled",
@@ -3672,12 +3701,6 @@ export function validateTuiConfig(raw: unknown): TuiConfig | undefined {
   );
 
   const out: { -readonly [K in keyof TuiConfig]: TuiConfig[K] } = {};
-  if (raw.vimMode !== undefined) {
-    if (typeof raw.vimMode !== "boolean") {
-      throw new InvalidTuiConfigError("vimMode", "expected boolean");
-    }
-    out.vimMode = raw.vimMode;
-  }
   if (raw.theme !== undefined) {
     if (!TUI_THEME_SETTINGS.includes(raw.theme as TuiThemeSetting)) {
       throw new InvalidTuiConfigError(
@@ -3704,188 +3727,6 @@ export function validateTuiConfig(raw: unknown): TuiConfig | undefined {
   const keybindings = validateTuiKeybindings(raw.keybindings);
   if (keybindings !== undefined) out.keybindings = keybindings;
   return Object.freeze(out as TuiConfig);
-}
-
-export function validateBufferConfig(raw: unknown): BufferConfig | undefined {
-  if (raw === undefined) return undefined;
-  const makeError: InvalidConfigFactory = (field, detail) =>
-    new InvalidBufferConfigError(field, detail);
-  const record = requirePlainObject(raw, "", makeError);
-  rejectUnknownFields(
-    record,
-    new Set(["provider", "show_tabs", "neovim", "prediction"]),
-    makeError,
-  );
-  const out: { -readonly [K in keyof BufferConfig]: BufferConfig[K] } = {};
-  if (record.provider !== undefined) {
-    if (
-      record.provider !== "auto" &&
-      record.provider !== "neovim" &&
-      record.provider !== "inline" &&
-      record.provider !== "external"
-    ) {
-      throw makeError(
-        "provider",
-        'expected "auto", "neovim", "inline", or "external"',
-      );
-    }
-    out.provider = record.provider;
-  }
-  if (record.show_tabs !== undefined) {
-    if (
-      record.show_tabs !== "auto" &&
-      record.show_tabs !== "always" &&
-      record.show_tabs !== "never"
-    ) {
-      throw makeError("show_tabs", 'expected "auto", "always", or "never"');
-    }
-    out.show_tabs = record.show_tabs;
-  }
-  if (record.neovim !== undefined) {
-    const neovim = requirePlainObject(record.neovim, "neovim", makeError);
-    rejectUnknownFields(
-      neovim,
-      new Set([
-        "executable",
-        "init",
-        "discovery_timeout_ms",
-        "startup_timeout_ms",
-        "operation_timeout_ms",
-        "cleanup_timeout_ms",
-      ]),
-      makeError,
-      "neovim",
-    );
-    const validated: {
-      -readonly [K in keyof BufferNeovimConfig]: BufferNeovimConfig[K];
-    } = {};
-    const executable = optionalString(
-      neovim.executable,
-      "neovim.executable",
-      makeError,
-    );
-    if (executable !== undefined) {
-      if (executable.trim().length === 0) {
-        throw makeError("neovim.executable", "expected non-empty string");
-      }
-      validated.executable = executable;
-    }
-    if (neovim.init !== undefined) {
-      if (
-        neovim.init !== "auto" &&
-        neovim.init !== "user" &&
-        neovim.init !== "clean"
-      ) {
-        throw makeError("neovim.init", 'expected "auto", "user", or "clean"');
-      }
-      validated.init = neovim.init;
-    }
-    for (const key of [
-      "discovery_timeout_ms",
-      "startup_timeout_ms",
-      "operation_timeout_ms",
-      "cleanup_timeout_ms",
-    ] as const) {
-      const value = optionalPositiveInteger(
-        neovim[key],
-        `neovim.${key}`,
-        makeError,
-      );
-      if (value !== undefined) validated[key] = value;
-    }
-    out.neovim = Object.freeze(validated as BufferNeovimConfig);
-  }
-  if (record.prediction !== undefined) {
-    const prediction = requirePlainObject(
-      record.prediction,
-      "prediction",
-      makeError,
-    );
-    rejectUnknownFields(
-      prediction,
-      new Set([
-        "enabled",
-        "debounce_ms",
-        "timeout_ms",
-        "max_output_tokens",
-        "provider",
-        "model",
-      ]),
-      makeError,
-      "prediction",
-    );
-    const validated: {
-      -readonly [K in keyof BufferPredictionConfig]: BufferPredictionConfig[K];
-    } = {};
-    if (prediction.enabled !== undefined) {
-      if (
-        prediction.enabled !== "ask" &&
-        prediction.enabled !== "on" &&
-        prediction.enabled !== "off"
-      ) {
-        throw makeError("prediction.enabled", 'expected "ask", "on", or "off"');
-      }
-      validated.enabled = prediction.enabled;
-    }
-    const debounceMs = optionalPositiveInteger(
-      prediction.debounce_ms,
-      "prediction.debounce_ms",
-      makeError,
-    );
-    if (debounceMs !== undefined) {
-      if (debounceMs < 25 || debounceMs > 5_000) {
-        throw makeError(
-          "prediction.debounce_ms",
-          "expected integer between 25 and 5000",
-        );
-      }
-      validated.debounce_ms = debounceMs;
-    }
-    const timeoutMs = optionalPositiveInteger(
-      prediction.timeout_ms,
-      "prediction.timeout_ms",
-      makeError,
-    );
-    if (timeoutMs !== undefined) {
-      if (timeoutMs < 100 || timeoutMs > 30_000) {
-        throw makeError(
-          "prediction.timeout_ms",
-          "expected integer between 100 and 30000",
-        );
-      }
-      validated.timeout_ms = timeoutMs;
-    }
-    const maxOutputTokens = optionalPositiveInteger(
-      prediction.max_output_tokens,
-      "prediction.max_output_tokens",
-      makeError,
-    );
-    if (maxOutputTokens !== undefined) {
-      if (maxOutputTokens > 2_048) {
-        throw makeError(
-          "prediction.max_output_tokens",
-          "expected integer between 1 and 2048",
-        );
-      }
-      validated.max_output_tokens = maxOutputTokens;
-    }
-    for (const key of ["provider", "model"] as const) {
-      const value = optionalString(
-        prediction[key],
-        `prediction.${key}`,
-        makeError,
-      );
-      if (value !== undefined) {
-        const trimmed = value.trim();
-        if (trimmed.length === 0) {
-          throw makeError(`prediction.${key}`, "expected non-empty string");
-        }
-        validated[key] = trimmed;
-      }
-    }
-    out.prediction = Object.freeze(validated as BufferPredictionConfig);
-  }
-  return Object.freeze(out as BufferConfig);
 }
 
 export class InvalidBrowserConfigError extends Error {

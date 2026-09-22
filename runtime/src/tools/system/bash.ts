@@ -11,14 +11,19 @@
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import type { Tool, ToolExecutionInjectedArgs, ToolResult } from "../types.js";
+import type { Tool, ToolExecutionInjectedArgs, ToolPreflightFailure, ToolResult } from "../types.js";
 import type { BashToolConfig, BashToolInput } from "./types.js";
 import {
   SHELL_COMMAND_SEPARATORS,
   SHELL_REDIRECT_OPERATORS,
   parseDirectCommandLine,
-  tokenizeShellCommand,
 } from "./command-line.js";
+import {
+  getShellRedirectOperator,
+  isShellCommandSeparator,
+  lexShellCommand,
+  type ShellToken,
+} from "../../utils/shell/command-line.js";
 import {
   DEFAULT_DENY_LIST,
   DEFAULT_DENY_PREFIXES,
@@ -29,6 +34,7 @@ import { silentLogger } from "../../utils/logger.js";
 import type { Logger } from "../../utils/logger.js";
 import { classifyShellWorkspaceWritePolicy } from "../../llm/shell-write-policy.js";
 import { shellWorkspaceMutationPermission } from "./shell-mutation-permission.js";
+import { preflightShellWorkspaceWritePolicy } from "./shell-preflight.js";
 import { bashToolHasPermission } from "../../permissions/bash.js";
 import type { PermissionResult } from "../../permissions/types.js";
 import { buildRecoverableToolFailureMetadata } from "../result-metadata.js";
@@ -40,7 +46,8 @@ import {
   applyRuntimeSandboxToSpawn,
   type SandboxSpawnCommand,
 } from "./apply-runtime-sandbox.js";
-import type { SandboxPreparedSpawn } from "../../sandbox/execution-broker.js";
+import { readSandboxExecutionBroker, type SandboxPreparedSpawn } from "../../sandbox/execution-broker.js";
+import { assertReadOnlyInspectionInvocation, readReadOnlyInspectionInvocation, type ReadOnlyInspectionInvocation } from "../../permissions/readonly-inspection.js";
 import {
   runSupervisedProcess,
   type SupervisedProcessStopReason,
@@ -60,6 +67,23 @@ const SHELL_WRAPPER_COMMANDS = new Set([
   "tcsh",
 ]);
 const SHELL_WRAPPER_INLINE_FLAG_RE = /^-[A-Za-z]*c[A-Za-z]*$/;
+const SHELL_INPUT_EVALUATORS = new Set([
+  ...SHELL_WRAPPER_COMMANDS,
+  "ash",
+  "mksh",
+  "lksh",
+  "posh",
+  "yash",
+  "rbash",
+  "rksh",
+  "ksh93",
+  ".",
+  "source",
+  "eval",
+  "busybox",
+  "powershell",
+  "pwsh",
+]);
 const SHELL_BUILTIN_COMMANDS = new Set([
   "set",
   "cd",
@@ -362,9 +386,13 @@ function runSpawnedCommand(params: {
   readonly cleanupDirectory?: string;
   readonly signal?: AbortSignal;
   readonly onProgress?: ToolExecutionInjectedArgs["__onProgress"];
+  readonly inspection?: ReadOnlyInspectionInvocation;
 }): Promise<ToolResult> {
   return (async () => {
     try {
+      if (params.inspection !== undefined) {
+        assertReadOnlyInspectionInvocation(params.inspection);
+      }
       const result = await runSupervisedProcess(params.spawnCommand, {
         maxOutputBytes: params.maxOutputBytes * 4,
         ...(params.timeout !== undefined ? { timeoutMs: params.timeout } : {}),
@@ -609,46 +637,49 @@ const DYNAMIC_SHELL_EXECUTABLE_REASON =
   "Command-substitution executables are not allowed in shell mode; " +
   "use an explicit command name/path.";
 
-function getDynamicShellExecutableReason(
-  token: string,
-  next: string | undefined,
-): string | null {
-  if ((token === "$" && next === "(") || token.startsWith("$(")) {
-    return DYNAMIC_SHELL_EXECUTABLE_REASON;
-  }
-
-  if (token === "`" || token.startsWith("`")) {
-    return DYNAMIC_SHELL_EXECUTABLE_REASON;
-  }
-
-  return null;
-}
-
 function getShellRedirectionSkipIndex(
-  tokens: string[],
+  tokens: readonly ShellToken[],
   index: number,
 ): number | null {
   const token = tokens[index];
-  const next = tokens[index + 1];
-
-  if (SHELL_REDIRECT_OPERATORS.has(token)) {
+  if (token !== undefined && getShellRedirectOperator(token) !== undefined) {
     return Math.min(index + 1, tokens.length - 1);
-  }
-
-  if (/^\d+$/.test(token) && next && SHELL_REDIRECT_OPERATORS.has(next)) {
-    return Math.min(index + 2, tokens.length - 1);
   }
 
   return null;
 }
 
-function shouldSkipExecutableCandidate(token: string): boolean {
-  return ENV_ASSIGNMENT_RE.test(token) || token === "$";
+function shellExecutableName(command: string): string {
+  return basename(command.replace(/\\/gu, "/"))
+    .toLowerCase()
+    .replace(/\.(?:exe|com|cmd|bat)$/u, "");
+}
+
+function isShellInputEvaluator(command: string): boolean {
+  return SHELL_INPUT_EVALUATORS.has(shellExecutableName(command));
+}
+
+function hasShellEvaluatedHereInput(tokens: readonly ShellToken[]): boolean {
+  let hasHereInput = false;
+  let hasEvaluator = false;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const redirect = getShellRedirectOperator(token);
+    if (redirect !== undefined) {
+      hasHereInput ||= redirect.startsWith("<<");
+      index += 1;
+      continue;
+    }
+    if (token.kind === "word" && isShellInputEvaluator(token.value)) {
+      hasEvaluator = true;
+    }
+  }
+  return hasHereInput && hasEvaluator;
 }
 
 function consumeShellExecutable(token: string, executables: string[]): boolean {
   executables.push(token);
-  return !SHELL_PREFIX_COMMANDS.has(token.toLowerCase());
+  return !SHELL_PREFIX_COMMANDS.has(shellExecutableName(token));
 }
 
 /**
@@ -659,26 +690,35 @@ function extractShellExecutables(command: string): {
   executables: string[];
   dynamicExecutableReason: string | null;
 } {
-  const tokens = tokenizeShellCommand(command);
+  const parsed = lexShellCommand(command);
+  if (parsed.hasCommandSubstitution) {
+    return {
+      executables: [],
+      dynamicExecutableReason: DYNAMIC_SHELL_EXECUTABLE_REASON,
+    };
+  }
+  if (parsed.malformed) {
+    return {
+      executables: [],
+      dynamicExecutableReason: "Malformed shell quoting or heredoc is not allowed.",
+    };
+  }
+  const tokens = parsed.tokens;
+  if (hasShellEvaluatedHereInput(tokens)) {
+    return {
+      executables: [],
+      dynamicExecutableReason:
+        "Shell-evaluated heredoc or here-string input is not allowed; use an explicit command instead.",
+    };
+  }
   const executables: string[] = [];
   let expectCommand = true;
   let index = 0;
 
   while (index < tokens.length) {
-    const token = tokens[index];
-    const next = tokens[index + 1];
+    const token = tokens[index]!;
 
-    if (expectCommand) {
-      const dynamicExecutableReason = getDynamicShellExecutableReason(
-        token,
-        next,
-      );
-      if (dynamicExecutableReason) {
-        return { executables, dynamicExecutableReason };
-      }
-    }
-
-    if (SHELL_COMMAND_SEPARATORS.has(token)) {
+    if (isShellCommandSeparator(token)) {
       expectCommand = true;
       index += 1;
       continue;
@@ -695,12 +735,28 @@ function extractShellExecutables(command: string): {
       continue;
     }
 
-    if (shouldSkipExecutableCandidate(token)) {
+    if (ENV_ASSIGNMENT_RE.test(token.value)) {
       index += 1;
       continue;
     }
 
-    expectCommand = !consumeShellExecutable(token, executables);
+    if (token.requiresExpansion) {
+      return {
+        executables,
+        dynamicExecutableReason:
+          "Variable-expanded executables are not allowed; use an explicit command name/path.",
+      };
+    }
+
+    if (token.value.startsWith("-")) {
+      return {
+        executables,
+        dynamicExecutableReason:
+          "Shell prefix options require explicit executable validation; use a command without prefix options.",
+      };
+    }
+
+    expectCommand = !consumeShellExecutable(token.value, executables);
     index += 1;
   }
 
@@ -848,15 +904,74 @@ export function createBashTool(config?: BashToolConfig): Tool {
   const shellModeEnabled = config?.shellMode !== false;
   const execObserver = config?.execObserver;
 
+  function prepareInput(input: Readonly<Record<string, unknown>>): ToolPreflightFailure | {
+    command: string;
+    shellCommand: string;
+    cwd: string;
+    useShellMode: boolean;
+    directArgs: string[];
+  } {
+    const failure = (message: string): ToolPreflightFailure => ({ code: "invalid_input", message });
+    if (Object.prototype.hasOwnProperty.call(input, "timeout")) return failure("unknown field `timeout`");
+    if (typeof input.command !== "string" || input.command.trim().length === 0) {
+      return failure("command must be a non-empty string");
+    }
+    if (input.args !== undefined && !Array.isArray(input.args)) return failure("args must be an array of strings");
+    if (Array.isArray(input.args) && input.args.some((argument) => typeof argument !== "string")) {
+      return failure("Each argument must be a string");
+    }
+    const normalized = normalizeDirectInvocation({
+      command: input.command.trim(),
+      args: input.args as string[] | undefined,
+    });
+    const command = normalized.command;
+    const builtinFallback = normalizeBuiltinShellFallback({ command, args: normalized.args, shellModeEnabled });
+    const shellCommand = builtinFallback ?? command;
+    if (input.cwd !== undefined && lockCwd) return failure("Per-call cwd override is disabled (lockCwd is enabled)");
+    if (input.cwd !== undefined && typeof input.cwd !== "string") return failure("cwd must be a string");
+    const cwd = input.cwd ?? defaultCwd;
+    const useShellMode = shellModeEnabled && (builtinFallback !== undefined || isShellModeCommand(command, normalized.args));
+    const directArgs = normalized.args ?? [];
+    if (useShellMode) {
+      const shellCheck = validateShellCommand(shellCommand);
+      if (!shellCheck.allowed) return failure(shellCheck.reason);
+      if (!unrestricted) {
+        const shellExecutables = extractShellExecutables(shellCommand);
+        if (shellExecutables.dynamicExecutableReason) return failure(shellExecutables.dynamicExecutableReason);
+        for (const executable of shellExecutables.executables) {
+          const check = isCommandAllowed(executable, denySet, allowSet, denyExclusionSet);
+          if (!check.allowed) return failure(check.reason);
+        }
+      }
+    } else {
+      if (normalized.args === undefined && shellModeEnabled && !SINGLE_EXECUTABLE_RE.test(command)) {
+        return failure("Shell mode is disabled. Use `command` + `args` for direct execution.");
+      }
+      const shapeError = validateCommandShape(command) ?? validateShellBuiltin(command);
+      if (shapeError) return failure(shapeError);
+      if (!unrestricted) {
+        const check = isCommandAllowed(command, denySet, allowSet, denyExclusionSet);
+        if (!check.allowed) return failure(check.reason);
+      }
+      const argsError = validateDirectArgs(command, directArgs);
+      if (argsError) return failure(argsError);
+      const wrapperScript = extractShellWrapperInlineScript(command, directArgs);
+      if (wrapperScript) {
+        const shellCheck = validateShellCommand(wrapperScript);
+        if (!shellCheck.allowed) return failure(shellCheck.reason);
+      }
+    }
+    return { command, shellCommand, cwd, useShellMode, directArgs };
+  }
+
   return {
     name: "system.bash",
-    // Marked deferred: exec_command is the canonical shell tool (donor runtime
-    // parity — the donor runtime's `local_shell` + `write_stdin` is what AgenC's
-    // `exec_command` + `write_stdin` mirrors). system.bash stays
+    // Marked deferred: exec_command (with write_stdin) is the canonical
+    // shell tool. system.bash stays
     // available via system.searchTools for callers that genuinely
     // need the direct-mode (command + args) split or the dual-mode
     // semantics, but defaults to off to keep the visible catalog
-    // donor runtime-small and avoid duplicate-tool confusion.
+    // small and avoid duplicate-tool confusion.
     metadata: {
       family: "terminal",
       source: "builtin",
@@ -907,6 +1022,21 @@ export function createBashTool(config?: BashToolConfig): Tool {
       );
     },
 
+    preflight(input) {
+      const prepared = prepareInput(input);
+      if ("code" in prepared) return prepared;
+      const directoryError = validateWorkingDirectory(prepared.cwd);
+      if (directoryError !== null) return { code: "workdir-validation", message: directoryError };
+      return preflightShellWorkspaceWritePolicy({
+        toolName: "system.bash",
+        args: prepared.useShellMode
+          ? { command: prepared.shellCommand, cwd: prepared.cwd }
+          : { command: prepared.command, args: prepared.directArgs, cwd: prepared.cwd },
+        workspaceRoot: prepared.cwd,
+        ...shellWorkspaceMutationPermission(input),
+      });
+    },
+
     async execute(rawArgs: Record<string, unknown>): Promise<ToolResult> {
       const input = rawArgs as unknown as BashToolInput &
         ToolExecutionInjectedArgs;
@@ -915,11 +1045,17 @@ export function createBashTool(config?: BashToolConfig): Tool {
       }
       const abortSignal = input.__abortSignal;
       const onProgress = input.__onProgress;
+      let inspection: ReadOnlyInspectionInvocation | undefined;
+      try {
+        inspection = readReadOnlyInspectionInvocation(rawArgs);
+      } catch (error) {
+        return errorResult(error instanceof Error ? error.message : String(error));
+      }
 
       let commandAuthority:
         | ReturnType<NonNullable<BashToolConfig["commandExecutionAuthority"]>>
         | undefined;
-      if (config?.commandExecutionAuthority !== undefined) {
+      if (inspection === undefined && config?.commandExecutionAuthority !== undefined) {
         try {
           commandAuthority = config.commandExecutionAuthority();
           if (commandAuthority === undefined) {
@@ -933,165 +1069,24 @@ export function createBashTool(config?: BashToolConfig): Tool {
           );
         }
       }
-      const env = buildEnv(
+      const env = inspection?.env ?? buildEnv(
         commandAuthority?.childEnvironment ?? standaloneEnv,
       );
       const shellPath = commandAuthority?.path ?? "/bin/bash";
       const commandWrapperArgv = commandAuthority?.commandWrapperArgv ?? [];
 
-      // Validate command
-      if (
-        typeof input.command !== "string" ||
-        input.command.trim().length === 0
-      ) {
-        return errorResult("command must be a non-empty string");
+      const prepared = prepareInput(rawArgs);
+      if ("code" in prepared) {
+        logger.warn(`Bash tool denied: ${prepared.message}`);
+        return errorResult(prepared.message);
       }
-      if (input.args !== undefined && !Array.isArray(input.args)) {
-        return errorResult("args must be an array of strings");
-      }
-
-      const directArgs = Array.isArray(input.args) ? input.args : undefined;
-      const normalizedDirectInvocation = normalizeDirectInvocation({
-        command: input.command.trim(),
-        args: directArgs,
-      });
-      const command = normalizedDirectInvocation.command;
-      const normalizedArgs = normalizedDirectInvocation.args;
-      const builtinShellFallback = normalizeBuiltinShellFallback({
-        command,
-        args: normalizedArgs,
-        shellModeEnabled,
-      });
-      const shellCommand = builtinShellFallback ?? command;
-
-      // Apply cwd — reject per-call override if lockCwd is enabled.
-      let cwd = defaultCwd;
-      if (input.cwd !== undefined) {
-        if (lockCwd) {
-          return errorResult(
-            "Per-call cwd override is disabled (lockCwd is enabled)",
-          );
-        }
-        cwd = input.cwd;
-      }
-
-      // Determine execution mode: shell vs direct
-      const useShellMode =
-        shellModeEnabled &&
-        (builtinShellFallback !== undefined ||
-          isShellModeCommand(command, normalizedArgs));
-
-      let execCommand: string;
-      let execArgs: string[];
-
-      if (useShellMode) {
-        // Shell mode: validate against dangerous patterns, then run via bash -c
-        const shellCheck = validateShellCommand(shellCommand);
-        if (!shellCheck.allowed) {
-          logger.warn(`Bash tool shell-mode denied: ${shellCheck.reason}`);
-          return errorResult(shellCheck.reason);
-        }
-
-        // Enforce deny/allow policy for each executable discovered in shell mode.
-        if (!unrestricted) {
-          const { executables: shellExecutables, dynamicExecutableReason } =
-            extractShellExecutables(shellCommand);
-          if (dynamicExecutableReason) {
-            logger.warn(
-              `Bash tool shell-mode denied: ${dynamicExecutableReason}`,
-            );
-            return errorResult(dynamicExecutableReason);
-          }
-          for (const shellExecutable of shellExecutables) {
-            const check = isCommandAllowed(
-              shellExecutable,
-              denySet,
-              allowSet,
-              denyExclusionSet,
-            );
-            if (!check.allowed) {
-              logger.warn(`Bash tool shell-mode denied: ${check.reason}`);
-              return errorResult(check.reason);
-            }
-          }
-        }
-
-        execCommand = shellPath;
-        execArgs = [
-          "-c",
-          wrapCommandForShell(shellPath, commandWrapperArgv, shellCommand),
-        ];
-      } else {
-        // Direct mode: validate command shape, builtins, and deny/allow lists
-        if (
-          normalizedArgs === undefined &&
-          shellModeEnabled &&
-          !SINGLE_EXECUTABLE_RE.test(command)
-        ) {
-          // Command has shell operators but shell mode is enabled — this was caught
-          // by isShellModeCommand above, so this branch shouldn't be reached.
-          // Safety fallback for edge cases.
-          return errorResult(
-            "Shell mode is disabled. Use `command` + `args` for direct execution.",
-          );
-        }
-
-        const commandShapeError = validateCommandShape(command);
-        if (commandShapeError) {
-          return errorResult(commandShapeError);
-        }
-        const shellBuiltinError = validateShellBuiltin(command);
-        if (shellBuiltinError) {
-          return errorResult(shellBuiltinError);
-        }
-
-        // Check deny/allow lists (skipped in unrestricted mode)
-        if (!unrestricted) {
-          const check = isCommandAllowed(
-            command,
-            denySet,
-            allowSet,
-            denyExclusionSet,
-          );
-          if (!check.allowed) {
-            logger.warn(`Bash tool denied: ${check.reason}`);
-            return errorResult(check.reason);
-          }
-        }
-
-        // Validate args
-        const args: string[] = [];
-        if (normalizedArgs !== undefined) {
-          if (!Array.isArray(normalizedArgs)) {
-            return errorResult("args must be an array of strings");
-          }
-          for (const arg of normalizedArgs) {
-            if (typeof arg !== "string") {
-              return errorResult("Each argument must be a string");
-            }
-            args.push(arg);
-          }
-          const directArgsError = validateDirectArgs(command, args);
-          if (directArgsError) {
-            return errorResult(directArgsError);
-          }
-        }
-
-        const shellWrapperScript = extractShellWrapperInlineScript(
-          command,
-          args,
-        );
-        if (shellWrapperScript) {
-          const shellCheck = validateShellCommand(shellWrapperScript);
-          if (!shellCheck.allowed) {
-            logger.warn(`Bash tool shell-wrapper denied: ${shellCheck.reason}`);
-            return errorResult(shellCheck.reason);
-          }
-        }
-
-        execCommand = command;
-        execArgs = args;
-      }
+      const { command, shellCommand } = prepared;
+      const cwd = inspection?.cwd ?? prepared.cwd;
+      const useShellMode = inspection === undefined && prepared.useShellMode;
+      const execCommand = inspection?.program ?? (useShellMode ? shellPath : command);
+      const execArgs = inspection !== undefined ? [...inspection.args] : useShellMode
+        ? ["-c", wrapCommandForShell(shellPath, commandWrapperArgv, shellCommand)]
+        : prepared.directArgs;
 
       const workspaceWriteDecision = classifyShellWorkspaceWritePolicy({
         toolName: "system.bash",
@@ -1164,6 +1159,19 @@ export function createBashTool(config?: BashToolConfig): Tool {
           }
         | { readonly ok: false; readonly error: ToolResult } => {
         try {
+          if (inspection !== undefined) {
+            const broker = readSandboxExecutionBroker(rawArgs);
+            if (broker === undefined || broker.mode !== "read_only" || !broker.required) {
+              throw new Error("Read-only inspection requires its authenticated read-only execution broker");
+            }
+            return {
+              ok: true,
+              spawnCommand: broker.prepareSpawn("tool", {
+                program, args, cwd, env: { ...env }, argv0: basename(program),
+                permissionProfileOverride: inspection.runtimeSandbox.permissionProfile,
+              }),
+            };
+          }
           const sandboxed = applyRuntimeSandboxToSpawn({
             toolArgs: rawArgs as Record<string, unknown>,
             fallbackCwd: defaultCwd,
@@ -1349,6 +1357,7 @@ export function createBashTool(config?: BashToolConfig): Tool {
       return observeEnd(
         runSpawnedCommand({
           spawnCommand: sandboxedDirect.spawnCommand,
+          ...(inspection !== undefined ? { inspection } : {}),
           cwd,
           timeout,
           maxOutputBytes,

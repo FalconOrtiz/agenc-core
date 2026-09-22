@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -6,13 +6,14 @@ import { describe, expect, test } from "vitest";
 
 import { APPLY_PATCH_LARK_GRAMMAR, APPLY_PATCH_TOOL_NAME, createApplyPatchTool } from "./tool.js";
 import { createEmptyToolPermissionContext } from "../../permissions/types.js";
+import { SESSION_ID_ARG } from "../../../src/tools/system/filesystem.js";
 
 async function tempRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), "agenc-apply-patch-tool-"));
 }
 
 describe("apply_patch tool", () => {
-  test("exports the donor Lark grammar", () => {
+  test("exports the Lark grammar", () => {
     expect(APPLY_PATCH_LARK_GRAMMAR).toContain("start: begin_patch hunk+ end_patch");
     expect(APPLY_PATCH_LARK_GRAMMAR).toContain(
       'change_line: ("+" | "-" | " ") /(.*)/ LF',
@@ -86,6 +87,76 @@ describe("apply_patch tool", () => {
 
     // The model-supplied root must not have made /etc writable.
     expect(decision.behavior).not.toBe("allow");
+  });
+
+  describe("failures before any file is touched are confirmed no-effect", () => {
+    // #2190: a bare isError from a side-effecting tool is filed as an unknown
+    // outcome and gates the session behind /resolve.
+    test("an empty payload", async () => {
+      const tool = createApplyPatchTool({ cwd: "/tmp", allowedPaths: ["/tmp"] });
+      const result = await tool.execute({ input: "" });
+      expect(result.isError).toBe(true);
+      expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    });
+
+    test("a payload the parser rejects", async () => {
+      const tool = createApplyPatchTool({ cwd: "/tmp", allowedPaths: ["/tmp"] });
+      const result = await tool.execute({
+        input: "this is not a valid apply_patch payload",
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("invalid patch");
+      expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    });
+
+    test("an update of a file that does not exist", async () => {
+      const root = await mkdtemp(join(tmpdir(), "agenc-apply-patch-missing-"));
+      const tool = createApplyPatchTool({ cwd: root, allowedPaths: [root] });
+      const result = await tool.execute({
+        input: `*** Begin Patch
+*** Update File: ${join(root, "missing.txt")}
+@@
+-old
++new
+*** End Patch`,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("Failed to read file to update");
+      expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    });
+
+    test("an update of a file the session has not read", async () => {
+      const root = await mkdtemp(join(tmpdir(), "agenc-apply-patch-unread-"));
+      const path = join(root, "unread.txt");
+      await writeFile(path, "foo\n", "utf8");
+      const tool = createApplyPatchTool({ cwd: root, allowedPaths: [root] });
+      const result = await tool.execute({
+        input: `*** Begin Patch
+*** Update File: unread.txt
+@@
+-foo
++bar
+*** End Patch`,
+        [SESSION_ID_ARG]: "apply-patch-unread-session",
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("File has not been read yet");
+      expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    });
+
+    test("a path outside the allowed directories", async () => {
+      const root = await mkdtemp(join(tmpdir(), "agenc-apply-patch-outside-"));
+      const tool = createApplyPatchTool({ cwd: root, allowedPaths: [root] });
+      const result = await tool.execute({
+        input: `*** Begin Patch
+*** Add File: /etc/agenc-apply-patch-escape.txt
++pwned
+*** End Patch`,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("outside allowed directories");
+      expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    });
   });
 
   test("declares a deferred mutating filesystem surface", () => {

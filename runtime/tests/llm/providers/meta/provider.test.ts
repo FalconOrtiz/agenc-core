@@ -15,6 +15,7 @@ import {
 } from "../../registry/provider-info.js";
 import { getTokenizerConfigForProvider } from "../../token-estimation.js";
 import { chatCompletionsCapabilityHintsForProvider } from "../../wire/capability-gating.js";
+import { encodeMcpToolNameForWire } from "../../wire/mcp-tool-naming.js";
 import type { LLMTool, LLMToolChoice } from "../../types.js";
 
 function successfulChat(model: string, content = "ok"): Response {
@@ -87,6 +88,118 @@ describe("MetaProvider", () => {
     expect(() => createProvider("meta", {})).toThrow(/meta.*apiKey/i);
   });
 
+  test.each([
+    ["connection closes before a terminal chunk", "", /Meta SSE stream closed before any finish_reason/i],
+    ["DONE arrives without a terminal chunk", "data: [DONE]\n\n", /explicit finish_reason/i],
+    ["malformed JSON follows visible content", "data: {not-json}\n\ndata: [DONE]\n\n", /malformed JSON.*Meta SSE/i],
+    ["a terminal chunk is cut off", 'data: {"choices":[', /Meta SSE stream ended with an unterminated event/i],
+  ])("rejects incomplete Meta output when %s", async (_label, tail, error) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n' + tail,
+      { headers: { "content-type": "text/event-stream" } },
+    ));
+    const provider = createProvider("meta", { apiKey: "meta-test", extra: { fetchImpl } });
+    const onChunk = vi.fn();
+
+    await expect(provider.chatStream(
+      [{ role: "user", content: "hello" }], onChunk,
+    )).rejects.toThrow(error);
+    expect(onChunk).not.toHaveBeenCalledWith(expect.objectContaining({ done: true }));
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([undefined, "stop", "length"])(
+    "rejects streamed tools without their terminal tool_calls reason (%s)",
+    async (finishReason) => {
+      const chunk = {
+        choices: [{
+          index: 0,
+          delta: { tool_calls: [{
+            index: 0,
+            id: "call_echo",
+            type: "function",
+            function: { name: "system.echo", arguments: '{"text":"ok"}' },
+          }] },
+          ...(finishReason === undefined ? {} : { finish_reason: finishReason }),
+        }],
+      };
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+        `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ));
+      const provider = createProvider("meta", { apiKey: "meta-test", tools: [echoTool], extra: { fetchImpl } });
+      const onChunk = vi.fn();
+
+      await expect(provider.chatStream(
+        [{ role: "user", content: "echo ok" }], onChunk,
+      )).rejects.toThrow(/without finish_reason=tool_calls/i);
+      expect(onChunk).not.toHaveBeenCalledWith(expect.objectContaining({ toolCalls: expect.anything() }));
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each(["stop", "length"])(
+    "rejects non-streaming tools with unfinished reason %s",
+    async (finishReason) => {
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+        JSON.stringify({ choices: [{
+          message: { role: "assistant", content: null, tool_calls: [{
+            id: "call_echo", type: "function",
+            function: { name: "system.echo", arguments: '{"text":"ok"}' },
+          }] },
+          finish_reason: finishReason,
+        }] }),
+        { headers: { "content-type": "application/json" } },
+      ));
+      const provider = createProvider("meta", { apiKey: "meta-test", tools: [echoTool], extra: { fetchImpl } });
+
+      await expect(provider.chat([{ role: "user", content: "echo ok" }]))
+        .rejects.toThrow(/without finish_reason=tool_calls/i);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test("assembles streamed tool arguments and final usage, then replays the tool result", async () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
+    const wireToolName = encodeMcpToolNameForWire(echoTool.function.name);
+    const chunks = [
+      { choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: "call_echo", type: "function", function: { name: wireToolName, arguments: '{"text":' } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"ok"}' } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+      { choices: [], usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 } },
+    ];
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(
+        chunks.map((chunk) => `data: ${JSON.stringify({ model, ...chunk })}\n\n`).join("") + "data: [DONE]\n\n",
+        { headers: { "content-type": "text/event-stream" } },
+      ))
+      .mockResolvedValueOnce(successfulChat(model));
+    const provider = new MetaProvider({ apiKey: "meta-test", model, tools: [echoTool], fetchImpl });
+    const userMessage = { role: "user" as const, content: "echo ok" };
+    const response = await provider.chatStream([userMessage], () => {});
+
+    expect(response).toMatchObject({
+      content: "",
+      finishReason: "tool_calls",
+      toolCalls: [{ id: "call_echo", name: "system.echo", arguments: '{"text":"ok"}' }],
+      usage: { promptTokens: 12, completionTokens: 7, totalTokens: 19 },
+    });
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body)).stream_options)
+      .toEqual({ include_usage: true });
+
+    await provider.chat([
+      userMessage,
+      { role: "assistant", content: "", toolCalls: response.toolCalls },
+      { role: "tool", content: "ok", toolCallId: "call_echo" },
+    ]);
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body)).messages)
+      .toEqual([
+        userMessage,
+        { role: "assistant", content: "", tool_calls: [{ id: "call_echo", type: "function", function: { name: wireToolName, arguments: '{"text":"ok"}' } }] },
+        { role: "tool", content: "ok", tool_call_id: "call_echo" },
+      ]);
+  });
+
   test.each(BUILT_IN_PROVIDER_MODEL_CATALOG.meta)(
     "registers and routes chat model %s",
     async (model) => {
@@ -135,6 +248,7 @@ describe("MetaProvider", () => {
           "medium",
           "high",
           "xhigh",
+          ...(model === "muse-spark-1.3" ? ["max"] : []),
         ],
         defaultReasoningLevel: "medium",
         inputModalities: ["text", "image"],
@@ -177,7 +291,37 @@ describe("MetaProvider", () => {
       "medium",
       "high",
       "xhigh",
+      "max",
     ]);
+  });
+
+  test.each([
+    ["muse-spark-1.3", "max", "max"],
+    ["muse-spark-1.3", "xhigh", "xhigh"],
+    ["muse-spark-1.3", "none", undefined],
+    ["muse-spark-1.3-contributor", "max", undefined],
+    ["muse-spark-1.2", "max", undefined],
+    ["muse-spark-1.2-contributor", "max", undefined],
+    ["muse-spark-1.1", "max", undefined],
+    ["muse-spark-1.3-unverified", "max", undefined],
+    ["meta/muse-spark-1.3-unverified", "max", undefined],
+    ["meta/muse-spark-1.3", "max", "max"],
+    ["muse-spark-2.0", "max", undefined],
+  ] as const)("keeps %s effort %s identical in chat and streaming", async (model, effort, expected) => {
+    const streamResponse = () => new Response(
+      `data: ${JSON.stringify({ model, choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async () => successfulChat(model))
+      .mockImplementationOnce(async () => streamResponse());
+    const provider = new MetaProvider({ apiKey: "meta-test", model, fetchImpl });
+    await provider.chat([{ role: "user", content: "hello" }], { reasoningEffort: effort });
+    await provider.chatStream([{ role: "user", content: "hello" }], () => {}, { reasoningEffort: effort });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchImpl.mock.calls) {
+      expect(JSON.parse(String(init?.body)).reasoning_effort).toBe(expected);
+    }
   });
 
   test.each([
@@ -255,11 +399,12 @@ describe("MetaProvider", () => {
       chatCompletionsCapabilityHintsForProvider("meta", model),
     ).toMatchObject({
       toolChoicePolicy: "auto_only",
+      toolResultImagePolicy: "relay_as_user",
       acceptsStopSequences: false,
     });
   });
 
-  test("sends image input and JSON-schema structured output with tools", async () => {
+  test("sends direct user image input in Meta's supported schema with tools", async () => {
     const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       successfulChat(model, JSON.stringify({ answer: "ok" })),
@@ -319,6 +464,177 @@ describe("MetaProvider", () => {
         ],
       },
     ]);
+  });
+
+  test("relays multimodal tool results as supported user image input", async () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      successfulChat(model, "A cat is shown."),
+    );
+    const provider = new MetaProvider({
+      apiKey: "meta-test",
+      model,
+      tools: [echoTool],
+      fetchImpl,
+    });
+
+    await provider.chat([
+      { role: "user", content: "Inspect the image" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "call_read_image",
+            name: "FileRead",
+            arguments: '{"file_path":"/tmp/cat.png"}',
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call_read_image",
+        toolName: "FileRead",
+        content: [
+          { type: "text", text: "Image Size: 640x480." },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,Y2F0" },
+          },
+          { type: "text", text: "Read image successfully." },
+        ],
+      },
+    ]);
+
+    const body = JSON.parse(
+      String(fetchImpl.mock.calls[0]?.[1]?.body),
+    ) as Record<string, unknown>;
+    expect(body.messages).toEqual([
+      { role: "user", content: "Inspect the image" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_read_image",
+            type: "function",
+            function: {
+              name: "FileRead",
+              arguments: '{"file_path":"/tmp/cat.png"}',
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: "Image Size: 640x480.\nRead image successfully.",
+        tool_call_id: "call_read_image",
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Image returned by tool FileRead." },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,Y2F0" },
+          },
+        ],
+      },
+    ]);
+  });
+
+  test("keeps parallel tool results contiguous before relaying their images", async () => {
+    const model = BUILT_IN_PROVIDER_DEFAULT_MODELS.meta;
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      successfulChat(model, "Both images are visible."),
+    );
+    const provider = new MetaProvider({
+      apiKey: "meta-test",
+      model,
+      fetchImpl,
+    });
+
+    await provider.chat([
+      { role: "user", content: "Compare both images" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [
+          {
+            id: "call_first",
+            name: "FileRead",
+            arguments: '{"file_path":"/tmp/first.png"}',
+          },
+          {
+            id: "call_second",
+            name: "FileRead",
+            arguments: '{"file_path":"/tmp/second.png"}',
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call_first",
+        toolName: "FileRead",
+        content: [
+          { type: "text", text: "First image." },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,Zmlyc3Q=" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call_second",
+        toolName: "FileRead",
+        content: [
+          { type: "text", text: "Second image." },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,c2Vjb25k" },
+          },
+        ],
+      },
+    ]);
+
+    const body = JSON.parse(
+      String(fetchImpl.mock.calls[0]?.[1]?.body),
+    ) as { messages: Array<Record<string, unknown>> };
+    expect(body.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "tool",
+      "user",
+    ]);
+    expect(body.messages.slice(2, 4)).toEqual([
+      {
+        role: "tool",
+        content: "First image.",
+        tool_call_id: "call_first",
+      },
+      {
+        role: "tool",
+        content: "Second image.",
+        tool_call_id: "call_second",
+      },
+    ]);
+    expect(body.messages[4]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Image returned by tool FileRead." },
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,Zmlyc3Q=" },
+        },
+        { type: "text", text: "Image returned by tool FileRead." },
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,c2Vjb25k" },
+        },
+      ],
+    });
   });
 
   test("resolves the Meta credential and endpoint from canonical env", () => {

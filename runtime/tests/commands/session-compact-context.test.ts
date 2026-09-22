@@ -1,4 +1,10 @@
 import { describe, expect, test, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ConfigStore } from "../../src/config/store.js";
+import * as memoryPrompt from "../../src/memory/memdir.js";
+import * as outputStyles from "../../src/constants/outputStyles.js";
 
 const { loadTieredInstructionsMock } = vi.hoisted(() => ({
   loadTieredInstructionsMock: vi.fn(async () => ({
@@ -26,6 +32,7 @@ import {
   compactCommand,
   computeContextUsageBreakdown,
   contextCommand,
+  projectManualCompactionReplacementHistoryForTests,
 } from "./session-compact.js";
 import type { LLMMessage, LLMTool } from "../llm/types.js";
 import type { RuntimeMessage } from "../services/compact/types.js";
@@ -63,6 +70,93 @@ function tool(name: string, description: string): LLMTool {
     },
   };
 }
+
+describe("manual compact runtime projection", () => {
+  test("keeps provider reasoning provenance in the fallback message shape", async () => {
+    const replacementHistory =
+      await projectManualCompactionReplacementHistoryForTests({
+        boundaryMarker: { role: "user", content: "boundary" },
+        summaryMessages: [],
+        messagesToKeep: [{
+          type: "assistant",
+          message: { role: "assistant", content: "kept" },
+          providerReasoningContent: "opaque qwen state",
+          providerReasoningProvenance: {
+            provider: "qwen",
+            model: "qwen3.8-max",
+          },
+        }],
+        attachments: [],
+      });
+
+    expect(replacementHistory[1]).toMatchObject({
+      role: "assistant",
+      content: "kept",
+      providerReasoningContent: "opaque qwen state",
+      providerReasoningProvenance: {
+        provider: "qwen",
+        model: "qwen3.8-max",
+      },
+    });
+  });
+
+  test("keeps a retained assistant tool call and its result with the arguments intact", async () => {
+    // The summarizer hands back `messagesToKeep` in the shape
+    // `toAgenCRuntimeMessages` wrote: top-level role and runtime content, the
+    // tool result remapped to the user wire role with its original role
+    // recorded. This is the branch that used to drop `toolCalls`.
+    const toolCall = {
+      id: "toolu_keep_1792",
+      name: "Bash",
+      arguments: JSON.stringify({ command: "pwd" }),
+    };
+    const replacementHistory =
+      await projectManualCompactionReplacementHistoryForTests({
+        boundaryMarker: { role: "user", content: "boundary" },
+        summaryMessages: [],
+        messagesToKeep: [
+          {
+            role: "assistant",
+            type: "assistant",
+            content: [{ type: "text", text: "Checking the working directory." }],
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Checking the working directory." }],
+            },
+            toolCalls: [toolCall],
+          },
+          {
+            role: "user",
+            originalRole: "tool",
+            type: "user",
+            isMeta: true,
+            content: [{ type: "text", text: "/tmp/project" }],
+            message: {
+              role: "user",
+              content: [{ type: "text", text: "/tmp/project" }],
+            },
+            toolCallId: toolCall.id,
+            toolName: "Bash",
+          },
+        ],
+        attachments: [],
+      });
+
+    expect(replacementHistory.slice(1)).toEqual([
+      {
+        role: "assistant",
+        content: "Checking the working directory.",
+        toolCalls: [toolCall],
+      },
+      {
+        role: "tool",
+        content: "/tmp/project",
+        toolCallId: toolCall.id,
+        toolName: "Bash",
+      },
+    ]);
+  });
+});
 
 describe("/context display: computeContextUsageBreakdown", () => {
   test("reports four distinct fields: hard limit, compaction threshold, used, free headroom", () => {
@@ -336,6 +430,37 @@ describe("/context display: computeContextUsageBreakdown", () => {
 });
 
 describe("/context TUI bridge", () => {
+  test("counts memory from the captured session home and working directory", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agenc-context-memory-owner-"));
+    const configStore = new ConfigStore({ home, cwd: home, env: { HOME: home, AGENC_HOME: home } });
+    await configStore.reload();
+    const load = vi.spyOn(memoryPrompt, "loadMemoryPrompt");
+    const style = vi.spyOn(outputStyles, "getOutputStyleConfig").mockResolvedValue(null);
+    const session = {
+      abortController: new AbortController(), conversationId: "context-memory-owner",
+      newDefaultTurnWithSubId: () => ({ cwd: home, config: {},
+        modelInfo: { slug: "grok-4", contextWindow: 200_000, effectiveContextWindowPercent: 100 },
+        modelProviderId: "grok", dynamicTools: [], options: {} }),
+      nextInternalSubId: () => "context-memory-1", snapshotHistoryMessages: () => [],
+      state: { unsafePeek: () => ({ totalTokenUsage: { promptTokens: 0 } }) },
+      permissionModeRegistry: { current: () => undefined },
+      services: { configStore, registry: { toLLMTools: () => [], allSpecs: () => [] },
+        permissionModeRegistry: { current: () => undefined }, providerEnvironment: {}, provider: {},
+        runtimeOptions: { simpleMode: false, remoteMode: false } },
+      emit: vi.fn(), clearProviderResponseId: vi.fn(),
+    };
+    try {
+      await contextCommand.execute({ session: session as never, argsRaw: "", cwd: home, home,
+        appState: { setToolJSX: vi.fn() } });
+      expect(load).toHaveBeenCalledWith(expect.objectContaining({ cwd: home, configStore }));
+      expect((await load.mock.results[0]?.value)?.directories).toContain(join(home, "memory"));
+    } finally {
+      load.mockRestore();
+      style.mockRestore();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test("loads managed policy from the session's captured authority", async () => {
     const capturedManagedPath = "/captured/policy/AGENC.md";
     const ambientManagedPath = "/ambient/policy/AGENC.md";
@@ -356,7 +481,8 @@ describe("/context TUI bridge", () => {
             contextWindow: 200_000,
             effectiveContextWindowPercent: 100,
           },
-          modelProviderId: "xai",
+          modelProviderId: "grok",
+          dynamicTools: [],
           options: {},
         }),
         nextInternalSubId: () => "sub-1",
@@ -423,7 +549,8 @@ describe("/context TUI bridge", () => {
           contextWindow: 200_000,
           effectiveContextWindowPercent: 100,
         },
-        modelProviderId: "xai",
+        modelProviderId: "grok",
+        dynamicTools: [],
         options: {},
       }),
       nextInternalSubId: () => "sub-1",
@@ -490,7 +617,8 @@ describe("/context TUI bridge", () => {
             contextWindow: 200_000,
             effectiveContextWindowPercent: 100,
           },
-          modelProviderId: "xai",
+          modelProviderId: "grok",
+          dynamicTools: [],
           options: {},
         }),
         nextInternalSubId: () => "sub-1",
@@ -541,7 +669,7 @@ describe("/context TUI bridge", () => {
     expect(spoofedPermissionContext).toBe(noPermissionContext);
   });
 
-  test("falls back to daemon token usage when no in-process turn context exists", async () => {
+  test.each([false, true])("uses resident daemon context and cache metrics independently of lifetime token usage (effective capacity: %s)", async effective => {
     const setToolJSX = vi.fn();
     const session = {
       conversationId: "bridge-session",
@@ -558,13 +686,34 @@ describe("/context TUI bridge", () => {
             },
           }),
         },
-        providerEnvironment: TEST_PROVIDER_ENVIRONMENT,
+        providerEnvironment: effective ? { AGENC_AUTO_COMPACT_WINDOW: "50000" } : TEST_PROVIDER_ENVIRONMENT,
       },
       getDaemonSessionSnapshot: async () => ({
         tokenUsage: {
           inputTokens: 10_000,
           outputTokens: 2_000,
-          totalTokens: 12_000,
+          totalTokens: 2_000_000,
+        },
+        cacheStats: {
+          requestCount: 10,
+          cacheReadInputTokens: 8_000,
+          cacheCreationInputTokens: 400,
+          cacheTotalInputTokens: 10_000,
+          hitRate: 0.8,
+        },
+        contextBreakdown: {
+          windowTokens: effective ? 200_000 : 100_000,
+          ...(effective ? { effectiveWindowTokens: 100_000 } : {}),
+          messageTokens: 22_000,
+          systemPromptTokens: 3_000,
+          systemToolTokens: 1_000,
+          systemToolCount: 2,
+          mcpToolTokens: 500,
+          mcpToolCount: 1,
+          deferredToolTokens: 90_000,
+          deferredToolCount: 20,
+          memoryFileTokens: 100,
+          memoryFileCount: 1,
         },
       }),
     };
@@ -582,8 +731,17 @@ describe("/context TUI bridge", () => {
 
     expect(result).toEqual({ kind: "skip" });
     const payload = setToolJSX.mock.calls[0]?.[0];
-    expect(payload?.jsx?.props?.text).toContain("Context: 12,000 / 200,000");
-    expect(payload?.jsx?.props?.text).toContain("estimate:");
+    const text = payload?.jsx?.props?.text;
+    expect(text).toContain("Context: 26,600 / 100,000 tokens (27% of hard limit)");
+    expect(text).toContain("messages: 22,000 tokens");
+    expect(text).toContain("tool catalog: 1,500 tokens");
+    expect(text).toContain("system: 3,000 tokens");
+    expect(text).toContain("files: 100 tokens");
+    expect(text).toContain("prompt cache: 80% hit");
+    expect(text).toContain("400 written to cache");
+    expect(text).not.toContain("2,000,000");
+    expect(text).not.toContain("90,000");
+    expect(text).toContain("estimate: daemon resident context");
   });
 });
 
@@ -631,7 +789,9 @@ describe("/compact TUI bridge", () => {
       isLocalJSXCommand: true,
       shouldHidePromptInput: true,
     });
-    expect(payload?.jsx?.props?.contextText).toContain("Context: 12,000 / 200,000");
+    expect(payload?.jsx?.props?.contextText).toContain("/ 200,000");
+    expect(payload?.jsx?.props?.contextText).not.toContain("12,000");
+    expect(payload?.jsx?.props?.contextText).not.toContain("prompt cache:");
     expect(payload?.jsx?.props?.message).toContain("requires the in-process runtime");
   });
 });

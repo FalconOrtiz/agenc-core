@@ -1,3 +1,4 @@
+import { runtimeSettingsEqual } from "./runtime-settings-snapshot.js";
 import type {
   EffectBoundary,
   EffectNoEffectProof,
@@ -1211,6 +1212,19 @@ export class StateRunDurabilityRepository {
         if (effectIntentContent(existing) === effectIntentContent(params)) {
           return { applied: false, value: existing };
         }
+        // Rollouts written before effect_intent carried childRunId replay a
+        // child-backed step without it while the row projected live has it.
+        // Same event, same sequence, same digest: accept the replay rather
+        // than strand the run on its own history.
+        if (
+          params.projection === "canonical_replay" &&
+          params.childRunId === undefined &&
+          existing.childRunId !== undefined &&
+          effectIntentContent(existing) ===
+            effectIntentContent({ ...params, childRunId: existing.childRunId })
+        ) {
+          return { applied: false, value: existing };
+        }
         throw conflict(
           "RUN_EFFECT_INTENT_CONFLICT",
           `run ${params.runId} step ${params.stepId} already has a different effect intent`,
@@ -2358,30 +2372,6 @@ function runtimeSettingsFromRow(
     serviceTier: row.service_tier,
     hooksDisabled: row.hooks_disabled === 1,
   };
-}
-
-function runtimeSettingsEqual(
-  left: RunRuntimeSettingsSnapshot,
-  right: RunRuntimeSettingsSnapshot,
-): boolean {
-  return (
-    left.permissionMode === right.permissionMode &&
-    left.prePlanMode === right.prePlanMode &&
-    left.autoModeActive === right.autoModeActive &&
-    left.autoModeAvailable === right.autoModeAvailable &&
-    left.bypassPermissionsModeAvailable ===
-      right.bypassPermissionsModeAvailable &&
-    left.bypassPermissionsWorkspace === right.bypassPermissionsWorkspace &&
-    left.bypassPermissionsConsentWorkspace ===
-      right.bypassPermissionsConsentWorkspace &&
-    left.model === right.model &&
-    left.provider === right.provider &&
-    left.profile === right.profile &&
-    left.reasoningEffort === right.reasoningEffort &&
-    left.modelVerbosity === right.modelVerbosity &&
-    left.serviceTier === right.serviceTier &&
-    left.hooksDisabled === right.hooksDisabled
-  );
 }
 
 function effectFromRow(row: EffectRow): DurableRunEffect {

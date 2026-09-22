@@ -19,15 +19,22 @@
  */
 
 import {
+  CLI_VALUE_OPTIONS,
   STARTUP_VALUE_OPTIONS,
   tokenizeCliOptionRegion,
 } from "./cli-option-region.js";
 import {
   AUTONOMOUS_FLAG,
+  BYPASS_APPROVALS_FLAG,
   DANGEROUS_BYPASS_FLAG,
   findRetiredStartupFlag,
   retiredStartupFlagError,
 } from "./startup-flags.js";
+import {
+  DeadlineFlagError,
+  parseDeadlineFlag,
+  parseDeadlineReserveFlag,
+} from "../session/deadline-flags.js";
 
 /**
  * Parse a `--flag <value>` or `--flag=<value>` pair out of an argv
@@ -96,17 +103,16 @@ const STARTUP_BOOLEAN_FLAGS = Object.freeze([
   "-c",
   "-p",
   "--print",
+  "--debug",
+  "-d",
+  "--debug-to-stderr",
+  "-d2e",
   AUTONOMOUS_FLAG,
+  BYPASS_APPROVALS_FLAG,
   DANGEROUS_BYPASS_FLAG,
 ] as const);
 
-// gaphunt3 #37: only list value flags that a downstream consumer actually
-// honors. --fork/--sandbox/--approval-policy had no consumer
-// anywhere (classifyCLI/readStartupCliFlags/bootstrap), so stripping them
-// here silently swallowed the flag AND its value, dropping the user's
-// intent with no behavior and no feedback. Removing them lets the flag
-// text fall through as visible prompt content instead of vanishing.
-const STARTUP_VALUE_FLAGS = STARTUP_VALUE_OPTIONS;
+const STARTUP_VALUE_FLAGS = CLI_VALUE_OPTIONS;
 
 function shouldStripValueFlag(arg: string): boolean {
   return STARTUP_VALUE_FLAGS.some(
@@ -179,6 +185,8 @@ const STARTUP_SELECTION_FLAG_USAGE: Readonly<
 const HEADLESS_FORMAT_VALUE_FLAGS = Object.freeze([
   "--output-format",
   "--input-format",
+  "--deadline",
+  "--deadline-reserve",
 ] as const);
 
 type HeadlessFormatValueFlag =
@@ -191,7 +199,38 @@ const HEADLESS_FORMAT_FLAG_USAGE: Readonly<
     "agenc --output-format requires a value (usage: agenc -p --output-format <text|json|stream-json>)",
   "--input-format":
     "agenc --input-format requires a value (usage: agenc -p --input-format <stream-json>)",
+  "--deadline":
+    "agenc --deadline requires a value (usage: agenc -p --deadline <+seconds|ISO-8601>)",
+  "--deadline-reserve":
+    "agenc --deadline-reserve requires a value (usage: agenc -p --deadline <…> --deadline-reserve <seconds>)",
 });
+
+/**
+ * `--deadline` / `--deadline-reserve` (#2503) only make sense for a run
+ * nobody attends; an interactive session is never stopped by a clock.
+ * Validated here so a malformed value is a usage error (exit 2) before any
+ * daemon work starts.
+ */
+function runDeadlineFlagError(
+  optionArgs: readonly string[],
+  headless: boolean,
+): string | null {
+  const deadline = extractFlagValue(optionArgs, "--deadline");
+  const reserve = extractFlagValue(optionArgs, "--deadline-reserve");
+  if (deadline === null && reserve === null) return null;
+  if (!headless) {
+    return "agenc --deadline applies to print mode (-p), piped stdin, --no-tui, and headless continue/resume";
+  }
+  if (deadline === null) return "agenc --deadline-reserve requires --deadline";
+  try {
+    parseDeadlineFlag(deadline, Date.now());
+    if (reserve !== null) parseDeadlineReserveFlag(reserve);
+  } catch (error) {
+    if (error instanceof DeadlineFlagError) return error.message;
+    throw error;
+  }
+  return null;
+}
 
 /**
  * Detect a selection value-flag (`--provider`/`--model`/`--profile`/`--image`)
@@ -239,7 +278,7 @@ function findMissingHeadlessFormatValueFlag(
 }
 
 function shouldStripBooleanFlag(arg: string): boolean {
-  return ROUTING_BOOLEAN_FLAGS.includes(
+  return arg.startsWith("--debug=") || ROUTING_BOOLEAN_FLAGS.includes(
     arg as (typeof ROUTING_BOOLEAN_FLAGS)[number],
   ) ||
     STARTUP_BOOLEAN_FLAGS.includes(
@@ -277,6 +316,14 @@ export interface BootTUIArgs {
   readonly startupImages?: readonly string[];
 }
 
+/**
+ * Which prior session a headless (`-p`, piped stdin, `--no-tui`) run continues.
+ * `latest` is `-c` / `--continue`; `resume` is `--resume <id>` / `-r <id>`.
+ */
+export type OneShotContinueSession =
+  | { readonly kind: "latest" }
+  | { readonly kind: "resume"; readonly sessionId: string };
+
 export interface ResumeTUIArgs {
   readonly resumeId: string;
 }
@@ -296,6 +343,7 @@ export interface RouteCLIOptions {
   readonly oneShotCLI: (
     userMessage: string,
     startupImages?: readonly string[],
+    continueSession?: OneShotContinueSession,
   ) => Promise<number>;
   /** Resume a prior session through the TUI. Returns the exit code. */
   readonly resumeTUI: (args: ResumeTUIArgs) => Promise<number>;
@@ -311,6 +359,8 @@ export type RouteCLIPlan =
       readonly kind: "oneShotCLI";
       readonly userMessage: string;
       readonly startupImages?: readonly string[];
+      /** Headless `-c` / `--resume <id>`: run the prompt as one more turn of a prior session. */
+      readonly continueSession?: OneShotContinueSession;
     }
   | {
       readonly kind: "errorAndExit";
@@ -347,6 +397,23 @@ export function classifyCLI(opts: ClassifyCLIOptions): RouteCLIPlan {
     return {
       kind: "errorAndExit",
       message: `agenc: ${retiredStartupFlagError(retiredStartupFlag)}`,
+      exitCode: 2,
+    };
+  }
+
+  for (let optionIndex = 0; optionIndex < optionArgs.length; optionIndex += 1) {
+    const option = optionArgs[optionIndex]!;
+    if (shouldStripBooleanFlag(option)) continue;
+    if (shouldStripValueFlag(option)) {
+      if (!option.includes("=")) {
+        const value = optionArgs[optionIndex + 1];
+        if (value !== undefined && !value.startsWith("-")) optionIndex += 1;
+      }
+      continue;
+    }
+    return {
+      kind: "errorAndExit",
+      message: `agenc: unknown option '${option}'. Use '--' before literal prompt text that starts with '-'.`,
       exitCode: 2,
     };
   }
@@ -395,18 +462,28 @@ export function classifyCLI(opts: ClassifyCLIOptions): RouteCLIPlan {
     };
   }
 
+  // Headless runs (`-p`, piped stdin, `--no-tui`) never mount Ink. A prior
+  // session is continued through the daemon-backed one-shot path instead:
+  // the prompt becomes one more turn of that session, the way
+  // `hermes chat -c` and `opencode run --continue` work from a shell.
+  const headless = hasPrintFlag || hasNoTuiFlag || !opts.isTTY;
+  const deadlineError = runDeadlineFlagError(optionArgs, headless);
+  if (deadlineError !== null) {
+    return { kind: "errorAndExit", message: deadlineError, exitCode: 2 };
+  }
+
   // 1. `--resume <id>` / `-r <id>` boots through the TUI resume path. Errors
   //    inside `resumeTUI` (missing session, corrupt rollout, etc.) are
   //    surfaced via its return code; the caller owns emitting the
-  //    `agenc: session not found: <id>` message.
-  //    Refuse this path in a non-TTY context: Ink can't read from a piped
-  //    stdin, so resuming there used to hang silently waiting for input.
+  //    `agenc: session not found: <id>` message. Ink cannot read from a piped
+  //    stdin, so headless resumes take the one-shot path.
   if (resumeId !== null && resumeId.length > 0) {
-    if (!opts.isTTY) {
+    if (headless) {
       return {
-        kind: "errorAndExit",
-        message: `agenc --resume requires an interactive terminal. Use 'agenc -p <prompt>' for headless one-shot calls.`,
-        exitCode: 2,
+        kind: "oneShotCLI",
+        userMessage: prompt,
+        ...(startupImages.length > 0 ? { startupImages } : {}),
+        continueSession: { kind: "resume", sessionId: resumeId },
       };
     }
     return { kind: "resumeTUI", args: { resumeId } };
@@ -414,14 +491,15 @@ export function classifyCLI(opts: ClassifyCLIOptions): RouteCLIPlan {
 
   // 2. `--continue` / `-c` is explicit resume of the latest project
   //    session. It is deliberately separate from plain `agenc`, which
-  //    must always start a fresh conversation. Same TTY requirement as
-  //    --resume (todo-122): Ink cannot drive a non-interactive continue.
+  //    must always start a fresh conversation. Headless continues take the
+  //    one-shot path for the same reason as --resume (todo-122).
   if (hasContinueFlag) {
-    if (!opts.isTTY) {
+    if (headless) {
       return {
-        kind: "errorAndExit",
-        message: `agenc --continue requires an interactive terminal. Use 'agenc -p <prompt>' for headless one-shot calls.`,
-        exitCode: 2,
+        kind: "oneShotCLI",
+        userMessage: prompt,
+        ...(startupImages.length > 0 ? { startupImages } : {}),
+        continueSession: { kind: "latest" },
       };
     }
     return { kind: "continueTUI", args: {} };
@@ -495,6 +573,13 @@ export async function routeCLI(opts: RouteCLIOptions): Promise<number> {
     case "continueTUI":
       return opts.continueTUI(plan.args);
     case "oneShotCLI":
+      if (plan.continueSession !== undefined) {
+        return opts.oneShotCLI(
+          plan.userMessage,
+          plan.startupImages,
+          plan.continueSession,
+        );
+      }
       return plan.startupImages === undefined
         ? opts.oneShotCLI(plan.userMessage)
         : opts.oneShotCLI(plan.userMessage, plan.startupImages);

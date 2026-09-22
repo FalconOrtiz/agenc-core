@@ -80,9 +80,13 @@ import {
   materializeAgentInvocationMessages,
 } from "../contracts/agent-invocation-envelope.js";
 import {
+  attachCompactionSession,
   createCompactionTransactionHarness,
   createProvider as createCompactionProvider,
 } from "../helpers/compaction-transaction-harness.js";
+import { sessionTranscriptV2FromRollout } from "../app-server/background-agent-runner/journal-reconstruction.js";
+import { daemonTranscriptSnapshotEvents } from "../tui/daemon-transcript-snapshot.js";
+import { adaptTranscriptEvents } from "../tui/session-transcript.js";
 import { CompactionReconstructionRequiredError } from "../services/compact/transaction-types.js";
 import {
   getSessionTempNamespaceName,
@@ -802,6 +806,46 @@ describe("Session.abortTerminal", () => {
     });
   });
 
+  it("scopes provider_switched to the turn in flight and keeps the session promptable", async () => {
+    const session = buildSession();
+    const turn = new AbortController();
+    const child = new AbortController();
+    await session.activeTurn.swap({
+      turnId: "turn-live",
+      startedAtMs: 123,
+      abortController: turn,
+      tasks: new Map([
+        ["turn-live", { abortController: turn }],
+        ["turn-live:child", { abortController: child }],
+      ]),
+    } as never);
+
+    session.abortTerminal("provider_switched");
+
+    expect(turn.signal.reason).toBe("provider_switched");
+    expect(child.signal.reason).toBe("provider_switched");
+    expect(session.abortController.signal.aborted).toBe(false);
+    expect(session.txEvent.tryRecv()).toMatchObject({
+      msg: {
+        type: "turn_aborted",
+        payload: { turnId: "turn-live", reason: "provider_switched" },
+      },
+    });
+
+    // The lifetime token is untouched: a real terminal abort still works.
+    session.abortTerminal("stdin_lost");
+    expect(session.abortController.signal.reason).toBe("stdin_lost");
+  });
+
+  it("treats provider_switched as a no-op when no turn is active", () => {
+    const session = buildSession();
+
+    session.abortTerminal("provider_switched");
+
+    expect(session.abortController.signal.aborted).toBe(false);
+    expect(session.txEvent.tryRecv()).toBeUndefined();
+  });
+
   it("omits turnId when no turn is active", () => {
     const session = buildSession();
 
@@ -1186,6 +1230,8 @@ describe("Session.consumePendingProviderSwitch", () => {
     });
     expect(state.sessionConfiguration.provider).toEqual({ slug: "grok" });
     expect(state.sessionConfiguration.collaborationMode.model).toBe("grok-4.3");
+    expect(state.sessionConfiguration.permissionInstructionsDeferred).toBe(true);
+    expect(state.sessionConfiguration.baseInstructions).not.toContain("# Permission Mode:");
     expect(state.sessionConfiguration.baseInstructions).toContain(
       SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     );
@@ -1912,39 +1958,6 @@ describe("Session turn-driver hooks", () => {
     expect(started).toEqual(["first", "second"]);
   });
 
-  it("defers Agent startup work across Editor turns and flushes it before an ordinary submit", async () => {
-    const session = buildSession();
-    const sequence: string[] = [];
-    session.appendDeferredOrdinarySubmitHook(async () => {
-      sequence.push("agent-startup");
-    });
-    session.installTurnDriverHooks({
-      submit: vi.fn(async (message: string) => {
-        sequence.push(`turn:${message}`);
-      }),
-    });
-    const editorInteraction = {
-      interactionId: "interaction-deferred-startup-ask",
-      kind: "ask" as const,
-      policy: "read_only" as const,
-      editorInstanceId: "editor-deferred-startup",
-      bufferHandle: 12,
-      changedtick: 5,
-      contentSha256: "e".repeat(64),
-      path: "/tmp/example.ts",
-      range: {
-        start: { line: 1, column: 0 },
-        end: { line: 1, column: 1 },
-      },
-    };
-
-    await session.submit("editor", { editorInteraction });
-    expect(sequence).toEqual(["turn:editor"]);
-
-    await session.submit("agent");
-    expect(sequence).toEqual(["turn:editor", "agent-startup", "turn:agent"]);
-  });
-
   it("discards never-started deferred work when shutdown wins", async () => {
     const cancel = vi.fn();
     const session = buildSession({
@@ -2381,8 +2394,9 @@ describe("Session.partialCompactFromMessage", () => {
         admissionRequired: true,
       },
     });
-    session.rolloutStore = harness.store;
+    attachCompactionSession(session, harness);
     try {
+      expect(session.eventLog.lastSeq).toBe(1);
       await session.state.with((state) => {
         state.history = sourceHistory;
       });
@@ -2420,6 +2434,18 @@ describe("Session.partialCompactFromMessage", () => {
           (message) => message.content === sourceHistory[2]?.content,
         ),
       ).toBe(false);
+      const items = harness.store.readAll();
+      const events = items.flatMap((item) => item.type === "event_msg" ? [item.payload] : []);
+      expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1));
+      const usage = events.filter((event) => event.msg.type === "session_usage").at(-1)?.msg;
+      expect(usage).toMatchObject({ type: "session_usage", payload: {
+        runId: session.conversationId, modelCalls: 1, hasUnknownCost: false,
+      } });
+      if (usage?.type !== "session_usage") throw new Error("Missing compaction usage");
+      expect(usage.payload.costUsd).toBeGreaterThan(0);
+      const snapshot = sessionTranscriptV2FromRollout(items, session.conversationId, session.conversationId);
+      const restored = adaptTranscriptEvents(daemonTranscriptSnapshotEvents(snapshot, session.conversationId));
+      expect(restored.sessionCostUsd).toBe(usage.payload.costUsd);
     } finally {
       harness.close();
     }
@@ -2468,7 +2494,7 @@ describe("Session.partialCompactFromMessage", () => {
         admissionRequired: true,
       },
     });
-    session.rolloutStore = harness.store;
+    attachCompactionSession(session, harness);
     try {
       await session.state.with((state) => {
         state.history = sourceHistory;
@@ -2530,7 +2556,7 @@ describe("Session.partialCompactFromMessage", () => {
         admissionRequired: true,
       },
     });
-    session.rolloutStore = harness.store;
+    attachCompactionSession(session, harness);
     try {
       await session.state.with((state) => {
         state.history = sourceHistory;
@@ -2898,29 +2924,6 @@ describe("Session.shutdown dispatches SessionEnd hooks", () => {
       const session = buildSession();
       await session.shutdown();
       expect(seen).toEqual([{ reason: "exit", session_id: "conv-test" }]);
-    } finally {
-      resetLifecycleHookRegistry();
-    }
-  });
-
-  it("does not run unmatched lifecycle hooks for an Editor-only deferred session", async () => {
-    const { registerSessionEndHook, resetLifecycleHookRegistry } =
-      await import("../llm/hooks/registry.js");
-    const sessionStart = vi.fn(async () => {});
-    const sessionEnd = vi.fn(async () => ({
-      succeeded: true,
-      output: "",
-    }));
-    resetLifecycleHookRegistry();
-    registerSessionEndHook(sessionEnd);
-    try {
-      const session = buildSession();
-      session.installDeferredSessionStartHook(sessionStart);
-
-      await session.shutdown();
-
-      expect(sessionStart).not.toHaveBeenCalled();
-      expect(sessionEnd).not.toHaveBeenCalled();
     } finally {
       resetLifecycleHookRegistry();
     }

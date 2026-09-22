@@ -74,6 +74,13 @@ export const HERMETIC_PROVIDER_CREDENTIAL_ENV_VARS = Object.freeze([
   'GROQ_API_KEY',
   'DEEPSEEK_API_KEY',
   'MODEL_API_KEY',
+  'QWEN_API_KEY',
+  'QWEN_TOKEN_PLAN_API_KEY',
+  'DASHSCOPE_TOKEN_PLAN_API_KEY',
+  'CEREBRAS_API_KEY',
+  'ZAI_API_KEY',
+  'ZAI_CODING_PLAN_API_KEY',
+  'MOONSHOT_API_KEY',
   'MISTRAL_API_KEY',
   'NVIDIA_API_KEY',
   'MINIMAX_API_KEY',
@@ -311,6 +318,13 @@ export const HERMETIC_AGENC_STATE_ENV_VARS = Object.freeze([
   'GROQ_BASE_URL',
   'DEEPSEEK_BASE_URL',
   'META_BASE_URL',
+  'DASHSCOPE_BASE_URL',
+  'QWEN_BASE_URL',
+  'QWEN_TOKEN_PLAN_BASE_URL',
+  'DASHSCOPE_TOKEN_PLAN_BASE_URL',
+  'CEREBRAS_BASE_URL',
+  'ZAI_BASE_URL',
+  'ZAI_CODING_PLAN_BASE_URL',
   'GEMINI_BASE_URL',
   'MISTRAL_BASE_URL',
   'NVIDIA_BASE_URL',
@@ -551,7 +565,7 @@ export function createHermeticRunRoot(prefix, explicitBase) {
     }
     base = join(systemRoot, 'Temp')
   } else {
-    base = '/tmp'
+    base = process.platform === 'darwin' ? '/private/tmp' : '/tmp'
   }
   mkdirSync(base, { mode: 0o700, recursive: true })
   return mkdtempSync(join(base, prefix))

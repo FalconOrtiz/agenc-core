@@ -14,7 +14,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createDaemonWorkflowController } from "../../src/app-server/workflow/daemon-wiring.js";
+import {
+  createDaemonWorkflowController,
+  resolveDaemonDefaultReviewerModel,
+} from "../../src/app-server/workflow/daemon-wiring.js";
 import type {
   WorkflowAgentSpawner,
   WorkflowChildOutcome,
@@ -40,6 +43,7 @@ import {
 } from "../../src/state/sqlite-driver.js";
 import type { WorkflowCommandRunner } from "../../src/workflow/verification.js";
 import type { ReviewerInvoker } from "../../src/workflow/independent-review.js";
+import { runWithStartupProviderSelection } from "../../src/utils/model/providers.js";
 import type { WorktreeHandle } from "../../src/agents/worktree.js";
 
 const BASE_COMMIT = "c".repeat(40);
@@ -238,8 +242,12 @@ const commands: WorkflowCommandRunner = {
   }),
 };
 
+const reviewerInvocations: { readonly reviewerModel: string }[] = [];
 const reviewer: ReviewerInvoker = {
-  invoke: async () => APPROVING_REVIEW,
+  invoke: async (input) => {
+    reviewerInvocations.push({ reviewerModel: input.reviewerModel });
+    return APPROVING_REVIEW;
+  },
 };
 
 interface ProjectFixture {
@@ -311,7 +319,7 @@ function makeSeams(): WorkflowSessionSeams & {
   };
 }
 
-function makeWiring() {
+function makeWiring(options: { readonly config?: () => { readonly model?: string } } = {}) {
   const admission = new FakeAdmission();
   const kernel = {
     bindClient: ({ scope }: { scope: { runId: string } }) => {
@@ -327,6 +335,7 @@ function makeWiring() {
     warn: () => {},
     env: {},
     argv: ["node", "agenc"],
+    ...(options.config !== undefined ? { config: options.config } : {}),
     stateDatabasePaths: () => [
       resolveStateDatabasePaths({ cwd: projectA.cwd, agencHome: home }),
       resolveStateDatabasePaths({ cwd: projectB.cwd, agencHome: home }),
@@ -350,7 +359,93 @@ afterEach(() => {
   rmSync(projectB.cwd, { recursive: true, force: true });
 });
 
+describe("createDaemonWorkflowController — reviewer model", () => {
+  it("pins the daemon's selected model as the reviewer model when the caller names none", async () => {
+    const { wiring } = makeWiring();
+    const before = reviewerInvocations.length;
+    const started = await runWithStartupProviderSelection(
+      { provider: "grok", model: "grok-4.6", environment: { ...process.env } },
+      () =>
+        wiring.controller.start({
+          goal: "fix a bug with the daemon's default model",
+          repoPath: projectB.cwd,
+          requiredVerification: [{ label: "unit", script: "run-tests" }],
+          runId: "wf-default-reviewer",
+        }),
+    );
+    await wiring.controller.awaitRun(started.runId);
+    expect(reviewerInvocations.slice(before).map((entry) => entry.reviewerModel)).toEqual([
+      "grok-4.6",
+    ]);
+    expect(projectB.repo.getCurrentTerminalResult("wf-default-reviewer")).toMatchObject({
+      status: "completed",
+    });
+  });
+
+  it("resolves the reviewer model from the scope first and the configured model second", () => {
+    // The daemon's RPC handlers run outside any session startup scope, which is
+    // where an SDK or script client that names no model arrives (soak F62).
+    const unbound = () => {
+      throw new Error("No provider authority is bound");
+    };
+    expect(resolveDaemonDefaultReviewerModel(() => "grok-4.6", () => "grok-4.6-fast")).toBe(
+      "grok-4.6",
+    );
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => "grok-4.6-fast")).toBe(
+      "grok-4.6-fast",
+    );
+    expect(resolveDaemonDefaultReviewerModel(() => "  ", () => " grok-4.6-fast ")).toBe(
+      "grok-4.6-fast",
+    );
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => undefined)).toBeUndefined();
+    expect(resolveDaemonDefaultReviewerModel(unbound, () => "")).toBeUndefined();
+  });
+});
+
 describe("createDaemonWorkflowController — per-run durability resolution", () => {
+  it("cancels a waiting child and commits its terminal before closing workflow seams", async () => {
+    const admission = new FakeAdmission();
+    const baseSeams = makeSeams();
+    let childSettled = false;
+    let seamsClosed = false;
+    let signalStarted!: () => void;
+    const startedChild = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const runId = "wf-waiting-shutdown";
+    const wiring = createDaemonWorkflowController({
+      agencHome: home, primaryCwd: projectA.cwd, env: {}, argv: [], warn: () => {},
+      kernel: {
+        bindClient: () => admission,
+        cancelRun: () => { admission.abort.abort("daemon_shutdown"); },
+      } as unknown as ExecutionAdmissionKernel,
+      sessionSeams: {
+        ...baseSeams,
+        spawner: {
+          ...baseSeams.spawner,
+          spawn: async ({ signal }) => {
+            signalStarted();
+            if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            childSettled = true;
+            return { status: "cancelled", finalMessage: "approval cancelled", usage: null };
+          },
+        },
+        close: async () => {
+          expect(childSettled).toBe(true);
+          expect(projectA.repo.getCurrentTerminalResult(runId)?.status).toBe("cancelled");
+          seamsClosed = true;
+        },
+      },
+    });
+    await wiring.controller.start({
+      runId, repoPath: projectA.cwd, goal: "wait for approval", reviewerModel: "reviewer",
+      requiredVerification: [{ label: "tests", script: "node --test" }],
+    });
+    await startedChild;
+    await wiring.close();
+    expect(childSettled).toBe(true);
+    expect(seamsClosed).toBe(true);
+    expect(wiring.controller.activeRunIds()).toEqual([]);
+  });
+
   it("journals a run into its own repository's project database and resolves status across projects", async () => {
     const { wiring } = makeWiring();
     const started = await wiring.controller.start({

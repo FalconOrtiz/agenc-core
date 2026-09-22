@@ -59,34 +59,29 @@ import { isRecord } from "../utils/record.js";
 import { timed } from "../utils/slow-store-op.js";
 
 // ─────────────────────────────────────────────────────────────────────
-// Params + types — mirrored from agenc runtime `thread-store/src/types.rs`.
+// Params + types.
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Thread memory mode. Mirrors source runtime
- * `ThreadMemoryMode` (`protocol/src/protocol.rs:811`). Serialized to
- * the registry as the lowercase string form, matching source runtime's
- * `#[serde(rename_all = "lowercase")]`.
+ * Thread memory mode. Serialized to the registry as the lowercase
+ * string form.
  */
 export type ThreadMemoryMode = "enabled" | "disabled";
 
 /**
  * Controls how many event variants should be persisted for future
- * replay. Mirrors source runtime `ThreadEventPersistenceMode`
- * (`thread-store/src/types.rs:21`). Currently unused by AgenC TS runtime's
- * `FileThreadStore` (kept for signature parity) because AgenC TS runtime has a
- * single event-persistence policy.
+ * replay. Currently unused by `FileThreadStore` (kept for signature
+ * stability) because the runtime has a single event-persistence policy.
  */
 export type ThreadEventPersistenceMode = "limited" | "extended";
 
 /**
- * Runtime source for the thread. Source runtime uses a serde enum
- * (`SessionSource`); the TS runtime currently accepts both compatibility
- * string labels and JSON-shaped structured sources used by subagents.
+ * Runtime source for the thread. Accepts both compatibility string
+ * labels and JSON-shaped structured sources used by subagents.
  */
 export type ThreadSource = string | Readonly<Record<string, unknown>>;
 
-/** Mirror of source runtime `CreateThreadParams` (`types.rs:31`). */
+/** Parameters for creating a new thread. */
 export interface CreateThreadParams {
   readonly threadId: ThreadId;
   readonly forkedFromId?: ThreadId;
@@ -98,15 +93,13 @@ export interface CreateThreadParams {
   readonly agencHome?: string;
   /**
    * The already-opened `RolloutStore` this thread will append into.
-   * The source runtime `LocalThreadStore` opens its own `RolloutRecorder`
-   * from `CreateThreadParams + RolloutConfig`; AgenC TS runtime keeps the
-   * `RolloutStore` lifecycle with `Session`, so the caller must pass
-   * an opened store in.
+   * The `RolloutStore` lifecycle lives with `Session`, so the caller
+   * must pass an opened store in.
    */
   readonly rolloutStore: RolloutStore;
 }
 
-/** Mirror of source runtime `ResumeThreadParams` (`types.rs:48`). */
+/** Parameters for resuming an existing thread. */
 export interface ResumeThreadParams {
   readonly threadId: ThreadId;
   readonly rolloutPath?: string;
@@ -118,45 +111,45 @@ export interface ResumeThreadParams {
   readonly rolloutStore: RolloutStore;
 }
 
-/** Mirror of source runtime `AppendThreadItemsParams` (`types.rs:63`). */
+/** Parameters for appending rollout items to a thread. */
 export interface AppendThreadItemsParams {
   readonly threadId: ThreadId;
   readonly items: ReadonlyArray<RolloutItem>;
 }
 
-/** Mirror of source runtime `LoadThreadHistoryParams` (`types.rs:72`). */
+/** Parameters for loading a thread's rollout history. */
 export interface LoadThreadHistoryParams {
   readonly threadId: ThreadId;
   readonly includeArchived: boolean;
 }
 
-/** Mirror of source runtime `StoredThreadHistory` (`types.rs:81`). */
+/** Rollout history loaded for a thread. */
 export interface StoredThreadHistory {
   readonly threadId: ThreadId;
   readonly items: ReadonlyArray<RolloutItem>;
 }
 
-/** Mirror of source runtime `ReadThreadParams` (`types.rs:90`). */
+/** Parameters for reading a thread by id. */
 export interface ReadThreadParams {
   readonly threadId: ThreadId;
   readonly includeArchived: boolean;
   readonly includeHistory: boolean;
 }
 
-/** Mirror of source runtime `ReadThreadByRolloutPathParams` (`types.rs:109`). */
+/** Parameters for reading a thread by its rollout path. */
 export interface ReadThreadByRolloutPathParams {
   readonly rolloutPath: string;
   readonly includeArchived: boolean;
   readonly includeHistory: boolean;
 }
 
-/** Mirror of source runtime `ThreadSortKey` (`types.rs:101`). */
+/** Sort key for thread listings. */
 export type ThreadSortKey = "created_at" | "updated_at";
 
-/** Mirror of source runtime `SortDirection` (`types.rs:111`). */
+/** Sort direction for thread listings. */
 export type SortDirection = "asc" | "desc";
 
-/** Mirror of source runtime `ListThreadsParams` (`types.rs:121`). */
+/** Parameters for listing threads. */
 export interface ListThreadsParams {
   readonly pageSize: number;
   readonly cursor?: string;
@@ -170,13 +163,12 @@ export interface ListThreadsParams {
   readonly useStateDbOnly?: boolean;
 }
 
-/** Mirror of source runtime `StoredThread` (`types.rs:157`), narrowed to the
- *  fields AgenC TS runtime actually persists in the registry. Fields source runtime
- *  reconstructs from a `agenc runtime-state` SQLite row (token usage,
- *  reasoning effort, approval mode, sandbox policy, git info, full
- *  preview, cli version) are not populated. */
+/** Persisted thread record, narrowed to the fields actually stored in
+ *  the registry. Token usage, reasoning effort, approval mode, sandbox
+ *  policy, git info, full preview, and cli version are not populated. */
 export interface StoredThread {
   readonly threadId: ThreadId;
+  readonly parentThreadId?: ThreadId;
   readonly rolloutPath?: string;
   readonly forkedFromId?: ThreadId;
   readonly name?: string;
@@ -191,51 +183,49 @@ export interface StoredThread {
   readonly history?: StoredThreadHistory;
 }
 
-/** Mirror of source runtime `ThreadPage` (`types.rs:148`). */
+/** One page of a thread listing. */
 export interface ThreadPage {
   readonly items: ReadonlyArray<StoredThread>;
   readonly nextCursor?: string;
 }
 
-/** Mirror of source runtime `OptionalStringPatch` (`types.rs:207`). */
+/** Optional string patch: `undefined` leaves the field alone, `null` clears it. */
 export type OptionalStringPatch = string | null | undefined;
 
-/** Mirror of source runtime `GitInfoPatch` (`types.rs:211`). Accepted for
- *  signature parity; `FileThreadStore.updateThreadMetadata` does NOT
- *  persist git info (matches source runtime's documented behaviour that the
- *  local store rejects git-info patches). */
+/** Git info patch. Accepted for signature stability;
+ *  `FileThreadStore.updateThreadMetadata` does NOT persist git info
+ *  (the local store rejects git-info patches). */
 export interface GitInfoPatch {
   readonly sha?: OptionalStringPatch;
   readonly branch?: OptionalStringPatch;
   readonly originUrl?: OptionalStringPatch;
 }
 
-/** Mirror of source runtime `ThreadMetadataPatch` (`types.rs:222`). */
+/** Metadata fields that can be patched on a thread. */
 export interface ThreadMetadataPatch {
   readonly name?: string;
   readonly memoryMode?: ThreadMemoryMode;
   readonly gitInfo?: GitInfoPatch;
 }
 
-/** Mirror of source runtime `UpdateThreadMetadataParams` (`types.rs:233`). */
+/** Parameters for updating thread metadata. */
 export interface UpdateThreadMetadataParams {
   readonly threadId: ThreadId;
   readonly patch: ThreadMetadataPatch;
   readonly includeArchived: boolean;
 }
 
-/** Mirror of source runtime `ArchiveThreadParams` (`types.rs:244`). */
+/** Parameters for archiving a thread. */
 export interface ArchiveThreadParams {
   readonly threadId: ThreadId;
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Error types — mirror of source runtime `thread-store/src/error.rs`.
+// Error types.
 // ─────────────────────────────────────────────────────────────────────
 
 /**
  * Error thrown when a requested thread does not exist in the store.
- * Source runtime: `ThreadStoreError::ThreadNotFound`.
  */
 export class ThreadNotFoundError extends Error {
   readonly threadId: ThreadId;
@@ -249,7 +239,6 @@ export class ThreadNotFoundError extends Error {
 
 /**
  * Error thrown when request data is invalid.
- * Source runtime: `ThreadStoreError::InvalidRequest`.
  */
 export class ThreadStoreInvalidRequestError extends Error {
   constructor(message: string) {
@@ -260,7 +249,6 @@ export class ThreadStoreInvalidRequestError extends Error {
 
 /**
  * Error thrown on state conflicts.
- * Source runtime: `ThreadStoreError::Conflict`.
  */
 class ThreadStoreConflictError extends Error {
   constructor(message: string) {
@@ -270,16 +258,11 @@ class ThreadStoreConflictError extends Error {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// ThreadStore interface — source runtime `trait ThreadStore`.
+// ThreadStore interface.
 // ─────────────────────────────────────────────────────────────────────
 
 /**
  * Storage-neutral thread persistence boundary.
- *
- * Matches the source runtime `ThreadStore` trait
- * (`agenc-rs/thread-store/src/store.rs:20`) method for method. Method
- * names are lower-camel-cased per `docs/plan/translation-conventions.md`;
- * parameter shapes match source runtime.
  */
 export interface ThreadStore {
   createThread(params: CreateThreadParams): void;
@@ -308,6 +291,7 @@ export interface ThreadStore {
 // ─────────────────────────────────────────────────────────────────────
 
 interface RegistryEntry {
+  readonly parentThreadId?: ThreadId;
   readonly threadId: ThreadId;
   readonly name?: string;
   readonly modelProvider?: string;
@@ -360,7 +344,7 @@ export interface FileThreadStoreOpts {
  * (via the caller-supplied `RolloutStore` per thread) in memory, and
  * persists thread metadata in the per-project AgenC state database.
  *
- * Wire-format deviations from source runtime:
+ * Wire-format notes:
  *   - Live archives defer the `archived_sessions/` move until the writer is
  *     no longer registered, preserving the open `RolloutStore` path.
  *   - No on-disk `ThreadNameUpdated` rows: name updates only rewrite the
@@ -426,7 +410,7 @@ export class FileThreadStore implements ThreadStore {
       params.source === undefined
         ? undefined
         : canonicalizeThreadSource(params.source);
-    this.liveRecorders.set(threadId, params.rolloutStore);
+    this.prepareLiveRecorder(params.rolloutStore);
 
     this.updateRegistry((registry) => {
       const now = new Date().toISOString();
@@ -471,6 +455,7 @@ export class FileThreadStore implements ThreadStore {
       };
       registry.set(threadId, entry);
     });
+    this.bindLiveRecorder(threadId, params.rolloutStore);
   }
 
   resumeThread(params: ResumeThreadParams): void {
@@ -492,7 +477,7 @@ export class FileThreadStore implements ThreadStore {
         );
       }
 
-      this.liveRecorders.set(threadId, params.rolloutStore);
+      this.prepareLiveRecorder(params.rolloutStore);
 
       const now = new Date().toISOString();
       const entry: RegistryEntry = {
@@ -531,6 +516,7 @@ export class FileThreadStore implements ThreadStore {
       };
       registry.set(threadId, entry);
     });
+    this.bindLiveRecorder(threadId, params.rolloutStore);
   }
 
   appendItems(params: AppendThreadItemsParams): void {
@@ -559,7 +545,7 @@ export class FileThreadStore implements ThreadStore {
     this.assertOpen();
     const recorder = this.liveRecorderOrThrow(threadId);
     recorder.flushDurable();
-    this.liveRecorders.delete(threadId);
+    this.unbindLiveRecorder(threadId, recorder);
     this.updateRegistry((registry) => {
       const existing = registry.get(threadId);
       if (
@@ -585,12 +571,12 @@ export class FileThreadStore implements ThreadStore {
 
   discardThread(threadId: ThreadId): void {
     this.assertOpen();
-    // Source runtime drops the live entry without flushing. Matches that
-    // contract here: we do NOT call flushDurable.
-    if (!this.liveRecorders.has(threadId)) {
+    // Drops the live entry without flushing: we do NOT call flushDurable.
+    const recorder = this.liveRecorders.get(threadId);
+    if (recorder === undefined) {
       throw new ThreadNotFoundError(threadId);
     }
-    this.liveRecorders.delete(threadId);
+    this.unbindLiveRecorder(threadId, recorder);
   }
 
   loadHistory(params: LoadThreadHistoryParams): StoredThreadHistory {
@@ -803,8 +789,7 @@ export class FileThreadStore implements ThreadStore {
   updateThreadMetadata(params: UpdateThreadMetadataParams): StoredThread {
     this.assertOpen();
     if (params.patch.gitInfo !== undefined) {
-      // Match source runtime behaviour: the local store rejects git-info
-      // patches in this slice (`local/update_thread_metadata.rs:33`).
+      // The local store rejects git-info patches.
       throw new ThreadStoreInvalidRequestError(
         "FileThreadStore does not implement git metadata updates",
       );
@@ -813,8 +798,7 @@ export class FileThreadStore implements ThreadStore {
       params.patch.name !== undefined &&
       params.patch.memoryMode !== undefined
     ) {
-      // Match source runtime behaviour: one field per patch
-      // (`local/update_thread_metadata.rs:39`).
+      // One metadata field per patch.
       throw new ThreadStoreInvalidRequestError(
         "FileThreadStore applies one metadata field per patch",
       );
@@ -913,6 +897,9 @@ export class FileThreadStore implements ThreadStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    for (const recorder of this.liveRecorders.values()) {
+      recorder.setOnRolloutCommitted(undefined);
+    }
     this.liveRecorders.clear();
     this.stateDriver.close();
   }
@@ -1161,6 +1148,37 @@ export class FileThreadStore implements ThreadStore {
       rolloutPath,
       threads: this.threadIndex,
     });
+  }
+
+  /**
+   * Register a live recorder and keep the SQLite mirror current as it
+   * flushes. Sessions normally append via `RolloutStore` directly, so
+   * without this hook the mirror only updates on explicit store calls
+   * (`appendItems`, metadata patches, path lookups).
+   */
+  private bindLiveRecorder(threadId: ThreadId, rolloutStore: RolloutStore): void {
+    rolloutStore.setOnRolloutCommitted((rolloutPath) => {
+      if (this.closed) return;
+      if (this.liveRecorders.get(threadId) !== rolloutStore) return;
+      this.indexRolloutFile(rolloutPath);
+    });
+    this.liveRecorders.set(threadId, rolloutStore);
+  }
+
+  private prepareLiveRecorder(rolloutStore: RolloutStore): void {
+    if (existsSync(rolloutStore.rolloutPath)) {
+      this.indexRolloutFile(rolloutStore.rolloutPath);
+    }
+  }
+
+  private unbindLiveRecorder(
+    threadId: ThreadId,
+    rolloutStore: RolloutStore,
+  ): void {
+    if (this.liveRecorders.get(threadId) === rolloutStore) {
+      this.liveRecorders.delete(threadId);
+    }
+    rolloutStore.setOnRolloutCommitted(undefined);
   }
 
   private archiveRolloutFile(
@@ -1475,6 +1493,7 @@ function toStoredThread(
       : (entry.rolloutPath ?? entry.archivedRolloutPath);
   return {
     threadId: entry.threadId,
+    ...(entry.parentThreadId !== undefined ? { parentThreadId: entry.parentThreadId } : {}),
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     modelProvider: entry.modelProvider ?? defaultModelProviderId,
@@ -1705,6 +1724,7 @@ function normalizeRegistryEntry(value: unknown): RegistryEntry | undefined {
   const source = normalizeThreadSource(value.source);
   return {
     threadId: value.threadId,
+    ...(typeof value.parentThreadId === "string" ? { parentThreadId: value.parentThreadId } : {}),
     createdAt:
       typeof value.createdAt === "string"
         ? value.createdAt

@@ -136,6 +136,27 @@ export class LLMProviderError extends RuntimeError {
   }
 }
 
+/** An authenticated AgenC response bound to this attempt proves no dispatch. */
+export class LLMManagedAdmissionError extends LLMProviderError {
+  constructor(readonly reason: "capacity" | "insufficient_credits" | "credits_unavailable" = "capacity") {
+    const message = reason === "insufficient_credits"
+      ? "Not enough available AgenC model credits for this request. Check your available credits and pending usage in Profile. No new model request was started."
+      : reason === "credits_unavailable"
+        ? "AgenC model credits are unavailable for this account. Check your credit status in Profile. No new model request was started."
+        : "Too many model requests are active. Try again after one finishes. No new model request was started.";
+    super("agenc", message, reason === "capacity" ? 429 : 402);
+    this.name = "LLMManagedAdmissionError";
+  }
+}
+
+/** A recorded managed attempt must be reconciled, not automatically dispatched again. */
+export class LLMManagedUsagePendingError extends LLMProviderError {
+  constructor() {
+    super("agenc", "The model request was recorded, but no usable response was received. Credit usage is pending reconciliation. Retry to start a new request.", 502);
+    this.name = "LLMManagedUsagePendingError";
+  }
+}
+
 /**
  * Error thrown when local tool-turn/message protocol validation fails before
  * sending a request to an external provider.
@@ -345,6 +366,34 @@ export class LLMServerError extends RuntimeError {
 }
 
 /**
+ * Error thrown when a provider stream ends before its terminal event
+ * (`response.completed` / `response.failed`). The transport delivered a clean
+ * end, so no HTTP status or socket code marks the failure, yet nothing
+ * definitive came from the provider: the request is safe to send again, and
+ * the turn's reconnect policy treats it as transient, like `stream_idle`.
+ */
+export class LLMStreamTruncatedError extends LLMProviderError {
+  constructor(providerName: string, message: string) {
+    super(providerName, message);
+    this.name = "LLMStreamTruncatedError";
+  }
+}
+
+/**
+ * Error thrown when the provider refused the shape of a request and the
+ * adapter has already changed its plan for the next attempt (for example
+ * xAI refusing to store a response, after which the conversation is resent
+ * with `store: false`). Nothing was sampled, so the turn's reconnect policy
+ * treats it as transient and the next admitted attempt carries the new plan.
+ */
+export class LLMRequestRebuiltError extends LLMProviderError {
+  constructor(providerName: string, message: string) {
+    super(providerName, message);
+    this.name = "LLMRequestRebuiltError";
+  }
+}
+
+/**
  * Error thrown when a provider transport succeeds but the returned response
  * envelope is malformed or contradicts the requested capability contract.
  */
@@ -487,7 +536,16 @@ export function mapLLMError(
     return new LLMServerError(providerName, 503, message);
   }
 
-  return new LLMProviderError(providerName, message, status);
+  const mapped = new LLMProviderError(providerName, message, status);
+  // Keep the transport error underneath: SDK connection failures carry the
+  // socket-level code (ECONNRESET, UND_ERR_SOCKET, ...) on their own cause,
+  // and the recovery ladder's transient classifier walks the cause chain.
+  // Without it a dropped connection became a bare "Connection error." that
+  // nothing retried, and one blip ended the turn.
+  if (err !== null && typeof err === "object") {
+    (mapped as { cause?: unknown }).cause = err;
+  }
+  return mapped;
 }
 
 /**

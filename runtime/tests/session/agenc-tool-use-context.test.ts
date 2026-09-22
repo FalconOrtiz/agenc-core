@@ -2,6 +2,8 @@ import { describe, expect, test, vi } from "vitest";
 
 import { createAgentRoleWorkspace } from "../agents/role.js";
 import { buildAgenCToolUseContext } from "../session/agenc-tool-use-context.js";
+import { PermissionModeRegistry } from "../permissions/permission-mode.js";
+import { createEmptyToolPermissionContext } from "../permissions/types.js";
 import type { Session } from "../session/session.js";
 import type { TurnContext } from "../session/turn-context.js";
 
@@ -44,6 +46,32 @@ function createSession(overrides: Record<string, unknown> = {}) {
 }
 
 describe("buildAgenCToolUseContext", () => {
+  test("preserves builtin and MCP metadata from the selected registry input", () => {
+    const tools = ["system.echo", "mcp__fixture__echo"].map((name) => ({
+      type: "function" as const,
+      function: {
+        name,
+        description: `Describe ${name}`,
+        parameters: { type: "object", properties: { text: { type: "string" } } },
+      },
+      annotations: { readOnly: true },
+    }));
+    const context = buildAgenCToolUseContext(
+      createSession() as unknown as Session,
+      createTurnContext(),
+      { llmTools: tools },
+    );
+    expect(context.options.tools.map((tool) => tool.name))
+      .toEqual(tools.map((tool) => tool.function.name));
+    expect(context.options.tools.map((tool) => tool.isMcp)).toEqual([false, true]);
+    for (const [index, projected] of context.options.tools.entries()) {
+      expect(projected.function).toBe(tools[index]!.function);
+      expect(projected.description).toBe(tools[index]!.function.description);
+      expect(projected.inputJSONSchema).toBe(tools[index]!.function.parameters);
+      expect(projected).toHaveProperty("annotations", tools[index]!.annotations);
+    }
+  });
+
   test("carries the exact admitted prompt snapshot into tool execution", () => {
     const session = createSession();
     const context = buildAgenCToolUseContext(
@@ -226,5 +254,136 @@ describe("buildAgenCToolUseContext", () => {
 
     sessionAbort.abort("session_shutdown");
     expect(context.abortController.signal.aborted).toBe(true);
+  });
+});
+
+describe("the turn's stop reaches the context", () => {
+  // Desktop soak, 2026-09-06: the context descended from the session's
+  // controller alone, so a cancelled turn's compaction summarizer call ran on
+  // for minutes; stop only landed when the provider gave up.
+  function sessionWithRunningTask(ctx: TurnContext, taskAbort: AbortController, subId = ctx.subId) {
+    return createSession({
+      abortController: new AbortController(),
+      activeTurn: {
+        unsafePeek: () => ({
+          turnId: ctx.subId,
+          tasks: new Map([[subId, { subId, abortController: taskAbort }]]),
+        }),
+      },
+    });
+  }
+
+  test("aborting the turn's task aborts the context", () => {
+    const ctx = createTurnContext();
+    const taskAbort = new AbortController();
+    const context = buildAgenCToolUseContext(
+      sessionWithRunningTask(ctx, taskAbort) as unknown as Session,
+      ctx,
+      { llmTools: [] },
+    );
+
+    expect(context.abortController.signal.aborted).toBe(false);
+    taskAbort.abort("interrupted");
+    expect(context.abortController.signal.aborted).toBe(true);
+  });
+
+  test("aborting the context never stops the turn's task", () => {
+    const ctx = createTurnContext();
+    const taskAbort = new AbortController();
+    const context = buildAgenCToolUseContext(
+      sessionWithRunningTask(ctx, taskAbort) as unknown as Session,
+      ctx,
+      { llmTools: [] },
+    );
+
+    context.abortController.abort("tool runtime done");
+    expect(taskAbort.signal.aborted).toBe(false);
+  });
+
+  test("another turn's task is not this context's parent", () => {
+    const ctx = createTurnContext();
+    const otherTaskAbort = new AbortController();
+    const session = sessionWithRunningTask(ctx, otherTaskAbort, "some-other-turn");
+    const context = buildAgenCToolUseContext(
+      session as unknown as Session,
+      ctx,
+      { llmTools: [] },
+    );
+
+    otherTaskAbort.abort("interrupted");
+    expect(context.abortController.signal.aborted).toBe(false);
+    (session.abortController as AbortController).abort("session_shutdown");
+    expect(context.abortController.signal.aborted).toBe(true);
+  });
+});
+
+describe("daemon sessions route tool permission changes through the registry", () => {
+  test("EnterPlanMode's update lands in the registry and is visible to the next read", async () => {
+    const registry = new PermissionModeRegistry(createEmptyToolPermissionContext());
+    const changes: string[] = [];
+    registry.subscribeToModeChange((next, previous) => {
+      changes.push(`${previous}->${next}`);
+    });
+    const session = createSession({
+      permissionModeRegistry: registry,
+      services: {
+        registry: { toLLMTools: () => [] },
+        provider: undefined,
+        permissionModeRegistry: registry,
+        skillsManager: {
+          skillsForConfig: vi.fn(async () => ({ invokedSkills: [] })),
+        },
+      },
+    });
+    const context = buildAgenCToolUseContext(
+      session as unknown as Session,
+      createTurnContext(),
+      { llmTools: [] },
+    );
+    const before = context.getAppState().toolPermissionContext as {
+      readonly mode: string;
+    };
+    expect(before.mode).toBe("default");
+    expect(context.setAppState).toBeDefined();
+
+    context.setAppState!((prev: { toolPermissionContext: Record<string, unknown> }) => ({
+      ...prev,
+      toolPermissionContext: {
+        ...prev.toolPermissionContext,
+        mode: "plan",
+        prePlanMode: "default",
+      },
+    }));
+    await vi.waitFor(() => expect(registry.current().mode).toBe("plan"));
+    expect(
+      (context.getAppState().toolPermissionContext as { mode: string }).mode,
+    ).toBe("plan");
+    expect(changes).toEqual(["default->plan"]);
+
+    // ExitPlanMode compares against the snapshot it read; a stale snapshot
+    // must not move the live context.
+    context.setAppState!((prev: { toolPermissionContext: unknown }) =>
+      prev.toolPermissionContext === before
+        ? { ...prev, toolPermissionContext: { mode: "acceptEdits" } }
+        : prev,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(registry.current().mode).toBe("plan");
+    expect(changes).toEqual(["default->plan"]);
+
+    // Returning the same snapshot publishes nothing.
+    context.setAppState!((prev: unknown) => prev);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(changes).toEqual(["default->plan"]);
+  });
+
+  test("an explicit app-state store still wins", () => {
+    const setAppState = vi.fn();
+    const context = buildAgenCToolUseContext(
+      createSession({ setAppState }) as unknown as Session,
+      createTurnContext(),
+      { llmTools: [] },
+    );
+    expect(context.setAppState).toBe(setAppState);
   });
 });

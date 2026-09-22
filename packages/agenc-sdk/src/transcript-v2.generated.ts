@@ -40,6 +40,56 @@ export interface SessionTranscriptV2TurnResult extends TranscriptV2JsonObject {
   readonly provider?: string;
 }
 
+export interface SessionTranscriptV2Event extends TranscriptV2JsonObject {
+  readonly eventId: string;
+  readonly committedSequence: number;
+  readonly type: "token_count" | "session_usage" | "turn_failed" | "turn_aborted";
+  readonly payload: {
+    readonly runId?: string;
+    readonly sequence?: number;
+    readonly costUsd?: number;
+    readonly heldCostUsd?: number;
+    readonly inputTokens?: number;
+    readonly outputTokens?: number;
+    readonly modelCalls?: number;
+    readonly hasUnknownCost?: boolean;
+    readonly models?: readonly {
+      readonly model: string;
+      readonly provider?: string;
+      readonly costUsd: number;
+      readonly heldCostUsd: number;
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly totalTokens: number;
+      readonly modelCalls: number;
+      readonly hasUnknownCost: boolean;
+    }[];
+    readonly agents?: readonly {
+      readonly runId: string;
+      readonly costUsd: number;
+      readonly heldCostUsd: number;
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly totalTokens: number;
+      readonly modelCalls: number;
+      readonly hasUnknownCost: boolean;
+    }[];
+    readonly promptTokens?: number;
+    readonly completionTokens?: number;
+    readonly totalTokens?: number;
+    readonly cachedInputTokens?: number;
+    readonly cacheCreationInputTokens?: number;
+    readonly reasoningOutputTokens?: number;
+    readonly webSearchRequests?: number;
+    readonly model?: string;
+    readonly provider?: string;
+    readonly turnId?: string;
+    readonly code?: string;
+    readonly message?: string;
+    readonly reason?: string;
+  };
+}
+
 export interface SessionTranscriptV2Result extends TranscriptV2JsonObject {
   readonly schemaVersion: 2;
   readonly sessionId: string;
@@ -49,4 +99,13 @@ export interface SessionTranscriptV2Result extends TranscriptV2JsonObject {
   readonly messages: readonly SessionTranscriptV2Message[];
   readonly activeTurn?: SessionTranscriptV2ActiveTurn;
   readonly turnResults?: readonly SessionTranscriptV2TurnResult[];
+  readonly events?: readonly SessionTranscriptV2Event[];
+  /**
+   * Plan-mode state at `asOfSequence`, taken from the latest
+   * run_runtime_settings_changed event in the same history the transcript was
+   * rebuilt from. Absent when that history holds no settings event. A client
+   * that receives it needs no run-journal replay to learn it.
+   */
+  readonly planModeActive?: boolean;
+  readonly planModeSequence?: number;
 }

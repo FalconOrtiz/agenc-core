@@ -278,6 +278,55 @@ function mkRegistry(tools: Tool[]): ToolRegistry {
 }
 
 describe("streamModel — live assistant text sanitization", () => {
+  test("captures the immutable prepared tool catalog before provider callbacks", async () => {
+    const ctx = mkCtx();
+    const state = mkState(ctx);
+    const tools: LLMTool[] = [{ type: "function", function: { name: "system.searchTools",
+      description: "Search", parameters: { type: "object" } } }];
+    const provider = mkProvider(async (_messages, onChunk) => {
+      expect(state.samplingRequestToolNames).toEqual(["system.searchTools"]);
+      expect(Object.isFrozen(state.samplingRequestToolNames)).toBe(true);
+      tools.push({ type: "function", function: { name: "Skill", description: "Skill", parameters: {} } });
+      onChunk({ content: "done", done: true });
+      return { content: "done", toolCalls: [], usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 }, model: "test-model", finishReason: "stop" };
+    });
+    const { session } = mkSession(provider);
+    await streamModel(state, ctx, session, { ...mkRequest([{ role: "user", content: "hello" }]), tools });
+    expect(tools).toHaveLength(2);
+    expect(state.samplingRequestToolNames).toEqual(["system.searchTools"]);
+  });
+
+  test.each([
+    ["gemini-3.1-pro-preview", "high", true],
+    ["gemini-3.1-pro-preview", "xhigh", false],
+    ["gemini-3.5-flash", "minimal", true],
+  ] as const)("uses the live Gemini selection for %s %s", async (model, effort, accepted) => {
+    const baseContext = mkCtx();
+    const context = {
+      ...baseContext,
+      provider: { name: "grok" },
+      modelInfo: { ...baseContext.modelInfo, slug: "gemini-3.1-pro-preview" },
+      reasoningEffort: effort,
+    } as TurnContext;
+    const dispatch = vi.fn(async () => ({
+      content: "ok",
+      toolCalls: [],
+      model,
+      finishReason: "stop" as const,
+    }));
+    const provider = { ...mkProvider(dispatch), name: "gemini" };
+    const { session: baseSession } = mkSession(provider);
+    const session = { ...baseSession, config: { model } } as Session;
+    const result = streamModel(mkState(context), context, session, mkRequest([{ role: "user", content: "fixture" }]));
+    if (accepted) {
+      await result;
+      expect(dispatch).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ reasoningEffort: effort }));
+    } else {
+      await expect(result).rejects.toThrow(/reasoning effort/iu);
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+  });
+
   test("writes provider text deltas to the assistant output sink", async () => {
     const ctx = mkCtx("chat");
     const state = mkState(ctx);
@@ -1485,10 +1534,8 @@ describe("streamModel — token budget boundary semantics", () => {
 describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
   // Regression guard. `run-turn.ts` reads `SessionState.totalTokenUsage`
   // via `getTotalTokenUsage(session)` to drive the mid-turn compact gate
-  // (`total_usage_tokens >= auto_compact_limit`). Upstream agenc runtime
-  // maintains a real cross-turn accumulator
-  // (`Session::update_token_info_from_usage`,
-  // `TokenUsageInfo::append_last_usage` at protocol.rs:2294-2297); AgenC
+  // (`total_usage_tokens >= auto_compact_limit`). The session
+  // maintains a real cross-turn accumulator; AgenC
   // used to read an unwritten field and papered over the miss with
   // `Math.max(sessionTotal, usage.totalTokens)` in the mid-turn arm. The
   // writer now lives in `streamModel` right after the per-turn usage
@@ -1523,7 +1570,7 @@ describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
       // totalTokens. Provider may surface cache/reasoning fields as
       // structural extras alongside the LLMUsage base contract; the
       // writer reads those optimistically so the accumulator stays
-      // aligned with agenc runtime's 5-field TokenUsage shape.
+      // aligned with the 5-field TokenUsage shape.
       if (call === 1) {
         return {
           content: "first",
@@ -1654,10 +1701,8 @@ describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
     const ctx = mkCtx("chat");
     const provider = mkProvider(async () =>
       parseAnthropicMessagesResponse(
-        // branding-scan: allow documented Anthropic API model identifier
         "claude-sonnet-4-5",
         {
-          // branding-scan: allow documented Anthropic API model identifier
           model: "claude-sonnet-4-5",
           content: [{ type: "text", text: "ok" }],
           stop_reason: "end_turn",
@@ -1670,7 +1715,6 @@ describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
           },
         },
         {
-          // branding-scan: allow documented Anthropic API model identifier
           model: "claude-sonnet-4-5",
           messages: [{ role: "user", content: "search" }],
           tools: [],
@@ -1691,7 +1735,6 @@ describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
     expect(sidecar.getPerModelUsage()).toMatchObject([
       {
         provider: "stub-provider",
-        // branding-scan: allow documented Anthropic API model identifier
         model: "claude-sonnet-4-5",
         inputTokens: 1000,
         outputTokens: 500,
@@ -1707,9 +1750,9 @@ describe("streamModel — SessionState.totalTokenUsage accumulator", () => {
 
   test("survives a non-compacting turn — a third call keeps adding onto the prior two", async () => {
     // Regression guard against a naive reset-per-turn implementation.
-    // agenc runtime's accumulator is additive across the whole session; the
-    // only agenc runtime reset paths are `recompute_token_usage` (after
-    // compaction) and `fill_to_context_window`, neither of which runs
+    // The accumulator is additive across the whole session; the
+    // only reset paths are the post-compaction recompute and the
+    // fill-to-context-window path, neither of which runs
     // on a plain non-compacting turn.
     const ctx = mkCtx("chat");
     const provider = mkProvider(async () => {

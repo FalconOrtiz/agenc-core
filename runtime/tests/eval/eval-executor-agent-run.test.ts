@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
+import { validateAgentRunReport } from "../../src/eval-executor/agent-run-report.js";
 import {
   runAgentOnTask,
   EvalExecutorError,
@@ -187,6 +188,7 @@ async function makeOverlay(): Promise<string> {
   );
   await mkdir(runtimeBin, { recursive: true });
   await writeFile(path.join(runtimeBin, "agenc.js"), "// fake agent build\n");
+  await writeFile(path.join(runtimeBin, "..", "VERSION"), "0.17.0\n");
   await mkdir(path.join(dir, "mock"), { recursive: true });
   await writeFile(path.join(dir, "mock", "serve.mjs"), "");
   return dir;
@@ -231,6 +233,7 @@ describe("eval executor agent run", () => {
       expect(new TextDecoder().decode(patchBytes!)).toBe(PATCH);
       expect(report.verification).not.toBeNull();
       expect(report.reportDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      expect(validateAgentRunReport(report, EMPTY_SETUP.task)).toEqual(report);
       // Agent container carries only the overlay mount; verification runs
       // with no mounts. (Network isolation is unconditional in the runner.)
       expect(runner.createOptions[0]!.readOnlyMounts).toHaveLength(1);
@@ -276,6 +279,18 @@ describe("eval executor agent run", () => {
       const { report } = await runAgentOnTask(runner, EMPTY_SETUP, config);
       expect(report.outcome).toBe("verification_failure");
       expect(report.failureDetail).toContain("target-1");
+    });
+  });
+
+  test("a failed verifier container still produces a complete resumable failure report", async () => {
+    await withOverlay(async (config) => {
+      const runner = new FakeAgentRunner([
+        { kind: "agent", agentResultJson: AGENT_RESULT, patchDiff: PATCH },
+      ]);
+      const { report } = await runAgentOnTask(runner, EMPTY_SETUP, config);
+      expect(report.outcome).toBe("infrastructure_error");
+      expect(report.verification).toMatchObject({ imageDigest: "", commands: [], testResults: null });
+      expect(validateAgentRunReport(report, EMPTY_SETUP.task)).toEqual(report);
     });
   });
 

@@ -2,8 +2,7 @@
  * Auth-refresh retry wrapper for the Grok compatible
  * Responses API adapter.
  *
- * Hand-port of agenc runtime `core/src/client.rs::stream_responses` retry loop
- * (lines 1154-1211). On an HTTP 401 from the provider, the adapter
+ * On an HTTP 401 from the provider, the adapter
  * must ask its `AuthManager` for a refreshed token, rebuild the
  * request with the new bearer, and retry — exactly once per
  * token-refresh attempt, up to a bounded number of attempts.
@@ -13,7 +12,7 @@
  *        orthogonal to auth refresh; handled by `incremental.ts`.
  *        This module handles ONLY 401 auth recovery.
  *
- * The retry loop has three exit paths (matching agenc runtime 1191-1208):
+ * The retry loop has three exit paths:
  *   - Ok(stream)                      → return to caller
  *   - Err(401 with recovery available) → refresh + continue
  *   - Err(other)                       → map + throw
@@ -26,11 +25,12 @@
  * @module
  */
 
+import { readXaiBillingRefusal } from "./billing-refusal.js";
+
 /**
- * Default max refresh attempts. Matches agenc runtime's implicit cap: agenc runtime
- * loops only while the AuthManager returns a `RecoveryDecision`, and
- * the manager's own state machine limits to ~2 refresh attempts
- * before surfacing the failure (see agenc runtime `AuthManager::unauthorized_recovery`).
+ * Default max refresh attempts. The auth manager's own state machine
+ * limits recovery to about two refresh attempts before surfacing the
+ * failure, so the loop caps at the same number.
  */
 const DEFAULT_MAX_AUTH_REFRESHES = 2;
 
@@ -49,9 +49,13 @@ export function isUnauthorizedError(error: unknown): error is UnauthorizedError 
   // xAI returns 403 (not 401) for an expired OAuth bearer — observed in
   // production: sessions died silently with zero events because the
   // refresh hook never fired. Treat 403 the same: refresh once and retry;
-  // a genuine permission/quota 403 simply fails again after the single
-  // retry and bubbles up unchanged.
-  return status === 401 || status === 403;
+  // a genuine permission 403 simply fails again after the single retry and
+  // bubbles up unchanged. A billing refusal (out of credits, spending limit)
+  // is a 403 that no refresh can lift, so it is not refreshed at all.
+  return (
+    (status === 401 || status === 403) &&
+    readXaiBillingRefusal(error) === undefined
+  );
 }
 
 /**
@@ -101,9 +105,6 @@ export interface RetryWithAuthRefreshOptions {
  *   authCallbacks,
  * );
  * ```
- *
- * Mirrors agenc runtime's `loop { client_setup = current_client_setup(); ...
- * if 401 { handle_unauthorized; continue; } else { ... } }`.
  */
 export async function retryWithAuthRefresh<T>(
   initialBearer: string,

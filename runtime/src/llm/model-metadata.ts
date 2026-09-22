@@ -3,6 +3,7 @@ import {
 } from "../config/resolve-provider.js";
 import type { AgenCConfig } from "../config/schema.js";
 import { resolveModelCatalogMetadata } from "./registry/model-catalog.js";
+import { rememberSuccessfulLookup } from "./remember-successful-lookup.js";
 import { normalizeProviderMetadataIdentity } from "../provider-identity.js";
 import {
   resolveProviderApiKeyEnvironment,
@@ -19,6 +20,7 @@ import {
   getOpenAICompatibleMaxOutputTokens,
   OPENAI_COMPATIBLE_FALLBACK_CONTEXT_WINDOW,
 } from "./openai-compatible-token-limits.js";
+import { OLLAMA_CLOUD_BASE_URL } from "./registry/ollama-cloud-models.js";
 import { asRecord } from "../utils/record.js";
 
 export const CONSERVATIVE_CONTEXT_WINDOW_TOKENS =
@@ -36,9 +38,13 @@ const LIVE_METADATA_PROVIDERS = new Set([
   "lmstudio",
   "openai-compatible",
   "ollama",
+  "ollama-cloud",
   "groq",
   "deepseek",
   "meta",
+  "qwen",
+  "qwen-token-plan",
+  "cerebras",
 ]);
 
 export type ModelMetadataSource =
@@ -79,6 +85,7 @@ interface ModelMetadataValues {
   readonly maxOutputTokens?: number;
   readonly maxOutputTokensUpperLimit?: number;
   readonly maxOutputTokensExplicit?: boolean;
+  readonly maxOutputTokensCappedDefault?: boolean;
 }
 
 interface FetchJsonOptions {
@@ -87,12 +94,18 @@ interface FetchJsonOptions {
   readonly jsonBody?: Readonly<Record<string, unknown>>;
 }
 
+type MetadataJson = object | string | number | boolean | null;
+
 export class ModelMetadataResolver {
   private readonly fetchImpl?: typeof fetch;
   private readonly env: Readonly<Record<string, string | undefined>>;
   private readonly timeoutMs: number;
   private readonly onWarn?: (msg: string) => void;
-  private readonly jsonCache = new Map<string, Promise<unknown | undefined>>();
+  private readonly inFlightJson = new Map<
+    string,
+    Promise<MetadataJson | undefined>
+  >();
+  private readonly jsonCache = new Map<string, MetadataJson | undefined>();
   private readonly warnedInvalidEnv = new Set<string>();
 
   constructor(options: ModelMetadataResolverOptions = {}) {
@@ -185,15 +198,24 @@ export class ModelMetadataResolver {
     source: ModelMetadataSource,
     usedFallbackModelMetadata: boolean,
   ): ResolvedModelMetadata {
+    // An explicit output cap overrides that field, not the model's remaining
+    // metadata. Dropping its known context window makes session admission fail.
+    const mergedMetadata = source === "explicit_config"
+      ? { ...inferBuiltInMetadata(params.provider, params.model), ...metadata }
+      : metadata;
+    const effectiveMetadata = applyRegisteredModelOutputContract(
+      params,
+      mergedMetadata,
+    );
     const output = resolveEffectiveOutputTokens({
       config: params.config,
       env: this.env,
-      metadata,
+      metadata: effectiveMetadata,
       onWarn: this.warnOnce.bind(this),
     });
     return {
-      ...(metadata.contextWindow !== undefined
-        ? { contextWindow: metadata.contextWindow }
+      ...(mergedMetadata.contextWindow !== undefined
+        ? { contextWindow: mergedMetadata.contextWindow }
         : {}),
       maxOutputTokens: output.maxOutputTokens,
       maxOutputTokensUpperLimit: output.maxOutputTokensUpperLimit,
@@ -218,10 +240,11 @@ export class ModelMetadataResolver {
     if (!shouldQueryLiveEndpoint(params, this.env)) return undefined;
     const baseUrl = providerBaseUrl(params.config, provider, this.env);
     if (!baseUrl) return undefined;
+    if (provider === "ollama-cloud" && baseUrl.replace(/\/+$/, "") !== OLLAMA_CLOUD_BASE_URL) return undefined;
     const headers = authHeaders(provider, this.env);
     // Ollama serves no context length over its OpenAI-compatible surface, so
     // the native endpoint is the only place the real number exists.
-    if (provider !== "ollama") {
+    if (provider !== "ollama" && provider !== "ollama-cloud") {
       const response = await this.fetchJson(modelsUrlFromBaseUrl(baseUrl), {
         headers,
       });
@@ -277,22 +300,23 @@ export class ModelMetadataResolver {
   private async fetchJson(
     url: string,
     options: FetchJsonOptions = {},
-  ): Promise<unknown | undefined> {
+  ): Promise<MetadataJson | undefined> {
     if (!this.fetchImpl) return undefined;
     const cacheKey = `${url}\n${JSON.stringify(options.headers ?? {})}\n${
       JSON.stringify(options.jsonBody ?? null)
     }`;
-    const cached = this.jsonCache.get(cacheKey);
-    if (cached) return await cached;
-    const request = this.fetchJsonUncached(url, options);
-    this.jsonCache.set(cacheKey, request);
-    return await request;
+    return await rememberSuccessfulLookup(
+      { inFlight: this.inFlightJson, success: this.jsonCache },
+      cacheKey,
+      () => this.fetchJsonUncached(url, options),
+      (value) => value !== undefined,
+    );
   }
 
   private async fetchJsonUncached(
     url: string,
     options: FetchJsonOptions,
-  ): Promise<unknown | undefined> {
+  ): Promise<MetadataJson | undefined> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -317,6 +341,60 @@ export class ModelMetadataResolver {
       clearTimeout(timeout);
     }
   }
+}
+
+function applyRegisteredModelOutputContract(
+  params: Pick<LookupParams, "provider" | "model">,
+  metadata: ModelMetadataValues,
+): ModelMetadataValues {
+  const catalog = resolveModelCatalogMetadata({
+    provider: normalizeMetadataProviderIdentity(params.provider),
+    model: params.model,
+  });
+  if (catalog?.maxOutputTokens === undefined) return metadata;
+
+  const catalogUpper =
+    catalog.maxOutputTokensUpperLimit ?? catalog.maxOutputTokens;
+  if (metadata.maxOutputTokens === undefined) {
+    return {
+      ...metadata,
+      maxOutputTokens: catalog.maxOutputTokens,
+      maxOutputTokensUpperLimit: catalogUpper,
+      ...(catalog.maxOutputTokensCappedDefault !== undefined
+        ? {
+          maxOutputTokensCappedDefault:
+            catalog.maxOutputTokensCappedDefault,
+        }
+        : {}),
+    };
+  }
+
+  const effectiveUpper = Math.min(
+    metadata.maxOutputTokensUpperLimit ?? metadata.maxOutputTokens,
+    catalogUpper,
+  );
+  if (
+    catalog.maxOutputTokensCappedDefault === true &&
+    metadata.maxOutputTokensExplicit !== true
+  ) {
+    return {
+      ...metadata,
+      maxOutputTokens: boundedOutputTokens(
+        catalog.maxOutputTokens,
+        effectiveUpper,
+      ),
+      maxOutputTokensUpperLimit: effectiveUpper,
+      maxOutputTokensCappedDefault: true,
+    };
+  }
+  return {
+    ...metadata,
+    maxOutputTokens: boundedOutputTokens(
+      metadata.maxOutputTokens,
+      effectiveUpper,
+    ),
+    maxOutputTokensUpperLimit: effectiveUpper,
+  };
 }
 
 export function readExplicitProviderContextWindowTokens(
@@ -348,6 +426,10 @@ function shouldPreferDynamicMetadata(
   env: Readonly<Record<string, string | undefined>>,
 ): boolean {
   const provider = normalizeMetadataProviderIdentity(params.provider);
+  // Z.AI's curated catalog is authoritative even when an operator overrides
+  // the API base URL. `/models` remains a credential health probe, but its
+  // list does not replace exact context/output limits here.
+  if (provider === "zai" || provider === "zai-coding-plan" || provider === "ollama-cloud") return false;
   return provider === "openrouter" || shouldQueryLiveEndpoint(params, env);
 }
 
@@ -361,6 +443,7 @@ function shouldQueryLiveEndpoint(
     provider === "lmstudio" ||
     provider === "openai-compatible" ||
     provider === "ollama" ||
+    provider === "ollama-cloud" ||
     Boolean(providerConfig?.base_url?.trim()) ||
     Boolean(envBaseUrl(provider, env))
   );
@@ -399,6 +482,12 @@ function mergeLiveEndpointMetadata(
         ...(explicit.maxOutputTokensExplicit !== undefined
           ? { maxOutputTokensExplicit: explicit.maxOutputTokensExplicit }
           : {}),
+        ...(explicit.maxOutputTokensCappedDefault !== undefined
+          ? {
+            maxOutputTokensCappedDefault:
+              explicit.maxOutputTokensCappedDefault,
+          }
+          : {}),
       }
       : live.maxOutputTokens !== undefined
         ? {
@@ -407,6 +496,12 @@ function mergeLiveEndpointMetadata(
             live.maxOutputTokensUpperLimit ?? live.maxOutputTokens,
           ...(live.maxOutputTokensExplicit !== undefined
             ? { maxOutputTokensExplicit: live.maxOutputTokensExplicit }
+            : {}),
+          ...(live.maxOutputTokensCappedDefault !== undefined
+            ? {
+              maxOutputTokensCappedDefault:
+                live.maxOutputTokensCappedDefault,
+            }
             : {}),
         }
         : {}),
@@ -470,6 +565,13 @@ const OPENAI_COMPATIBLE_METADATA_PROVIDERS = new Set([
   "groq",
   "deepseek",
   "meta",
+  "qwen",
+  "qwen-token-plan",
+  "cerebras",
+  "ollama-cloud",
+  "zai",
+  "zai-coding-plan",
+  "kimi",
   "gemini",
   "ollama",
 ]);
@@ -485,6 +587,20 @@ function inferBuiltInMetadata(
     model,
   });
   if (hasAnyMetadata(catalog)) {
+    if (
+      normalizedProvider === "kimi" &&
+      /^kimi-k2\.(?:7-code(?:-highspeed)?|6)$/u.test(normalizedModel)
+    ) {
+      // Moonshot recommends 32,768 output tokens for long thinking tasks but
+      // does not publish a K2.x model maximum. Keep that as the runtime
+      // reservation while retaining the existing 64k harness safety ceiling;
+      // the curated catalog deliberately does not claim an upstream maximum.
+      return {
+        ...catalog,
+        maxOutputTokens: 32_768,
+        maxOutputTokensUpperLimit: DEFAULT_MAX_OUTPUT_TOKENS_UPPER_LIMIT,
+      };
+    }
     return catalog;
   }
   if (OPENAI_COMPATIBLE_METADATA_PROVIDERS.has(normalizedProvider)) {
@@ -856,6 +972,48 @@ function normalizePositiveInteger(value: unknown): number | undefined {
   return undefined;
 }
 
+/**
+ * Largest share of a context window an output reservation may claim.
+ *
+ * The reservation and the prompt come out of the same window, so a default
+ * that claims most of it leaves no room to be prompted at all.
+ */
+export const MAX_OUTPUT_TOKENS_WINDOW_FRACTION = 0.5;
+
+/**
+ * Hold an output reservation inside the window it has to share with a prompt.
+ *
+ * `getModelMaxOutputTokens` picks the reservation from the model name and
+ * never sees the context window, so an uncatalogued model takes the 32,000
+ * default whatever its window is. On a local runtime that window is routinely
+ * 32k, and admission compares prompt + reservation against it: 32,000 reserved
+ * against a measured 31,129-token window is refused before a single byte of
+ * prompt exists, so every turn is denied `context_window_exceeded` and no
+ * local model can answer at all.
+ *
+ * Half is the split, so the prompt always has as much of the window as the
+ * answer. Nothing catalogued moves: this only binds when the reservation is
+ * more than half the window, which for the 32,000 default means windows under
+ * 64k, and every catalogued hosted model is 128k or larger. It is the models
+ * with no catalogue entry, which is every local one, that this rescues.
+ */
+export function fitOutputTokensToContextWindow(
+  maxOutputTokens: number,
+  contextWindow: number | undefined,
+): number {
+  if (
+    contextWindow === undefined ||
+    !Number.isFinite(contextWindow) ||
+    contextWindow <= 0
+  ) {
+    return maxOutputTokens;
+  }
+  const cap = Math.floor(contextWindow * MAX_OUTPUT_TOKENS_WINDOW_FRACTION);
+  // A window too small to halve is already unusable; never return 0, which
+  // reads downstream as "no reservation configured" rather than a small one.
+  return Math.max(1, Math.min(maxOutputTokens, cap));
+}
+
 interface EffectiveOutputTokens {
   readonly maxOutputTokens: number;
   readonly maxOutputTokensUpperLimit: number;
@@ -875,14 +1033,18 @@ function resolveEffectiveOutputTokens(params: {
     metadata.maxOutputTokensUpperLimit ??
     metadata.maxOutputTokens ??
     DEFAULT_MAX_OUTPUT_TOKENS_UPPER_LIMIT;
+  const fit = (tokens: number): number =>
+    fitOutputTokensToContextWindow(tokens, metadata.contextWindow);
 
   if (
     metadata.maxOutputTokens !== undefined &&
     metadata.maxOutputTokensExplicit === true
   ) {
     return {
-      maxOutputTokens: metadata.maxOutputTokens,
-      maxOutputTokensUpperLimit: metadata.maxOutputTokens,
+      maxOutputTokens: fit(
+        boundedOutputTokens(metadata.maxOutputTokens, metadataUpper),
+      ),
+      maxOutputTokensUpperLimit: metadataUpper,
       maxOutputTokensExplicit: true,
       maxOutputTokensCappedDefault: false,
     };
@@ -893,18 +1055,27 @@ function resolveEffectiveOutputTokens(params: {
   const explicitOverride = envOverride ?? configOverride;
   if (explicitOverride !== undefined) {
     return {
-      maxOutputTokens: boundedOutputTokens(explicitOverride, metadataUpper),
+      maxOutputTokens: fit(
+        boundedOutputTokens(explicitOverride, metadataUpper),
+      ),
       maxOutputTokensUpperLimit: metadataUpper,
       maxOutputTokensExplicit: true,
       maxOutputTokensCappedDefault: false,
     };
   }
 
-  if (params.config.capped_default_max_output_tokens === true) {
+  if (
+    metadata.maxOutputTokensCappedDefault === true ||
+    params.config.capped_default_max_output_tokens === true
+  ) {
     return {
-      maxOutputTokens: boundedOutputTokens(
-        CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
-        metadataUpper,
+      maxOutputTokens: fit(
+        boundedOutputTokens(
+          metadata.maxOutputTokensCappedDefault === true
+            ? metadataDefault
+            : CAPPED_DEFAULT_MAX_OUTPUT_TOKENS,
+          metadataUpper,
+        ),
       ),
       maxOutputTokensUpperLimit: metadataUpper,
       maxOutputTokensExplicit: false,
@@ -913,7 +1084,7 @@ function resolveEffectiveOutputTokens(params: {
   }
 
   return {
-    maxOutputTokens: boundedOutputTokens(metadataDefault, metadataUpper),
+    maxOutputTokens: fit(boundedOutputTokens(metadataDefault, metadataUpper)),
     maxOutputTokensUpperLimit: metadataUpper,
     maxOutputTokensExplicit: false,
     maxOutputTokensCappedDefault: false,

@@ -7,7 +7,7 @@
  *   - sorted, capped file-path output with donor-compatible empty and
  *     truncation text
  *
- * Shape differences from the donor runtime:
+ * Shape differences:
  *   - AgenC returns plain `ToolResult.content` instead of a structured
  *     tool-result block.
  *   - Paths are relativized to the nearest allowed workspace root so nested
@@ -19,6 +19,13 @@
  */
 
 import { promises as fs } from "node:fs";
+import {
+  hasReadOnlyDelegationReadGuard,
+  readOnlyDelegationReadAuthorityCurrent,
+  readOnlyDelegationReadPathAllowed,
+} from "../../permissions/readonly-read-guard.js";
+import { collectGuardedSearchCandidates } from "./guarded-search-candidates.js";
+import { createSearchIgnoreMatcher, pinnedSnapshotPathEligibility } from "./grep.js";
 import {
   basename,
   dirname,
@@ -70,12 +77,8 @@ import {
   type RipgrepWireParser,
 } from "./ripgrep-protocol.js";
 import {
-  beginWorkspaceReadToolOperation,
-  endWorkspaceToolOperation,
-  type WorkspaceToolOperationToken,
-} from "../../workspace/mutation-coordinator.js";
-import {
   bindWorkspaceDirectoryReadCapability,
+  workspaceBoundReadOnlyCwd,
   type WorkspaceBoundReadCapability,
   type WorkspaceBoundReadIdentity,
 } from "../../workspace/file-mutation-transaction.js";
@@ -473,6 +476,7 @@ function assertRipgrepFilesArgvWithinLimits(
 const BOUND_RIPGREP_COMMAND_CWD = ".";
 
 function prepareBoundRipgrepFilesCommand(params: {
+  readonly readCapability?: WorkspaceBoundReadCapability;
   readonly toolArgs: Record<string, unknown>;
   readonly fallbackCwd: string;
   readonly program: string;
@@ -488,6 +492,7 @@ function prepareBoundRipgrepFilesCommand(params: {
     // transformed command off live absolute pathnames.
     cwd: BOUND_RIPGREP_COMMAND_CWD,
     cwdBinding: "inherited_readonly",
+    ...(params.readCapability === undefined ? {} : { cwdCapability: workspaceBoundReadOnlyCwd(params.readCapability) }),
     env: params.env,
   });
   return command;
@@ -562,6 +567,7 @@ async function runRipgrepFilesWithIgnorePaths(
     let command: SandboxSpawnCommand | SandboxPreparedSpawn;
     try {
       command = prepareBoundRipgrepFilesCommand({
+        readCapability: params.readCapability,
         toolArgs: params.toolArgs,
         fallbackCwd: params.cwd,
         program: params.command,
@@ -799,11 +805,13 @@ const MATCH_VALIDATION_CONCURRENCY = 16;
 async function validateMatch(params: {
   readonly match: Buffer;
   readonly target: ResolvedGlobTarget;
+  readonly toolArgs?: object;
   readonly readCapability?: WorkspaceBoundReadCapability;
 }): Promise<string | undefined> {
   const normalizedBytes = normalizeRelativeRipgrepPathBytes(params.match);
   if (!isSafeRelativeRipgrepPathBytes(normalizedBytes)) return undefined;
   const decoded = decodeRipgrepPathBytes(normalizedBytes);
+  if (params.toolArgs !== undefined && (decoded === undefined || !readOnlyDelegationReadPathAllowed(params.toolArgs, resolve(params.target.displayRoot, decoded)))) return undefined;
   if (params.readCapability !== undefined) {
     if (decoded === undefined) return undefined;
     const absolute = resolve(params.target.displayRoot, decoded);
@@ -821,6 +829,7 @@ async function validateMatch(params: {
     } catch {
       return undefined;
     }
+    if (params.toolArgs !== undefined && !readOnlyDelegationReadPathAllowed(params.toolArgs, absolute)) return undefined;
     return renderRipgrepPathBytes(normalizedBytes);
   }
   if (decoded === undefined) {
@@ -837,6 +846,7 @@ async function validateMatch(params: {
 async function normalizeAndFilterMatches(params: {
   readonly matches: readonly Buffer[];
   readonly target: ResolvedGlobTarget;
+  readonly toolArgs?: object;
   readonly readCapability?: WorkspaceBoundReadCapability;
 }): Promise<readonly string[]> {
   const safeMatches: string[] = [];
@@ -854,6 +864,7 @@ async function normalizeAndFilterMatches(params: {
         validateMatch({
           match,
           target: params.target,
+          toolArgs: params.toolArgs,
           ...(params.readCapability !== undefined
             ? { readCapability: params.readCapability }
             : {}),
@@ -1004,9 +1015,9 @@ export function createGlobTool(
       if ("error" in target) {
         return errorResult(target.error);
       }
+      if (!readOnlyDelegationReadPathAllowed(rawArgs, target.searchRoot)) return errorResult("Access denied: search path is outside delegated read authority");
       let readCapability: WorkspaceBoundReadCapability | undefined;
       let enumerationCapability: WorkspaceBoundReadCapability | undefined;
-      let toolOperation: WorkspaceToolOperationToken | undefined;
       const bindReadCapabilities = async (): Promise<void> => {
         await beforeReadCapabilityBind?.();
         readCapability = await bindWorkspaceDirectoryReadCapability(
@@ -1021,21 +1032,14 @@ export function createGlobTool(
               });
       };
       try {
-        toolOperation = beginWorkspaceReadToolOperation(
-          target.displayRoot,
-          GLOB_TOOL_NAME,
-        ).token;
         await bindReadCapabilities();
       } catch (error) {
         await enumerationCapability?.dispose().catch(() => {});
         if (enumerationCapability !== readCapability) {
           await readCapability?.dispose().catch(() => {});
         }
-        if (toolOperation !== undefined) {
-          endWorkspaceToolOperation(toolOperation);
-        }
         return errorResult(
-          `Glob error: authoritative Editor workspace files cannot be read safely: ${
+          `Glob error: workspace files cannot be read safely: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -1047,6 +1051,40 @@ export function createGlobTool(
         const effectiveLimit = limit + 1;
         const signal = args.__abortSignal;
         const includeIgnored = asBoolean(args.includeIgnored) ?? false;
+        if (hasReadOnlyDelegationReadGuard(rawArgs)) {
+          const ignored = includeIgnored ? async () => false : await createSearchIgnoreMatcher(target.displayRoot, {
+            toolArgs: rawArgs,
+            readCapability: enumerationCapability,
+          });
+          const excludedDirectories = new Set(DEFAULT_GLOB_EXCLUDE_GLOBS.filter(pattern => pattern.endsWith("/**")).map(pattern => pattern.split("/")[1]));
+          const candidates = await collectGuardedSearchCandidates({
+            root: target.searchRoot,
+            toolArgs: rawArgs,
+            signal,
+            acceptPath: async (path, directory) => (includeIgnored || !relative(target.displayRoot, path).split(sep).some(segment => excludedDirectories.has(segment))) && !(await ignored(directory ? join(path, ".agenc-search-candidate") : path)),
+          });
+          const selected = await pinnedSnapshotPathEligibility({
+            relativePaths: candidates.map(candidate => relative(target.searchRoot, candidate.path)),
+            globs: [target.pattern, ...(includeIgnored ? [] : DEFAULT_GLOB_EXCLUDE_GLOBS.map(pattern => `!${pattern}`))],
+            signal,
+          });
+          if ("error" in selected) return errorResult(selected.error);
+          const matches = candidates.filter(candidate => selected.has(relative(target.searchRoot, candidate.path).split(sep).join("/"))).sort((left, right) => right.modifiedMs - left.modifiedMs || left.path.localeCompare(right.path));
+          const normalized = await normalizeAndFilterMatches({
+            matches: matches.map(candidate => Buffer.from(relative(target.displayRoot, candidate.path))),
+            target,
+            toolArgs: rawArgs,
+            readCapability,
+          });
+          const kept = normalized.slice(0, limit);
+          const truncated = normalized.length > limit;
+          if (!readOnlyDelegationReadAuthorityCurrent(rawArgs)) {
+            return errorResult("Access denied: delegated read authority changed during search");
+          }
+          return textResult(kept.length === 0 ? "No files found" : [...kept, ...(truncated ? [TRUNCATION_NOTE] : [])].join("\n"), {
+            pattern, searchRoot: target.searchRoot, numFiles: kept.length, durationMs: Date.now() - startedAt, truncated,
+          });
+        }
         const rootIgnoreFiles = includeIgnored
           ? []
           : await discoverRipgrepRootIgnoreFiles({
@@ -1130,16 +1168,10 @@ export function createGlobTool(
         return textResult(lines.join("\n"), metadata);
       } finally {
         try {
-          try {
-            await enumerationCapability?.dispose();
-          } finally {
-            if (enumerationCapability !== readCapability) {
-              await readCapability?.dispose();
-            }
-          }
+          await enumerationCapability?.dispose();
         } finally {
-          if (toolOperation !== undefined) {
-            endWorkspaceToolOperation(toolOperation);
+          if (enumerationCapability !== readCapability) {
+            await readCapability?.dispose();
           }
         }
       }

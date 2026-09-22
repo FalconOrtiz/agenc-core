@@ -31,8 +31,10 @@ import { connectMCPClientWithCleanup } from "./connect-with-cleanup.js";
 import { getProxyFetchOptions } from "../../utils/proxy.js";
 import type { ProviderEnvironment } from "../../llm/provider-options.js";
 import { EMPTY_MCP_REQUEST_ENVIRONMENT } from "../environment.js";
+import type { McpOAuthConfig } from "../../config/mcp-oauth.js";
 
 export interface MCPServerSseConfig {
+  readonly oauth?: McpOAuthConfig;
   readonly name: string;
   readonly endpoint: string;
   readonly headers?: Record<string, string>;
@@ -63,16 +65,22 @@ export async function createSseMCPConnection(
   const proxyOptions = getProxyFetchOptions({ environment });
 
   const url = new URL(config.endpoint);
+  const oauth = config.oauth === undefined ? undefined : await import("../../services/mcp/interactive-auth.js");
   const transport = new SSEClientTransport(url, {
+    ...(oauth === undefined || config.oauth === undefined ? {} : {
+      authProvider: oauth.runtimeMcpOAuthProvider(config.name, config.endpoint, "sse", config.oauth, environment, config.headers),
+      fetch: oauth.mcpOAuthTransportFetch(environment, fetch, config),
+    }),
     requestInit: {
       ...proxyOptions,
-      ...(config.headers !== undefined
+      ...(config.headers !== undefined && config.oauth === undefined
         ? { headers: { ...config.headers } }
         : {}),
     },
     eventSourceInit: {
-      fetch: (input: string | URL, init?: RequestInit) =>
-        fetch(input, { ...init, ...proxyOptions }),
+      fetch: oauth === undefined
+        ? (input: string | URL, init?: RequestInit) => fetch(input, { ...init, ...proxyOptions })
+        : oauth.mcpOAuthTransportFetch(environment, fetch, config),
     },
   });
 

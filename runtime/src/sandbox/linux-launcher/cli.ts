@@ -8,6 +8,7 @@ import {
   permissionProfileToRuntimePermissions,
 } from "../engine/index.js";
 import { INHERITED_CWD_SANDBOX_PATH } from "./config.js";
+import { parseBoundReadOnlyCwdIdentity, type BoundReadOnlyCwdIdentity } from "../bound-readonly-cwd.js";
 
 export class LinuxSandboxCliError extends Error {
   constructor(message: string) {
@@ -20,6 +21,7 @@ export interface LinuxSandboxLauncherOptions {
   readonly sandboxPolicyCwd: string;
   readonly commandCwd: string;
   readonly inheritedCwd: boolean;
+  readonly boundReadOnlyCwd?: BoundReadOnlyCwdIdentity;
   readonly permissionProfile: PermissionProfile;
   readonly sessionTempRoot: string;
   readonly applySeccompThenExec: boolean;
@@ -45,6 +47,7 @@ const FILE_SYSTEM_KEYS: ReadonlySet<string> = new Set([
   "entries",
   "globScanMaxDepth",
   "includePlatformDefaults",
+  "reservedReadOnlyPaths",
 ]);
 const ENTRY_KEYS: ReadonlySet<string> = new Set(["path", "access"]);
 const PATH_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
@@ -68,6 +71,7 @@ export function parseLinuxSandboxLauncherArgs(
   let sandboxPolicyCwd: string | null = null;
   let commandCwd: string | null = null;
   let inheritedCwd = false;
+  let boundReadOnlyCwd: BoundReadOnlyCwdIdentity | undefined;
   let permissionProfile: PermissionProfile | null = null;
   let sessionTempRoot: string | null = null;
   let applySeccompThenExec = false;
@@ -108,6 +112,10 @@ export function parseLinuxSandboxLauncherArgs(
         break;
       case "--permission-profile":
         permissionProfile = parsePermissionProfile(takeValue(arg, index));
+        index += 1;
+        break;
+      case "--bound-readonly-cwd-identity":
+        boundReadOnlyCwd = parseBoundReadOnlyCwdIdentity(JSON.parse(takeValue(arg, index)));
         index += 1;
         break;
       case "--session-temp-root":
@@ -152,6 +160,7 @@ export function parseLinuxSandboxLauncherArgs(
       "--inherited-readonly-command-cwd is only valid for the outer launcher stage",
     );
   }
+  if (boundReadOnlyCwd !== undefined && !inheritedCwd) throw new LinuxSandboxCliError("bound cwd identity requires inherited read-only cwd");
   if (proxyRouteSpec !== null && !allowNetworkForProxy) {
     throw new LinuxSandboxCliError(
       "--proxy-route-spec requires --allow-network-for-proxy",
@@ -170,6 +179,7 @@ export function parseLinuxSandboxLauncherArgs(
     sandboxPolicyCwd: resolvedSandboxCwd,
     commandCwd: resolvedCommandCwd,
     inheritedCwd,
+    ...(boundReadOnlyCwd === undefined ? {} : { boundReadOnlyCwd }),
     permissionProfile,
     sessionTempRoot,
     applySeccompThenExec,
@@ -291,6 +301,11 @@ function assertFileSystem(value: unknown): void {
   for (const entry of candidate.entries) {
     assertFileSystemEntry(entry);
   }
+  if (candidate.reservedReadOnlyPaths !== undefined && (
+    !Array.isArray(candidate.reservedReadOnlyPaths) ||
+    candidate.reservedReadOnlyPaths.length > 32 ||
+    candidate.reservedReadOnlyPaths.some((root) => typeof root !== "string" || !path.isAbsolute(root) || root.includes(NUL_BYTE))
+  )) throw new LinuxSandboxCliError("permission profile reservedReadOnlyPaths must be bounded absolute paths");
 }
 
 function assertFileSystemEntry(value: unknown): void {

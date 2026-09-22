@@ -1,17 +1,4 @@
-/**
- * Tests for `isSessionPlanFile` — the AgenC-compatible carve-out used
- * by `tools/system/filesystem.ts:validatePath` and
- * `tools/system/coding-common.ts:resolveWorkspacePath` to allow writes
- * to the active session's plan-file family even when the path is
- * outside the workspace allowlist.
- *
- * Mirrors reference `isSessionPlanFile`
- * (`src/utils/permissions/filesystem.ts:254`):
- *
- *     const expectedPrefix = join(getPlansDirectory(), getPlanSlug())
- *     return path.startsWith(expectedPrefix) && path.endsWith('.md')
- */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -54,11 +41,7 @@ describe("isSessionPlanFile", () => {
     expect(isSessionPlanFile(planPath, { sessionId, agencHome })).toBe(true);
   });
 
-  test("matches the per-agent variant `<slug>-agent-<agentId>.md`", () => {
-    // AgenC allows both the main plan and per-agent plan files for
-    // the same session — the prefix is `getPlansDirectory()/<slug>` and
-    // the suffix is `.md`. The agent-id segment fits between the slug
-    // and the `.md` suffix.
+  test("requires exact per-agent ownership rather than a slug prefix", () => {
     const sessionId = "session-B";
     const slug = "ember-bridge-cafef00d";
     setPlanSlug({ sessionId, agencHome }, slug);
@@ -67,8 +50,10 @@ describe("isSessionPlanFile", () => {
       `${slug}-agent-explorer-1.md`,
     );
     expect(isSessionPlanFile(agentPlanPath, { sessionId, agencHome })).toBe(
-      true,
+      false,
     );
+    expect(isSessionPlanFile(agentPlanPath, { sessionId, agencHome, agentId: "explorer-1" })).toBe(true);
+    expect(isSessionPlanFile(join(agencHome, "plans", `${slug}-other.md`), { sessionId, agencHome })).toBe(false);
   });
 
   test("rejects another session's plan file (slug mismatch)", () => {
@@ -290,4 +275,18 @@ describe("isSessionPlanFile", () => {
     expect(copiedPath).toBe(getPlanFilePath(target));
     expect(getPlan(target)).toBe("# Transcript Plan\n\nRecovered.");
   });
+  test.skipIf(process.platform === "win32")(
+    "getPlansDirectory creates the directory owner-only under a permissive umask",
+    () => {
+      const home = mkdtempSync(join(tmpdir(), "agenc-plan-mode-"));
+      const previousUmask = process.umask(0o007);
+      try {
+        const dir = getPlansDirectory({ agencHome: home });
+        expect(statSync(dir).mode & 0o777).toBe(0o700);
+      } finally {
+        process.umask(previousUmask);
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
 });

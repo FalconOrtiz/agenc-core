@@ -8,6 +8,7 @@ import {
 import {
   MAX_ADDITIONAL_WORKING_DIRECTORIES,
 } from "../../src/contracts/additional-working-directories.js";
+import { MAX_WHISPER_WAV_BYTES, WHISPER_LANGUAGES } from "../../src/audio/whisper.js";
 import {
   AGENC_DAEMON_PROTOCOL_PACKAGE_NAME,
   AGENC_DAEMON_PROTOCOL_PUBLISH_TARGET,
@@ -43,9 +44,36 @@ interface ProtocolSchema {
   };
   readonly "x-agenc-methods": readonly string[];
   readonly "x-agenc-notifications": readonly string[];
+  readonly "x-agenc-whisper-internal-methods": readonly string[];
 }
 
 const expectedMethods = [
+  "remote.capabilities",
+  "remote.status",
+  "remote.start",
+  "remote.stop",
+  "remote.pair.begin",
+  "remote.pair.refresh",
+  "remote.pair.cancel",
+  "remote.devices",
+  "remote.pending",
+  "remote.approve",
+  "remote.revoke",
+  "telegram.capabilities",
+  "telegram.status",
+  "telegram.configure",
+  "telegram.start",
+  "telegram.stop",
+  "telegram.revoke",
+  "telegram.agents.list",
+  "telegram.agents.create",
+  "telegram.agents.update",
+  "telegram.agents.start",
+  "telegram.agents.stop",
+  "telegram.agents.remove",
+  "telegram.agents.pair.begin",
+  "telegram.agents.pair.confirm",
+  "telegram.agents.pair.cancel",
   "initialize",
   "request.cancel",
   "agent.create",
@@ -59,6 +87,15 @@ const expectedMethods = [
   "run.evidence",
   "run.cancel",
   "run.start",
+  "routine.capabilities",
+  "routine.list",
+  "routine.get",
+  "routine.create",
+  "routine.update",
+  "routine.delete",
+  "routine.run",
+  "routine.runs",
+  "routine.cancel",
   "csvJob.review.list",
   "csvJob.review.show",
   "csvJob.review.resolve",
@@ -69,6 +106,8 @@ const expectedMethods = [
   "session.terminate",
   "session.clear",
   "session.snapshot",
+  "session.processes.list",
+  "session.processes.stop",
   "session.transcript",
   "session.transcript.v2",
   "session.cancelTurn",
@@ -103,6 +142,7 @@ const expectedMethods = [
 ] as const;
 
 const expectedNotifications = [
+  "routine.updated",
   "commandExec.outputDelta",
   "event.message_chunk",
   "event.tool_request",
@@ -124,6 +164,9 @@ const expectedNotifications = [
 ] as const;
 
 const expectedInternalMethods = [
+  "audio.whisper.status",
+  "audio.whisper.install",
+  "audio.whisper.transcribe",
   "workspace.editor.acquire",
   "workspace.editor.sync",
   "workspace.editor.staleAuthority.refresh",
@@ -154,6 +197,7 @@ const expectedInternalMethods = [
   "session.permissions.mutateRule",
   "session.hooks.status",
   "session.hooks.setDisabled",
+  "session.statusLine.execute",
   "session.applyConfig",
   "session.mcp.reconnectServer",
   "session.mcp.enableServer",
@@ -198,7 +242,7 @@ function compileDefinitionValidator(
 
 describe("AgenC daemon protocol surface", () => {
   it("defines the current live attach-settings contract", () => {
-    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.9.0");
+    expect(AGENC_DAEMON_PROTOCOL_VERSION).toBe("1.13.0");
 
     const status: AgenCDaemonInternalResultByMethod["session.hooks.status"] = {
       sessionId: "session-bare",
@@ -362,6 +406,81 @@ describe("AgenC daemon protocol surface", () => {
     // against this repository's canonical TypeScript registry and schema.
   });
 
+  it("accepts an optional manual routine run revision without widening other routine requests", () => {
+    const validate = compileRequestValidator(readProtocolSchema());
+    const envelope = { jsonrpc: JSON_RPC_VERSION, id: "reviewed-run", method: "routine.run" };
+    const params = { id: "routine_test", expectedUpdatedAt: "2026-09-09T12:00:00.000Z" };
+    expect(validate({ ...envelope, params })).toBe(true);
+    expect(validate({ ...envelope, params: { id: params.id } })).toBe(true);
+    for (const expectedUpdatedAt of [null, 12, "", "x".repeat(65)]) {
+      expect(validate({ ...envelope, params: { ...params, expectedUpdatedAt } })).toBe(false);
+    }
+    expect(validate({ ...envelope, method: "routine.get", params })).toBe(false);
+    expect(validate({ ...envelope, params: { ...params, permissionMode: "bypassPermissions" } })).toBe(false);
+  });
+
+  it("bounds request-only workspace expectations and only permits update guards with a cwd patch", () => {
+    const schema = readProtocolSchema();
+    const validate = compileRequestValidator(schema);
+    const expectedWorkspace = { cwd: "/workspace/project", dev: "1", ino: "1234" };
+    const create = { name: "Review", instructions: "Review this project.", cwd: expectedWorkspace.cwd, schedule: { kind: "manual" } };
+    const update = { id: "routine_test", patch: { cwd: expectedWorkspace.cwd } };
+    const envelope = (method: string, params: unknown) => ({ jsonrpc: JSON_RPC_VERSION, id: "workspace-guard", method, params });
+    for (const [method, params] of [["routine.create", create], ["routine.update", update]] as const) {
+      expect(validate(envelope(method, params))).toBe(true);
+      expect(validate(envelope(method, { ...params, expectedWorkspace })), JSON.stringify(validate.errors)).toBe(true);
+      for (const guard of [
+        null, [], {}, { ...expectedWorkspace, extra: true }, { cwd: expectedWorkspace.cwd, dev: "1" },
+        { ...expectedWorkspace, cwd: "" }, { ...expectedWorkspace, cwd: "x".repeat(4097) },
+        ...[null, 12, "", "-1", "1.0", "1e2", "1\n", "x", "1".repeat(33)].flatMap(value => [{ ...expectedWorkspace, dev: value }, { ...expectedWorkspace, ino: value }]),
+      ]) expect(validate(envelope(method, { ...params, expectedWorkspace: guard })), JSON.stringify(guard)).toBe(false);
+    }
+    expect(validate(envelope("routine.update", { ...update, patch: { name: "Not a workspace edit" }, expectedWorkspace }))).toBe(false);
+    expect(validate(envelope("routine.update", { ...update, patch: { ...update.patch, expectedWorkspace } }))).toBe(false);
+    expect(validate(envelope("routine.run", { id: update.id, expectedWorkspace }))).toBe(false);
+    expect(validate(envelope("routine.get", { id: update.id, expectedWorkspace }))).toBe(false);
+    const validateRoutine = compileDefinitionValidator(schema, "Routine");
+    const routine = { ...create, id: update.id, description: "", permissionMode: "plan", enabled: false, notifyOnCompletion: true, createdAt: "2026-09-09T12:00:00.000Z", updatedAt: "2026-09-09T12:00:00.000Z", nextRunAt: null, lastRun: null };
+    expect(validateRoutine(routine)).toBe(true);
+    expect(validateRoutine({ ...routine, expectedWorkspace })).toBe(false);
+  });
+
+  it("defines bounded Whisper internal contracts without widening the public request surface", () => {
+    const schema = readProtocolSchema();
+    const methods = ["audio.whisper.status", "audio.whisper.install", "audio.whisper.transcribe"];
+    expect(schema["x-agenc-whisper-internal-methods"]).toEqual(methods);
+    for (const method of methods) {
+      expect(schema["x-agenc-methods"]).not.toContain(method);
+      expect(AGENC_DAEMON_INTERNAL_METHODS).toContain(method);
+    }
+    const internal = compileDefinitionValidator(schema, "WhisperInternalRequest");
+    const external = compileRequestValidator(schema);
+    const audio = { mimeType: "audio/wav", data: "A".repeat(64) };
+    const envelope = (method: string, params: Record<string, unknown>) => ({ jsonrpc: JSON_RPC_VERSION, id: "whisper", method, params });
+    for (const request of [envelope(methods[0]!, {}), envelope(methods[1]!, { model: "base" }), ...WHISPER_LANGUAGES.map(language => envelope(methods[2]!, { model: "small", language, audio, task: "translate", compute: "cpu", prompt: "AgenC" }))]) {
+      expect(internal(request), JSON.stringify(internal.errors)).toBe(true);
+      expect(external(request)).toBe(false);
+    }
+    for (const request of [
+      envelope(methods[0]!, { download: true }),
+      envelope(methods[1]!, { model: "base", url: "https://invalid.example/model" }),
+      envelope(methods[1]!, { model: "tiny" }),
+      ...[
+        { audio: { ...audio, path: "/private/audio.wav" } }, { audio: { ...audio, mimeType: "audio/mp3" } },
+        { audio: { ...audio, data: "A".repeat(Math.ceil(MAX_WHISPER_WAV_BYTES / 3) * 4 + 4) } },
+        { language: "--translate" }, { task: "translate-to-es" }, { compute: "gpu" },
+        { prompt: "x".repeat(501) }, { prompt: "line\nbreak" }, { executable: "/tmp/other" },
+      ].map(patch => envelope(methods[2]!, { model: "base", language: "auto", audio, ...patch })),
+    ]) expect(internal(request), JSON.stringify(request).slice(0, 200)).toBe(false);
+    const status = compileDefinitionValidator(schema, "WhisperStatus");
+    expect(status({ engine: "whisper.cpp", optionsVersion: 1, available: true, models: [{ id: "base", installed: true, bytes: 147951465 }] })).toBe(true);
+    expect(status({ engine: "whisper.cpp", available: false, models: [], executable: "/private/engine" })).toBe(false);
+    const result = compileDefinitionValidator(schema, "WhisperTranscription");
+    expect(result({ text: "", model: "base", provider: "local" })).toBe(true);
+    expect(result({ text: "hello", model: "base", provider: "google" })).toBe(false);
+    expect(result({ text: "x".repeat(16001), model: "base", provider: "local" })).toBe(false);
+  });
+
   it("keeps the additional-directory ingress limit aligned", () => {
     const schema = readProtocolSchema();
     const agentCreate = schema.definitions.AgentCreateParams as {
@@ -425,6 +544,25 @@ describe("AgenC daemon protocol surface", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("publishes the private Desktop attachment without loosening other request fields", () => {
+    const validate = compileRequestValidator(readProtocolSchema());
+    const config = {
+      name: "agenc-desktop-control", transport: "http",
+      endpoint: "http://127.0.0.1:12345/mcp", localOnly: true,
+      headers: { Authorization: "Bearer fixture-only" },
+      desktopAuthority: { id: "fixture-authority", signature: "fixture-proof" },
+    };
+    const request = (patch: Record<string, unknown> = {}) => ({
+      jsonrpc: JSON_RPC_VERSION, id: "desktop-attach", method: "session.mcp.addServer",
+      params: { sessionId: "session_1", config, replace: true, ...patch },
+    });
+    expect(validate(request()), JSON.stringify(validate.errors)).toBe(true);
+    expect(validate(request({ config: { ...config, headers: { Authorization: 1 } } }))).toBe(false);
+    expect(validate(request({ config: { ...config, desktopAuthority: { ...config.desktopAuthority, trusted: true } } }))).toBe(false);
+    expect(validate(request({ replace: "true" }))).toBe(false);
+    expect(validate(request({ trusted: true }))).toBe(false);
   });
 
   it("publishes only passive, non-authority MCP status fields", () => {
@@ -559,6 +697,17 @@ describe("AgenC daemon protocol surface", () => {
       }),
       "untrusted MCP descriptions must not enter the passive DTO",
     ).toBe(false);
+  });
+
+  it("exposes a distinct const-method request envelope for every Connections method", () => {
+    const schema = readProtocolSchema();
+    const request = schema.definitions.AgenCDaemonRequest as { oneOf: { $ref: string }[] };
+    const definitions = request.oneOf.map(({ $ref }) => schema.definitions[$ref.split("/").at(-1)!] as { properties: { method: { const?: string } } });
+    const validate = compileRequestValidator(schema);
+    for (const method of expectedMethods.filter((name) => name.startsWith("remote.") || name.startsWith("telegram."))) {
+      expect(definitions.filter((definition) => definition.properties.method.const === method)).toHaveLength(1);
+      expect(validate({ jsonrpc: "2.0", id: method, method, params: {} })).toBe(true);
+    }
   });
 
   it("validates all request-bearing methods through the published schema", () => {

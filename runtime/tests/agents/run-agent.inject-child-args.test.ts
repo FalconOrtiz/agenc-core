@@ -1,0 +1,65 @@
+import { describe, expect, it } from "vitest";
+import {
+  SESSION_ALLOWED_ROOTS_ARG,
+  SESSION_ID_ARG,
+} from "../../src/agents/_deps/filesystem-args.js";
+import {
+  injectChildToolArgs,
+  WORKTREE_CWD_FIELD_BY_TOOL,
+} from "../../src/agents/run-agent.js";
+
+const worktree = { path: "/repo/.agenc-worktrees/m5-abc" } as never;
+const opts = { childConversationId: "child-1", worktree };
+
+describe("injectChildToolArgs pins the worktree through each tool's own field", () => {
+  it("gives exec_command a workdir and never the removed cwd alias", () => {
+    const args = injectChildToolArgs({ cmd: "npm test" }, "exec_command", opts);
+    expect(args.workdir).toBe(worktree.path);
+    expect(Object.hasOwn(args, "cwd")).toBe(false);
+    expect(args[SESSION_ID_ARG]).toBe("child-1");
+    expect(args[SESSION_ALLOWED_ROOTS_ARG]).toContain(worktree.path);
+  });
+
+  it("keeps a working directory the model supplied", () => {
+    const args = injectChildToolArgs(
+      { cmd: "npm test", workdir: "/repo/.agenc-worktrees/m5-abc/pkg" },
+      "exec_command",
+      opts,
+    );
+    expect(args.workdir).toBe("/repo/.agenc-worktrees/m5-abc/pkg");
+    expect(Object.hasOwn(args, "cwd")).toBe(false);
+  });
+
+  it("uses cwd for the shell, patch, search and file tools", () => {
+    expect(injectChildToolArgs({ command: "ls" }, "system.bash", opts).cwd).toBe(
+      worktree.path,
+    );
+    expect(injectChildToolArgs({ patch: "" }, "apply_patch", opts).cwd).toBe(
+      worktree.path,
+    );
+    // Delegated file and search tools resolve in the caller's directory, so
+    // they carry the worktree through `cwd` too; exec_command keeps `workdir`.
+    const fileRead = injectChildToolArgs({ path: "x" }, "FileRead", opts);
+    expect(fileRead.cwd).toBe(worktree.path);
+    expect(Object.hasOwn(fileRead, "workdir")).toBe(false);
+    expect(WORKTREE_CWD_FIELD_BY_TOOL).toEqual({
+      "system.bash": "cwd",
+      exec_command: "workdir",
+      apply_patch: "cwd",
+      Glob: "cwd",
+      Grep: "cwd",
+      FileRead: "cwd",
+      Write: "cwd",
+      Edit: "cwd",
+      MultiEdit: "cwd",
+    });
+  });
+
+  it("injects no working directory without a worktree", () => {
+    const args = injectChildToolArgs({ cmd: "ls" }, "exec_command", {
+      childConversationId: "child-1",
+    });
+    expect(Object.hasOwn(args, "workdir")).toBe(false);
+    expect(Object.hasOwn(args, "cwd")).toBe(false);
+  });
+});

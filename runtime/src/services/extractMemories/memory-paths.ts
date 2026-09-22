@@ -18,6 +18,7 @@
  */
 
 import { homedir } from "node:os";
+import { projectStorageKey } from "../../utils/project-storage-key.js";
 import {
   isAbsolute,
   join,
@@ -69,7 +70,7 @@ export interface ResolveAutoMemoryDirectoryOptions {
   readonly runtimeOptions?: Pick<
     AgentRuntimeOptions,
     "coworkMemoryPathOverride" | "remoteMode" | "remoteMemoryRoot"
-  >;
+  > & Partial<Pick<AgentRuntimeOptions, "simpleMode" | "coworkMemoryExtraGuidelines">>;
   readonly settings?: {
     readonly [K in PermissionRuleSource]?: AgenCConfig | null;
   };
@@ -87,7 +88,6 @@ const AUTO_MEMORY_REPOSITORY_SOURCES: readonly CanonicalSettingSource[] = [
   "localSettings",
   "projectSettings",
 ];
-const MAX_SANITIZED_PROJECT_KEY_LENGTH = 200;
 
 function effectiveEnv(
   env: MemoryPathEnv | undefined,
@@ -100,7 +100,7 @@ function effectiveCwd(opts: ResolveAutoMemoryDirectoryOptions): string {
 }
 
 function effectiveHome(opts: ResolveAutoMemoryDirectoryOptions): string {
-  return opts.homeDir ?? homedir();
+  return opts.homeDir ?? (opts.env === undefined ? homedir() : opts.env.HOME ?? opts.env.USERPROFILE ?? "");
 }
 
 function resolveConfigHome(opts: ResolveAutoMemoryDirectoryOptions): string {
@@ -164,21 +164,8 @@ export function validateAutoMemoryDirectoryPath(
   return `${normalized}${sep}`.normalize("NFC");
 }
 
-function djb2Hash(value: string): number {
-  let hash = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
-  }
-  return hash;
-}
-
 export function sanitizePathForProjectKey(path: string): string {
-  const sanitized = path.replace(/[^a-zA-Z0-9]/gu, "-");
-  if (sanitized.length <= MAX_SANITIZED_PROJECT_KEY_LENGTH) {
-    return sanitized;
-  }
-  const hash = Math.abs(djb2Hash(path)).toString(36);
-  return `${sanitized.slice(0, MAX_SANITIZED_PROJECT_KEY_LENGTH)}-${hash}`;
+  return projectStorageKey(path);
 }
 
 async function readSettings(
@@ -242,7 +229,7 @@ export async function resolveAutoMemoryDirectory(
 ): Promise<AutoMemoryPathResult> {
   const env = effectiveEnv(opts.env);
   const runtimeOptions = opts.runtimeOptions ?? getActiveAgentRuntimeOptions();
-  if (isBareMode()) {
+  if (opts.runtimeOptions === undefined ? isBareMode() : opts.runtimeOptions.simpleMode === true) {
     return { enabled: false, reason: "simple_mode" };
   }
   if (runtimeOptions?.remoteMode && !runtimeOptions.remoteMemoryRoot) {

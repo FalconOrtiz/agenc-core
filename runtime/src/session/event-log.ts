@@ -2,8 +2,7 @@
  * Event log — the discriminated union that every state change in
  * AgenC flows through.
  *
- * Hand-port of agenc runtime `protocol/src/protocol.rs` EventMsg (78 variants)
- * reduced to AgenC's 82-variant runtime surface.
+ * The EventMsg union covers AgenC's 83-variant runtime surface.
  *
  * Invariants wired here:
  *   I-8  (every error site emits a typed event) — `emitError()` helper
@@ -19,9 +18,10 @@
  * @module
  */
 
+import type { SessionGoal } from "../goal/goal.js";
 import type { LLMContentPart, LLMMessage, LLMUsage } from "../llm/types.js";
-import type { AgentStatus } from "../agents/status.js";
-import type { AdmissionJournalEvent } from "../budget/admission-types.js";
+import type { AgentStatus, NativeWorkerTiming } from "../agents/status.js";
+import type { AdmissionJournalEvent, AdmissionUsageSummary } from "../budget/admission-types.js";
 import type {
   EffectBoundary,
   EffectNoEffectProof,
@@ -35,6 +35,8 @@ import type {
   RunUsageTotals,
 } from "../contracts/run-contracts.js";
 import type { ToolRecoveryCategory } from "../tools/types.js";
+import type { TurnFailedEvent } from "../contracts/turn-terminal.js";
+export type { TurnFailedEvent } from "../contracts/turn-terminal.js";
 import type {
   CollaborationMode,
   FileSystemSandboxPolicy,
@@ -101,7 +103,7 @@ export interface Event {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Event payloads — 82 variants
+// Event payloads — 83 variants
 // ─────────────────────────────────────────────────────────────────────
 
 export interface SessionMetaLine {
@@ -119,6 +121,11 @@ export interface SessionMetaLine {
   readonly modelProvider?: string;
   /** Upstream thread memory mode persisted by metadata-update rows. */
   readonly memoryMode?: string;
+  readonly admissionOwner?: {
+    readonly workspaceId: string;
+    readonly runId: string;
+    readonly parentRunId?: string;
+  };
 }
 
 export interface TurnStartedEvent {
@@ -288,6 +295,54 @@ export interface TurnResumedEvent {
   readonly haltedSideEffectingTools?: ReadonlyArray<string>;
 }
 
+/**
+ * One decision of the non-interactive completion gate (phase 4b): a
+ * verification prompt was injected, or a final answer was accepted as
+ * verified, accepted as partial because remaining checks are unavailable,
+ * accepted because the rounds ran out, or the turn was not gated.
+ * `verified` is structural compliance, not a benchmark pass.
+ */
+/**
+ * The session goal changed (`/goal`, or a goal-gate round). The payload is
+ * the full snapshot so a resumed session restores the goal from the last
+ * event alone; the goal lives outside the conversation on purpose, so
+ * compaction cannot lose or paraphrase it.
+ */
+export interface GoalChangedEvent {
+  readonly goal: SessionGoal;
+  readonly cause:
+    | "set"
+    | "round"
+    | "settled"
+    | "paused"
+    | "resumed"
+    | "cleared";
+  readonly turnId?: string;
+}
+
+export interface CompletionGateEvent {
+  readonly turnId: string;
+  /** Gate prompts injected so far in this turn, after this decision. */
+  readonly round: number;
+  readonly maxRounds: number;
+  readonly outcome: "injected" | "verified" | "partial" | "exhausted" | "skipped";
+  readonly reason:
+    | "initial"
+    | "no_verification"
+    | "no_checklist"
+    | "unmet_items"
+    | "unavailable_unproven"
+    | "verified_with_tools"
+    | "unavailable_checks"
+    | "rounds_exhausted"
+    | "no_tool_use"
+    | "deadline_reserve";
+  /** Tool calls that completed between the last injection and this decision. */
+  readonly toolCallsSinceInjection: number;
+  /** Unchecked, unassociated, or explicitly unverified checklist items, when any. */
+  readonly unmetItems?: ReadonlyArray<string>;
+}
+
 export interface AgentMessageEvent {
   readonly message: string;
 }
@@ -367,6 +422,11 @@ export interface ExecApprovalRequestEvent {
   readonly reason?: string;
 }
 
+export type FileWriteApprovalPreview =
+  | { readonly kind: "existing"; readonly content: string }
+  | { readonly kind: "missing" }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
 export interface RequestPermissionsEvent {
   readonly callId: string;
   readonly toolName: string;
@@ -376,6 +436,7 @@ export interface RequestPermissionsEvent {
   readonly input?: Readonly<Record<string, unknown>>;
   readonly planContent?: string;
   readonly planFilePath?: string;
+  readonly fileWritePreview?: FileWriteApprovalPreview;
   readonly recordedAt?: string;
 }
 
@@ -441,6 +502,14 @@ export interface StreamErrorEvent {
 export interface WarningEvent {
   readonly cause: string;
   readonly message: string;
+  /** Explicit scope for warnings produced before a daemon message submission. */
+  readonly turnId?: string;
+  /**
+   * Structured facts behind the message: error names, messages, Node error
+   * codes and paths, byte sizes. Scalar values only. Readers that predate
+   * the field ignore it (journal schemas are additive).
+   */
+  readonly details?: Readonly<Record<string, string | number | boolean | null>>;
 }
 
 /**
@@ -463,6 +532,14 @@ export interface EffectIntentEvent {
   readonly intentDigest: string;
   readonly attempt: number;
   readonly recordedAt: string;
+  /**
+   * The subordinate run that executes this step (a workflow's plan or
+   * implement child). Absent when the effect belongs to the journaling
+   * session itself. Projected to `run_effects.child_run_id`; a replay that
+   * drops it rebuilds a different intent identity, which is how a resumed
+   * workflow used to die on its own history.
+   */
+  readonly childRunId?: string;
 }
 
 /**
@@ -790,6 +867,7 @@ export interface CollabAgentSpawnBeginEvent {
 }
 
 export interface CollabAgentSpawnEndEvent {
+  readonly timing?: NativeWorkerTiming;
   readonly callId: string;
   readonly senderThreadId: string;
   readonly newThreadId?: string;
@@ -821,6 +899,7 @@ export type CollabAgentTaskStatus =
   "pending" | "running" | "idle" | "completed" | "failed" | "killed";
 
 export interface CollabAgentStatusEvent {
+  readonly timing?: NativeWorkerTiming;
   readonly callId: string;
   readonly senderThreadId: string;
   readonly threadId: string;
@@ -919,7 +998,7 @@ export interface CollabResumeEndEvent {
  * TurnContextItem — emitted once per real user turn after computing
  * that turn's model-visible context updates (and again after
  * mid-turn compaction) so resume/fork replay recovers the latest
- * durable baseline. Port of agenc runtime `TurnContextItem` (protocol.rs:2896).
+ * durable baseline.
  *
  * Full-parity shape: every field populated by `toTurnContextItem` in
  * `turn-context.ts` is declared here so downstream readers (notably
@@ -957,11 +1036,11 @@ export interface TurnContextItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// EventMsg discriminated union (82 variants)
+// EventMsg discriminated union (83 variants)
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * agenc runtime `SessionConfigured` payload. Emitted once at session open.
+ * `SessionConfigured` payload. Emitted once at session open.
  * Kept in the canonical union so session.ts can rely on event-log.ts
  * as the single source of truth for event types.
  */
@@ -1097,12 +1176,6 @@ export type EventMsg =
          * compatibility with historical rollout events.
          */
         readonly toolName?: string;
-        /**
-         * Runtime-authored Editor authority identity when the tool completed
-         * inside an Editor interaction. Historical and ordinary Agent events
-         * omit it.
-         */
-        readonly editorInteractionId?: string;
         readonly result: string;
         readonly isError: boolean;
         readonly metadata?: Record<string, unknown>;
@@ -1155,11 +1228,14 @@ export type EventMsg =
     }
   | { readonly type: "turn_complete"; readonly payload: TurnCompleteEvent }
   | { readonly type: "turn_aborted"; readonly payload: TurnAbortedEvent }
+  | { readonly type: "turn_failed"; readonly payload: TurnFailedEvent }
   | {
       readonly type: "turn_checkpoint";
       readonly payload: TurnCheckpointEvent;
     }
   | { readonly type: "turn_resumed"; readonly payload: TurnResumedEvent }
+  | { readonly type: "completion_gate"; readonly payload: CompletionGateEvent }
+  | { readonly type: "goal_changed"; readonly payload: GoalChangedEvent }
   | {
       readonly type: "thread_rolled_back";
       readonly payload: ThreadRolledBackEvent;
@@ -1206,6 +1282,10 @@ export type EventMsg =
       /** Durable projection of the daemon-owned M3 admission journal. */
       readonly type: "execution_admission";
       readonly payload: AdmissionJournalEvent;
+    }
+  | {
+      readonly type: "session_usage";
+      readonly payload: AdmissionUsageSummary;
     }
   | {
       readonly type: "guardian_assessment";
@@ -1413,8 +1493,11 @@ export const KNOWN_EVENT_TYPES = Object.freeze(
     "subagent_turn_outcome",
     "turn_complete",
     "turn_aborted",
+    "turn_failed",
     "turn_checkpoint",
     "turn_resumed",
+    "completion_gate",
+    "goal_changed",
     "thread_rolled_back",
     "error",
     "stream_error",
@@ -1435,6 +1518,7 @@ export const KNOWN_EVENT_TYPES = Object.freeze(
     "run_cancel_requested",
     "recovery_decision",
     "execution_admission",
+    "session_usage",
     "guardian_assessment",
     "review_delegate_started",
     "review_delegate_completed",
@@ -1481,6 +1565,7 @@ const DURABLE_EVENT_TYPES = Object.freeze(
     "message_submission",
     "turn_complete",
     "turn_aborted",
+    "turn_failed",
     "error",
     "context_compacted",
     "subagent_turn_outcome",

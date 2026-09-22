@@ -94,6 +94,7 @@ vi.mock("./tool-rendering.js", () => ({
 }));
 
 import {
+  AGENC_DAEMON_LOST_TURN_REASON,
   AGENC_DAEMON_RECONNECTING_MESSAGE,
   attachDaemonAgentTuiSession,
   type AgenCDaemonConnectionState,
@@ -811,6 +812,19 @@ describe("AgenC TUI daemon session adapter", () => {
           runtimeSettingsEventId: "settings:agent_1:initial",
         } as never;
       }
+      if (method === "session.transcript.v2") {
+        return {
+          schemaVersion: 2,
+          sessionId: "session_1",
+          runId: "agent_runtime",
+          historyEpoch: "epoch_1",
+          asOfSequence: 20,
+          messages: [
+            { messageId: "user_1", commitEventId: "event:1", role: "user", text: "Build a notes CLI", committedSequence: 1 },
+            { messageId: "assistant_1", commitEventId: "event:19", role: "assistant", text: "The notes CLI passes its tests", committedSequence: 19 },
+          ],
+        } as never;
+      }
       return {} as never;
     };
 
@@ -835,11 +849,16 @@ describe("AgenC TUI daemon session adapter", () => {
     unsubscribe();
 
     expect(session.conversationId).toBe("agent_runtime");
+    expect(session.getInitialTranscriptEvents()).toEqual([
+      { id: "snapshot:epoch_1:user_1", type: "user_message", payload: { message: "Build a notes CLI" } },
+      { id: "snapshot:epoch_1:assistant_1", type: "agent_message", payload: { message: "The notes CLI passes its tests" } },
+    ]);
     expect(client.requests).toEqual([
       {
         method: "agent.attach",
         params: { agentId: "agent_1", clientId: "tui_1" },
       },
+      { method: "session.transcript.v2", params: { sessionId: "session_1" } },
     ]);
     expect(received).toEqual([{ type: "turn_delta", id: "turn_1" }]);
   });
@@ -898,6 +917,55 @@ describe("AgenC TUI daemon session adapter", () => {
     ]);
     unsubscribeEarly();
     unsubscribeLate();
+  });
+
+  it.each([501, 1_000])("replays all %i attach events to a late transcript subscriber", async count => {
+    const client = createClient();
+    const session = await attachDaemonTuiSession({
+      baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1",
+    });
+    const early: unknown[] = [];
+    const stopEarly = session.subscribeToEvents(event => early.push(event));
+    const late: unknown[] = [];
+    let stopLate: (() => void) | undefined;
+    try {
+      for (let index = 1; index <= count; index += 1) {
+        client.emit("session_1", {
+          type: "daemon.event", msg: { id: `replay-${index}`, seq: index, type: "user_message", payload: { message: `prompt ${index}` } },
+        });
+      }
+      stopLate = session.subscribeToEvents(event => late.push(event));
+      expect(late).toHaveLength(count);
+      expect(late).toEqual(early);
+      client.emit("session_1", { type: "daemon.event", msg: { id: "live", type: "turn_delta" } });
+      expect(late).toEqual(early);
+      expect(late).toHaveLength(count + 1);
+    } finally {
+      stopLate?.();
+      stopEarly();
+    }
+  });
+
+  it("rejects incomplete late replay without interrupting an existing live subscriber", async () => {
+    const client = createClient();
+    const session = await attachDaemonTuiSession({
+      baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1",
+    });
+    const early: unknown[] = [];
+    const stopEarly = session.subscribeToEvents(event => early.push(event));
+    try {
+      for (let index = 1; index <= 1_001; index += 1) {
+        client.emit("session_1", { type: "daemon.event", msg: { id: `event-${index}`, type: "turn_delta" } });
+      }
+      const late = vi.fn();
+      expect(() => session.subscribeToEvents(late)).toThrow(/reopen.*conversation/i);
+      expect(late).not.toHaveBeenCalled();
+      client.emit("session_1", { type: "daemon.event", msg: { id: "still-live", type: "turn_delta" } });
+      expect(early).toHaveLength(1_002);
+      expect(late).not.toHaveBeenCalled();
+    } finally {
+      stopEarly();
+    }
   });
 
   it("attaches the TUI client before returning a daemon-backed session", async () => {
@@ -1502,6 +1570,13 @@ describe("AgenC TUI daemon session adapter", () => {
     });
     expect(session.activeTurn?.unsafePeek()).toEqual({ turnId: "daemon-turn" });
 
+    await session.cancelActiveTurn?.("interrupt foreground tool");
+    expect(client.requests).toContainEqual({
+      method: "session.cancelTurn",
+      params: { sessionId: "session_1", expectedTurnId: "turn_1", reason: "interrupt foreground tool" },
+      signal: expect.any(AbortSignal),
+    });
+
     client.emit("session_1", {
       method: "event.session_event",
       params: {
@@ -1750,52 +1825,6 @@ describe("AgenC TUI daemon session adapter", () => {
     });
   });
 
-  it("preserves exact editor selection metadata through message.stream", async () => {
-    const client = createClient();
-    const session = createDaemonTuiSession({
-      baseSession: createBaseSession(),
-      client,
-      sessionId: "session_1",
-      clientId: "tui_1",
-    });
-
-    await session.submit?.("explain this selection", {
-      editorInteraction: {
-        interactionId: "interaction-1",
-        kind: "explain",
-        policy: "read_only",
-        editorInstanceId: "editor-1",
-        bufferHandle: 7,
-        changedtick: 19,
-        contentSha256: "a".repeat(64),
-        path: "/workspace/src/main.ts",
-        range: {
-          start: { line: 4, column: 2 },
-          end: { line: 6, column: 9 },
-        },
-        selectionMode: "block",
-      },
-    });
-
-    expect(client.requests).toHaveLength(1);
-    expect(client.requests[0]).toMatchObject({
-      method: "message.stream",
-      params: {
-        sessionId: "session_1",
-        content: "explain this selection",
-        metadata: {
-          editorInteraction: {
-            range: {
-              start: { line: 4, column: 2 },
-              end: { line: 6, column: 9 },
-            },
-            selectionMode: "block",
-          },
-        },
-      },
-    });
-  });
-
   it("clears daemon-owned session history through session.clear", async () => {
     const client = createClient();
     const session = createDaemonTuiSession({
@@ -1822,6 +1851,11 @@ describe("AgenC TUI daemon session adapter", () => {
       client,
       sessionId: "session_1",
       clientId: "tui_1",
+      transcriptSnapshot: {
+        schemaVersion: 2, sessionId: "session_1", runId: "run_1",
+        historyEpoch: "initial", asOfSequence: 0, messages: [],
+        activeTurn: { turnId: "observed_turn" },
+      },
     });
 
     await session.cancelActiveTurn?.("interrupted");
@@ -1829,7 +1863,7 @@ describe("AgenC TUI daemon session adapter", () => {
     expect(client.requests).toEqual([
       {
         method: "session.cancelTurn",
-        params: { sessionId: "session_1", reason: "interrupted" },
+        params: { sessionId: "session_1", reason: "interrupted", expectedTurnId: "observed_turn" },
         // The cancel RPC carries a 5s timeout signal so a wedged daemon can
         // never swallow an ESC silently.
         signal: expect.any(AbortSignal),
@@ -1844,6 +1878,11 @@ describe("AgenC TUI daemon session adapter", () => {
       client,
       sessionId: "session_1",
       clientId: "tui_1",
+      transcriptSnapshot: {
+        schemaVersion: 2, sessionId: "session_1", runId: "run_1",
+        historyEpoch: "initial", asOfSequence: 0, messages: [],
+        activeTurn: { turnId: "observed_turn" },
+      },
     });
 
     await session.cancelActiveTurn?.();
@@ -1851,7 +1890,7 @@ describe("AgenC TUI daemon session adapter", () => {
     expect(client.requests).toEqual([
       {
         method: "session.cancelTurn",
-        params: { sessionId: "session_1" },
+        params: { sessionId: "session_1", expectedTurnId: "observed_turn" },
         signal: expect.any(AbortSignal),
       },
     ]);
@@ -2254,7 +2293,7 @@ describe("AgenC TUI daemon session adapter", () => {
     expect(authority.currentMode()).toBe("plan");
   });
 
-  it("holds immediate input until an in-flight permission-mode change settles", async () => {
+  it.each([false, true])("holds immediate input until an in-flight permission-mode change settles (cancelled: %s)", async (cancelled) => {
     const authority = runtimeAuthorityBase();
     const client = createClient();
     const request = client.request.bind(client);
@@ -2295,7 +2334,14 @@ describe("AgenC TUI daemon session adapter", () => {
       "session.setPermissionMode",
     ]);
 
+    if (cancelled) await session.cancelActiveTurn?.("cancel before dispatch");
     releaseModeRequest.resolve();
+    if (cancelled) {
+      await expect(submission).rejects.toMatchObject({ name: "AbortError" });
+      await modeChange;
+      expect(client.requests.map((entry) => entry.method)).toEqual(["session.setPermissionMode"]);
+      return;
+    }
     await Promise.all([modeChange, submission]);
     expect(client.requests.map((entry) => entry.method)).toEqual([
       "session.setPermissionMode",
@@ -2586,347 +2632,6 @@ describe("AgenC TUI daemon session adapter", () => {
     ]);
   });
 
-  it("forwards workspace editor lease and synchronization RPCs without session projection", async () => {
-    const client = createClient();
-    const session = createDaemonTuiSession({
-      baseSession: createBaseSession(),
-      client,
-      sessionId: "session_1",
-      clientId: "tui_1",
-    });
-    const lease = {
-      workspaceRoot: "/workspace",
-      editorInstanceId: "editor_1",
-      leaseToken: "00000000-0000-4000-8000-000000000001",
-      epoch: 2,
-    };
-
-    await expect(
-      session.acquireWorkspaceEditor?.({
-        workspaceRoot: lease.workspaceRoot,
-        editorInstanceId: lease.editorInstanceId,
-      }),
-    ).resolves.toMatchObject({
-      ...lease,
-      sequence: -1,
-      expiresAt: 15_000,
-    });
-    await expect(
-      session.syncWorkspaceEditor?.({
-        ...lease,
-        sequence: 1,
-        buffers: [
-          {
-            path: "/workspace/src/index.ts",
-            bufferHandle: 7,
-            changedtick: 4,
-            contentSha256: "a".repeat(64),
-            contentBytes: 0,
-            dirty: false,
-          },
-        ],
-      }),
-    ).resolves.toEqual({
-      accepted: true,
-      sequence: 1,
-      expiresAt: 16_000,
-      dirtyPaths: [],
-      stalePaths: [],
-    });
-    await expect(
-      session.refreshWorkspaceEditorStaleAuthority?.(lease),
-    ).resolves.toEqual({
-      refreshed: true,
-      staleAuthority: [],
-    });
-    await expect(
-      session.heartbeatWorkspaceEditor?.(lease),
-    ).resolves.toMatchObject({
-      ...lease,
-      sequence: -1,
-      expiresAt: 15_000,
-    });
-    await expect(
-      session.releaseWorkspaceEditor?.({
-        ...lease,
-        abandonDirty: false,
-      }),
-    ).resolves.toEqual({
-      released: true,
-      stalePaths: [],
-    });
-    const topologyTargets = [
-      {
-        path: "/workspace/src",
-        includeDescendants: true,
-        allowOwnedClean: true,
-      },
-      {
-        path: "/workspace/lib",
-        includeDescendants: true,
-        allowOwnedClean: false,
-      },
-    ] as const;
-    const finalBuffers = [
-      {
-        path: "/workspace/lib/index.ts",
-        bufferHandle: 7,
-        changedtick: 5,
-        contentSha256: "b".repeat(64),
-        contentBytes: 0,
-        dirty: false,
-      },
-    ] as const;
-    await expect(
-      session.reserveWorkspaceEditorTopology?.({
-        ...lease,
-        targets: topologyTargets,
-      }),
-    ).resolves.toEqual({
-      tokenId: "topology-1",
-      targets: topologyTargets,
-    });
-    await expect(
-      session.completeWorkspaceEditorTopology?.({
-        ...lease,
-        tokenId: "topology-1",
-        status: "applied",
-        sequence: 2,
-        buffers: finalBuffers,
-      }),
-    ).resolves.toEqual({
-      completed: true,
-      tokenId: "topology-1",
-      status: "applied",
-      sync: {
-        accepted: true,
-        sequence: 2,
-        expiresAt: 17_000,
-        dirtyPaths: [],
-        stalePaths: [],
-      },
-    });
-    await expect(
-      session.releaseWorkspaceEditorTopology?.({
-        ...lease,
-        tokenId: "topology-1",
-        sequence: 3,
-        buffers: finalBuffers,
-      }),
-    ).resolves.toEqual({
-      released: true,
-      tokenId: "topology-1",
-      sync: {
-        accepted: true,
-        sequence: 3,
-        expiresAt: 18_000,
-        dirtyPaths: [],
-        stalePaths: [],
-      },
-    });
-    await expect(
-      session.listRecoveredWorkspaceEditorTopologies?.(lease),
-    ).resolves.toEqual({
-      mutations: [
-        {
-          tokenId: "recovered-topology-1",
-          workspaceRoot: "/workspace",
-          targets: [
-            {
-              path: "/workspace/src",
-              includeDescendants: true,
-            },
-          ],
-          source: "editor",
-          createdAt: 123,
-        },
-      ],
-    });
-    await expect(
-      session.resolveRecoveredWorkspaceEditorTopology?.({
-        ...lease,
-        tokenId: "recovered-topology-1",
-      }),
-    ).resolves.toEqual({
-      resolved: true,
-      tokenId: "recovered-topology-1",
-      status: "unknown_outcome",
-    });
-    await expect(
-      session.getWorkspaceEditorProposal?.({
-        ...lease,
-        proposalId: "proposal-1",
-      }),
-    ).resolves.toMatchObject({
-      proposalId: "proposal-1",
-      beforeText: "const value = 1;\n",
-      afterText: "const value = 2;\n",
-    });
-    await expect(
-      session.getWorkspaceEditorProposalStatus?.({
-        ...lease,
-        proposalId: "proposal-1",
-      }),
-    ).resolves.toEqual({
-      status: "committed",
-      proposalId: "proposal-1",
-      path: "/workspace/src/index.ts",
-      source: "file_edit",
-      baseContentSha256: "a".repeat(64),
-      afterContentSha256: "b".repeat(64),
-      baseChangedtick: 4,
-      bufferHandle: 7,
-    });
-    await expect(
-      session.applyWorkspaceEditorProposal?.({
-        ...lease,
-        proposalId: "proposal-1",
-        changedtick: 5,
-        contentSha256: "b".repeat(64),
-        content: "const value = 2;\n",
-      }),
-    ).resolves.toMatchObject({
-      applied: true,
-      proposalId: "proposal-1",
-      changedtick: 5,
-    });
-    await expect(
-      session.discardWorkspaceEditorProposal?.({
-        ...lease,
-        proposalId: "proposal-1",
-      }),
-    ).resolves.toMatchObject({
-      discarded: true,
-      proposalId: "proposal-1",
-    });
-    await expect(
-      session.listWorkspaceEditorChanges?.({
-        ...lease,
-        afterSequence: 2,
-      }),
-    ).resolves.toEqual({
-      sequence: 3,
-      changes: [],
-    });
-
-    expect(client.requests).toEqual([
-      {
-        method: "workspace.editor.acquire",
-        params: {
-          workspaceRoot: "/workspace",
-          editorInstanceId: "editor_1",
-        },
-      },
-      {
-        method: "workspace.editor.sync",
-        params: {
-          ...lease,
-          sequence: 1,
-          buffers: [
-            {
-              path: "/workspace/src/index.ts",
-              bufferHandle: 7,
-              changedtick: 4,
-              contentSha256: "a".repeat(64),
-              contentBytes: 0,
-              dirty: false,
-            },
-          ],
-        },
-      },
-      {
-        method: "workspace.editor.staleAuthority.refresh",
-        params: lease,
-      },
-      {
-        method: "workspace.editor.heartbeat",
-        params: lease,
-      },
-      {
-        method: "workspace.editor.release",
-        params: {
-          ...lease,
-          abandonDirty: false,
-        },
-      },
-      {
-        method: "workspace.editor.topology.reserve",
-        params: {
-          ...lease,
-          targets: topologyTargets,
-        },
-      },
-      {
-        method: "workspace.editor.topology.complete",
-        params: {
-          ...lease,
-          tokenId: "topology-1",
-          status: "applied",
-          sequence: 2,
-          buffers: finalBuffers,
-        },
-      },
-      {
-        method: "workspace.editor.topology.release",
-        params: {
-          ...lease,
-          tokenId: "topology-1",
-          sequence: 3,
-          buffers: finalBuffers,
-        },
-      },
-      {
-        method: "workspace.editor.topology.recovered.list",
-        params: lease,
-      },
-      {
-        method: "workspace.editor.topology.recovered.resolve",
-        params: {
-          ...lease,
-          tokenId: "recovered-topology-1",
-        },
-      },
-      {
-        method: "workspace.editor.proposal.get",
-        params: {
-          ...lease,
-          proposalId: "proposal-1",
-        },
-      },
-      {
-        method: "workspace.editor.proposal.status",
-        params: {
-          ...lease,
-          proposalId: "proposal-1",
-        },
-      },
-      {
-        method: "workspace.editor.proposal.apply",
-        params: {
-          ...lease,
-          proposalId: "proposal-1",
-          changedtick: 5,
-          contentSha256: "b".repeat(64),
-          content: "const value = 2;\n",
-        },
-      },
-      {
-        method: "workspace.editor.proposal.discard",
-        params: {
-          ...lease,
-          proposalId: "proposal-1",
-        },
-      },
-      {
-        method: "workspace.editor.changes.list",
-        params: {
-          ...lease,
-          afterSequence: 2,
-        },
-      },
-    ]);
-  });
-
   it("forwards shell execution through the attached session with cancellation", async () => {
     const client = createClient();
     const session = createDaemonTuiSession({
@@ -2985,6 +2690,47 @@ describe("AgenC TUI daemon session adapter", () => {
         params: { sessionId: "session_1" },
       },
     ]);
+  });
+
+  it("sends only owned status-line identity and presentation with transport cancellation", async () => {
+    const client = createClient();
+    const request = vi.spyOn(client, "request").mockResolvedValue({ status: "rendered", text: "daemon-cost" });
+    const session = createDaemonTuiSession({
+      baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1",
+    });
+    const controller = new AbortController();
+    await expect(session.executeDaemonStatusLine?.({
+      sessionId: "foreign-session", command: "never-send", cost: 100,
+    }, controller.signal)).resolves.toEqual({ status: "rendered", text: "daemon-cost" });
+    expect(request).toHaveBeenCalledWith("session.statusLine.execute", {
+      sessionId: "session_1", presentation: {},
+    }, { signal: controller.signal });
+    request.mockRestore();
+  });
+
+  it.each([
+    [new AgenCDaemonResponseError({ code: -32601, message: "unsupported" }), "unavailable", "unsupported_method"],
+    [new Error("private transport detail"), "error", "request_failed"],
+  ] as const)("does not retry status-line transport failure %s", async (error, status, reason) => {
+    const client = createClient();
+    const request = vi.spyOn(client, "request").mockRejectedValue(error);
+    const session = createDaemonTuiSession({
+      baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1",
+    });
+    await expect(session.executeDaemonStatusLine?.({})).resolves.toEqual({ status, reason });
+    expect(request).toHaveBeenCalledOnce();
+    request.mockRestore();
+  });
+
+  it("does not dispatch a status-line request with an already cancelled signal", async () => {
+    const client = createClient();
+    const session = createDaemonTuiSession({
+      baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1",
+    });
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled status"));
+    await expect(session.executeDaemonStatusLine?.({}, controller.signal)).rejects.toThrow("cancelled status");
+    expect(client.requests).toHaveLength(0);
   });
 
   it("forwards setDaemonHooksDisabled to the daemon session.hooks.setDisabled RPC", async () => {
@@ -3384,6 +3130,7 @@ describe("AgenC TUI daemon session adapter", () => {
             },
           ],
           metadata: { displayUserMessage: null },
+          clientMessageId: expect.any(String),
           streamId: expect.stringMatching(/^tui_1:/),
         },
       },
@@ -3413,67 +3160,6 @@ describe("AgenC TUI daemon session adapter", () => {
           { type: "text", text: "typed" },
         ],
       },
-    });
-  });
-
-  it("never drains Editor-owned input into Agent submits and admits only the exact Editor interaction", async () => {
-    const client = createClient();
-    const session = createDaemonTuiSession({
-      baseSession: createBaseSession(),
-      client,
-      sessionId: "session_1",
-      clientId: "tui_1",
-    });
-    const interaction = {
-      interactionId: "editor-owned-daemon-input",
-      kind: "explain" as const,
-      policy: "read_only" as const,
-      editorInstanceId: "editor-1",
-      bufferHandle: 7,
-      changedtick: 3,
-      contentSha256: "a".repeat(64),
-      path: "src/value.ts",
-      range: {
-        start: { line: 1, column: 0 },
-        end: { line: 1, column: 5 },
-      },
-    };
-    session.enqueueIdleInput(
-      { role: "user", content: "EDITOR_ATTACHMENT_SENTINEL" },
-      {
-        workspaceView: "editor",
-        editorInteractionId: interaction.interactionId,
-      },
-    );
-
-    await session.submit("Agent prompt");
-    await session.submit("Editor prompt", {
-      editorInteraction: interaction,
-    });
-    await session.submit("later Agent prompt");
-
-    expect(client.requests).toHaveLength(3);
-    expect(client.requests[0]).toMatchObject({
-      method: "message.stream",
-      params: { content: "Agent prompt" },
-    });
-    expect(client.requests[1]).toMatchObject({
-      method: "message.stream",
-      params: {
-        content: [
-          { type: "text", text: "EDITOR_ATTACHMENT_SENTINEL" },
-          { type: "text", text: "Editor prompt" },
-        ],
-        metadata: {
-          editorInteraction: {
-            interactionId: interaction.interactionId,
-          },
-        },
-      },
-    });
-    expect(client.requests[2]).toMatchObject({
-      method: "message.stream",
-      params: { content: "later Agent prompt" },
     });
   });
 
@@ -3965,6 +3651,85 @@ describe("AgenC TUI daemon session adapter", () => {
       },
       { type: "turn_complete", id: "turn_1" },
     ]);
+  });
+
+  describe("a turn whose daemon is gone", () => {
+    function sessionWithActiveTurn(request: (method: string) => Promise<unknown>, lostTurnProbeMs?: number) {
+      const client = createClient();
+      client.request = ((method: string) => request(method)) as typeof client.request;
+      const received: JsonObject[] = [];
+      const session = createDaemonTuiSession({
+        baseSession: createBaseSession(),
+        client,
+        sessionId: "session_1",
+        clientId: "tui_1",
+        ...(lostTurnProbeMs !== undefined ? { lostTurnProbeMs } : {}),
+      });
+      const unsubscribe = session.subscribeToEvents((event) => {
+        received.push(event as JsonObject);
+      });
+      client.emit("session_1", {
+        type: "daemon.event",
+        msg: { type: "turn_started", payload: { turnId: "turn_1" } },
+      });
+      expect(session.activeTurn.unsafePeek()).toEqual({ turnId: "turn_1" });
+      return { client, session, received, unsubscribe };
+    }
+    const aborted = (events: readonly JsonObject[]) =>
+      events.filter((event) => event.type === "turn_aborted");
+
+    it("ends the turn locally once the daemon is proven unreachable, so the TUI is not busy forever", async () => {
+      // No terminal event can arrive from a killed daemon. Without this the
+      // composer stays busy: Esc cancels nothing and /exit is refused.
+      const probes: string[] = [];
+      const { client, session, received, unsubscribe } = sessionWithActiveTurn(async (method) => {
+        probes.push(method);
+        throw new Error("connect ECONNREFUSED daemon.sock");
+      });
+      client.emitConnection({ status: "disconnected", message: "Daemon connection closed" });
+      await vi.waitFor(() => expect(aborted(received)).toHaveLength(1));
+      expect(probes).toEqual(["session.snapshot"]);
+      expect(aborted(received)[0]).toMatchObject({
+        payload: { turnId: "turn_1", reason: AGENC_DAEMON_LOST_TURN_REASON },
+      });
+      expect(session.activeTurn.unsafePeek()).toBeNull();
+      // The failed probe reports "disconnected" again; the settled turn is not aborted twice.
+      client.emitConnection({ status: "disconnected", message: "connect ECONNREFUSED" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(aborted(received)).toHaveLength(1);
+      unsubscribe();
+    });
+
+    it("leaves the turn alone when the daemon answers: a dropped socket is not a dead turn", async () => {
+      const { client, session, received, unsubscribe } = sessionWithActiveTurn(async () => ({ sessionId: "session_1" }));
+      client.emitConnection({ status: "disconnected", message: "Daemon connection closed" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(aborted(received)).toHaveLength(0);
+      expect(session.activeTurn.unsafePeek()).toEqual({ turnId: "turn_1" });
+      unsubscribe();
+    });
+
+    it("ends the turn when the daemon stays silent past the probe deadline, not the 30 s RPC window", async () => {
+      const { client, received, unsubscribe } = sessionWithActiveTurn(
+        () => new Promise(() => {}),
+        25,
+      );
+      client.emitConnection({ status: "disconnected", message: "Daemon connection closed" });
+      await vi.waitFor(() => expect(aborted(received)).toHaveLength(1), { timeout: 2_000 });
+      expect(aborted(received)[0]).toMatchObject({ payload: { reason: AGENC_DAEMON_LOST_TURN_REASON } });
+      unsubscribe();
+    });
+
+    it("does not probe when no turn is in flight", async () => {
+      const client = createClient();
+      const session = createDaemonTuiSession({ baseSession: createBaseSession(), client, sessionId: "session_1", clientId: "tui_1" });
+      const unsubscribe = session.subscribeToEvents(() => {});
+      const before = client.requests.length;
+      client.emitConnection({ status: "disconnected" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(client.requests.slice(before).map((request) => request.method)).not.toContain("session.snapshot");
+      unsubscribe();
+    });
   });
 
   it("preserves initial transcript state while surfacing an existing disconnect", () => {

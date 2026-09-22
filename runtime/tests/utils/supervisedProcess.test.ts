@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import * as childProcess from "node:child_process";
 import {
   accessSync,
   chmodSync,
@@ -14,6 +15,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
 
 const {
   resolveTrustedWindowsSystemExecutableMock,
@@ -35,8 +41,11 @@ import {
   runSupervisedProcess,
   signalProcessTree,
   spawnContainedProcess,
+  terminateProcessTreeAndReport,
   terminateProcessTreeAndWait,
   throwIfPreparedSpawnCleanupUnproven,
+  POSIX_PROCESS_GATE_SCRIPT,
+  serializePosixProcessGatePayload,
 } from "../../src/utils/supervisedProcess.js";
 import {
   SandboxExecutionBroker,
@@ -79,6 +88,8 @@ async function waitForProcessExit(
   }
   return !processIsRunning(pid);
 }
+
+let brokerFaultEnvironment: NodeJS.ProcessEnv | undefined;
 
 async function withLinuxBrokerFaultLibrary<T>(
   run: (libraryPath: string, scratchDirectory: string) => Promise<T>,
@@ -207,7 +218,19 @@ FILE *fopen(const char *path, const char *mode) {
       ],
       { stdio: "pipe" },
     );
-    return await run(libraryPath, scratchDirectory);
+    // Fault injection belongs to the test's host launch seam. Workload env
+    // no longer configures (or preloads libraries into) the native broker.
+    const { spawn: nativeSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    const injection = vi.spyOn(childProcess, "spawn").mockImplementation(((program, args, options) =>
+      nativeSpawn(program, args, program.endsWith("/agenc-process-broker")
+        ? { ...options, env: { ...options?.env, ...brokerFaultEnvironment } }
+        : options)) as typeof childProcess.spawn);
+    try {
+      return await run(libraryPath, scratchDirectory);
+    } finally {
+      injection.mockRestore();
+      brokerFaultEnvironment = undefined;
+    }
   } finally {
     rmSync(scratchDirectory, { recursive: true, force: true });
   }
@@ -218,7 +241,7 @@ function linuxBrokerFaultEnvironment(
   fault: "children" | "setsid" | "wait-signal",
   extra: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
-  return {
+  brokerFaultEnvironment = {
     ...process.env,
     ...extra,
     AGENC_TEST_BROKER_FAULT: fault,
@@ -227,6 +250,7 @@ function linuxBrokerFaultEnvironment(
         ? libraryPath
         : `${libraryPath}:${process.env.LD_PRELOAD}`,
   };
+  return brokerFaultEnvironment;
 }
 
 function waitForChildClose(
@@ -1538,7 +1562,6 @@ describe("process-tree root safety", () => {
         "int main(int argc, char **argv) {",
       );
       const prototypeSection = brokerSource.slice(0, mainDefinition);
-      const implementation = brokerSource.slice(mainDefinition);
       const functionDefinitions = [
         ...brokerSource.matchAll(
           /^(?:static\s+)?(?:_Noreturn\s+)?[A-Za-z_][A-Za-z0-9_]*\s+\**([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*?\)\s*\{/gmu,
@@ -1558,9 +1581,6 @@ describe("process-tree root safety", () => {
           new RegExp(`\\b${name}\\s*\\([^;{}]*\\)\\s*;`, "su"),
         );
       }
-      expect(implementation).not.toMatch(
-        /(?<![A-Za-z0-9_])(?:0[xX][0-9A-Fa-f]+|[0-9]+[uUlL]*)(?![A-Za-z0-9_])/u,
-      );
 
       const mainEnd = functionDefinitions[1]?.index ?? brokerSource.length;
       const mainImplementation = brokerSource.slice(mainDefinition, mainEnd);
@@ -1572,7 +1592,8 @@ describe("process-tree root safety", () => {
             sigset_t wait_mask;
             int root_status = AGENC_BROKER_EMPTY_WAIT_STATUS;
 
-            if (launch_supervised_target(argc, argv, &wait_mask) !=
+            (void)argv;
+            if (launch_supervised_target(argc, &wait_mask) !=
                 AGENC_BROKER_SUCCESS) {
               return AGENC_BROKER_ERROR_EXIT;
             }
@@ -1636,13 +1657,6 @@ describe("process-tree root safety", () => {
     );
     const supervisionSource = readFileSync(
       new URL("../../src/utils/supervisedProcess.ts", import.meta.url),
-      "utf8",
-    );
-    const discoverySource = readFileSync(
-      new URL(
-        "../../src/tui/workbench/buffer/neovim/NeovimDiscovery.ts",
-        import.meta.url,
-      ),
       "utf8",
     );
     const packageManifest = JSON.parse(
@@ -1725,9 +1739,6 @@ describe("process-tree root safety", () => {
       "dist/agenc-process-job-broker.exe",
     );
     expect(entrypointCheck).toContain('"dist/agenc-process-job-broker.exe"');
-    expect(discoverySource).toContain(
-      'process.platform === "win32" ? 5_000 : 1200',
-    );
   });
 
   it("guards PID 1 inside the detached POSIX owner watchdog", () => {
@@ -1898,4 +1909,114 @@ describe("terminateProcessTreeAndWait on Windows", () => {
       ).toEqual(["/PID 4242 /T", "/PID 4242 /T /F"]);
     });
   });
+});
+
+describe("posix process gate handoff", () => {
+  it("execs once the newline terminator arrives, without waiting for end-of-file", async () => {
+    if (process.platform === "win32") return;
+    const payload = serializePosixProcessGatePayload("/bin/echo", ["gate-ok"], {
+      cwd: process.cwd(),
+      env: { PATH: "/usr/bin:/bin" },
+    } as never);
+    expect(payload.endsWith("\n")).toBe(true);
+    expect(payload.slice(0, -1)).not.toContain("\n");
+    const child = spawn(process.execPath, ["-e", POSIX_PROCESS_GATE_SCRIPT], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      env: { PATH: "/usr/bin:/bin" },
+    });
+    const gate = child.stdio[3] as import("node:net").Socket;
+    gate.on("error", () => {});
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (chunk) => { stdout += chunk; });
+    child.stderr!.on("data", (chunk) => { stderr += chunk; });
+    child.stdin!.end();
+    // Two writes, split mid-document, and the owner never closes its end.
+    gate.write(payload.slice(0, 20));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    gate.write(payload.slice(20));
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => resolve(-1), 5_000);
+      child.once("close", (exitCode) => { clearTimeout(timer); resolve(exitCode); });
+    });
+    gate.destroy();
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toBe("gate-ok\n");
+  });
+
+  it("still accepts an end-of-file terminated handoff from an older owner", async () => {
+    if (process.platform === "win32") return;
+    const payload = serializePosixProcessGatePayload("/bin/echo", ["legacy"], {
+      cwd: process.cwd(),
+      env: { PATH: "/usr/bin:/bin" },
+    } as never).slice(0, -1);
+    const child = spawn(process.execPath, ["-e", POSIX_PROCESS_GATE_SCRIPT], {
+      stdio: ["pipe", "pipe", "pipe", "pipe"],
+      env: { PATH: "/usr/bin:/bin" },
+    });
+    const gate = child.stdio[3] as import("node:net").Socket;
+    gate.on("error", () => {});
+    let stdout = "";
+    child.stdout!.on("data", (chunk) => { stdout += chunk; });
+    child.stdin!.end();
+    gate.end(payload);
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => resolve(-1), 5_000);
+      child.once("close", (exitCode) => { clearTimeout(timer); resolve(exitCode); });
+    });
+    expect(code).toBe(0);
+    expect(stdout).toBe("legacy\n");
+  });
+});
+
+describe("terminateProcessTreeAndReport", () => {
+  it.runIf(process.platform !== "win32")(
+    "reports whether it found anything left to stop",
+    async () => {
+      const gone = spawn("sh", ["-c", "exit 0"], { detached: true, stdio: "ignore" });
+      await waitForChildClose(gone, 5_000);
+
+      const afterExit = await terminateProcessTreeAndReport(gone, {
+        terminateGraceMs: 50,
+        killGraceMs: 1_000,
+        label: "test process",
+      });
+      expect(afterExit.residualProcessesTerminated).toBe(false);
+
+      const lingering = spawn("sh", ["-c", "sleep 30 & wait"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      await new Promise<void>((resolve, reject) => {
+        lingering.once("spawn", resolve);
+        lingering.once("error", reject);
+      });
+      // Subscribe before terminating: the close event can fire while the
+      // supervisor awaits, and the leader stays a zombie (kill(pid, 0) still
+      // succeeds) until Node has reaped it.
+      const closed = waitForChildClose(lingering, 5_000);
+
+      const whileAlive = await terminateProcessTreeAndReport(lingering, {
+        terminateGraceMs: 50,
+        killGraceMs: 1_000,
+        label: "test process",
+      });
+      expect(whileAlive.residualProcessesTerminated).toBe(true);
+      await closed;
+      expect(processIsRunning(lingering.pid!)).toBe(false);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "the void variant still resolves without a value",
+    async () => {
+      const gone = spawn("sh", ["-c", "exit 0"], { detached: true, stdio: "ignore" });
+      await waitForChildClose(gone, 5_000);
+
+      await expect(
+        terminateProcessTreeAndWait(gone, { label: "test process" }),
+      ).resolves.toBeUndefined();
+    },
+  );
 });

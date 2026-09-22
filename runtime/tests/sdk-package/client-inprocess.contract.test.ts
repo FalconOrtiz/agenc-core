@@ -18,12 +18,14 @@ import {
   type JsonObject,
 } from "../../src/app-server/protocol/index.js";
 import {
+  collectClientEnvOverrides,
   createAgencClient,
   type AgencClient,
   type AgencPermissionRequest,
   type AgencPromptEvent,
   type AgencTransport,
 } from "../../../packages/agenc-sdk/src/index";
+import { AGENC_DAEMON_CLIENT_ENV_KEYS } from "../../../packages/agenc-sdk/src/protocol-wire.generated.js";
 
 const workspaces = createTempWorkspaceFixture(
   "agenc-sdk-in-process-workspace-",
@@ -48,11 +50,13 @@ interface FakeDaemon {
   readonly pluginStorageRoot: string;
   readonly transport: AgenCInProcessDaemonTransport;
   readonly multiplexer: AgenCDaemonClientMultiplexer;
+  readonly sessionManager: AgenCDaemonSessionManager;
   readonly calls: {
     created: JsonObject[];
     streamed: JsonObject[];
     approved: JsonObject[];
     denied: JsonObject[];
+    cancelled: JsonObject[];
   };
   broadcast(
     sessionId: string,
@@ -93,6 +97,7 @@ async function createFakeDaemon(
     streamed: [],
     approved: [],
     denied: [],
+    cancelled: [],
   };
   const pluginStorageRoot = await workspaces.create();
 
@@ -236,6 +241,10 @@ async function createFakeDaemon(
         requestId: String(params.requestId),
         decision: "cancelled" as const,
       }),
+      cancelSessionTurn: async (params: JsonObject) => {
+        calls.cancelled.push(params);
+        return { sessionId: String(params.sessionId), cancelled: true };
+      },
       snapshotSession: async (params: JsonObject) => ({
         sessionId: String(params.sessionId),
         turnCount: 1,
@@ -245,6 +254,14 @@ async function createFakeDaemon(
           totalTokens: 18,
           costUsd: 0.0042,
         },
+      }),
+      getSessionTranscriptV2: async (params: JsonObject) => ({
+        schemaVersion: 2,
+        sessionId: String(params.sessionId),
+        runId: "run_1",
+        historyEpoch: "initial",
+        asOfSequence: 0,
+        messages: [],
       }),
     } as never,
     sessionManager,
@@ -270,6 +287,7 @@ async function createFakeDaemon(
     pluginStorageRoot,
     transport,
     multiplexer,
+    sessionManager,
     calls,
     broadcast: (sessionId, notification) =>
       multiplexer.broadcastSessionNotification(sessionId, notification),
@@ -301,6 +319,45 @@ function statusNotification(
 }
 
 describe("agenc-sdk client over the in-process transport", () => {
+  it("closing a prompt detaches its client and settles handles while the daemon session remains live", async () => {
+    let started!: () => void;
+    let release!: () => void;
+    const admitted = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let completed = false;
+    const daemon = await createFakeDaemon({
+      onStreamMessage: async () => {
+        started();
+        await gate;
+        completed = true;
+      },
+    });
+    try {
+      await daemon.client.initialize();
+      const session = await daemon.client.createSession({ pluginStorageRoot: daemon.pluginStorageRoot });
+      const run = session.prompt("keep running after detach", { includeUsage: false });
+      await admitted;
+      await expect(daemon.multiplexer.attachedClientIds(session.sessionId)).resolves.toEqual([daemon.client.clientId]);
+
+      await daemon.client.close();
+      await expect(run.accepted).rejects.toThrow("AgenC SDK client is closed");
+      await expect(run.result()).rejects.toThrow("AgenC SDK client is closed");
+      await expect(daemon.multiplexer.attachedClientIds(session.sessionId)).resolves.toEqual([]);
+      await expect(daemon.sessionManager.getSession(session.sessionId)).resolves.toMatchObject({
+        sessionId: session.sessionId,
+        status: "idle",
+      });
+      expect(daemon.calls.cancelled).toEqual([]);
+      expect(completed).toBe(false);
+      release();
+      await gate;
+      expect(completed).toBe(true);
+    } finally {
+      release();
+      await daemon.close();
+    }
+  });
+
   it("initializes, creates a session, and streams a typed prompt event stream", async () => {
     const cwd = await workspaces.create();
     const daemon = await createFakeDaemon({
@@ -347,7 +404,7 @@ describe("agenc-sdk client over the in-process transport", () => {
     const initialized = await daemon.client.initialize();
     expect(initialized).toMatchObject({
       type: "initialized",
-      protocol: { version: "1.9.0" },
+      protocol: { version: "1.15.0" },
     });
 
     const session = await daemon.client.createSession({
@@ -420,6 +477,104 @@ describe("agenc-sdk client over the in-process transport", () => {
     await daemon.close();
   });
 
+  it("createSession bypassApprovals keeps the sandbox and forwards permissionMode, model and provider", async () => {
+    const cwd = await workspaces.create();
+    const daemon = await createFakeDaemon({});
+    try {
+      await daemon.client.initialize();
+      const session = await daemon.client.createSession({
+        cwd,
+        pluginStorageRoot: daemon.pluginStorageRoot,
+        bypassApprovals: true,
+        model: "grok-4.6",
+        provider: "grok",
+      });
+      expect(session.sessionId).toBe("session_1");
+      const created = daemon.calls.created.at(-1);
+      expect(created).toMatchObject({
+        permissionMode: "bypassPermissions",
+        model: "grok-4.6",
+        provider: "grok",
+      });
+      // Approvals off, sandbox on: only the dangerous option drops the sandbox.
+      expect(created?.runtimeOptions).toMatchObject({
+        dangerouslyBypassApprovalsAndSandbox: false,
+      });
+
+      await expect(
+        daemon.client.createSession({
+          cwd,
+          pluginStorageRoot: daemon.pluginStorageRoot,
+          bypassApprovals: true,
+          permissionMode: "plan",
+        }),
+      ).rejects.toThrow(/bypassApprovals conflicts with permissionMode "plan"/u);
+      // The conflict is refused before anything reaches the daemon.
+      expect(daemon.calls.created).toHaveLength(1);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  it("createSession forwards this process's allowlisted environment as envOverrides, like agenc -p", async () => {
+    const cwd = await workspaces.create();
+    const previous = {
+      DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY,
+      AGENC_CREDENTIAL_TEST_MCP: process.env.AGENC_CREDENTIAL_TEST_MCP,
+      SDK_TEST_UNRELATED_SECRET: process.env.SDK_TEST_UNRELATED_SECRET,
+    };
+    process.env.DEEPSEEK_API_KEY = "sk-test-not-a-real-key";
+    process.env.AGENC_CREDENTIAL_TEST_MCP = "bearer-test";
+    process.env.SDK_TEST_UNRELATED_SECRET = "must-not-leak";
+    const daemon = await createFakeDaemon({});
+    try {
+      await daemon.client.initialize();
+      await daemon.client.createSession({
+        cwd,
+        pluginStorageRoot: daemon.pluginStorageRoot,
+      });
+      const forwarded = daemon.calls.created.at(-1)?.envOverrides as
+        | Record<string, string>
+        | undefined;
+      expect(forwarded).toBeDefined();
+      expect(forwarded).toMatchObject({
+        DEEPSEEK_API_KEY: "sk-test-not-a-real-key",
+        AGENC_CREDENTIAL_TEST_MCP: "bearer-test",
+      });
+      // Only the daemon's allowlist crosses; arbitrary process state does not.
+      expect(forwarded).not.toHaveProperty("SDK_TEST_UNRELATED_SECRET");
+      for (const key of Object.keys(forwarded ?? {})) {
+        expect(
+          (AGENC_DAEMON_CLIENT_ENV_KEYS as readonly string[]).includes(key) ||
+            /^AGENC_CREDENTIAL_[A-Z0-9_]+$/u.test(key),
+        ).toBe(true);
+      }
+
+      // An explicit empty map opts out of forwarding: none of the process
+      // keys travel (the daemon may still add its own guard entries).
+      await daemon.client.createSession({
+        cwd,
+        pluginStorageRoot: daemon.pluginStorageRoot,
+        envOverrides: {},
+      });
+      // The daemon materializes every allowlisted key from the snapshot, so an
+      // omitted key arrives as an explicit clear ("") rather than a value.
+      const optedOut = (daemon.calls.created.at(-1)?.envOverrides ?? {}) as Record<string, string>;
+      expect(optedOut.DEEPSEEK_API_KEY ?? "").toBe("");
+      expect(optedOut.AGENC_CREDENTIAL_TEST_MCP ?? "").toBe("");
+
+      expect(collectClientEnvOverrides({ DEEPSEEK_API_KEY: "  ", PATH: "/usr/bin", OTHER: "x" })).toEqual({
+        PATH: "/usr/bin",
+      });
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await daemon.close();
+    }
+  });
+
   it("routes a permission request through the callback and back over tool.approve", async () => {
     const seen: AgencPermissionRequest[] = [];
     const daemon = await createFakeDaemon({
@@ -478,6 +633,45 @@ describe("agenc-sdk client over the in-process transport", () => {
     expect(result.deniedPermissionRequestIds).toEqual([]);
 
     await daemon.close();
+  });
+
+  it("deduplicates retransmission but answers distinct occurrences on the same tool call", async () => {
+    const seen: AgencPermissionRequest[] = [];
+    const daemon = await createFakeDaemon({
+      onPermissionRequest: (request) => {
+        seen.push(request);
+        return { behavior: "allow", scope: "once" };
+      },
+      onStreamMessage: async (fake, params) => {
+        const sessionId = String(params.sessionId);
+        for (const ordinal of [1, 1, 2, 2]) {
+          await fake.broadcast(sessionId, {
+            jsonrpc: JSON_RPC_VERSION, method: "event.permission_request",
+            params: { sessionId, requestId: `occurrence-${ordinal}`, eventId: `occurrence-${ordinal}`,
+              callId: "same-tool-call", sequence: ordinal, toolName: "request_permissions",
+              permissions: ["tool.use"], input: { network: [`scope-${ordinal}.example`] } },
+          });
+        }
+      },
+      onApproveTool: (fake, params) => {
+        if (params.requestId === "occurrence-2") {
+          void fake.broadcast(String(params.sessionId), statusNotification(String(params.sessionId), "completed", "done"));
+        }
+      },
+    });
+    try {
+      await daemon.client.initialize();
+      const session = await daemon.client.createSession({ pluginStorageRoot: daemon.pluginStorageRoot });
+      const result = await session.prompt("request scopes").result();
+      expect(result.stopReason).toBe("completed");
+      expect(seen.map(({ requestId, callId }) => ({ requestId, callId }))).toEqual([
+        { requestId: "occurrence-1", callId: "same-tool-call" },
+        { requestId: "occurrence-2", callId: "same-tool-call" },
+      ]);
+      expect(daemon.calls.approved.map((call) => call.requestId)).toEqual(["occurrence-1", "occurrence-2"]);
+    } finally {
+      await daemon.close();
+    }
   });
 
   it("denies permission requests when no handler is registered (never hangs)", async () => {

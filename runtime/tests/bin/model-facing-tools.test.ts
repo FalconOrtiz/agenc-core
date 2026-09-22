@@ -9,6 +9,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ExecutionAdmissionKernel } from "../budget/execution-admission-kernel.js";
+import { runAdmittedToolCall } from "../budget/admitted-tool-call.js";
+import { EventLog, type Event } from "../session/event-log.js";
+import { resetCronSchedulerForTests } from "../utils/cronScheduler.js";
 import type { ProviderFactoryOptions } from "../llm/provider.js";
 import type { LLMProvider, LLMResponse } from "../llm/types.js";
 import type { ToolEvaluatorContext } from "../permissions/evaluator.js";
@@ -22,6 +26,8 @@ import {
 import { collectSkillsSnapshot } from "../commands/skills.js";
 import { createLocalSkillsServices } from "../skills/local-loader.js";
 import { buildBootstrapToolRegistry } from "./bootstrap-tool-registry.js";
+import { buildToolRegistry } from "../tool-registry.js";
+import { StreamingToolExecutor } from "../tools/streaming-executor.js";
 import {
   _clearAgentControlCacheForTesting,
   _setAgentControlForTesting,
@@ -142,6 +148,20 @@ function fakeSession(cwd = process.cwd()): Session {
   } as const;
   return {
     conversationId: "session-test",
+    // The runtime's active-turn slot: tools read the live turn id off it,
+    // and these fixtures run outside any turn.
+    activeTurn: { unsafePeek: () => null },
+    // v2 spawn owns a durable-close finalizer and an agent-status
+    // subscription, and disposes both. These fixtures never shut down, so the
+    // listeners are dropped and the status stays at its initial value.
+    onBeforeDurableClose: () => () => {},
+    agentStatus: {
+      // A session executing a tool is live; the spawn path rejects a caller
+      // whose status is not, with invalid-runtime-identity.
+      value: { status: "running", turnId: "t", startedAtMs: 1 },
+      subscribe: () => () => {},
+      next: () => {},
+    },
     roleWorkspace,
     agentDefinitions: {
       agentRoleWorkspaceId: roleWorkspace.id,
@@ -721,6 +741,62 @@ describe("model-facing tools", () => {
     expect(visibleNames).not.toContain("StructuredOutput");
   });
 
+  it("defers the CSV job family until system.searchTools loads it, keeping the worker-side report tool visible", async () => {
+    const session = fakeSession(process.cwd());
+    const registry = buildBootstrapToolRegistry({
+      workspaceRoot: process.cwd(),
+      agencHome: join(tmpdir(), "agenc-tools-test"),
+      mcpManager: fakeMcpManager() as never,
+      csvAgentJobsRepositories: UNUSED_CSV_AGENT_JOBS_REPOSITORIES,
+      getSession: () => session,
+      emitWarning: () => {},
+    });
+    const deferredCsvTools = [
+      "spawn_agents_on_csv",
+      "inspect_csv_agent_job",
+      "read_csv_agent_job_result",
+      "list_csv_job_reviews",
+      "show_csv_job_review",
+      "resolve_csv_job_review",
+    ];
+    const allNames = registry.tools.map((tool) => tool.name);
+    const visibleBefore = registry
+      .toLLMTools()
+      .map((tool) => tool.function.name);
+    for (const name of deferredCsvTools) {
+      expect(allNames).toContain(name);
+      expect(visibleBefore).not.toContain(name);
+      expect(
+        registry.tools.find((tool) => tool.name === name)?.metadata?.deferred,
+      ).toBe(true);
+    }
+    // Row subagents spawned by a CSV job must call this without a discovery
+    // step, so it stays in the default catalog.
+    expect(visibleBefore).toContain("report_agent_job_result");
+    // The orchestration tools a coding turn does use stay visible.
+    for (const name of ["spawn_agent", "wait_agent", "close_agent", "list_agents"]) {
+      expect(visibleBefore).toContain(name);
+    }
+
+    const result = await registry.dispatch({
+      id: "search-select-csv",
+      name: "system.searchTools",
+      arguments: JSON.stringify({ select: "spawn_agents_on_csv" }),
+    });
+    const body = JSON.parse(result.content) as { loaded?: string[] };
+    expect(body.loaded, result.content).toContain("spawn_agents_on_csv");
+    const visibleAfter = registry
+      .toLLMTools()
+      .map((tool) => tool.function.name);
+    expect(visibleAfter).toContain("spawn_agents_on_csv");
+    // The loaded description tells the model where the companion tools are.
+    const loaded = registry
+      .toLLMTools()
+      .find((tool) => tool.function.name === "spawn_agents_on_csv");
+    expect(loaded?.function.description).toContain("system.searchTools");
+    expect(loaded?.function.description).toContain("inspect_csv_agent_job");
+  });
+
   it("exposes only max_concurrency for CSV worker limits", async () => {
     const tools = createModelFacingTools({
       workspaceRoot: process.cwd(),
@@ -756,6 +832,43 @@ describe("model-facing tools", () => {
     expect(JSON.parse(removedAlias.content).error).toContain(
       "unknown field `max_workers`",
     );
+  });
+
+  it("admits local Skill and Cron effects under a hard cap without pricing remote tools as free", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenc-local-priced-tools-"));
+    const home = join(root, "home");
+    const kernel = new ExecutionAdmissionKernel({ agencHome: home, ownerId: "local-pricing", ownerPid: process.pid });
+    try {
+      const session = fakeSession(root);
+      const admission = kernel.bindClient({ cwd: root, scope: { runId: session.conversationId, sessionId: session.conversationId, autonomous: false }, budget: { runMaxCostUsd: 0.01 } });
+      const eventLog = new EventLog();
+      Object.assign(session, { eventLog, emit: (event: Event) => eventLog.emit(event), rolloutStore: { assertToolAdmissionAllowed: vi.fn() } });
+      Object.assign(session.services, { executionAdmission: admission, admissionRequired: true });
+      const registry = buildBootstrapToolRegistry({ workspaceRoot: root, agencHome: home, mcpManager: fakeMcpManager() as never, csvAgentJobsRepositories: UNUSED_CSV_AGENT_JOBS_REPOSITORIES, getSession: () => session, emitWarning: () => {} });
+      let callSequence = 0;
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const tool = registry.tools.find((candidate) => candidate.name === name)!;
+        callSequence += 1;
+        return runAdmittedToolCall({ session, turnId: "turn-1", callId: `local-${callSequence}`, tool, args, invoke: async ({ crossEffectBoundary }) => { crossEffectBoundary(); return tool.execute(args); } });
+      };
+      expect((await call("Skill", { skill: "demo-skill" })).isError).not.toBe(true);
+      const created = await call("CronCreate", { cron: "0 0 1 1 *", prompt: "check the workspace", recurring: false, durable: false });
+      expect(created.isError).not.toBe(true);
+      const createdId = JSON.parse(created.content).cron.id;
+      expect(JSON.parse((await call("CronList", {})).content).crons).toEqual(expect.arrayContaining([expect.objectContaining({ id: createdId })]));
+      expect(JSON.parse((await call("CronDelete", { id: createdId })).content).deleted).toBe(true);
+      expect(admission.getUsageSummary?.()).toMatchObject({ costUsd: 0, heldCostUsd: 0, hasUnknownCost: false });
+      const unknown = registry.tools.find((tool) => tool.name === "WorkflowTool")!;
+      expect(unknown.admissionEstimate?.({})).toMatchObject({ maxCostUsd: null });
+      const invoke = vi.fn(async () => ({ content: "must not run" }));
+      await expect(runAdmittedToolCall({ session, turnId: "turn-1", callId: "unknown-priced", tool: unknown, args: {}, invoke })).rejects.toMatchObject({ reason: "unpriced_under_hard_cap" });
+      expect(invoke).not.toHaveBeenCalled();
+      await expect(admission.acquire({ stepId: "scheduled-model", kind: "model_turn", maxInputTokens: 10, maxOutputTokens: 10, maxCostUsd: 0.02 })).rejects.toMatchObject({ reason: "budget_exceeded" });
+    } finally {
+      await resetCronSchedulerForTests();
+      kernel.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("keeps CSV review reads bounded and resolution approval-gated", () => {
@@ -2904,6 +3017,53 @@ describe("model-facing tools", () => {
     );
   });
 
+  it("finishes each skill invocation before starting the next plugin skill", async () => {
+    const session = fakeSession();
+    const skill = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => session,
+    }).find((tool) => tool.name === "Skill")!;
+    const registry = buildToolRegistry({
+      workspaceRoot: process.cwd(),
+      modelFacingTools: [skill],
+      requireAdmission: false,
+    });
+    let active = 0;
+    let peakActive = 0;
+    const order: string[] = [];
+    const executor = new StreamingToolExecutor({
+      registry,
+      runToolUseFn: async (call) => {
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        order.push(`start:${call.id}`);
+        try {
+          const result = await skill.execute(JSON.parse(call.arguments));
+          // Keep the invocation open while its recorded effect settles.
+          await new Promise((resolve) => setTimeout(resolve, 15));
+          return result;
+        } finally {
+          active -= 1;
+          order.push(`finish:${call.id}`);
+        }
+      },
+    });
+    for (const id of ["first", "second"]) {
+      const input = { skill: "demo-skill", args: id };
+      executor.addTool(
+        { type: "tool_use", id, name: "Skill", input },
+        { id, name: "Skill", arguments: JSON.stringify(input) },
+      );
+    }
+    executor.close();
+    const results = [];
+    for await (const result of executor.getRemainingResults()) results.push(result);
+    expect(results).toHaveLength(2);
+    expect(results.every((result) => result.result.isError !== true)).toBe(true);
+    expect(peakActive).toBe(1);
+    expect(order).toEqual(["start:first", "finish:first", "start:second", "finish:second"]);
+  });
+
   it("frames repository skill content as guidance-only model context", async () => {
     const session = fakeSession();
     (
@@ -2947,7 +3107,7 @@ describe("model-facing tools", () => {
     const agencHome = await mkdtemp(join(tmpdir(), "agenc-skill-tool-home-"));
     const workspaceRoot = await mkdtemp(join(tmpdir(), "agenc-skill-tool-ws-"));
     const home = await mkdtemp(join(tmpdir(), "agenc-skill-tool-user-"));
-    const legacyUserSkillRoot = ".codex"; // branding-scan: allow legacy user skill root compatibility
+    const legacyUserSkillRoot = ".legacy-agent";
     try {
       await writeTestSkill(join(home, ".agents", "skills"), "shared-visible");
       await writeTestSkill(
@@ -3156,12 +3316,12 @@ describe("model-facing tools", () => {
     const hiddenModel = await spawnAgent.execute({
       message: "inspect",
       task_name: "task_1",
-      model: "codex-auto-review", // branding-scan: allow OpenAI model identifier
+      model: "codex-auto-review",
       fork_turns: "none",
     });
     expect(hiddenModel.isError).toBe(true);
     expect(JSON.parse(hiddenModel.content).error).toBe(
-      "Unknown model `codex-auto-review` for spawn_agent. Available models: test-model", // branding-scan: allow OpenAI model identifier
+      "Unknown model `codex-auto-review` for spawn_agent. Available models: test-model",
     );
 
     const fullHistoryWithOverride = await spawnAgent.execute({
@@ -3396,7 +3556,7 @@ describe("model-facing tools", () => {
     };
     const unsupportedModelInfo = {
       ...fakeSession().modelInfo,
-      slug: "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+      slug: "gpt-5.3-codex",
       serviceTiers: [],
     };
     const session = fakeSession();
@@ -3464,14 +3624,14 @@ describe("model-facing tools", () => {
     const rejected = await spawn.execute({
       message: "inspect",
       task_name: "slow_task",
-      model: "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+      model: "gpt-5.3-codex",
       service_tier: "priority",
       fork_turns: "none",
     });
 
     expect(rejected.isError).toBe(true);
     expect(JSON.parse(rejected.content).error).toBe(
-      "Service tier `priority` is not supported for model `gpt-5.3-codex`. Supported service tiers: none", // branding-scan: allow OpenAI model identifier
+      "Service tier `priority` is not supported for model `gpt-5.3-codex`. Supported service tiers: none",
     );
     expect(delegateMock).toHaveBeenCalledTimes(1);
   });
@@ -3496,7 +3656,7 @@ describe("model-facing tools", () => {
     };
     const requestedModelInfo = {
       ...fakeSession().modelInfo,
-      slug: "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+      slug: "gpt-5.3-codex",
       supportedReasoningLevels: ["low", "medium"],
       serviceTiers: [
         {
@@ -3573,7 +3733,7 @@ describe("model-facing tools", () => {
         message: "inspect",
         task_name: "priority_review",
         agent_type: "priority-reviewer",
-        model: "gpt-5.3-codex", // branding-scan: allow OpenAI model identifier
+        model: "gpt-5.3-codex",
         reasoning_effort: "low",
         service_tier: "standard",
         fork_turns: "none",
@@ -4495,7 +4655,9 @@ describe("model-facing tools", () => {
         message: "Wait completed.",
         timed_out: false,
       });
-      expect(waitForMailboxChange).toHaveBeenCalledWith(30_000);
+      // The wait now also receives the ownership slot and the turn's abort
+      // signal (#2201); neither is set when the executor injected no signal.
+      expect(waitForMailboxChange).toHaveBeenCalledWith(30_000, undefined, undefined);
       expect(control.listAgents).not.toHaveBeenCalled();
       expect(control.subscribeStatus).not.toHaveBeenCalled();
       expect(
@@ -4553,15 +4715,15 @@ describe("model-facing tools", () => {
 
       const tooSmall = await wait.execute({ timeout_ms: 5_000 });
       expect(tooSmall.isError).toBeUndefined();
-      expect(waitForMailboxChange).toHaveBeenLastCalledWith(10_000);
+      expect(waitForMailboxChange).toHaveBeenLastCalledWith(10_000, undefined, undefined);
 
       const tooLarge = await wait.execute({ timeout_ms: 3_600_001 });
       expect(tooLarge.isError).toBeUndefined();
-      expect(waitForMailboxChange).toHaveBeenLastCalledWith(3_600_000);
+      expect(waitForMailboxChange).toHaveBeenLastCalledWith(3_600_000, undefined, undefined);
 
       const inRange = await wait.execute({ timeout_ms: 45_000 });
       expect(inRange.isError).toBeUndefined();
-      expect(waitForMailboxChange).toHaveBeenLastCalledWith(45_000);
+      expect(waitForMailboxChange).toHaveBeenLastCalledWith(45_000, undefined, undefined);
     } finally {
       _clearAgentControlCacheForTesting(session);
     }
@@ -4649,8 +4811,10 @@ describe("model-facing tools", () => {
     expect(JSON.parse(result.content)).toEqual({
       message: "Wait timed out.",
       timed_out: true,
+      consecutive_timeouts: 1,
+      waited_ms: 10_000,
     });
-    expect(waitForMailboxChange).toHaveBeenCalledWith(10_000);
+    expect(waitForMailboxChange).toHaveBeenCalledWith(10_000, undefined, undefined);
   });
 
   it("wait_agent rejects the removed target filter instead of draining unrelated receipts", async () => {
@@ -4704,12 +4868,12 @@ describe("model-facing tools", () => {
     const tooSmall = await wait.execute({ timeout_ms: 100 });
 
     expect(defaulted.isError).toBeUndefined();
-    expect(waitForMailboxChange).toHaveBeenNthCalledWith(1, 1_250);
+    expect(waitForMailboxChange).toHaveBeenNthCalledWith(1, 1_250, undefined, undefined);
     // Out-of-range values clamp to the configured bounds instead of erroring.
     expect(tooLarge.isError).toBeUndefined();
-    expect(waitForMailboxChange).toHaveBeenNthCalledWith(2, 2_000);
+    expect(waitForMailboxChange).toHaveBeenNthCalledWith(2, 2_000, undefined, undefined);
     expect(tooSmall.isError).toBeUndefined();
-    expect(waitForMailboxChange).toHaveBeenNthCalledWith(3, 500);
+    expect(waitForMailboxChange).toHaveBeenNthCalledWith(3, 500, undefined, undefined);
     expect(wait.inputSchema.properties?.timeout_ms).toMatchObject({
       minimum: 500,
       maximum: 2_000,

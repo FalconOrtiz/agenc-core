@@ -23,7 +23,14 @@ import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AsyncQueue } from "../utils/async-queue.js";
 import { AgentControl } from "./control.js";
+import { delegate } from "./delegate.js";
+import type { AgentThread } from "./thread.js";
+import { buildToolRegistry as buildProductionToolRegistry } from "../../src/tool-registry.js";
+import { UnifiedExecProcessManager } from "../../src/unified-exec/process-manager.js";
+import { childApprovalRevocationSignal, isApprovalSessionOwnedBy, observeChildApprovalSessions } from "../../src/agents/child-approval-context.js";
 import { AgentRegistry } from "./registry.js";
+import { createMultiAgentV2Tools } from "./v2/index.js";
+import { bindLiveAgentSession, liveAgentSession } from "./live-session.js";
 import {
   buildFilteredRegistry,
   initMcpForAgent,
@@ -71,6 +78,9 @@ import {
 } from "../sandbox/execution-broker.js";
 import { PermissionModeRegistry } from "../permissions/permission-mode.js";
 import { createEmptyToolPermissionContext } from "../permissions/types.js";
+import { freshDenialTracking } from "../permissions/denial-tracking.js";
+import { buildAgenCToolUseContext } from "../session/agenc-tool-use-context.js";
+import { DEFAULT_MAX_RESULT_SIZE_CHARS } from "../constants/toolLimits.js";
 import {
   disposeSandboxExecutionBroker,
   isSandboxExecutionBrokerDisposed,
@@ -97,6 +107,7 @@ import type {
   ManagedFeatures,
   ModelInfo,
   SessionConfiguration,
+  TurnContext,
 } from "../session/turn-context.js";
 import type { ToolRegistry } from "../tool-registry.js";
 import type {
@@ -121,7 +132,13 @@ import {
   withSignedAllowedRoots,
 } from "../tools/system/filesystem.js";
 import { signSessionId } from "../agents/_deps/filesystem-args.js";
-import { explicitDangerBroker } from "../helpers/explicit-danger-boundary.js";
+import { bindExplicitDangerBoundary, explicitDangerBroker } from "../helpers/explicit-danger-boundary.js";
+import { registerBuiltinTool } from "../../src/tools/builtin-provenance.js";
+import { createGlobTool } from "../../src/tools/system/glob.js";
+import { createGrepTool } from "../../src/tools/system/grep.js";
+import { createFileReadTool } from "../../src/tools/system/file-read.js";
+import { createFileWriteTool } from "../../src/tools/system/file-write.js";
+import { createFileEditTool, createFileMultiEditTool } from "../../src/tools/system/file-edit.js";
 import { createApplyPatchTool } from "../tools/apply-patch/tool.js";
 import { cloneFileStateCache } from "../utils/fileStateCache.js";
 import { normalizeLspServerConfig } from "../services/lsp/config.js";
@@ -134,6 +151,8 @@ import {
 } from "../services/lsp/manager.js";
 import { ConfigStore } from "../config/store.js";
 import { resolveAgentRuntimeOptions } from "../session/runtime-options.js";
+import { createAutoMemoryToolPolicy } from "../../src/services/extractMemories/extractMemories.js";
+import { applyPermissionUpdate } from "../../src/permissions/permission-updates.js";
 import { enterCanonicalSettingsAuthority } from "../utils/settings/canonicalAuthority.js";
 
 // ─────────────────────────────────────────────────────────────────────
@@ -581,7 +600,10 @@ function mkNamedTool(name: string): ToolRegistry["tools"][number] {
 }
 
 function mkNamedRegistry(names: readonly string[]): ToolRegistry {
-  const tools = names.map(mkNamedTool);
+  const tools = names.map((name) => ({
+    ...mkNamedTool(name),
+    metadata: { source: "builtin" as const },
+  }));
   return {
     tools,
     toLLMTools: () =>
@@ -665,6 +687,62 @@ describe("wrapProviderForAgentSummary", () => {
 });
 
 describe("runAgent", () => {
+  it("forks and disposes a factory Grok provider for the child session", async () => {
+    const provider = createProvider("grok", {
+      apiKey: "xai-test",
+      model: "grok-4-fast",
+      extra: { incrementalContinuation: true },
+    });
+    const parentChat = vi.spyOn(provider, "chatStream");
+    const parentDispose = vi.spyOn(provider, "dispose");
+    const fork = provider.forkForSession!.bind(provider);
+    let child: LLMProvider | undefined;
+    let childDispose: ReturnType<typeof vi.fn> | undefined;
+    const forkSpy = vi.spyOn(provider, "forkForSession").mockImplementation((options) => {
+      child = fork(options);
+      childDispose = vi.spyOn(child, "dispose");
+      vi.spyOn(child, "chatStream").mockResolvedValue({
+        content: "child completed",
+        toolCalls: [],
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        model: "grok-4-fast",
+        finishReason: "stop",
+      });
+      return child;
+    });
+    const session = makeStubSession({
+      services: {
+        provider,
+        sandboxExecutionBroker: new SandboxExecutionBroker({
+          mode: "danger_full_access",
+          cwd: "/tmp",
+        }),
+      },
+    });
+    const { live } = await spawnLive(session);
+    try {
+      const { result } = await collectRun(runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "go" }],
+        taskPrompt: "go",
+      }));
+
+      expect(result.error).toBeUndefined();
+      expect(result.outcome).toBe("completed");
+      expect(forkSpy).toHaveBeenCalledOnce();
+      expect(child).not.toBe(provider);
+      expect(child!.chatStream).toHaveBeenCalledOnce();
+      expect(parentChat).not.toHaveBeenCalled();
+      expect(childDispose).toHaveBeenCalledOnce();
+      expect(parentDispose).not.toHaveBeenCalled();
+    } finally {
+      await session.shutdown();
+      await provider.dispose?.();
+      vi.restoreAllMocks();
+    }
+  });
+
   it.each([
     ["success", "completed"],
     ["error", "errored"],
@@ -984,6 +1062,7 @@ describe("runAgent", () => {
       expect(result).toMatchObject({ outcome: "completed" });
       expect(refreshFromAuthority).not.toHaveBeenCalled();
       expect(childServices?.mcpManager).not.toBe(parentMcpManager);
+      expect(Object.isFrozen(childServices?.mcpManager)).toBe(true);
       expect(childServices?.mcpManager.getConnectedServers?.()).toEqual([]);
       expect(childServices?.registry.tools.map((tool) => tool.name)).toEqual([
         "system.echo",
@@ -1489,6 +1568,395 @@ describe("runAgent", () => {
     expect(events.some((e) => e.kind === "run_error")).toBe(true);
   });
 
+  it("registers silent child approval ownership before sampling and revokes it at shutdown", async () => {
+    const provider = makeProvider([{ content: "Memory extraction complete." }]);
+    const parent = makeStubSession({ services: { provider } });
+    const { live } = await spawnLive(parent);
+    let child: Session | undefined;
+    const unsubscribe = observeChildApprovalSessions(parent, (registered) => {
+      child = registered;
+      expect(isApprovalSessionOwnedBy(registered, parent)).toBe(true);
+      expect(provider.chatStream).not.toHaveBeenCalled();
+      registered.trackDurableOperation(new Promise<void>((resolve) => {
+        childApprovalRevocationSignal(registered)!.addEventListener("abort", () => resolve(), { once: true });
+      }));
+      return () => {};
+    });
+    try {
+      const { result } = await collectRun(runAgent({
+        live,
+        parent,
+        initialMessages: [{ role: "user", content: "Extract useful memory" }],
+        taskPrompt: "Extract useful memory",
+        silent: true,
+      }));
+      expect(result.outcome).toBe("completed");
+      expect(child?.conversationId).toBe(live.agentId);
+      expect(isApprovalSessionOwnedBy(child!, parent)).toBe(false);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("revokes live Session authority synchronously at shutdown and permits a fresh binding after close", async () => {
+    const parent = makeStubSession();
+    const { control, live } = await spawnLive(parent);
+    const child = makeStubSession({ conversationId: live.agentId });
+    const revoke = bindLiveAgentSession(live, child);
+    expect(liveAgentSession(live)).toBe(child);
+    child.beginShutdown();
+    expect(liveAgentSession(live)).toBeUndefined();
+    await child.shutdown();
+    const replacement = makeStubSession({ conversationId: live.agentId });
+    bindLiveAgentSession(live, replacement);
+    revoke();
+    expect(liveAgentSession(live)).toBe(replacement);
+    await replacement.shutdown();
+    expect(liveAgentSession(live)).toBeUndefined();
+    const closing = makeStubSession({ conversationId: live.agentId });
+    closing.beginShutdown();
+    expect(() => bindLiveAgentSession(live, closing)).toThrow(/shutting down/);
+    await closing.shutdown();
+    await control.shutdownAll();
+    await parent.shutdown();
+  });
+
+  it.each(["execute", "dispatch"] as const)("keeps nested %s on its own broker and identity while retaining ancestor policies", async (boundary) => {
+    const parentBroker = new SandboxExecutionBroker({ mode: "danger_full_access", cwd: "/tmp/parent" });
+    const childBroker = new SandboxExecutionBroker({ mode: "read_only", cwd: "/tmp/child" });
+    const admission = makeChildToolAdmission({ runId: "nested-child", sessionId: "nested-child" });
+    const child = makeStubSession({ conversationId: "nested-child", sessionConfiguration: mkSessionConfiguration({ cwd: "/tmp/child" }), services: { executionAdmission: admission.client, sandboxExecutionBroker: childBroker } });
+    let parentDeny = false;
+    let childDeny = false;
+    let childRewrites = false;
+    const execute = vi.fn(async (args: Record<string, unknown>) => ({ content: JSON.stringify({ parentChecked: args.parentChecked, childChecked: args.childChecked }) }));
+    const ancestor = buildFilteredRegistry({ ...mkRegistry(), tools: [{ name: "exec_command", description: "fixture command", inputSchema: { type: "object" }, execute }, { name: "hidden", description: "hidden", inputSchema: { type: "object" }, execute }] }, {
+      childConversationId: "parent-child", sandboxExecutionBroker: parentBroker, disabledTools: new Set(["hidden"]),
+      worktree: { path: "/tmp/parent", branch: "parent", gitRoot: "/tmp", created: false },
+      childToolPolicy: (_tool, args) => parentDeny || args.redirected === true ? { behavior: "deny", message: "ancestor denies" } : { behavior: "allow", updatedInput: { ...args, parentChecked: true } },
+    });
+    const nested = buildFilteredRegistry(ancestor, {
+      childConversationId: child.conversationId, sandboxExecutionBroker: childBroker, getSession: () => child,
+      childToolPolicy: (_tool, args) => childDeny ? { behavior: "deny", message: "child denies" } : { behavior: "allow", updatedInput: { ...args, childChecked: true, redirected: childRewrites } },
+    });
+    const invoke = () => boundary === "execute" ? nested.tools[0]!.execute({ __agencSessionId: "forged" }) : nested.dispatch({ name: "exec_command", id: "nested-policy", arguments: JSON.stringify({ __agencSessionId: "forged" }) });
+    try {
+      expect(nested.tools.map((tool) => tool.name)).toEqual(["exec_command"]);
+      expect(await invoke()).toMatchObject({ content: JSON.stringify({ parentChecked: true, childChecked: true }) });
+      expect(execute.mock.calls[0]![0][SESSION_ID_ARG]).toBe(child.conversationId);
+      expect(execute.mock.calls[0]![0].workdir).toBe("/tmp/child");
+      expect(readSandboxExecutionBroker(execute.mock.calls[0]![0])).toBe(childBroker);
+      parentDeny = true;
+      expect(await invoke()).toMatchObject({ isError: true, content: expect.stringContaining("ancestor denies") });
+      parentDeny = false;
+      childDeny = true;
+      expect(await invoke()).toMatchObject({ isError: true, content: expect.stringContaining("child denies") });
+      childDeny = false;
+      childRewrites = true;
+      expect(await invoke()).toMatchObject({ isError: true, content: expect.stringContaining("ancestor denies") });
+      expect(execute).toHaveBeenCalledOnce();
+    } finally {
+      await child.shutdown();
+      await disposeSandboxExecutionBroker(parentBroker);
+      await disposeSandboxExecutionBroker(childBroker);
+    }
+  });
+
+  it.each([
+    ["Glob", "read-only", "execute"], ["Glob", "read-only", "dispatch"],
+    ["Grep", "read-only", "execute"], ["Grep", "read-only", "dispatch"],
+    ["Glob", "writer", "execute"], ["Glob", "writer", "dispatch"],
+    ["Grep", "writer", "execute"], ["Grep", "writer", "dispatch"],
+  ] as const)("defaults nested %s for a %s child to its live cwd through %s", async (toolName, role, boundary) => {
+    const workspace = mkdtempSync(join(tmpdir(), "agenc-delegated-search-cwd-"));
+    const implementationCwd = join(workspace, "implementation");
+    const childCwd = role === "writer" ? join(workspace, "writer") : implementationCwd;
+    const alternate = join(childCwd, "alternate");
+    mkdirSync(implementationCwd, { recursive: true });
+    mkdirSync(alternate, { recursive: true });
+    mkdirSync(join(workspace, "src"));
+    mkdirSync(join(childCwd, "src"));
+    writeFileSync(join(workspace, "parent-cwd-hit.txt"), "cwd-proof-token\n");
+    writeFileSync(join(workspace, "src", "parent-src-hit.txt"), "cwd-proof-token\n");
+    writeFileSync(join(childCwd, "src", "child-src-hit.txt"), "cwd-proof-token\n");
+    writeFileSync(join(childCwd, "child-cwd-hit.txt"), "cwd-proof-token\n");
+    writeFileSync(join(alternate, "alternate-cwd-hit.txt"), "cwd-proof-token\n");
+    // Exercise actual search results and delegated path checks. Subprocess
+    // confinement has its own kernel suite; this owned unit fixture declares
+    // the host mechanics explicitly instead of depending on a built launcher.
+    const tool = registerBuiltinTool(bindExplicitDangerBoundary(toolName === "Glob"
+      ? createGlobTool({ allowedPaths: [workspace] })
+      : createGrepTool({ allowedPaths: [workspace] })));
+    const broker = new SandboxExecutionBroker({ mode: "workspace_write", cwd: childCwd });
+    const admission = makeChildToolAdmission({ runId: "search-child", sessionId: "search-child" });
+    const child = makeStubSession({
+      conversationId: "search-child",
+      sessionConfiguration: mkSessionConfiguration({ cwd: childCwd }),
+      services: { executionAdmission: admission.client, sandboxExecutionBroker: broker,
+        ...(role === "read-only" ? { readOnlyDelegation: { kind: "read-only", ownerThreadId: "implementation" } as const } : {}),
+      },
+    });
+    const ancestor = buildFilteredRegistry({ ...mkRegistry(), tools: [tool] }, {
+      childConversationId: "implementation",
+      worktree: { path: implementationCwd, branch: "implementation", gitRoot: workspace, created: false },
+    });
+    const nested = buildFilteredRegistry(ancestor, {
+      childConversationId: child.conversationId, getSession: () => child,
+      sandboxExecutionBroker: broker,
+      ...(role === "writer" ? { worktree: { path: childCwd, branch: "writer", gitRoot: workspace, created: false } } : {}),
+    });
+    const pattern = toolName === "Glob" ? "*.txt" : "cwd-proof-token";
+    let calls = 0;
+    const invoke = (extra: Record<string, unknown> = {}) => {
+      const args = { pattern, ...extra };
+      return boundary === "execute" ? nested.tools[0]!.execute(args)
+        : nested.dispatch({ name: toolName, id: `search-${++calls}`, arguments: JSON.stringify(args) });
+    };
+    try {
+      const first = await invoke();
+      expect(first.isError, first.content).not.toBe(true);
+      expect(first.content).toContain("child-cwd-hit.txt");
+      expect(first.content).not.toContain("parent-cwd-hit.txt");
+
+      // Reuse the same live child registry after its first completed search.
+      writeFileSync(join(childCwd, "later-cwd-hit.txt"), "cwd-proof-token\n");
+      const reused = await invoke({ path: "", cwd: "" });
+      expect(reused.isError, reused.content).not.toBe(true);
+      expect(reused.content).toContain("later-cwd-hit.txt");
+      expect(reused.content).not.toContain("parent-cwd-hit.txt");
+
+      const explicitCwd = await invoke({ cwd: alternate });
+      expect(explicitCwd.isError, explicitCwd.content).not.toBe(true);
+      expect(explicitCwd.content).toContain("alternate-cwd-hit.txt");
+      expect(explicitCwd.content).not.toContain("child-cwd-hit.txt");
+      const explicitPath = await invoke({ path: alternate, cwd: workspace });
+      expect(explicitPath.isError, explicitPath.content).not.toBe(true);
+      expect(explicitPath.content).toContain("alternate-cwd-hit.txt");
+      expect(explicitPath.content).not.toContain("parent-cwd-hit.txt");
+      const malformedCwd = await invoke({ cwd: 42 });
+      if (toolName === "Glob" && role === "writer") {
+        // Glob ignores a non-string cwd; do not silently normalize it here.
+        expect(malformedCwd.content).toContain("parent-cwd-hit.txt");
+      } else {
+        expect(malformedCwd).toMatchObject({ isError: true });
+      }
+      const nullDefault = await invoke({ path: null, cwd: null });
+      expect(nullDefault.isError, nullDefault.content).not.toBe(true);
+      expect(nullDefault.content).toContain("child-cwd-hit.txt");
+      expect(nullDefault.content).not.toContain("parent-cwd-hit.txt");
+
+      // Explicit relative paths keep their existing registry-root resolution.
+      // Caller-relative explicit paths are a separate issue from omitted cwd.
+      for (const relativePath of [".", "src"]) {
+        const relative = await invoke({ path: relativePath });
+        if (role === "read-only") {
+          expect(relative).toMatchObject({
+            isError: true, content: expect.stringContaining("outside delegated read authority"),
+          });
+        } else {
+          expect(relative.isError, relative.content).not.toBe(true);
+          expect(relative.content).toContain("parent-src-hit.txt");
+        }
+      }
+      if (role === "read-only") {
+        expect(await invoke({ path: workspace })).toMatchObject({
+          isError: true, content: expect.stringContaining("Read-only delegation cannot read"),
+        });
+        expect(await invoke({ cwd: workspace })).toMatchObject({
+          isError: true, content: expect.stringContaining("Read-only delegation cannot read"),
+        });
+      }
+    } finally {
+      await child.shutdown();
+      await disposeSandboxExecutionBroker(broker);
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["scanner", "execute"], ["scanner", "dispatch"],
+    ["writer", "execute"], ["writer", "dispatch"],
+  ] as const)("resolves nested FileRead from the %s caller through %s", async (role, boundary) => {
+    const workspace = mkdtempSync(join(tmpdir(), "agenc-delegated-file-cwd-"));
+    const implementationCwd = join(workspace, "implementation");
+    const childCwd = role === "scanner" ? implementationCwd : join(workspace, "writer");
+    const alternate = join(childCwd, "alternate");
+    mkdirSync(implementationCwd, { recursive: true });
+    mkdirSync(alternate, { recursive: true });
+    writeFileSync(join(workspace, "README.md"), "parent-only-content\n");
+    writeFileSync(join(childCwd, "README.md"), "child-only-content\n");
+    writeFileSync(join(alternate, "README.md"), "alternate-only-content\n");
+    const tool = registerBuiltinTool(createFileReadTool({ allowedPaths: [workspace] }));
+    const broker = new SandboxExecutionBroker({ mode: "workspace_write", cwd: childCwd });
+    const admission = makeChildToolAdmission({ runId: "file-child", sessionId: "file-child" });
+    const child = makeStubSession({
+      conversationId: "file-child",
+      sessionConfiguration: mkSessionConfiguration({ cwd: childCwd }),
+      services: {
+        executionAdmission: admission.client,
+        sandboxExecutionBroker: broker,
+        ...(role === "scanner" ? { readOnlyDelegation: { kind: "read-only", ownerThreadId: "implementation" } as const } : {}),
+      },
+    });
+    const ancestor = buildFilteredRegistry({ ...mkRegistry(), tools: [tool] }, {
+      childConversationId: "implementation",
+      worktree: { path: implementationCwd, branch: "implementation", gitRoot: workspace, created: false },
+    });
+    const nested = buildFilteredRegistry(ancestor, {
+      childConversationId: child.conversationId, getSession: () => child,
+      sandboxExecutionBroker: broker,
+      ...(role === "writer" ? { worktree: { path: childCwd, branch: "writer", gitRoot: workspace, created: false } } : {}),
+    });
+    let calls = 0;
+    const invoke = (extra: Record<string, unknown> = {}) => {
+      const args = { file_path: "README.md", ...extra };
+      return boundary === "execute" ? nested.tools[0]!.execute(args)
+        : nested.dispatch({ name: "FileRead", id: `file-read-${++calls}`, arguments: JSON.stringify(args) });
+    };
+    try {
+      for (const cwd of [undefined, null, "", "  ", 42]) {
+        const result = await invoke(cwd === undefined ? {} : { cwd });
+        expect(result.isError, result.content).not.toBe(true);
+        expect(result.content).toContain("child-only-content");
+        expect(result.content).not.toContain("parent-only-content");
+      }
+      writeFileSync(join(childCwd, "README.md"), "updated-child-content\n");
+      expect((await invoke()).content).toContain("updated-child-content");
+      expect((await invoke({ cwd: alternate })).content).toContain("alternate-only-content");
+      expect((await invoke({ file_path: "alternate/README.md" })).content).toContain("alternate-only-content");
+      expect((await invoke({ file_path: join(alternate, "README.md"), cwd: workspace })).content).toContain("alternate-only-content");
+      if (role === "scanner") {
+        expect(await invoke({ file_path: join(workspace, "README.md") })).toMatchObject({
+          isError: true, content: expect.stringContaining("Read-only delegation cannot read"),
+        });
+        expect(await invoke({ cwd: workspace })).toMatchObject({
+          isError: true, content: expect.stringContaining("outside delegated read authority"),
+        });
+      }
+    } finally {
+      await child.shutdown();
+      await disposeSandboxExecutionBroker(broker);
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["Write", "execute"], ["Write", "dispatch"],
+    ["Edit", "execute"], ["Edit", "dispatch"],
+    ["MultiEdit", "execute"], ["MultiEdit", "dispatch"],
+  ] as const)("resolves nested %s mutations inside the writer cwd through %s", async (toolName, boundary) => {
+    const workspace = mkdtempSync(join(tmpdir(), "agenc-delegated-mutation-cwd-"));
+    const implementationCwd = join(workspace, "implementation");
+    const childCwd = join(workspace, "writer");
+    const alternate = join(childCwd, "alternate");
+    mkdirSync(implementationCwd, { recursive: true });
+    mkdirSync(alternate, { recursive: true });
+    const config = { allowedPaths: [workspace] };
+    const tools = [createFileReadTool(config), createFileWriteTool(config), createFileEditTool(config), createFileMultiEditTool(config)].map(registerBuiltinTool);
+    const broker = new SandboxExecutionBroker({ mode: "workspace_write", cwd: childCwd });
+    const admission = makeChildToolAdmission({ runId: "file-writer", sessionId: "file-writer" });
+    const child = makeStubSession({
+      conversationId: "file-writer",
+      sessionConfiguration: mkSessionConfiguration({ cwd: childCwd }),
+      services: { executionAdmission: admission.client, sandboxExecutionBroker: broker },
+    });
+    const ancestor = buildFilteredRegistry({ ...mkRegistry(), tools }, {
+      childConversationId: "implementation",
+      worktree: { path: implementationCwd, branch: "implementation", gitRoot: workspace, created: false },
+    });
+    const nested = buildFilteredRegistry(ancestor, {
+      childConversationId: child.conversationId, getSession: () => child,
+      sandboxExecutionBroker: broker,
+      worktree: { path: childCwd, branch: "writer", gitRoot: workspace, created: false },
+    });
+    let calls = 0;
+    const invoke = (name: string, args: Record<string, unknown>) => boundary === "execute"
+      ? nested.tools.find((tool) => tool.name === name)!.execute(args)
+      : nested.dispatch({ name, id: `file-mutate-${++calls}`, arguments: JSON.stringify(args) });
+    try {
+      for (const [index, cwd] of [undefined, toolName === "Write" ? "" : "  ", alternate].entries()) {
+        const name = `target-${index}.txt`;
+        const target = join(cwd === alternate ? alternate : childCwd, name);
+        if (toolName !== "Write") {
+          writeFileSync(join(workspace, name), "parent-old\n");
+          writeFileSync(target, "child-old\n");
+          const read = await invoke("FileRead", { file_path: target });
+          expect(read.isError, read.content).not.toBe(true);
+        }
+        const args = {
+          file_path: name,
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(toolName === "Write" ? { content: "child-new\n" }
+            : toolName === "Edit" ? { old_string: "child-old", new_string: "child-new" }
+            : { edits: [{ old_string: "child-old", new_string: "child-new" }] }),
+        };
+        const result = await invoke(toolName, args);
+        expect(result.isError, result.content).not.toBe(true);
+        expect(readFileSync(target, "utf8")).toBe("child-new\n");
+        if (toolName === "Write") expect(existsSync(join(workspace, name))).toBe(false);
+        else expect(readFileSync(join(workspace, name), "utf8")).toBe("parent-old\n");
+      }
+      if (toolName === "Write") {
+        const whitespace = await invoke(toolName, { file_path: "whitespace.txt", content: "unchanged", cwd: "  " });
+        expect(whitespace).toMatchObject({ isError: true });
+        expect(existsSync(join(childCwd, "whitespace.txt"))).toBe(false);
+      }
+    } finally {
+      await child.shutdown();
+      await disposeSandboxExecutionBroker(broker);
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["FileRead", false], ["FileRead", true], ["Write", false], ["Write", true],
+    ["Edit", false], ["Edit", true], ["MultiEdit", false], ["MultiEdit", true],
+  ] as const)("checks nested %s permissions on the execution cwd with policy=%s", async (toolName, withPolicy) => {
+    const workspace = mkdtempSync(join(tmpdir(), "agenc-file-permission-cwd-"));
+    const childCwd = join(workspace, "child");
+    mkdirSync(childCwd);
+    const config = { allowedPaths: [workspace] };
+    const tools = [createFileReadTool(config), createFileWriteTool(config), createFileEditTool(config), createFileMultiEditTool(config)];
+    const tool = tools.find((candidate) => candidate.name === toolName)!;
+    const check = vi.spyOn(tool, "checkPermissions");
+    const child = makeStubSession({
+      conversationId: "file-permission-child",
+      sessionConfiguration: mkSessionConfiguration({ cwd: childCwd }),
+    });
+    const nested = buildFilteredRegistry(buildFilteredRegistry({ ...mkRegistry(), tools: [tool] }, {
+      childConversationId: "implementation",
+      worktree: { path: join(workspace, "implementation"), branch: "implementation", gitRoot: workspace, created: false },
+    }), {
+      childConversationId: child.conversationId, getSession: () => child,
+      ...(withPolicy ? { childToolPolicy: (_tool: unknown, args: Record<string, unknown>) => ({ behavior: "allow" as const, updatedInput: { ...args, policySeen: true } }) } : {}),
+    });
+    let permissions = createEmptyToolPermissionContext({
+      mode: "acceptEdits",
+      alwaysDenyRules: { session: [`${toolName === "FileRead" ? "FileRead" : "Edit"}(${join(childCwd, "denied.txt")})`] },
+    });
+    const context = { session: child, getAppState: () => ({ toolPermissionContext: permissions, denialTracking: freshDenialTracking(), autoModeActive: false }) };
+    const args = { file_path: "denied.txt", content: "new", old_string: "old", new_string: "new", edits: [{ old_string: "old", new_string: "new" }] };
+    try {
+      expect(await nested.tools[0]!.checkPermissions!(args, context)).toMatchObject({ behavior: "deny" });
+      expect(check.mock.calls[0]![0]).toMatchObject({ cwd: childCwd });
+      expect(check.mock.calls[0]![0]).not.toHaveProperty(SESSION_ALLOWED_ROOTS_ARG);
+      expect(check.mock.calls[0]![0]).not.toHaveProperty(SESSION_ID_ARG);
+      permissions = createEmptyToolPermissionContext({ mode: "default" });
+      const allowed = await nested.tools[0]!.checkPermissions!({ ...args, file_path: "allowed.txt" }, context);
+      expect(allowed).toMatchObject({
+        behavior: toolName === "FileRead" ? "allow" : "ask",
+      });
+      expect(allowed.updatedInput).not.toHaveProperty("cwd");
+      const explicit = join(childCwd, "explicit");
+      await nested.tools[0]!.checkPermissions!({ ...args, cwd: explicit }, context);
+      expect(check.mock.lastCall?.[0]).toMatchObject({ cwd: explicit });
+    } finally {
+      check.mockRestore();
+      await child.shutdown();
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("marks completed on success", async () => {
     const provider = makeProvider([{ content: "ok" }]);
     const session = makeStubSession({ services: { provider } });
@@ -1545,6 +2013,51 @@ describe("runAgent", () => {
       taskId: "cancelled-task",
     });
     expect(receipt?.content).toContain('"outcome":"interrupted"');
+  });
+
+  it.each(["external", "parent", "live"] as const)("does not dispatch after a pre-aborted %s signal", async (source) => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-pre-aborted-run-"));
+    const sentinel = join(cwd, "unexpected-provider-effect");
+    const baseProvider = makeProvider([{ content: "must not run" }]);
+    const provider: LLMProvider = {
+      ...baseProvider,
+      chatStream: vi.fn(async (...args) => {
+        writeFileSync(sentinel, "unexpected dispatch\n");
+        return baseProvider.chatStream(...args);
+      }),
+    };
+    const session = makeStubSession({
+      sessionConfiguration: mkSessionConfiguration({ cwd }),
+      services: { provider },
+    });
+    const { live, control } = await spawnLive(session);
+    const external = new AbortController();
+    const controller = source === "external" ? external
+      : source === "parent" ? session.abortController : live.abortController;
+    controller.abort("already cancelled");
+    try {
+      const { events, result } = await collectRun(runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "must not execute" }],
+        taskPrompt: "must not execute",
+        taskId: "pre-aborted-task",
+        externalSignal: external.signal,
+      }));
+      expect(provider.chatStream).not.toHaveBeenCalled();
+      expect(provider.chat).not.toHaveBeenCalled();
+      expect(existsSync(sentinel)).toBe(false);
+      expect(result.outcome).toBe("aborted");
+      expect(events.some((event) => event.kind === "run_interrupted")).toBe(true);
+      expect(events.some((event) => event.kind === "run_complete")).toBe(false);
+      const receipt = session.mailbox.drain().find((message) => message.metadata?.lifecycle === "turn");
+      expect(receipt?.metadata).toMatchObject({
+        outcome: "interrupted", taskId: "pre-aborted-task",
+      });
+    } finally {
+      await control.shutdown(live.agentId, "test cleanup");
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("removes the external abort listener after completion", async () => {
@@ -1715,12 +2228,13 @@ describe("runAgent", () => {
     });
   });
 
-  it("captures AgentSummary cache-safe params from the real child run state", async () => {
+  it("captures matching session and child tool metadata from the same registry", async () => {
+    const toolName = "system.echo";
     const provider = makeProvider([{ content: "summary seed" }]);
     const registry = {
       tools: [
         {
-          name: "system.echo",
+          name: toolName,
           description: "echo",
           inputSchema: { type: "object" },
           execute: async () => ({ content: JSON.stringify({ ok: true }) }),
@@ -1730,7 +2244,7 @@ describe("runAgent", () => {
         {
           type: "function",
           function: {
-            name: "system.echo",
+            name: toolName,
             description: "echo",
             parameters: { type: "object" },
           },
@@ -1789,6 +2303,23 @@ describe("runAgent", () => {
     expect(params.toolUseContext.options.contextWindowTokens).toBe(
       providerOptions.contextWindowTokens,
     );
+    const mainContext = buildAgenCToolUseContext(session, {
+      cwd: "/tmp",
+      modelInfo: {
+        slug: "fake-model",
+        contextWindow: 200_000,
+        effectiveContextWindowPercent: 100,
+      },
+    } as TurnContext);
+    expect(params.toolUseContext.options.tools).toEqual(mainContext.options.tools);
+    expect(params.toolUseContext.options.tools).toEqual([{
+      ...registry.toLLMTools()[0],
+      name: toolName,
+      description: "echo",
+      inputJSONSchema: { type: "object" },
+      isMcp: toolName.startsWith("mcp__"),
+      maxResultSizeChars: DEFAULT_MAX_RESULT_SIZE_CHARS,
+    }]);
     expect(typeof params.toolUseContext.getAppState).toBe("function");
     expect(params.toolUseContext.readFileState.max).toBeGreaterThan(0);
     expect(params.toolUseContext.readFileState.maxSize).toBeGreaterThan(0);
@@ -2014,6 +2545,132 @@ describe("runAgent", () => {
     } finally {
       await stopKeepAliveRun(iter, live.abortController);
     }
+  });
+
+  it.each([
+    ["max_turns", "subagent exceeded maxTurns"],
+    ["max_budget_usd", "subagent reached the canonical session cost cap"],
+    ["no_progress", "Turn stopped because progress stalled."],
+    ["compact_failed", "compact request does not fit"],
+    ["empty_response", "subagent returned no assistant output after a retry"],
+  ] as const)("publishes an errored %s receipt and accepts the next assignment", async (stopReason, reason) => {
+    let turns = 0;
+    const turnSpy = vi.spyOn(Session.prototype, "runTurn").mockImplementation(async function* () {
+      turns += 1;
+      const error = turns === 1 && stopReason === "compact_failed"
+        ? new Error("compact request does not fit")
+        : undefined;
+      yield {
+        type: "turn_complete",
+        content: turns > 1
+          ? "completed the follow-up"
+          : stopReason === "no_progress"
+            ? "Turn stopped because progress stalled."
+            : "Let me finish the implementation.",
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        stopReason: turns > 1 ? "completed" : stopReason,
+        ...(error !== undefined ? { error } : {}),
+      };
+      return { reason: "completed", ...(error !== undefined ? { error } : {}) };
+    });
+    const session = makeStubSession({ services: { provider: makeProvider([]) } });
+    const { control, live } = await spawnLive(session);
+    const iter = runAgent({
+      live,
+      parent: session,
+      initialMessages: [{ role: "user", content: "initial task" }],
+      taskPrompt: "initial task",
+      taskId: "bounded-task",
+      keepAlive: true,
+    });
+
+    try {
+      const first = await nextProgressEvent(iter, "turn_complete");
+      expect(first.finalMessage).toBe(reason);
+      expect(live.status.value.status).toBe("idle");
+      const failedReceipt = session.mailbox.drain().find((message) =>
+        message.metadata?.lifecycle === "turn",
+      );
+      expect(failedReceipt?.metadata).toMatchObject({
+        outcome: "errored",
+        taskId: "bounded-task",
+        reason,
+      });
+      expect(failedReceipt?.content).toContain('"outcome":"errored"');
+
+      const next = nextProgressEvent(iter, "turn_complete");
+      control.assignTask(live.agentId, {
+        author: "/root",
+        recipient: live.agentPath,
+        content: "finish the remaining work",
+        taskId: "retry-task",
+      });
+      const completed = await next;
+      expect(completed.turnId).not.toBe(first.turnId);
+      expect(completed.finalMessage).toBe("completed the follow-up");
+      const completedReceipt = session.mailbox.drain().find((message) =>
+        message.metadata?.lifecycle === "turn",
+      );
+      expect(completedReceipt?.metadata).toMatchObject({
+        outcome: "completed",
+        taskId: "retry-task",
+      });
+    } finally {
+      try {
+        await stopKeepAliveRun(iter, live.abortController);
+      } finally {
+        turnSpy.mockRestore();
+      }
+    }
+  });
+
+  it("fails a one-shot worker after the empty-response retry is exhausted", async () => {
+    const provider = makeProvider([{ content: "" }, { content: "" }]);
+    const session = makeStubSession({ services: { provider } });
+    const { live } = await spawnLive(session);
+    const { result } = await collectRun(runAgent({
+      live,
+      parent: session,
+      initialMessages: [{ role: "user", content: "answer the question" }],
+      taskPrompt: "answer the question",
+      taskId: "empty-task",
+    }));
+
+    expect(provider.chatStream).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      outcome: "errored",
+      error: expect.objectContaining({
+        message: "subagent returned no assistant output after a retry",
+      }),
+    });
+    expect(session.mailbox.drain()).toContainEqual(expect.objectContaining({
+      metadata: expect.objectContaining({ outcome: "errored", taskId: "empty-task" }),
+    }));
+  });
+
+  it("retains a failed idle worker outcome when the worker closes", async () => {
+    const provider = makeProvider([{ content: "" }, { content: "" }]);
+    const session = makeStubSession({ services: { provider } });
+    const { live } = await spawnLive(session);
+    const iter = runAgent({
+      live,
+      parent: session,
+      initialMessages: [{ role: "user", content: "answer the question" }],
+      taskPrompt: "answer the question",
+      taskId: "empty-task",
+      keepAlive: true,
+    });
+    await nextProgressEvent(iter, "turn_complete");
+    const receipts = session.mailbox.drain();
+    live.abortController.abort("worker closed");
+    const { result } = await collectRun(iter);
+
+    expect(result.outcome).toBe("errored");
+    expect(live.status.value.status).toBe("errored");
+    expect(receipts.filter((message) => message.metadata?.lifecycle === "turn"))
+      .toHaveLength(1);
+    expect(session.mailbox.drain().filter((message) => message.metadata?.lifecycle === "turn"))
+      .toHaveLength(0);
   });
 
   it("closes an idle keep-alive worker as completed instead of failing its finished turn", async () => {
@@ -2279,6 +2936,73 @@ describe("runAgent", () => {
     expect(session.mailbox.hasPending()).toBe(false);
   });
 
+  // #2236: after a user Stop, a child's receipt must not start a parent turn;
+  // it waits in the mailbox for the user's next prompt.
+  it("holds a parent follow-up while the user's stop is latched; the receipt waits for the next user turn", async () => {
+    vi.useFakeTimers();
+    const provider = makeProvider([{ content: "follow-up result" }]);
+    const session = makeStubSession({ services: { provider } });
+    const submit = vi.fn(async () => {
+      session.drainPendingInputMessages();
+    });
+    session.installTurnDriverHooks({ submit });
+    session.markStoppedByUser();
+    const { live } = await spawnLive(session);
+
+    const { result } = await collectRun(
+      runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "schedule follow-up" }],
+        taskPrompt: "schedule follow-up",
+      }),
+    );
+    expect(result.outcome).toBe("completed");
+    expect(session.mailbox.hasPending()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(submit).not.toHaveBeenCalled();
+    expect(session.mailbox.hasPending()).toBe(true);
+
+    // The next user prompt clears the latch and its turn drains the receipt.
+    session.clearUserStop();
+    expect(session.stoppedByUserSinceLastPrompt).toBe(false);
+    session.drainPendingInputMessages();
+    expect(session.mailbox.hasPending()).toBe(false);
+  });
+
+  it("schedules a fresh receipt after a user stop supersedes an older coalescing window", async () => {
+    vi.useFakeTimers();
+    const session = makeStubSession({ services: { provider: makeProvider([{ content: "first receipt" }, { content: "second receipt" }]) } });
+    const submit = vi.fn(async () => { session.drainPendingInputMessages(); });
+    session.installTurnDriverHooks({ submit });
+    const first = await spawnLive(session);
+    await collectRun(runAgent({ live: first.live, parent: session, initialMessages: [{ role: "user", content: "first" }], taskPrompt: "first" }));
+    session.markStoppedByUser();
+    session.clearUserStop();
+    const second = await spawnLive(session);
+    await collectRun(runAgent({ live: second.live, parent: session, initialMessages: [{ role: "user", content: "second" }], taskPrompt: "second" }));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(submit).toHaveBeenCalledOnce();
+    expect(session.mailbox.hasPending()).toBe(false);
+  });
+
+  it("does not retry closed-parent admission while a child receipt remains queued", async () => {
+    vi.useFakeTimers();
+    const session = makeStubSession({ services: { provider: makeProvider([{ content: "completed receipt" }]) } });
+    const submit = vi.fn(async () => {});
+    session.installTurnDriverHooks({ submit });
+    const submitChildFollowup = vi.spyOn(session, "submitChildFollowup");
+    const { live } = await spawnLive(session);
+    await collectRun(runAgent({ live, parent: session, initialMessages: [{ role: "user", content: "finish" }], taskPrompt: "finish" }));
+    expect(session.mailbox.hasPending()).toBe(true);
+    session.beginShutdown();
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(submitChildFollowup).toHaveBeenCalledOnce();
+    expect(submit).not.toHaveBeenCalled();
+    expect(session.mailbox.hasPending()).toBe(true);
+  });
+
   it("durably NACKs an accepted assignment that teardown prevents from starting", async () => {
     const provider = makeProvider([{ content: "initial result" }]);
     const session = makeStubSession({ services: { provider } });
@@ -2369,6 +3093,7 @@ describe("runAgent", () => {
     const parked = iter.next();
     await vi.waitFor(() => expect(live.status.value.status).toBe("idle"));
     expect(childSession).toBeDefined();
+    expect(childSession!.fileReadScope).toBe(session.fileReadScope);
     const originalEmit = childSession!.emit.bind(childSession);
     const emitSpy = vi
       .spyOn(childSession!, "emit")
@@ -2495,6 +3220,234 @@ describe("runAgent", () => {
       expect(firstReceiptContent).not.toContain(secondHead);
       await stopKeepAliveRun(iter, live.abortController);
     } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])("preserves a delegated worktree across three assignments until close (commits=%s)", async (commitResults) => {
+    const repo = makeWorktreeEvidenceRepo();
+    const worktreePath = join(repo, ".agenc-worktrees", "reusable");
+    const turns: Extract<RunAgentProgressEvent, { kind: "turn_complete" }>[] = [];
+    const baseProvider = makeProvider([
+      { content: "first result" },
+      { content: "second result" },
+      { content: "third result" },
+    ]);
+    let turnIndex = 0;
+    const provider: LLMProvider = {
+      ...baseProvider,
+      chatStream: vi.fn(async (...args) => {
+        turnIndex += 1;
+        if (commitResults) {
+          const filename = `result-${turnIndex}.txt`;
+          writeFileSync(join(worktreePath, filename), `result ${turnIndex}\n`);
+          git(worktreePath, "add", filename);
+          git(worktreePath, "commit", "-m", `task result ${turnIndex}`);
+        }
+        return baseProvider.chatStream(...args);
+      }),
+    };
+    const session = makeStubSession({
+      sessionConfiguration: mkSessionConfiguration({ cwd: repo }),
+      services: {
+        provider,
+        sandboxExecutionBroker: explicitDangerBroker.forkForCwd(repo),
+      },
+    });
+    const registry = new AgentRegistry();
+    const control = new AgentControl({ session, registry });
+    let thread: AgentThread | undefined;
+    try {
+      const outcome = await delegate({
+        parent: session,
+        parentPath: "/root",
+        control,
+        registry,
+        agentName: "reusable",
+        taskPrompt: "first assignment",
+        taskId: "reusable-task-1",
+        isolation: "worktree",
+        worktreeSlug: "reusable",
+        keepAlive: true,
+        runInBackground: true,
+        onProgress: (event) => {
+          if (event.kind === "turn_complete") turns.push(event);
+        },
+      });
+      expect(outcome.kind).toBe("async_launched");
+      if (outcome.kind !== "async_launched") {
+        throw new Error("delegate did not launch");
+      }
+      thread = outcome.thread;
+      const agentId = thread.live.agentId;
+      let firstReceipt = "";
+      for (let index = 1; index <= 3; index += 1) {
+        if (index > 1) {
+          control.assignTask(agentId, {
+            author: "/root",
+            recipient: thread.live.agentPath,
+            content: `assignment ${index}`,
+            taskId: `reusable-task-${index}`,
+          });
+        }
+        await vi.waitFor(() => {
+          expect(turns).toHaveLength(index);
+          expect(thread!.live.status.value.status).toBe("idle");
+        });
+        expect(thread.live.agentId).toBe(agentId);
+        expect(readFileSync(join(worktreePath, "README.md"), "utf8")).toBe("base\n");
+        expect(existsSync(join(repo, ".git", "worktrees", "reusable"))).toBe(true);
+        const receipt = session.mailbox.drain().find(
+          (message) => message.metadata?.lifecycle === "turn" &&
+            message.metadata.taskId === `reusable-task-${index}`,
+        );
+        expect(receipt).toBeDefined();
+        expect(turns[index - 1]?.worktreeEvidence?.state).toBe(
+          commitResults ? "committed_clean" : "unchanged_clean",
+        );
+        if (index === 1) firstReceipt = receipt!.content;
+        if (commitResults) {
+          const head = git(worktreePath, "rev-parse", "HEAD");
+          expect(receipt!.content).toContain(`"integration_ref":"${head}"`);
+          expect(readFileSync(join(worktreePath, `result-${index}.txt`), "utf8")).toBe(`result ${index}\n`);
+          if (index > 1) {
+            expect(firstReceipt).not.toContain(head);
+            const previousEvidence = turns[index - 2]?.worktreeEvidence;
+            if (previousEvidence?.state !== "committed_clean") {
+              throw new Error("previous assignment has no immutable commit evidence");
+            }
+            expect(turns[index - 1]?.worktreeEvidence).toMatchObject({
+              baseCommit: previousEvidence.headCommit,
+            });
+          }
+        }
+      }
+      expect(new Set(turns.map((turn) => turn.turnId)).size).toBe(3);
+      await control.shutdown(thread.threadId, "test explicit close");
+      await thread.join();
+      expect(existsSync(worktreePath)).toBe(commitResults);
+      expect(existsSync(join(repo, ".git", "worktrees", "reusable"))).toBe(commitResults);
+    } finally {
+      if (thread) {
+        await control.shutdown(thread.threadId, "test cleanup");
+        await thread.join();
+      }
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ...(["keep-alive", "one-shot", "sync", "workflow"] as const).flatMap((mode) =>
+      (["completed", "errored", "interrupted"] as const).map((terminal) => ({ mode, terminal })),
+    ),
+    { mode: "sync", terminal: "preconstruction" } as const,
+    { mode: "sync", terminal: "receipt-failure" } as const,
+  ])("preserves a delegated worktree with unverifiable child evidence ($mode, $terminal)", async ({ mode, terminal }) => {
+    const repo = makeWorktreeEvidenceRepo();
+    const worktreePath = join(repo, ".agenc-worktrees", "unverifiable");
+    const parentBroker = explicitDangerBroker.forkForCwd(repo);
+    const childBroker = explicitDangerBroker.forkForCwd(worktreePath);
+    const prepareSpawn = vi.spyOn(childBroker, "prepareSpawn").mockImplementation(() => {
+      throw new Error("child Git evidence authority is unavailable");
+    });
+    const originalFork = parentBroker.forkForCwd.bind(parentBroker);
+    const fork = vi.spyOn(parentBroker, "forkForCwd").mockImplementation((cwd) =>
+      cwd === worktreePath ? childBroker : originalFork(cwd),
+    );
+    const provider = makeProvider([{ content: "read-only task complete" }]);
+    if (terminal === "errored") {
+      vi.mocked(provider.chatStream).mockRejectedValue(new Error("injected provider failure"));
+    }
+    const session = makeStubSession({
+      sessionConfiguration: mkSessionConfiguration({ cwd: repo }),
+      services: {
+        provider,
+        sandboxExecutionBroker: parentBroker,
+        ...(terminal === "interrupted" ? {
+          guardianRejectionCircuitBreaker: {
+            clearTurn: vi.fn(),
+            isOpen: vi.fn(() => true),
+          } as never,
+        } : {}),
+      },
+    });
+    const registry = new AgentRegistry();
+    const control = new AgentControl({ session, registry });
+    const external = new AbortController();
+    const originalEmit = Session.prototype.emit;
+    const emit = terminal === "receipt-failure"
+      ? vi.spyOn(Session.prototype, "emit").mockImplementation(function (this: Session, event, options) {
+          if (this !== session && event.msg.type === "subagent_turn_outcome") {
+            throw new Error("injected receipt fsync failure");
+          }
+          return originalEmit.call(this, event, options);
+        })
+      : undefined;
+    let thread: AgentThread | undefined;
+    try {
+      const outcome = await delegate({
+        parent: session,
+        parentPath: "/root",
+        control,
+        registry,
+        taskPrompt: "read-only assignment",
+        taskId: "unverifiable-task",
+        isolation: "worktree",
+        worktreeSlug: "unverifiable",
+        externalSignal: external.signal,
+        onProgress: (event) => {
+          if (terminal === "preconstruction" && event.kind === "status") {
+            external.abort("injected early abort");
+          }
+        },
+        keepAlive: mode === "keep-alive",
+        runInBackground: mode === "keep-alive" || mode === "one-shot",
+        forceSynchronous: mode === "sync" || mode === "workflow",
+        ...(mode === "workflow" ? {
+          finalMessageSink: { reset() {}, writeCanonicalDelta() {} },
+        } : {}),
+      });
+      expect(outcome.kind).toBe(
+        mode === "sync" || mode === "workflow" ? "sync_completed" : "async_launched",
+      );
+      if (outcome.kind === "rejected") {
+        throw new Error("delegate did not launch");
+      }
+      thread = outcome.thread;
+      const result = outcome.kind === "sync_completed" ? outcome.result : await thread.join();
+      expect(result.outcome).toBe(
+        terminal === "preconstruction" ? "aborted"
+          : terminal === "receipt-failure" ? "errored" : terminal,
+      );
+      const receipt = session.mailbox.drain().find((message) => message.metadata?.lifecycle === "turn");
+      if (terminal === "preconstruction") {
+        expect(prepareSpawn).not.toHaveBeenCalled();
+        expect(provider.chatStream).not.toHaveBeenCalled();
+      } else {
+        expect(prepareSpawn).toHaveBeenCalled();
+      }
+      if (terminal === "receipt-failure") {
+        expect(receipt).toBeUndefined();
+        expect(result.error?.message).toContain("task receipt durability failed");
+      } else {
+        expect(receipt?.metadata?.outcome).toBe(terminal === "preconstruction" ? "interrupted" : terminal);
+        expect(receipt?.metadata?.worktreeEvidence).toMatchObject({ state: "unverifiable" });
+        expect(receipt?.content).not.toContain("integration_ref");
+      }
+      expect(thread.live.status.value.status).not.toBe("idle");
+      expect(() => control.assignTask(thread!.live.agentId, {
+        author: "/root",
+        recipient: thread!.live.agentPath,
+        content: "unsafe reuse",
+        taskId: "unsafe-reuse",
+      })).toThrow();
+      expect(existsSync(join(repo, ".git", "worktrees", "unverifiable"))).toBe(true);
+      expect(readFileSync(join(worktreePath, "README.md"), "utf8")).toBe("base\n");
+    } finally {
+      emit?.mockRestore();
+      if (thread) await control.shutdown(thread.threadId, "test cleanup");
+      fork.mockRestore();
+      prepareSpawn.mockRestore();
       rmSync(repo, { recursive: true, force: true });
     }
   });
@@ -3220,6 +4173,42 @@ describe("runAgent", () => {
     expect(allowed.isError).toBe(false);
   });
 
+  it.each(["Plan", "scanner", "verification", "custom-inspector"])(
+    "preserves constrained %s role instructions alongside read-only authority",
+    async (roleName) => {
+      registerAgentRole(ROLE_WORKSPACE, {
+        name: "custom-inspector",
+        config: { systemPrompt: "CUSTOM_INSPECTOR_SENTINEL: report timestamp edge cases." },
+      });
+      const provider = makeProvider([{ content: "inspection complete" }]);
+      const session = makeStubSession({
+        services: {
+          provider,
+          permissionModeRegistry: new PermissionModeRegistry(
+            createEmptyToolPermissionContext({ mode: "plan" }),
+          ),
+        },
+      });
+      const { live } = await spawnLive(session, roleName);
+      const rolePrompt = live.role.config.systemPrompt;
+      expect(rolePrompt).toBeTruthy();
+      expect(live.metadata.executionConstraint).toMatchObject({ kind: "read-only" });
+
+      const { result } = await collectRun(runAgent({
+        live,
+        parent: session,
+        initialMessages: [{ role: "user", content: "Inspect without changing files." }],
+        taskPrompt: "Inspect without changing files.",
+      }));
+
+      expect(result.outcome).toBe("completed");
+      const options = vi.mocked(provider.chatStream).mock.calls[0]?.[2];
+      expect(options?.systemPrompt).toContain(rolePrompt);
+      expect(options?.systemPrompt).toContain("permanent read-only execution authority");
+      expect(options?.systemPrompt).toContain('<workspace_agent_role trust="untrusted" authority="guidance_only">');
+    },
+  );
+
   it("a live read-only role spawn (Plan) strips mutating tools end-to-end", async () => {
     // Drives the real wiring: control.spawn -> role resolution (Plan carries the
     // read-only disallowlist) -> buildChildSession reads role.config.disallowlist
@@ -3245,15 +4234,7 @@ describe("runAgent", () => {
         },
       ),
     } satisfies LLMProvider;
-    const parentRegistry = mkNamedRegistry([
-      "Edit",
-      "MultiEdit",
-      "Write",
-      "NotebookEdit",
-      "apply_patch",
-      "spawn_agent",
-      "Read",
-    ]);
+    const parentRegistry = buildProductionToolRegistry({ workspaceRoot: process.cwd(), requireAdmission: false });
     const session = makeStubSession({
       services: { provider, registry: parentRegistry },
     });
@@ -3287,8 +4268,116 @@ describe("runAgent", () => {
     ]) {
       expect(advertised).not.toContain(denied);
     }
-    expect(advertised).toContain("Read");
+    expect(advertised).toContain("FileRead");
   });
+
+  it("executes a planned child's real FileRead and stamped exec tools through the provider loop after parent YOLO", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-planned-provider-"));
+    writeFileSync(join(cwd, "README.md"), "readonly provider fixture\n");
+    const manager = new UnifiedExecProcessManager({ cwd });
+    const exec = vi.spyOn(manager, "execCommand").mockImplementation(async (request) => {
+      expect(request.directInvocation?.program).toMatch(/\/cat$/);
+      expect(request.directInvocation?.args).toEqual(["README.md"]);
+      expect(request.runtimeSandbox).toBe(request.directInvocation?.runtimeSandbox);
+      expect(request.runtimeSandbox).toMatchObject({ preference: "require", permissionProfile: { network: "disabled" } });
+      expect(request.runtimeSandbox?.permissionProfile.fileSystem.entries.every((entry) => entry.access !== "write")).toBe(true);
+      return { output: "readonly shell fixture", stdout: "readonly shell fixture", stderr: "", exitCode: 0, exit_code: 0, durationMs: 1, wall_time_seconds: 0.001, timedOut: false, truncated: false, original_token_count: 3 };
+    });
+    const provider = makeProvider([
+      { toolCalls: [{ id: "read-plan", name: "FileRead", arguments: JSON.stringify({ file_path: join(cwd, "README.md") }) }], finishReason: "tool_calls" },
+      { toolCalls: [{ id: "inspect-plan", name: "exec_command", arguments: JSON.stringify({ cmd: "cat README.md" }) }], finishReason: "tool_calls" },
+      { content: "inspected without editing", finishReason: "stop" },
+    ]);
+    const permissionModeRegistry = new PermissionModeRegistry(createEmptyToolPermissionContext({ mode: "plan" }));
+    const broker = new SandboxExecutionBroker({ mode: "danger_full_access", cwd, probe: (options) => ({ kind: "ready", mode: options.mode, platform: process.platform }) });
+    const session = makeStubSession({ sessionConfiguration: mkSessionConfiguration({ cwd, sandboxPolicy: { value: "danger_full_access" } }), services: { provider, permissionModeRegistry, sandboxExecutionBroker: broker, registry: buildProductionToolRegistry({ workspaceRoot: cwd, unifiedExecManager: manager, requireAdmission: false }) } });
+    const { live } = await spawnLive(session, "default");
+    expect(live.metadata.executionConstraint).toMatchObject({ kind: "read-only" });
+    await permissionModeRegistry.update({ ...permissionModeRegistry.current(), mode: "bypassPermissions", isBypassPermissionsModeAvailable: true, bypassPermissionsAcceptedIn: [cwd] });
+    try {
+      const { result } = await collectRun(runAgent({ live, parent: session, initialMessages: [{ role: "user", content: "Inspect README without changes" }], taskPrompt: "Inspect README without changes" }));
+      expect(result.outcome, String(result.error)).toBe("completed");
+      expect(exec).toHaveBeenCalledOnce();
+      const conversation = JSON.stringify(vi.mocked(provider.chatStream).mock.calls);
+      expect(conversation).toContain("readonly provider fixture");
+      expect(conversation).toContain("readonly shell fixture");
+    } finally {
+      exec.mockRestore();
+      await manager.closeAll();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["allowed", "ask", "deny", "outside"] as const)(
+    "keeps %s memory maintenance off the foreground approval bridge", async (kind) => {
+      const cwd = mkdtempSync(join(tmpdir(), "agenc-memory-maintenance-"));
+      const memoryRoot = join(cwd, "state", "memory");
+      mkdirSync(memoryRoot, { recursive: true });
+      const target = join(kind === "outside" ? cwd : memoryRoot, "feedback.md");
+      const configStore = new ConfigStore({ home: join(cwd, "state"), cwd,
+        cliOverrides: { autoMemoryEnabled: true, autoMemoryDirectory: memoryRoot } });
+      await configStore.reload();
+      let permissions = createEmptyToolPermissionContext();
+      if (kind === "ask" || kind === "deny") {
+        permissions = applyPermissionUpdate(permissions, { type: "addRules",
+          destination: "session", behavior: kind,
+          rules: [{ toolName: "Write", ruleContent: target }] });
+      }
+      writeFileSync(join(memoryRoot, "MEMORY.md"), "Response preferences\n");
+      const provider = makeProvider([
+        ...(kind === "allowed" ? [
+          { toolCalls: [{ id: "memory-glob", name: "Glob", arguments: JSON.stringify({ path: memoryRoot, pattern: "*.md" }) }], finishReason: "tool_calls" as const },
+          { toolCalls: [{ id: "memory-read", name: "FileRead", arguments: JSON.stringify({ file_path: join(memoryRoot, "MEMORY.md") }) }], finishReason: "tool_calls" as const },
+        ] : []),
+        { toolCalls: [{ id: "memory-write", name: "Write", arguments: JSON.stringify({
+          file_path: target, content: "Prefer concise responses.\n",
+        }) }], finishReason: "tool_calls" },
+        { content: "Memory reviewed", finishReason: "stop" },
+      ]);
+      const foregroundRequest = vi.fn(async () => ({ kind: "approved" as const }));
+      const deferred = vi.fn();
+      const parent = makeStubSession({ config: { ...mkConfig(), cwd },
+        sessionConfiguration: mkSessionConfiguration({ cwd,
+          approvalPolicy: { value: "on_request" }, sandboxPolicy: { value: "danger_full_access" } }),
+        services: { provider, configStore,
+          permissionModeRegistry: new PermissionModeRegistry(permissions),
+          approvalResolver: { request: foregroundRequest },
+          registry: buildProductionToolRegistry({ workspaceRoot: cwd, requireAdmission: false }),
+        } });
+      // This is how the daemon installs its foreground bridge on newly-created
+      // children. A silent maintenance child must remain noninteractive even
+      // when that observer installs a resolver after construction.
+      const unobserve = observeChildApprovalSessions(parent, (child) => {
+        Object.assign(child.services, { approvalResolver: { request: foregroundRequest } });
+        return () => {};
+      });
+      try {
+        const { live } = await spawnLive(parent);
+        const { result, events } = await collectRun(runAgent({ live, parent,
+          initialMessages: [{ role: "user", content: "Remember response preferences" }],
+          taskPrompt: "Remember response preferences", silent: true,
+          toolAllowlist: ["Glob", "FileRead", "Write"], childToolPolicy: createAutoMemoryToolPolicy(memoryRoot),
+          deferInteractiveApprovals: deferred,
+        }));
+        expect(foregroundRequest).not.toHaveBeenCalled();
+        expect(existsSync(target)).toBe(kind === "allowed");
+        if (kind === "allowed") {
+          expect(readFileSync(target, "utf8")).toBe("Prefer concise responses.\n");
+          expect(result.outcome, String(result.error)).toBe("completed");
+          const toolResults = events.filter((event) => event.kind === "tool_result");
+          expect(toolResults.map((event) => [event.callId, event.isError])).toEqual([
+            ["memory-glob", false], ["memory-read", false], ["memory-write", false],
+          ]);
+        }
+        if (kind === "ask") expect(deferred).toHaveBeenCalledWith("Write");
+        else expect(deferred).not.toHaveBeenCalled();
+        expect(parent.abortController.signal.aborted).toBe(false);
+      } finally {
+        unobserve();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("strips model-supplied __agenc* keys before they reach a wrapped child tool", async () => {
     // SECURITY (audit #1/#2/#4): a child model that emits
@@ -4232,6 +5321,116 @@ describe("runAgent", () => {
       await disposeSandboxExecutionBroker(parentBroker);
       if (previousAgencHome === undefined) delete process.env.AGENC_HOME;
       else process.env.AGENC_HOME = previousAgencHome;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["worker", "bypassPermissions"], ["scanner", "bypassPermissions"],
+    ["worker", "default"], ["scanner", "default"],
+  ] as const)("admits a nested %s in %s mode and reads its current worktree", async (role, permissionMode) => {
+    const previousHome = process.env.AGENC_HOME;
+    const home = mkdtempSync(join(tmpdir(), "agenc-nested-parent-home-"));
+    const cwd = mkdtempSync(join(tmpdir(), "agenc-nested-parent-workspace-"));
+    const worktreePath = join(cwd, "implementation");
+    const git = (directory: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", ...args], { cwd: directory, stdio: "pipe" });
+    git(cwd, "init", "-q");
+    writeFileSync(join(cwd, "revision.txt"), "stale root revision");
+    git(cwd, "add", "revision.txt");
+    git(cwd, "commit", "-qm", "initial fixture");
+    git(cwd, "worktree", "add", "-qb", "implementation", worktreePath);
+    writeFileSync(join(worktreePath, "revision.txt"), "current implementation revision");
+    git(worktreePath, "add", "revision.txt");
+    git(worktreePath, "commit", "-qm", "implementation fixture change");
+    process.env.AGENC_HOME = home;
+    const kernel = new ExecutionAdmissionKernel({ agencHome: home, ownerId: "nested-parent-test", ownerPid: process.pid });
+    const rootAdmission = kernel.bindClient({ cwd, scope: { runId: "nested-root", sessionId: "nested-root", autonomous: false } });
+    const children: Session[] = [];
+    let spawned = false;
+    let readRequested = false;
+    const provider = makeProvider([]);
+    provider.getExecutionProfile = async () => ({ provider: "fake", model: "fake-model", usageReporting: "authoritative", supportsMaxOutputTokens: true });
+    vi.mocked(provider.chatStream).mockImplementation(async (messages) => {
+      const nested = messages.some((message) => message.role === "user" && JSON.stringify(message.content).includes("nested-worker-task"));
+      const base = { content: "complete", toolCalls: [], usage: { promptTokens: 8, completionTokens: 4, totalTokens: 12, availability: "reported" as const, provenance: "provider" as const }, model: "fake-model", finishReason: "stop" as const };
+      if (nested && !readRequested) {
+        readRequested = true;
+        return { ...base, content: "", finishReason: "tool_calls", toolCalls: [{ id: "nested-read", name: "FileRead", arguments: JSON.stringify({ file_path: "revision.txt" }) }] };
+      }
+      if (!nested && !spawned) {
+        spawned = true;
+        return { ...base, content: "", finishReason: "tool_calls", toolCalls: [{ id: "nested-spawn", name: "spawn_agent", arguments: JSON.stringify({ message: "nested-worker-task", task_name: "worker", fork_turns: "none", isolation: "none", ...(role === "scanner" ? { agent_type: "scanner" } : {}) }) }] };
+      }
+      return base;
+    });
+    const tools: ToolRegistry["tools"][number][] = [];
+    const fileRead = buildProductionToolRegistry({ workspaceRoot: cwd, requireAdmission: false }).tools.find((tool) => tool.name === "FileRead")!;
+    const read = vi.spyOn(fileRead, "execute");
+    // The observer wrapper changes execute's identity. Register that trusted
+    // test wrapper so the scanner retains the actual builtin implementation.
+    registerBuiltinTool(fileRead);
+    tools.push(fileRead);
+    const broker = new SandboxExecutionBroker({ cwd, mode: "danger_full_access" });
+    const session = makeStubSession({
+      conversationId: "nested-root",
+      services: { provider, executionAdmission: rootAdmission, admissionRequired: true, sandboxExecutionBroker: broker, permissionModeRegistry: new PermissionModeRegistry(createEmptyToolPermissionContext({ mode: permissionMode, isBypassPermissionsModeAvailable: true, bypassPermissionsAcceptedIn: [cwd], alwaysAllowRules: { session: ["spawn_agent"] } })), registry: { ...mkRegistry(), tools } },
+      sessionConfiguration: mkSessionConfiguration({ cwd, sandboxPolicy: { value: "danger_full_access" }, provider: { slug: "fake" } as SessionConfiguration["provider"] }),
+      config: { ...mkConfig(), cwd }, modelInfo: { ...mkModelInfo(), maxOutputTokens: 32 },
+    });
+    const store = new RolloutStore({ cwd, sessionId: session.conversationId, agencVersion: "0.2.0", sessionTempRoot: tmpdir() });
+    store.open({ sessionId: session.conversationId, timestamp: new Date().toISOString(), cwd, originator: "nested-parent-test", agencVersion: "0.2.0", model: "fake-model", modelProvider: "fake" });
+    session.mountRolloutStore(store);
+    session.onBeforeDurableClose(bindExecutionAdmissionJournal(session, rootAdmission));
+    const { control, registry, live } = await spawnLive(session);
+    tools.push(...createMultiAgentV2Tools({ getSession: () => session, workspace: session.roleWorkspace, ensureAgentControl: () => ({ control, registry }) }));
+    const unsubscribe = observeChildApprovalSessions(session, (child) => { children.push(child); return () => {}; });
+    const shutdowns = new Map<Session, Promise<void>>();
+    const shutdown = Session.prototype.shutdown;
+    const observeShutdown = vi.spyOn(Session.prototype, "shutdown").mockImplementation(function (this: Session) {
+      const pending = shutdown.call(this);
+      shutdowns.set(this, pending);
+      void pending.catch(() => {});
+      return pending;
+    });
+    try {
+      const { result } = await collectRun(runAgent({ live, parent: session, initialMessages: [{ role: "user", content: "implementation-parent-task" }], taskPrompt: "implementation-parent-task", worktree: { path: worktreePath, branch: "implementation", gitRoot: cwd, created: false } }));
+      expect(result.outcome, String(result.error)).toBe("completed");
+      await vi.waitFor(() => expect(children, JSON.stringify(vi.mocked(provider.chatStream).mock.calls.at(-1)?.[0].filter((message) => message.role === "tool"))).toHaveLength(2));
+      expect(children[1]!.services.executionAdmission!.scope.parentRunId).toBe(live.agentId);
+      expect(children[1]!.sessionConfiguration.cwd).toBe(worktreePath);
+      if (role === "scanner") expect(children[1]!.services.readOnlyDelegation?.kind).toBe("read-only");
+      expect(store.getThreadSpawnEdge(children[1]!.conversationId)?.parentThreadId).toBe(live.agentId);
+      await vi.waitFor(() => expect(read,
+        JSON.stringify(vi.mocked(provider.chatStream).mock.calls.flatMap(([messages]) => messages.filter((message) => message.role === "tool"))),
+      ).toHaveBeenCalledOnce());
+      expect(read.mock.calls[0]![0][SESSION_ID_ARG]).toBe(children[1]!.conversationId);
+      const readBroker = readSandboxExecutionBroker(read.mock.calls[0]![0]);
+      if (role === "scanner") {
+        // Read-only admission attenuates the session broker for this call.
+        expect(readBroker?.cwd).toBe(worktreePath);
+        expect(readBroker?.executionAuthority?.().mode).toBe("read_only");
+        expect(readBroker).not.toBe(broker);
+      } else {
+        expect(readBroker).toBe(children[1]!.services.sandboxExecutionBroker);
+      }
+      expect((await read.mock.results[0]!.value).content).toContain("current implementation revision");
+      const admissionEvents = () => readFileSync(children[1]!.rolloutStore!.rolloutPath, "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((item) => item.type === "event_msg" && item.payload.msg.type === "execution_admission").map((item) => item.payload.msg.payload);
+      await vi.waitFor(() => expect(admissionEvents().filter((event) => event.event === "allowed").map((event) => event.kind)).toEqual(expect.arrayContaining(["model_turn", "tool_exec"])));
+      expect(admissionEvents().some((event) => JSON.stringify(event).includes("ancestor_parent_ambiguous"))).toBe(false);
+    } finally {
+      unsubscribe();
+      read.mockRestore();
+      await control.shutdownAll("nested test cleanup");
+      // Abort the owned runners, then join their cleanup. Calling shutdown
+      // again here races the runner's durable terminal finalizer.
+      await vi.waitFor(() => expect(children.every((child) => shutdowns.has(child))).toBe(true));
+      await Promise.all(children.map((child) => shutdowns.get(child)!));
+      observeShutdown.mockRestore();
+      await session.shutdown();
+      await disposeSandboxExecutionBroker(broker);
+      kernel.close();
+      if (previousHome === undefined) delete process.env.AGENC_HOME; else process.env.AGENC_HOME = previousHome;
       rmSync(home, { recursive: true, force: true });
       rmSync(cwd, { recursive: true, force: true });
     }

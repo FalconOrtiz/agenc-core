@@ -31,7 +31,9 @@ import {
   type CompactionPersistedRollbackCommittedV1,
   type CompactionRollbackCommittedV1,
 } from "../services/compact/transaction-types.js";
-import { digestWithDomain } from "../services/compact/summary-v1.js";
+import {
+  digestSourceWithDomain,
+} from "../services/compact/summary-v1.js";
 import { DiskCanonicalIdentityRegistry } from "../state/recovery-file.js";
 import {
   StrictCanonicalJournalValidator,
@@ -46,6 +48,7 @@ import {
 } from "../state/recovery-contract.js";
 import type { RolloutItem } from "./rollout-item.js";
 import type { ResponseItem } from "./rollout-item.js";
+import { isAdmissionUsageSummary } from "./usage-summary.js";
 import {
   emptyReducedState,
   reduce,
@@ -73,6 +76,7 @@ class DiskCompactionPayloadRegistry {
   readonly #select: BetterSqlite3.Statement<[string, string]>;
   readonly #count: BetterSqlite3.Statement<[string, string]>;
   #closed = false;
+  #retainedPayloadBytes = 0;
 
   constructor(temporaryRoot: string) {
     const directory = mkdtempSync(join(temporaryRoot, "agenc-c2-payloads-"));
@@ -149,8 +153,17 @@ class DiskCompactionPayloadRegistry {
     );
   }
 
-  reconstruct(manifest: CompactionPayloadManifestV1): unknown {
+  /**
+   * Rebuild a spooled payload. `retained` says whether the caller keeps the
+   * result: a scan that only proves a payload hands it straight back to the
+   * collector, while a hydrated lifecycle row holds it for as long as the
+   * scan state does.
+   */
+  reconstruct(manifest: CompactionPayloadManifestV1, retained = true): unknown {
     this.#assertOpen();
+    if (retained) {
+      this.#retainedPayloadBytes += manifest.canonical_utf8_bytes;
+    }
     const chunks = this.#select
       .all(manifest.attempt_id, manifest.payload_kind)
       .map((row) => {
@@ -167,6 +180,11 @@ class DiskCompactionPayloadRegistry {
         return parsed;
       });
     return reconstructCompactionPayloadV1(manifest, chunks);
+  }
+
+  /** Reconstructed payload bytes the caller is still holding. */
+  get retainedPayloadBytes(): number {
+    return this.#retainedPayloadBytes;
   }
 
   hasComplete(manifest: CompactionPayloadManifestV1): boolean {
@@ -286,25 +304,149 @@ export interface CanonicalRolloutScanOptions extends Pick<
 }
 
 /**
+ * Pass-one state that survives between scans of the same rollout inode. It is
+ * exactly what replaying the validated prefix would rebuild, so a scanner that
+ * kept it only has to push the bytes appended since.
+ */
+interface MutableRolloutScanState {
+  readonly capturedAttemptIds: ReadonlySet<string>;
+  readonly trackHistory: boolean;
+  readonly attempts: Map<string, MutableAttemptScan>;
+  readonly payloadLineAttempts: Map<number, string>;
+  readonly historyAtAttempts: Map<string, readonly ResponseItem[]>;
+  readonly activeLineBytes: Map<number, number>;
+  reducedState: ReducedSessionState;
+  activePositions: CanonicalActiveHistoryPosition[];
+  activeSourceBytes: number;
+  retainedLifecycleRecords: number;
+  activeAdmissionAttempt: MutableAttemptScan | undefined;
+  latestCommittedAttempt: MutableAttemptScan | undefined;
+  postCommitBookkeeping: PostCommitBookkeeping;
+}
+
+interface ValidatedPrefix {
+  readonly rolloutPath: string;
+  /** Every scan option the first pass depends on, for reuse eligibility. */
+  readonly fingerprint: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  /** Redirected to the running scan's deadline before every push. */
+  readonly budget: { check: () => void };
+  readonly validator: StrictCanonicalJournalValidator;
+  readonly identityRegistry: DiskCanonicalIdentityRegistry;
+  readonly payloadRegistry: DiskCompactionPayloadRegistry;
+  readonly state: MutableRolloutScanState;
+  validatedBytes: bigint;
+}
+
+/**
+ * How many validated prefixes one scanner keeps. Compaction bookkeeping asks
+ * two shapes of question about the same rollout, one that reduces the active
+ * history for a compaction source and one that does not, and evicting either
+ * to answer the other would replay the whole file for both.
+ */
+const MAX_VALIDATED_PREFIXES = 2;
+
+/**
+ * How much a scanner keeps in memory between scans of one rollout.
+ *
+ * Two of the things a prefix holds grow with the session rather than with the
+ * compaction budget. Reduced active history is a second copy of the whole
+ * conversation next to the one the runtime already has. The other is what a
+ * hydrated compaction lifecycle row reconstructs back into itself:
+ * `MAX_COMPACTION_LIFECYCLE_RECORDS` bounds how many rows a prefix retains,
+ * not how large one is, and a rollback row holds the entire pre-compaction
+ * conversation. A prefix past this ceiling answers its scan and is then
+ * released, and the next scan replays the whole file exactly as it did before
+ * this scanner existed: past the ceiling there is no regression and no gain,
+ * so the reuse this file buys is only ever claimed below it.
+ *
+ * Where the ceiling actually bites, measured on real rollouts rather than
+ * argued: the one call per compaction step that reduces active history loses
+ * its prefix as soon as the session's own active history passes the ceiling,
+ * which is the shape #2229 opens with. The other seven reduce none, so they
+ * are charged only for what their lifecycle rows hydrate, and that is charged
+ * in persisted canonical bytes: about 266 B for every message a committed
+ * compaction pins, so a rollout carrying sixteen 1,000-message compactions
+ * releases even that prefix, while one rollback is charged the whole
+ * pre-compaction conversation and releases it at once.
+ *
+ * The charge is not what the prefix holds. A persisted ref hydrates back into
+ * a much larger object than its canonical bytes, so the count runs under the
+ * heap: eight such compactions counted 2.1 MB here and held 4.2 MB of settled
+ * heap. That keeps the bound a small constant - a few times this ceiling,
+ * times `MAX_VALIDATED_PREFIXES` - rather than the session-scaled retention
+ * the ceiling exists to prevent, but the constant is not this number.
+ */
+const MAX_RETAINED_PREFIX_BYTES = 4 * 1_024 * 1_024;
+
+/** Validated prefixes, most recently used first. */
+interface PrefixOwner {
+  readonly prefixes: ValidatedPrefix[];
+}
+
+/**
+ * A rollout scanner that keeps the prefix it already validated.
+ *
+ * Compaction bookkeeping scans the same rollout several times per step, and
+ * every scan used to replay the whole file from zero, so the cost grew with
+ * the session. This scanner replays only the bytes appended since its last
+ * scan of the same inode. The second pass still reads the whole file and its
+ * digest must equal the incrementally maintained one, so a prefix that changed
+ * underneath a reused validator fails the scan instead of answering from it.
+ *
+ * What it keeps is bounded: a prefix holding more than
+ * `MAX_RETAINED_PREFIX_BYTES` of reduced history and hydrated compaction
+ * payload, and a prefix keyed to one attempt, are released once they have
+ * answered.
+ *
+ * Every prefix owns two disk registries, so a scanner must be closed.
+ */
+export class CanonicalRolloutScanner {
+  readonly #owner: PrefixOwner = { prefixes: [] };
+
+  scan(
+    rolloutPath: string,
+    options: CanonicalRolloutScanOptions,
+  ): CanonicalRolloutScan {
+    return timed("canonical_rollout_scan", () =>
+      scanCanonicalRolloutUntimed(rolloutPath, options, this.#owner),
+    );
+  }
+
+  /** Release the prefix registries. A closed scanner scans from zero again. */
+  close(): void {
+    while (this.#owner.prefixes.length > 0) {
+      discardPrefix(this.#owner, this.#owner.prefixes[0]!);
+    }
+  }
+}
+
+/**
  * Scan a live rollout without retaining ordinary canonical rows. The first
  * pass validates identities with a disk-backed registry and retains only the
  * bounded compaction lifecycle. A digest-anchored second pass selects the
  * exact source rows named by those lifecycles and existing retention pins.
+ *
+ * This replays the whole file. A caller that scans one rollout repeatedly
+ * should hold a `CanonicalRolloutScanner` instead.
  */
 export function scanCanonicalRollout(
   rolloutPath: string,
   options: CanonicalRolloutScanOptions,
 ): CanonicalRolloutScan {
-  // Every open, compaction attempt and resume re-parses the whole file here
-  // (17,610 lines / 8.6 MB for the measured session), synchronously.
-  return timed("canonical_rollout_scan", () =>
-    scanCanonicalRolloutUntimed(rolloutPath, options),
-  );
+  const scanner = new CanonicalRolloutScanner();
+  try {
+    return scanner.scan(rolloutPath, options);
+  } finally {
+    scanner.close();
+  }
 }
 
 function scanCanonicalRolloutUntimed(
   rolloutPath: string,
   options: CanonicalRolloutScanOptions,
+  owner: PrefixOwner,
 ): CanonicalRolloutScan {
   const nowMilliseconds = options.nowMilliseconds ?? Date.now;
   const startedAt = nowMilliseconds();
@@ -324,453 +466,657 @@ function scanCanonicalRolloutUntimed(
       throw new Error("canonical rollout source is not a regular file");
     }
     checkOperationalBudget();
-    const attempts = new Map<string, MutableAttemptScan>();
-    const capturedAttemptIds = new Set(
-      options.captureHistoryAtAttemptIds ?? [],
-    );
-    const capturedPayloadAttemptIds = new Set(
-      options.capturePayloadRecordsAtAttemptIds ?? [],
-    );
-    const payloadLineAttempts = new Map<number, string>();
-    const trackHistory =
-      options.captureActiveHistory === true || capturedAttemptIds.size > 0;
-    let reducedState = emptyReducedState();
-    let activePositions: CanonicalActiveHistoryPosition[] = [];
-    const activeLineBytes = new Map<number, number>();
-    let activeSourceBytes = 0;
-    const historyAtAttempts = new Map<string, readonly ResponseItem[]>();
-    let retainedLifecycleRecords = 0;
-    let activeAdmissionAttempt: MutableAttemptScan | undefined;
-    let latestCommittedAttempt: MutableAttemptScan | undefined;
-    let postCommitBookkeeping: PostCommitBookkeeping;
-    checkOperationalBudget();
-    let identityRegistry: DiskCanonicalIdentityRegistry | undefined;
-    let payloadRegistry: DiskCompactionPayloadRegistry | undefined;
-    let first: StrictCanonicalJournal;
+    const fingerprint = prefixFingerprint(options);
+    const carried = reusablePrefix(owner, rolloutPath, fingerprint, snapshot);
+    const prefix =
+      carried ?? beginPrefix(rolloutPath, options, fingerprint, snapshot);
+    prefix.budget.check = checkOperationalBudget;
+    const state = prefix.state;
     try {
-      identityRegistry = new DiskCanonicalIdentityRegistry(
-        options.sessionTempRoot,
+      streamCanonicalTail(fd, snapshot.size, prefix, checkOperationalBudget);
+      const first = prefix.validator.snapshot();
+
+      // A file that ends mid-bookkeeping is a conclusion about where this
+      // scan stopped reading, not about the bytes: the session_meta that
+      // completes the window is appended straight after the boundary. Keeping
+      // it out of the carried-over state is what makes a reused prefix answer
+      // exactly as a full replay of the same bytes would.
+      const awaitingPostCommitMeta =
+        state.postCommitBookkeeping === "await_meta"
+          ? state.latestCommittedAttempt
+          : undefined;
+      assertAttemptsReconstructed(state.attempts);
+
+      checkOperationalBudget();
+      const sourceLines = collectSourceLines(
+        options,
+        state.attempts,
+        state.activePositions,
       );
-      payloadRegistry = new DiskCompactionPayloadRegistry(
-        options.sessionTempRoot,
+      const sourceRecords = new Map<number, CanonicalRolloutSourceRecord>();
+      const payloadRecordsAtAttempts = new Map<
+        string,
+        CanonicalRolloutPayloadRecord[]
+      >();
+      const capturedPayloadAttemptIds = new Set(
+        options.capturePayloadRecordsAtAttemptIds ?? [],
       );
-      const activeIdentityRegistry = identityRegistry;
-      const activePayloadRegistry = payloadRegistry;
-      first = scanPass(fd, snapshot.size, {
+      for (const attemptId of capturedPayloadAttemptIds) {
+        payloadRecordsAtAttempts.set(attemptId, []);
+      }
+      const second = scanPass(fd, snapshot.size, {
         ...strictOptions(options, checkOperationalBudget),
+        trustedSourceSha256: first.sourceSha256,
         retainRecords: false,
-        identityRegistry: activeIdentityRegistry,
-        onRecord: (physicalRecord) => {
-          let record = physicalRecord;
-          let item = record.item;
-          const persistedIntent = persistedIntentPayload(item);
-          const attemptId =
-            item.type.startsWith("compaction_") && "attempt_id" in item.payload
-              ? item.payload.attempt_id
-              : undefined;
-
-          if (latestCommittedAttempt !== undefined) {
-            const next = nextPostCommitBookkeeping(
-              item,
-              latestCommittedAttempt,
-              postCommitBookkeeping,
-              options.expectedRunId,
-            );
-            if (next === "later_work") {
-              latestCommittedAttempt.laterWork = true;
-              latestCommittedAttempt = undefined;
-              postCommitBookkeeping = undefined;
-            } else {
-              postCommitBookkeeping = next;
-            }
-          }
-          if (
-            trackHistory &&
-            item.type === "compaction_intent" &&
-            attemptId !== undefined &&
-            capturedAttemptIds.has(attemptId)
-          ) {
-            checkOperationalBudget();
-            historyAtAttempts.set(
-              attemptId,
-              Object.freeze(reducedState.history.slice()),
-            );
-          }
-
-          if (item.type === "compaction_payload_chunk") {
-            if (activeAdmissionAttempt !== undefined) {
-              observeAdmission(record, activeAdmissionAttempt);
-            }
-            activePayloadRegistry.add(item.payload);
-            if (
-              item.payload.payload_kind === "source_history" &&
-              capturedPayloadAttemptIds.has(item.payload.attempt_id)
-            ) {
-              payloadLineAttempts.set(
-                record.lineNumber,
-                item.payload.attempt_id,
-              );
-            }
-            retainedLifecycleRecords += 1;
-            if (retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
-              throw new RecoveryOperationalError(
-                "recovery_history_storage_limit",
-                "canonical compaction lifecycle exceeds its bounded retention budget",
-              );
-            }
-            const pending = attempts.get(item.payload.attempt_id);
-            const pendingIntent = pending?.persistedIntent;
-            if (
-              pending !== undefined &&
-              pendingIntent !== undefined &&
-              activePayloadRegistry.hasComplete(
-                pendingIntent.source.active_history_refs_manifest,
-              ) &&
-              pending.intent === undefined
-            ) {
-              const hydrated = hydratePersistedIntentRecord(
-                pending.intentRecord!,
-                pendingIntent,
-                activePayloadRegistry,
-              );
-              pending.intent = hydrated.intent;
-              pending.records.push(hydrated.record);
-              pending.sourceHistoryManifest =
-                pendingIntent.source_history_manifest;
-              activeAdmissionAttempt = pending;
-            }
-            if (
-              pending !== undefined &&
-              pendingIntent !== undefined &&
-              item.payload.payload_kind === "source_history" &&
-              activePayloadRegistry.hasComplete(
-                pendingIntent.source_history_manifest,
-              )
-            ) {
-              validatePersistedSourceHistory(
-                pendingIntent,
-                activePayloadRegistry,
-              );
-              pending.sourceHistoryValidated = true;
-            }
-            return;
-          }
-
-          if (persistedIntent !== undefined) {
-            attempts.set(persistedIntent.attempt_id, {
-              persistedIntent,
-              intentRecord: record,
-              sourceHistoryManifest: persistedIntent.source_history_manifest,
-              records: [],
-              calls: new Map(),
-              eventIds: new Set(),
-              reservationIds: new Set(),
-              latestCall: 0,
-              latestAdmissionSequence: 0,
-              contaminated: false,
-              terminal: false,
-              laterWork: false,
-            });
-            retainedLifecycleRecords += 1;
-            if (retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
-              throw new RecoveryOperationalError(
-                "recovery_history_storage_limit",
-                "canonical compaction lifecycle exceeds its bounded retention budget",
-              );
-            }
-            return;
-          }
-
-          const incompleteAttempt = [...attempts.values()].find(
-            (attempt) =>
-              attempt.persistedIntent !== undefined &&
-              attempt.intent === undefined &&
-              !attempt.terminal,
+        identityPolicy: "trusted_replay",
+        onRecord: (record) => {
+          const payloadLineAttemptId = state.payloadLineAttempts.get(
+            record.lineNumber,
           );
-          if (incompleteAttempt !== undefined) {
-            throw new Error(
-              "canonical compaction intent is missing its required source payload bundle",
-            );
-          }
-
-          const persistedCommit = persistedCommitPayload(item);
-          if (persistedCommit !== undefined) {
-            const attempt = attempts.get(persistedCommit.attempt_id);
-            if (attempt?.intent === undefined) {
-              throw new Error(
-                "persisted compaction commit has no hydrated intent",
-              );
-            }
-            record = hydratePersistedCommitRecord(
-              record,
-              persistedCommit,
-              attempt.intent,
-              activePayloadRegistry,
-            );
-            item = record.item;
-            if (
-              item.type !== "compaction_committed" ||
-              item.payload.summary_dag.planned_provider_calls !==
-                attempt.intent.planned_provider_calls
-            ) {
-              throw new Error(
-                "canonical compaction commit provider-call plan conflicts with its intent",
-              );
-            }
-          }
-          const persistedRollback = persistedRollbackPayload(item);
-          if (persistedRollback !== undefined) {
-            if (
-              activePayloadRegistry.hasComplete(
-                persistedRollback.source_history_manifest,
-              )
-            ) {
-              record = hydratePersistedRollbackRecord(
-                record,
-                persistedRollback,
-                activePayloadRegistry,
-              );
-              item = record.item;
-            }
-          }
-          if (activeAdmissionAttempt !== undefined) {
-            observeAdmission(record, activeAdmissionAttempt);
-          }
-          if (trackHistory) {
-            checkOperationalBudget();
-            const next = reduceStreamingHistory(reducedState, item);
-            if (item.type === "response_item") {
-              activePositions.push({
-                lineNumber: record.lineNumber,
-                recordMessageIndex: 0,
-              });
-              if (!activeLineBytes.has(record.lineNumber)) {
-                activeLineBytes.set(
-                  record.lineNumber,
-                  record.encodedByteLength + 1,
-                );
-                activeSourceBytes += record.encodedByteLength + 1;
-              }
-            } else if (
-              (item.type === "compacted" &&
-                item.payload.replacementHistory !== undefined) ||
-              item.type === "compaction_committed" ||
-              (item.type === "compaction_rollback_committed" &&
-                Array.isArray(item.payload.source_history) &&
-                item.payload.target_session_id === options.expectedRunId)
-            ) {
-              checkOperationalBudget();
-              activePositions = next.history.map((_, recordMessageIndex) => ({
-                lineNumber: record.lineNumber,
-                recordMessageIndex,
-              }));
-              activeLineBytes.clear();
-              activeLineBytes.set(
-                record.lineNumber,
-                record.encodedByteLength + 1,
-              );
-              activeSourceBytes = record.encodedByteLength + 1;
-            } else if (next.history.length < activePositions.length) {
-              activePositions = activePositions.slice(0, next.history.length);
-              const retainedLines = new Set(
-                activePositions.map((position) => position.lineNumber),
-              );
-              for (const lineNumber of activeLineBytes.keys()) {
-                if (!retainedLines.has(lineNumber))
-                  activeLineBytes.delete(lineNumber);
-              }
-              activeSourceBytes = [...activeLineBytes.values()].reduce(
-                (total, bytes) => total + bytes,
-                0,
-              );
-            }
-            reducedState = next;
-            if (
-              reducedState.history.length > MAX_COMPACTION_SOURCE_MESSAGES ||
-              activeSourceBytes > MAX_COMPACTION_SOURCE_BYTES
-            ) {
-              throw new RecoveryOperationalError(
-                "recovery_history_storage_limit",
-                "canonical active history exceeds its bounded compaction scan budget",
-              );
-            }
-          }
+          const payloadAttemptId =
+            payloadLineAttemptId !== undefined &&
+            capturedPayloadAttemptIds.has(payloadLineAttemptId)
+              ? payloadLineAttemptId
+              : undefined;
           if (
-            !item.type.startsWith("compaction_") ||
-            !("attempt_id" in item.payload)
+            !sourceLines.has(record.lineNumber) &&
+            payloadAttemptId === undefined
           )
             return;
-          retainedLifecycleRecords += 1;
-          if (retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
-            throw new RecoveryOperationalError(
-              "recovery_history_storage_limit",
-              "canonical compaction lifecycle exceeds its bounded retention budget",
-            );
-          }
-          const lifecycleAttemptId = item.payload.attempt_id;
-          if (item.type === "compaction_intent") {
-            attempts.set(lifecycleAttemptId, {
-              intent: item.payload,
-              records: [record],
-              calls: new Map(),
-              eventIds: new Set(),
-              reservationIds: new Set(),
-              latestCall: 0,
-              latestAdmissionSequence: 0,
-              contaminated: false,
-              terminal: false,
-              laterWork: false,
+          checkOperationalBudget();
+          const physical = readPhysicalRecord(fd, record);
+          const item = record.item;
+          const physicalSha256 = createHash("sha256")
+            .update(options.compactionSourceDigestDomain, "utf8")
+            .update(physical)
+            .digest("hex");
+          if (sourceLines.has(record.lineNumber)) {
+            sourceRecords.set(record.lineNumber, {
+              lineNumber: record.lineNumber,
+              encodedByteLength: physical.byteLength,
+              itemType: item.type,
+              compactionSourceSha256: physicalSha256,
+              ...(item.type === "compaction_committed"
+                ? { committedAttemptId: item.payload.attempt_id }
+                : {}),
             });
-            activeAdmissionAttempt = attempts.get(lifecycleAttemptId);
-            return;
           }
-          const attempt = attempts.get(lifecycleAttemptId);
-          if (attempt === undefined) return;
-          if (
-            attempt.commitSha256 !== undefined &&
-            "commit_sha256" in item.payload &&
-            item.payload.commit_sha256 !== attempt.commitSha256
-          ) {
-            throw new Error(
-              "canonical compaction post-commit event is not bound to its hydrated commit",
-            );
-          }
-          attempt.records.push(record);
-          if (
-            item.type === "compaction_committed" ||
-            item.type === "compaction_failed"
-          ) {
-            attempt.terminal = true;
-            if (item.type === "compaction_committed") {
-              attempt.commitSha256 = digestWithDomain(
-                COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
-                item.payload,
+          if (payloadAttemptId !== undefined) {
+            if (
+              item.type !== "compaction_payload_chunk" ||
+              item.payload.attempt_id !== payloadAttemptId ||
+              item.payload.payload_kind !== "source_history"
+            ) {
+              throw new Error(
+                "captured compaction source-history row changed during canonical scan",
               );
-              latestCommittedAttempt = attempt;
-              postCommitBookkeeping = "await_context";
             }
-            if (activeAdmissionAttempt === attempt) {
-              activeAdmissionAttempt = undefined;
-            }
+            const records =
+              payloadRecordsAtAttempts.get(payloadAttemptId) ?? [];
+            records.push({
+              lineNumber: record.lineNumber,
+              encodedByteLength: physical.byteLength,
+              payloadKind: item.payload.payload_kind,
+              compactionSourceSha256: physicalSha256,
+            });
+            payloadRecordsAtAttempts.set(payloadAttemptId, records);
           }
         },
       });
-    } finally {
-      try {
-        identityRegistry?.close();
-      } finally {
-        payloadRegistry?.close();
-      }
-    }
-
-    if (
-      latestCommittedAttempt !== undefined &&
-      postCommitBookkeeping === "await_meta"
-    ) {
-      latestCommittedAttempt.laterWork = true;
-    }
-    assertAttemptsReconstructed(attempts);
-
-    checkOperationalBudget();
-    const sourceLines = collectSourceLines(options, attempts, activePositions);
-    const sourceRecords = new Map<number, CanonicalRolloutSourceRecord>();
-    const payloadRecordsAtAttempts = new Map<
-      string,
-      CanonicalRolloutPayloadRecord[]
-    >();
-    for (const attemptId of capturedPayloadAttemptIds) {
-      payloadRecordsAtAttempts.set(attemptId, []);
-    }
-    const second = scanPass(fd, snapshot.size, {
-      ...strictOptions(options, checkOperationalBudget),
-      trustedSourceSha256: first.sourceSha256,
-      retainRecords: false,
-      identityPolicy: "trusted_replay",
-      onRecord: (record) => {
-        const payloadAttemptId = payloadLineAttempts.get(record.lineNumber);
-        if (
-          !sourceLines.has(record.lineNumber) &&
-          payloadAttemptId === undefined
-        )
-          return;
-        checkOperationalBudget();
-        const physical = readPhysicalRecord(fd, record);
-        const item = record.item;
-        const physicalSha256 = createHash("sha256")
-          .update(options.compactionSourceDigestDomain, "utf8")
-          .update(physical)
-          .digest("hex");
-        if (sourceLines.has(record.lineNumber)) {
-          sourceRecords.set(record.lineNumber, {
-            lineNumber: record.lineNumber,
-            encodedByteLength: physical.byteLength,
-            itemType: item.type,
-            compactionSourceSha256: physicalSha256,
-            ...(item.type === "compaction_committed"
-              ? { committedAttemptId: item.payload.attempt_id }
-              : {}),
-          });
-        }
-        if (payloadAttemptId !== undefined) {
-          if (
-            item.type !== "compaction_payload_chunk" ||
-            item.payload.attempt_id !== payloadAttemptId ||
-            item.payload.payload_kind !== "source_history"
-          ) {
-            throw new Error(
-              "captured compaction source-history row changed during canonical scan",
-            );
-          }
-          const records = payloadRecordsAtAttempts.get(payloadAttemptId) ?? [];
-          records.push({
-            lineNumber: record.lineNumber,
-            encodedByteLength: physical.byteLength,
-            payloadKind: item.payload.payload_kind,
-            compactionSourceSha256: physicalSha256,
-          });
-          payloadRecordsAtAttempts.set(payloadAttemptId, records);
-        }
-      },
-    });
-    assertMatchingProof(first, second);
-    assertPinnedSnapshot(fd, snapshot);
-    checkOperationalBudget();
-    return {
-      proof: withoutRecords(first),
-      attempts: new Map(
-        [...attempts].map(([attemptId, attempt]) => [
-          attemptId,
-          {
-            intent: attempt.intent!,
-            records: Object.freeze(attempt.records.slice()),
-            admissionValid: validAdmission(attempt),
-            hasLaterCanonicalWork: attempt.laterWork,
-            sourceHistoryRetained: attempt.sourceHistoryValidated === true,
-            ...(attempt.sourceHistoryManifest !== undefined
-              ? { sourceHistoryManifest: attempt.sourceHistoryManifest }
-              : {}),
-          },
-        ]),
-      ),
-      sourceRecords,
-      payloadRecordsAtAttempts: new Map(
-        [...payloadRecordsAtAttempts].map(([attemptId, records]) => [
-          attemptId,
-          Object.freeze(records.slice()),
-        ]),
-      ),
-      ...(options.captureActiveHistory === true
-        ? {
-            activeHistory: {
-              messages: Object.freeze(reducedState.history.slice()),
-              positions: Object.freeze(activePositions.slice()),
+      assertMatchingProof(first, second);
+      assertPinnedSnapshot(fd, snapshot);
+      checkOperationalBudget();
+      const scan: CanonicalRolloutScan = {
+        proof: withoutRecords(first),
+        attempts: new Map(
+          [...state.attempts].map(([attemptId, attempt]) => [
+            attemptId,
+            {
+              intent: attempt.intent!,
+              records: Object.freeze(attempt.records.slice()),
+              admissionValid: validAdmission(attempt),
+              hasLaterCanonicalWork:
+                attempt.laterWork || attempt === awaitingPostCommitMeta,
+              sourceHistoryRetained: attempt.sourceHistoryValidated === true,
+              ...(attempt.sourceHistoryManifest !== undefined
+                ? { sourceHistoryManifest: attempt.sourceHistoryManifest }
+                : {}),
             },
-          }
-        : {}),
-      historyAtAttempts,
-    };
+          ]),
+        ),
+        sourceRecords,
+        payloadRecordsAtAttempts: new Map(
+          [...payloadRecordsAtAttempts].map(([attemptId, records]) => [
+            attemptId,
+            Object.freeze(records.slice()),
+          ]),
+        ),
+        ...(options.captureActiveHistory === true
+          ? {
+              activeHistory: {
+                messages: Object.freeze(state.reducedState.history.slice()),
+                positions: Object.freeze(state.activePositions.slice()),
+              },
+            }
+          : {}),
+        historyAtAttempts: new Map(state.historyAtAttempts),
+      };
+      // Whether this prefix is worth keeping is only knowable now: how much
+      // history it reduced, and how much payload its lifecycle rows hold, are
+      // facts about the bytes it read. Deciding here also keeps a prefix that
+      // is about to be released from taking a slot away from one a later scan
+      // can still use. A prefix keyed to one attempt's history is never worth
+      // keeping - no later scan asks its question.
+      if (
+        (options.captureHistoryAtAttemptIds ?? []).length > 0 ||
+        state.activeSourceBytes + prefix.payloadRegistry.retainedPayloadBytes >
+          MAX_RETAINED_PREFIX_BYTES
+      ) {
+        discardPrefix(owner, prefix);
+      } else if (carried === undefined) {
+        retainPrefix(owner, prefix);
+      }
+      return scan;
+    } catch (error) {
+      // Whatever failed may have left this prefix out of step with the
+      // file: a partial push, or a second pass that rejected the digest it
+      // carried. The next scan rebuilds it from zero.
+      discardPrefix(owner, prefix);
+      throw error;
+    }
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * The scan options the first pass consumes. `additionalSourceLines` and
+ * `capturePayloadRecordsAtAttemptIds` are not among them: both only select
+ * rows in the second pass, which is why one validated prefix serves
+ * bookkeeping calls that ask about different rows.
+ */
+function prefixFingerprint(options: CanonicalRolloutScanOptions): string {
+  return JSON.stringify({
+    sessionTempRoot: options.sessionTempRoot,
+    expectedRunId: options.expectedRunId ?? null,
+    expectedEpoch: options.expectedEpoch ?? null,
+    terminalPolicy: options.terminalPolicy ?? null,
+    compactionSourceDigestDomain: options.compactionSourceDigestDomain,
+    captureActiveHistory: options.captureActiveHistory === true,
+    /*
+     * Code-unit order, not `localeCompare`: this string keys a cache whose
+     * entries must match across machines, and locale-aware collation is not
+     * stable between them. A bare `.sort()` would do the same thing, but only
+     * by accident of these being strings.
+     */
+    captureHistoryAtAttemptIds: [
+      ...new Set(options.captureHistoryAtAttemptIds ?? []),
+    ].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)),
+  });
+}
+
+/**
+ * A prefix stands in for the file only while it is the same inode, still asks
+ * the same questions of the first pass, and the file has only grown.
+ */
+function reusablePrefix(
+  owner: PrefixOwner,
+  rolloutPath: string,
+  fingerprint: string,
+  snapshot: BigIntStats,
+): ValidatedPrefix | undefined {
+  const index = owner.prefixes.findIndex(
+    (candidate) =>
+      candidate.rolloutPath === rolloutPath &&
+      candidate.fingerprint === fingerprint,
+  );
+  if (index === -1) return undefined;
+  const prefix = owner.prefixes[index]!;
+  if (
+    prefix.dev !== snapshot.dev ||
+    prefix.ino !== snapshot.ino ||
+    prefix.validatedBytes > snapshot.size
+  ) {
+    // A replaced or truncated file has no prefix here any more.
+    discardPrefix(owner, prefix);
+    return undefined;
+  }
+  owner.prefixes.splice(index, 1);
+  owner.prefixes.unshift(prefix);
+  return prefix;
+}
+
+function retainPrefix(
+  owner: PrefixOwner,
+  prefix: ValidatedPrefix,
+): ValidatedPrefix {
+  owner.prefixes.unshift(prefix);
+  while (owner.prefixes.length > MAX_VALIDATED_PREFIXES) {
+    discardPrefix(owner, owner.prefixes[owner.prefixes.length - 1]!);
+  }
+  return prefix;
+}
+
+function beginPrefix(
+  rolloutPath: string,
+  options: CanonicalRolloutScanOptions,
+  fingerprint: string,
+  snapshot: BigIntStats,
+): ValidatedPrefix {
+  const capturedAttemptIds = new Set(options.captureHistoryAtAttemptIds ?? []);
+  const state: MutableRolloutScanState = {
+    capturedAttemptIds,
+    trackHistory:
+      options.captureActiveHistory === true || capturedAttemptIds.size > 0,
+    attempts: new Map(),
+    payloadLineAttempts: new Map(),
+    historyAtAttempts: new Map(),
+    activeLineBytes: new Map(),
+    reducedState: emptyReducedState(),
+    activePositions: [],
+    activeSourceBytes: 0,
+    retainedLifecycleRecords: 0,
+    activeAdmissionAttempt: undefined,
+    latestCommittedAttempt: undefined,
+    postCommitBookkeeping: undefined,
+  };
+  const budget = { check: (): void => {} };
+  const checkBudget = (): void => {
+    budget.check();
+  };
+  const identityRegistry = new DiskCanonicalIdentityRegistry(
+    options.sessionTempRoot,
+  );
+  let payloadRegistry: DiskCompactionPayloadRegistry;
+  try {
+    payloadRegistry = new DiskCompactionPayloadRegistry(
+      options.sessionTempRoot,
+    );
+  } catch (error) {
+    identityRegistry.close();
+    throw error;
+  }
+  let validator: StrictCanonicalJournalValidator;
+  try {
+    validator = new StrictCanonicalJournalValidator({
+      ...strictOptions(options, checkBudget),
+      retainRecords: false,
+      identityRegistry,
+      onRecord: (record) =>
+        observeCanonicalRecord(
+          record,
+          options.expectedRunId,
+          state,
+          payloadRegistry,
+          checkBudget,
+        ),
+    });
+  } catch (error) {
+    try {
+      identityRegistry.close();
+    } finally {
+      payloadRegistry.close();
+    }
+    throw error;
+  }
+  return {
+    rolloutPath,
+    fingerprint,
+    dev: snapshot.dev,
+    ino: snapshot.ino,
+    budget,
+    validator,
+    identityRegistry,
+    payloadRegistry,
+    state,
+    validatedBytes: 0n,
+  };
+}
+
+function discardPrefix(owner: PrefixOwner, prefix: ValidatedPrefix): void {
+  const index = owner.prefixes.indexOf(prefix);
+  if (index !== -1) owner.prefixes.splice(index, 1);
+  try {
+    prefix.identityRegistry.close();
+  } finally {
+    prefix.payloadRegistry.close();
+  }
+}
+
+/** Validate everything appended since this prefix was last brought current. */
+function streamCanonicalTail(
+  fd: number,
+  size: bigint,
+  prefix: ValidatedPrefix,
+  checkBudget: () => void,
+): void {
+  checkBudget();
+  const chunk = Buffer.allocUnsafe(RECOVERY_SCAN_CHUNK_BYTES);
+  let offset = Number(prefix.validatedBytes);
+  while (BigInt(offset) < size) {
+    checkBudget();
+    const remaining = size - BigInt(offset);
+    const requested = Number(
+      remaining < BigInt(chunk.byteLength)
+        ? remaining
+        : BigInt(chunk.byteLength),
+    );
+    const bytesRead = readSync(fd, chunk, 0, requested, offset);
+    if (bytesRead <= 0) {
+      throw new Error("canonical rollout ended before its pinned size");
+    }
+    prefix.validator.push(chunk.subarray(0, bytesRead));
+    offset += bytesRead;
+    prefix.validatedBytes = BigInt(offset);
+  }
+}
+
+function observeCanonicalRecord(
+  physicalRecord: StrictCanonicalJournalRecord,
+  expectedRunId: string | undefined,
+  state: MutableRolloutScanState,
+  payloadRegistry: DiskCompactionPayloadRegistry,
+  checkBudget: () => void,
+): void {
+  let record = physicalRecord;
+  let item = record.item;
+  const persistedIntent = persistedIntentPayload(item);
+  const attemptId =
+    item.type.startsWith("compaction_") && "attempt_id" in item.payload
+      ? item.payload.attempt_id
+      : undefined;
+
+  if (state.latestCommittedAttempt !== undefined) {
+    const next = nextPostCommitBookkeeping(
+      item,
+      state.latestCommittedAttempt,
+      state.postCommitBookkeeping,
+      expectedRunId,
+    );
+    if (next === "later_work") {
+      state.latestCommittedAttempt.laterWork = true;
+      state.latestCommittedAttempt = undefined;
+      state.postCommitBookkeeping = undefined;
+    } else {
+      state.postCommitBookkeeping = next;
+    }
+  }
+  if (
+    state.trackHistory &&
+    item.type === "compaction_intent" &&
+    attemptId !== undefined &&
+    state.capturedAttemptIds.has(attemptId)
+  ) {
+    checkBudget();
+    state.historyAtAttempts.set(
+      attemptId,
+      Object.freeze(state.reducedState.history.slice()),
+    );
+  }
+
+  if (item.type === "compaction_payload_chunk") {
+    if (state.activeAdmissionAttempt !== undefined) {
+      observeAdmission(record, state.activeAdmissionAttempt);
+    }
+    payloadRegistry.add(item.payload);
+    if (item.payload.payload_kind === "source_history") {
+      // Every source-history line, not just the ones this scan was asked
+      // about: which attempt a scan captures must not decide what the
+      // reusable first pass builds. The bounded lifecycle budget below
+      // already counts these rows, so the map stays bounded with it.
+      state.payloadLineAttempts.set(
+        record.lineNumber,
+        item.payload.attempt_id,
+      );
+    }
+    state.retainedLifecycleRecords += 1;
+    if (state.retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
+      throw new RecoveryOperationalError(
+        "recovery_history_storage_limit",
+        "canonical compaction lifecycle exceeds its bounded retention budget",
+      );
+    }
+    const pending = state.attempts.get(item.payload.attempt_id);
+    const pendingIntent = pending?.persistedIntent;
+    if (
+      pending !== undefined &&
+      pendingIntent !== undefined &&
+      payloadRegistry.hasComplete(
+        pendingIntent.source.active_history_refs_manifest,
+      ) &&
+      pending.intent === undefined
+    ) {
+      const hydrated = hydratePersistedIntentRecord(
+        pending.intentRecord!,
+        pendingIntent,
+        payloadRegistry,
+      );
+      pending.intent = hydrated.intent;
+      pending.records.push(hydrated.record);
+      pending.sourceHistoryManifest =
+        pendingIntent.source_history_manifest;
+      state.activeAdmissionAttempt = pending;
+    }
+    if (
+      pending !== undefined &&
+      pendingIntent !== undefined &&
+      item.payload.payload_kind === "source_history" &&
+      payloadRegistry.hasComplete(
+        pendingIntent.source_history_manifest,
+      )
+    ) {
+      validatePersistedSourceHistory(
+        pendingIntent,
+        payloadRegistry,
+      );
+      pending.sourceHistoryValidated = true;
+    }
+    return;
+  }
+
+  if (persistedIntent !== undefined) {
+    state.attempts.set(persistedIntent.attempt_id, {
+      persistedIntent,
+      intentRecord: record,
+      sourceHistoryManifest: persistedIntent.source_history_manifest,
+      records: [],
+      calls: new Map(),
+      eventIds: new Set(),
+      reservationIds: new Set(),
+      latestCall: 0,
+      latestAdmissionSequence: 0,
+      contaminated: false,
+      terminal: false,
+      laterWork: false,
+    });
+    state.retainedLifecycleRecords += 1;
+    if (state.retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
+      throw new RecoveryOperationalError(
+        "recovery_history_storage_limit",
+        "canonical compaction lifecycle exceeds its bounded retention budget",
+      );
+    }
+    return;
+  }
+
+  const incompleteAttempt = [...state.attempts.values()].find(
+    (attempt) =>
+      attempt.persistedIntent !== undefined &&
+      attempt.intent === undefined &&
+      !attempt.terminal,
+  );
+  if (incompleteAttempt !== undefined) {
+    throw new Error(
+      "canonical compaction intent is missing its required source payload bundle",
+    );
+  }
+
+  const persistedCommit = persistedCommitPayload(item);
+  if (persistedCommit !== undefined) {
+    const attempt = state.attempts.get(persistedCommit.attempt_id);
+    if (attempt?.intent === undefined) {
+      throw new Error(
+        "persisted compaction commit has no hydrated intent",
+      );
+    }
+    record = hydratePersistedCommitRecord(
+      record,
+      persistedCommit,
+      attempt.intent,
+      payloadRegistry,
+    );
+    item = record.item;
+    if (
+      item.type !== "compaction_committed" ||
+      item.payload.summary_dag.planned_provider_calls !==
+        attempt.intent.planned_provider_calls
+    ) {
+      throw new Error(
+        "canonical compaction commit provider-call plan conflicts with its intent",
+      );
+    }
+  }
+  const persistedRollback = persistedRollbackPayload(item);
+  if (persistedRollback !== undefined) {
+    if (
+      payloadRegistry.hasComplete(
+        persistedRollback.source_history_manifest,
+      )
+    ) {
+      record = hydratePersistedRollbackRecord(
+        record,
+        persistedRollback,
+        payloadRegistry,
+      );
+      item = record.item;
+    }
+  }
+  if (state.activeAdmissionAttempt !== undefined) {
+    observeAdmission(record, state.activeAdmissionAttempt);
+  }
+  if (state.trackHistory) {
+    checkBudget();
+    const next = reduceStreamingHistory(state.reducedState, item);
+    if (item.type === "response_item") {
+      state.activePositions.push({
+        lineNumber: record.lineNumber,
+        recordMessageIndex: 0,
+      });
+      if (!state.activeLineBytes.has(record.lineNumber)) {
+        state.activeLineBytes.set(
+          record.lineNumber,
+          record.encodedByteLength + 1,
+        );
+        state.activeSourceBytes += record.encodedByteLength + 1;
+      }
+    } else if (
+      (item.type === "compacted" &&
+        item.payload.replacementHistory !== undefined) ||
+      item.type === "compaction_committed" ||
+      (item.type === "compaction_rollback_committed" &&
+        Array.isArray(item.payload.source_history) &&
+        item.payload.target_session_id === expectedRunId)
+    ) {
+      checkBudget();
+      state.activePositions = next.history.map((_, recordMessageIndex) => ({
+        lineNumber: record.lineNumber,
+        recordMessageIndex,
+      }));
+      state.activeLineBytes.clear();
+      state.activeLineBytes.set(
+        record.lineNumber,
+        record.encodedByteLength + 1,
+      );
+      state.activeSourceBytes = record.encodedByteLength + 1;
+    } else if (next.history.length < state.activePositions.length) {
+      state.activePositions = state.activePositions.slice(
+        0,
+        next.history.length,
+      );
+      const retainedLines = new Set(
+        state.activePositions.map((position) => position.lineNumber),
+      );
+      for (const lineNumber of state.activeLineBytes.keys()) {
+        if (!retainedLines.has(lineNumber))
+          state.activeLineBytes.delete(lineNumber);
+      }
+      state.activeSourceBytes = [...state.activeLineBytes.values()].reduce(
+        (total, bytes) => total + bytes,
+        0,
+      );
+    }
+    state.reducedState = next;
+    if (
+      state.reducedState.history.length > MAX_COMPACTION_SOURCE_MESSAGES ||
+      state.activeSourceBytes > MAX_COMPACTION_SOURCE_BYTES
+    ) {
+      throw new RecoveryOperationalError(
+        "recovery_history_storage_limit",
+        "canonical active history exceeds its bounded compaction scan budget",
+      );
+    }
+  }
+  if (
+    !item.type.startsWith("compaction_") ||
+    !("attempt_id" in item.payload)
+  )
+    return;
+  state.retainedLifecycleRecords += 1;
+  if (state.retainedLifecycleRecords > MAX_COMPACTION_LIFECYCLE_RECORDS) {
+    throw new RecoveryOperationalError(
+      "recovery_history_storage_limit",
+      "canonical compaction lifecycle exceeds its bounded retention budget",
+    );
+  }
+  const lifecycleAttemptId = item.payload.attempt_id;
+  if (item.type === "compaction_intent") {
+    state.attempts.set(lifecycleAttemptId, {
+      // Persisted intents arrive hydrated, and their bytes were counted
+      // against the retention ceiling on the way through the payload
+      // registry. An inline intent is retained here uncounted: no writer
+      // emits that shape today, and one that did would need counting here.
+      intent: item.payload,
+      records: [record],
+      calls: new Map(),
+      eventIds: new Set(),
+      reservationIds: new Set(),
+      latestCall: 0,
+      latestAdmissionSequence: 0,
+      contaminated: false,
+      terminal: false,
+      laterWork: false,
+    });
+    state.activeAdmissionAttempt = state.attempts.get(lifecycleAttemptId);
+    return;
+  }
+  const attempt = state.attempts.get(lifecycleAttemptId);
+  if (attempt === undefined) return;
+  if (
+    attempt.commitSha256 !== undefined &&
+    "commit_sha256" in item.payload &&
+    item.payload.commit_sha256 !== attempt.commitSha256
+  ) {
+    throw new Error(
+      "canonical compaction post-commit event is not bound to its hydrated commit",
+    );
+  }
+  attempt.records.push(record);
+  if (
+    item.type === "compaction_committed" ||
+    item.type === "compaction_failed"
+  ) {
+    attempt.terminal = true;
+    if (item.type === "compaction_committed") {
+      attempt.commitSha256 = digestSourceWithDomain(
+        COMPACTION_ACCOUNTING_DIGEST_DOMAIN,
+        item.payload,
+      );
+      state.latestCommittedAttempt = attempt;
+      state.postCommitBookkeeping = "await_context";
+    }
+    if (state.activeAdmissionAttempt === attempt) {
+      state.activeAdmissionAttempt = undefined;
+    }
   }
 }
 
@@ -848,8 +1194,11 @@ function validatePersistedSourceHistory(
   persisted: CompactionPersistedIntentV1,
   payloadRegistry: DiskCompactionPayloadRegistry,
 ): void {
+  // Proving the chain is all this does with the payload; the reader below
+  // rejects it or drops it, so the prefix keeps nothing from here.
   const sourceHistory = payloadRegistry.reconstruct(
     persisted.source_history_manifest,
+    false,
   );
   // The inline rollback reader strictly validates projection messages and the
   // source-history digest before the value can participate in reconstruction.
@@ -1055,6 +1404,7 @@ function nextPostCommitBookkeeping(
   current: PostCommitBookkeeping,
   expectedRunId: string | undefined,
 ): PostCommitBookkeeping | "later_work" {
+  if (isUsageObservation(item)) return current;
   if (
     item.type === "compaction_cleanup_pending" &&
     item.payload.attempt_id === committed.intent?.attempt_id
@@ -1087,6 +1437,11 @@ function isCausalAutoCompactionBoundary(item: RolloutItem): boolean {
       item.payload.msg.payload.summary,
     )
   );
+}
+
+function isUsageObservation(item: RolloutItem): boolean {
+  return item.type === "event_msg" && item.payload.msg.type === "session_usage" &&
+    isAdmissionUsageSummary(item.payload.msg.payload);
 }
 
 function strictOptions(
@@ -1142,6 +1497,19 @@ function observeAdmission(
 ): void {
   if (attempt.terminal) return;
   const item = record.item;
+  if (isUsageObservation(item)) return;
+  // The strict journal validator has already checked this event's complete
+  // schema, sequence and identity. A child status update is observational: it
+  // changes neither source history nor this attempt's execution admissions.
+  // Keep the exception bound to a distinct child of the source session.
+  if (
+    item.type === "event_msg" &&
+    item.payload.msg.type === "collab_agent_status" &&
+    item.payload.msg.payload.senderThreadId === attempt.intent?.source.session_id &&
+    item.payload.msg.payload.callId.length > 0 &&
+    item.payload.msg.payload.threadId.length > 0 &&
+    item.payload.msg.payload.threadId !== item.payload.msg.payload.senderThreadId
+  ) return;
   if (
     (item.type === "compaction_committed" ||
       item.type === "compaction_failed") &&

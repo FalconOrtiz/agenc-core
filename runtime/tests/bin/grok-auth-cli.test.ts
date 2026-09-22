@@ -74,6 +74,23 @@ function jsonLines(output: string): Record<string, unknown>[] {
 }
 
 describe('headless Grok auth CLI', () => {
+  test('reports explicit API mode while retaining a stored sign-in', async () => {
+    mocks.read.mockReturnValue({ accessToken: 'private-oauth-token' })
+    const { io, stdout } = captureIo()
+    await runGrokAuthCli({ kind: 'status', json: true }, { home, environment: { GROK_AUTH_MODE: 'api-key', XAI_API_KEY: 'private-api-key' } }, io)
+    expect(jsonLines(stdout())[0]?.authSelection).toEqual({ version: 1, preference: 'api-key', effectiveMode: 'api-key', available: { oauth: true, apiKey: true } })
+    expect(stdout()).not.toContain('private-')
+    expect(mocks.clear).not.toHaveBeenCalled()
+    expect(mocks.browserLogin).not.toHaveBeenCalled()
+  })
+
+  test('does not advertise quarantined OAuth as usable or fall back to API billing', async () => {
+    mocks.read.mockReturnValue({ accessToken: 'bad-token', quarantinedAt: 1 })
+    const { io, stdout } = captureIo()
+    await runGrokAuthCli({ kind: 'status', json: true }, { home, environment: { GROK_AUTH_MODE: 'oauth', XAI_API_KEY: 'api-key' } }, io)
+    expect(jsonLines(stdout())[0]?.authSelection).toEqual({ version: 1, preference: 'oauth', effectiveMode: null, available: { oauth: false, apiKey: true } })
+  })
+
   beforeEach(() => {
     mocks.read.mockReset()
     mocks.clear.mockReset()
@@ -128,7 +145,7 @@ describe('headless Grok auth CLI', () => {
     )
     expect(code).toBe(0)
     expect(jsonLines(stdout())).toEqual([
-      { ok: true, signedIn: true, account: 'paul@x.com' },
+      { ok: true, signedIn: true, account: 'paul@x.com', authSelection: { version: 1, preference: 'auto', effectiveMode: 'oauth', available: { oauth: true, apiKey: false } } },
     ])
     expect(mocks.read).toHaveBeenCalledWith(home)
   })

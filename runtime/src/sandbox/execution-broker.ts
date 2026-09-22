@@ -1,3 +1,4 @@
+import type { BoundReadOnlyCwdCapability } from "./bound-readonly-cwd.js";
 /**
  * Final process-execution boundary for commands that do not naturally pass
  * through the model-tool router (hooks, MCP stdio, and direct interactive
@@ -12,13 +13,24 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawnSync } from "node:child_process";
 import { probeLandlock, resolveLandlockRun } from "./landlock-run.js";
-import { realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path, { basename, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   canWritePathWithCwd,
+  restrictedFileSystemPolicy,
+  resolvePermissionPath,
   SandboxManager,
   type AdditionalPermissionProfile,
   type PermissionProfile,
@@ -51,6 +63,8 @@ import {
   type SandboxPreparedSpawn,
 } from "./execution-prepared-spawn.js";
 import { resolveSessionTempRoot } from "../session/runtime-options.js";
+import { cronLockAuthorityRoots, protectCronAuthority } from "./cron-authority-protection.js";
+import { desktopAuthorityRoot, protectDesktopAuthority } from "./desktop-authority-protection.js";
 
 export {
   SandboxExecutionLeaseCleanupError,
@@ -125,6 +139,7 @@ export interface SandboxSpawnCommand {
   readonly argv0?: string;
   /** Keep cwd attached to the caller's open directory and expose it read-only. */
   readonly cwdBinding?: "inherited_readonly";
+  readonly cwdCapability?: BoundReadOnlyCwdCapability;
   /** Narrow, surface-owned grants required by the child process. */
   readonly additionalPermissions?: AdditionalPermissionProfile;
   /** Require the executable itself to be outside every sandbox-writable root. */
@@ -158,10 +173,13 @@ export interface SandboxExecutionBrokerLike {
   readonly sessionTempRoot: string;
   /** Zero for a root session; increments for each isolated child authority. */
   readonly forkDepth?: number;
+  /** Captured operator-owned policy; reading it grants no spawn admission. */
+  executionAuthority?(): SandboxExecutionBrokerAuthority;
   /** Permanent authority poison set after a lifecycle rollback cannot recover. */
   isClosedAfterLifecycleAuthorityFailure?(): boolean;
   /** Fork an independent boundary for a child session or worktree. */
   forkForCwd(cwd: string): SandboxExecutionBrokerLike;
+  forkForReadOnlyInspection?(cwd: string, deniedReadPatterns?: readonly string[]): SandboxExecutionBrokerLike;
   status(): SandboxExecutionStatus;
   assertReady(surface: SandboxExecutionSurface): SandboxExecutionStatus;
   runtimeSandbox(
@@ -293,6 +311,9 @@ function immutablePermissionProfile(
     fileSystem: Object.freeze({
       ...profile.fileSystem,
       entries: Object.freeze(entries),
+      ...(profile.fileSystem.reservedReadOnlyPaths === undefined ? {} : {
+        reservedReadOnlyPaths: Object.freeze([...profile.fileSystem.reservedReadOnlyPaths]),
+      }),
     }),
   });
 }
@@ -507,6 +528,8 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
     UnifiedExecRuntimeSandbox["windowsSandboxLevel"]
   >;
   readonly #windowsSandboxPrivateDesktop: boolean;
+  readonly #desktopAuthorityRoot: string;
+  readonly #cronAuthorityRoots: readonly string[];
   #allowGpu: boolean;
   #permissionProfile: PermissionProfile | undefined;
   readonly #probe: NonNullable<SandboxExecutionBrokerOptions["probe"]>;
@@ -529,6 +552,8 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
       : 0;
     this.#cwd = path.resolve(options.cwd);
     this.#env = { ...(options.env ?? process.env) };
+    this.#desktopAuthorityRoot = desktopAuthorityRoot(undefined, this.#env);
+    this.#cronAuthorityRoots = cronLockAuthorityRoots();
     this.#platform = options.platform ?? process.platform;
     this.#sandboxManager = options.sandboxManager ?? defaultSandboxManager;
     this.#explicitLinuxHelper = options.agencLinuxSandboxExe;
@@ -922,6 +947,56 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
     });
   }
 
+  forkForReadOnlyInspection(cwd: string, deniedReadPatterns: readonly string[] = []): SandboxExecutionBroker {
+    this.#assertLifecycleAuthorityOpen("child_agent");
+    const base = this.#permissionProfile ?? permissionProfileForSandboxMode(this.mode, { cwd: this.#cwd });
+    if (base.fileSystem.kind === "external_sandbox") {
+      throw new Error("Read-only inspection requires an enforceable managed sandbox, not an external sandbox declaration");
+    }
+    const fileSystem = base.fileSystem;
+    const permissionProfile: PermissionProfile = {
+      fileSystem: fileSystem.kind === "restricted"
+        ? restrictedFileSystemPolicy(fileSystem.entries.map((entry) => {
+            const resolved = resolvePermissionPath(entry.path, this.#cwd, this.#sessionTempRoot);
+            return {
+              path: entry.path.kind === "glob"
+                ? { kind: "glob" as const, pattern: path.resolve(this.#cwd, entry.path.pattern) }
+                : resolved === null ? entry.path : { kind: "path" as const, path: resolved },
+              access: entry.access === "write" ? "read" as const : entry.access,
+            };
+          }), {
+            ...(fileSystem.globScanMaxDepth !== undefined ? { globScanMaxDepth: fileSystem.globScanMaxDepth } : {}),
+            ...(fileSystem.includePlatformDefaults !== undefined ? { includePlatformDefaults: fileSystem.includePlatformDefaults } : {}),
+            ...(fileSystem.reservedReadOnlyPaths !== undefined ? { reservedReadOnlyPaths: fileSystem.reservedReadOnlyPaths } : {}),
+          })
+        : restrictedFileSystemPolicy([{ path: { kind: "special", value: { kind: "root" } }, access: "read" }], { includePlatformDefaults: true }),
+      network: "disabled",
+      ...(base.enforcement !== undefined ? { enforcement: base.enforcement } : {}),
+    };
+    const deniedEntries = deniedReadPatterns.map((pattern) => {
+      if (/[\[\]{}]/u.test(pattern) || /(?:[^/]\*\*|\*\*[^/])/u.test(pattern)) throw new Error("Read-only inspection cannot safely lower this read-denial pattern to platform isolation");
+      const target = pattern.endsWith("/**") ? pattern.slice(0, -3) : pattern;
+      return { path: /[*?]/u.test(target) ? { kind: "glob" as const, pattern: target } : { kind: "path" as const, path: target }, access: "none" as const };
+    });
+    return new SandboxExecutionBroker({
+      mode: "read_only",
+      cwd,
+      env: this.#env,
+      sessionTempRoot: this.#sessionTempRoot,
+      ...(this.#explicitLinuxHelper !== undefined ? { agencLinuxSandboxExe: this.#explicitLinuxHelper } : {}),
+      windowsSandboxLevel: this.#windowsSandboxLevel,
+      windowsSandboxPrivateDesktop: this.#windowsSandboxPrivateDesktop,
+      allowGpu: false,
+      permissionProfile: { ...permissionProfile, fileSystem: { ...permissionProfile.fileSystem, entries: [...permissionProfile.fileSystem.entries, ...deniedEntries] } },
+      platform: this.#platform,
+      sandboxManager: this.#sandboxManager,
+      probe: this.#probe,
+      planLandlockPolicy: this.#planLandlockPolicy,
+      forkDepth: this.forkDepth + 1,
+      lifecycleLeaseDrainTimeoutMs: this.#lifecycleLeaseDrainTimeoutMs,
+    });
+  }
+
   status(): SandboxExecutionStatus {
     if (this.#lifecycleAuthorityFailure !== undefined) {
       return this.#closedLifecycleAuthorityStatus();
@@ -964,11 +1039,13 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
     if (!this.required) return undefined;
     const status = this.#assertReadyAfterLifecycleAdmission(surface);
     return {
-      permissionProfile:
+      permissionProfile: protectCronAuthority(protectDesktopAuthority(
         this.#permissionProfile ??
         permissionProfileForSandboxMode(this.mode, {
           cwd: this.#cwd,
         }),
+        this.#desktopAuthorityRoot,
+      ), this.#cronAuthorityRoots),
       sandboxPolicyCwd: this.#cwd,
       sessionTempRoot: this.#sessionTempRoot,
       preference: "require",
@@ -1012,7 +1089,7 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
         this.mode === "workspace_write"
           ? {
               ...modeSandbox,
-              permissionProfile: command.permissionProfileOverride,
+              permissionProfile: protectCronAuthority(protectDesktopAuthority(command.permissionProfileOverride, this.#desktopAuthorityRoot), this.#cronAuthorityRoots),
             }
           : modeSandbox;
       const resolvedProgram = resolveSpawnExecutable({
@@ -1259,6 +1336,23 @@ function rebasePermissionProfile(
   nextCwd: string,
 ): PermissionProfile {
   if (profile.fileSystem.kind !== "restricted") return profile;
+  const sharedGitMetadata = verifiedSharedGitMetadata(previousCwd, nextCwd);
+  const rebasePath = (candidate: string): string => {
+    if (sharedGitMetadata !== null && path.isAbsolute(candidate)) {
+      const relative = path.relative(sharedGitMetadata, candidate);
+      if (
+        relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative)
+      ) {
+        // A linked worktree's .git is a pointer file. The existing grants and
+        // restrictions on its common metadata must retain their original
+        // authority, rather than becoming impossible child/.git/config paths.
+        return candidate;
+      }
+    }
+    return rebaseWorkspacePath(candidate, previousCwd, nextCwd);
+  };
   const entries = profile.fileSystem.entries.map((entry) => {
     switch (entry.path.kind) {
       case "path":
@@ -1266,11 +1360,7 @@ function rebasePermissionProfile(
           ...entry,
           path: {
             kind: "path" as const,
-            path: rebaseWorkspacePath(
-              entry.path.path,
-              previousCwd,
-              nextCwd,
-            ),
+            path: rebasePath(entry.path.path),
           },
         };
       case "glob":
@@ -1278,11 +1368,7 @@ function rebasePermissionProfile(
           ...entry,
           path: {
             kind: "glob" as const,
-            pattern: rebaseWorkspacePath(
-              entry.path.pattern,
-              previousCwd,
-              nextCwd,
-            ),
+            pattern: rebasePath(entry.path.pattern),
           },
         };
       case "special":
@@ -1293,11 +1379,7 @@ function rebasePermissionProfile(
             kind: "special" as const,
             value: {
               ...entry.path.value,
-              path: rebaseWorkspacePath(
-                entry.path.value.path,
-                previousCwd,
-                nextCwd,
-              ),
+              path: rebasePath(entry.path.value.path),
             },
           },
         };
@@ -1310,6 +1392,70 @@ function rebasePermissionProfile(
       entries,
     },
   };
+}
+
+/**
+ * Recognize Git's registered linked-worktree relationship without executing Git.
+ * This adds no grant: only already-present common-metadata entries may remain
+ * anchored. Unregistered, foreign, missing or symlinked pointers retain the
+ * ordinary rebase, which fails closed when it cannot express a policy.
+ */
+function verifiedSharedGitMetadata(
+  previousCwd: string,
+  nextCwd: string,
+): string | null {
+  const originalMetadata = path.join(previousCwd, ".git");
+  const pointerPath = path.join(nextCwd, ".git");
+  try {
+    if (!lstatSync(originalMetadata).isDirectory()) return null;
+    const common = realpathSync(originalMetadata);
+    const pointer = readSmallGitPointer(pointerPath);
+    if (pointer === null || !pointer.startsWith("gitdir: ")) return null;
+    const adminPath = path.resolve(nextCwd, pointer.slice("gitdir: ".length));
+    if (
+      !lstatSync(adminPath).isDirectory() ||
+      !lstatSync(path.dirname(adminPath)).isDirectory()
+    ) return null;
+    const admin = realpathSync(adminPath);
+    const worktrees = path.join(common, "worktrees");
+    if (
+      path.dirname(admin) !== worktrees ||
+      realpathSync(path.dirname(adminPath)) !== worktrees ||
+      realpathSync(worktrees) !== worktrees
+    ) return null;
+    const commonPointer = readSmallGitPointer(path.join(admin, "commondir"));
+    const worktreePointer = readSmallGitPointer(path.join(admin, "gitdir"));
+    if (commonPointer === null || worktreePointer === null) return null;
+    if (realpathSync(path.resolve(admin, commonPointer)) !== common) return null;
+    if (
+      realpathSync(path.resolve(admin, worktreePointer)) !==
+      realpathSync(pointerPath)
+    ) return null;
+    return originalMetadata;
+  } catch {
+    return null;
+  }
+}
+
+function readSmallGitPointer(file: string): string | null {
+  // Pointer records are tiny. Bound reads and refuse final-component symlinks
+  // and hard links instead of following model-editable metadata as authority.
+  if (!lstatSync(file).isFile()) return null;
+  const fd = openSync(
+    file,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const metadata = fstatSync(fd);
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > 4096) return null;
+    const bytes = Buffer.alloc(4097);
+    const length = readSync(fd, bytes, 0, bytes.length, 0);
+    if (length > 4096) return null;
+    const value = bytes.subarray(0, length).toString("utf8").trim();
+    return value.length > 0 && !/[\0\r\n]/u.test(value) ? value : null;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function rebaseWorkspacePath(
@@ -1750,6 +1896,7 @@ export function transformSandboxedCommand(params: SandboxSpawnCommand & {
         args: params.args,
         cwd: params.cwd,
         env: params.env,
+        ...(params.cwdCapability !== undefined ? { cwdCapability: params.cwdCapability } : {}),
         ...(params.cwdBinding !== undefined
           ? { cwdBinding: params.cwdBinding }
           : {}),

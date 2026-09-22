@@ -1,0 +1,1100 @@
+/**
+ * Compaction for run-turn: the auto-compact dispatcher, the AgenC
+ * compaction result projection, the previous-model inline compact,
+ * pre-sampling compact and the token-limit gates. Pure move out of
+ * run-turn.ts; the declarations are the originals byte for byte.
+ *
+ * @module
+ */
+
+import type { LLMMessage } from "../llm/types.js";
+import { getSelectedProviderEnvironment } from "../utils/model/providers.js";
+import type { CompactionResult } from "../services/compact/types.js";
+import { getAutoCompactThreshold } from "../services/compact/autoCompact.js";
+import { estimateMessagesTokens } from "../services/compact/_deps/runtime.js";
+import {
+  extractMessageText,
+  fromAgenCRuntimeMessages,
+  toAgenCRuntimeMessages,
+  type AgenCRuntimeMessage,
+} from "./runtime-message-conversion.js";
+import { resetRelevantMemoryBudget } from "./attachment-state.js";
+import {
+  CompactionReconstructionRequiredError,
+  CompactionTransactionError,
+  type CompactionCannotReduceError,
+} from "../services/compact/transaction-types.js";
+import {
+  CompactionCleanupPendingError,
+  finalizeCompactionTransaction,
+} from "../services/compact/finalize-transaction.js";
+import { runPostCompactCleanup } from "../services/compact/postCompactCleanup.js";
+import { resetMicrocompactState } from "../services/compact/microCompact.js";
+import type { CompactedItem } from "./rollout-item.js";
+import type { Session } from "./session.js";
+import {
+  llmMessageToReplacementResponseItem,
+  responseItemToLlmMessage,
+} from "./message-history-conversion.js";
+import {
+  modelContextWindow,
+  type ModelInfo,
+  type TurnContext,
+} from "./turn-context.js";
+import type { TurnState } from "./turn-state.js";
+import { buildAgenCToolUseContext } from "./agenc-tool-use-context.js";
+import {
+  excludeFromDurableHistory,
+  finitePositive,
+} from "./run-turn-messages.js";
+import { sessionQuerySourceForTurn } from "./run-turn-queued-commands.js";
+import { buildSamplingRequestContract } from "./run-turn-sampling-request.js";
+import { usesLocalToolProfile } from "../llm/wire/capability-gating.js";
+import {
+  describeCompactionDecline,
+  ladderAppliesToDecline,
+  ladderAppliesToReason,
+  nextLadderTiers,
+  resolveCompactionLadderPolicy,
+  strongerTierThan,
+  type CompactionLadderTier,
+} from "../services/compact/ladder.js";
+import type { CompactionTransactionError as CompactionTransactionErrorType } from "../services/compact/transaction-types.js";
+import {
+  compactionFailureDetails,
+  type CompactionFailureDetails,
+} from "../services/compact/failure-details.js";
+import { logForDebugging } from "../utils/debug.js";
+
+const AUTOCOMPACT_NOTICE_BUFFER_TOKENS = 13_000;
+const TRUTHY_ENV = new Set(["1", "true", "yes", "on"]);
+
+interface AgenCAutoCompactResult {
+  readonly wasCompacted: boolean;
+  readonly compactionResult?: {
+    readonly message: string;
+    readonly replacementHistory: readonly LLMMessage[];
+    readonly preCompactTokens?: number;
+    readonly postCompactTokens?: number;
+    readonly transaction?: CompactionResult["transaction"];
+  };
+  readonly consecutiveFailures?: number;
+  /** Why an attempt declined to compact; surfaced to the turn. */
+  readonly skippedReason?: string;
+  readonly skippedCode?: CompactionCannotReduceError["code"];
+  readonly skippedFailureReason?: CompactionTransactionErrorType["reason"];
+  readonly skippedDetails?: CompactionFailureDetails;
+  readonly advisoryFailure?: "summary_rejected";
+  /** Ladder tier this result came from (#2497). */
+  readonly tier?: CompactionLadderTier;
+}
+
+type AgenCCompactionResult = {
+  readonly boundaryMarker?: AgenCRuntimeMessage;
+  readonly summaryMessages?: readonly AgenCRuntimeMessage[];
+  readonly messagesToKeep?: readonly AgenCRuntimeMessage[];
+  readonly attachments?: readonly AgenCRuntimeMessage[];
+  readonly userDisplayMessage?: string;
+  readonly preCompactTokenCount?: number;
+  readonly postCompactTokenCount?: number;
+  readonly truePostCompactTokenCount?: number;
+  readonly transaction?: CompactionResult["transaction"];
+};
+
+async function runAgenCAutoCompact(params: {
+  readonly session?: Session;
+  readonly ctx?: TurnContext;
+  readonly state?: TurnState;
+  /** Durable history offered to the transaction (see runAutoCompact). */
+  readonly messages: readonly LLMMessage[];
+  readonly querySource?: string;
+  readonly reason?: string;
+  readonly phase?: string;
+  readonly initialContextInjection?: string;
+  readonly force?: boolean;
+  readonly tier?: CompactionLadderTier;
+}): Promise<AgenCAutoCompactResult> {
+  if (!params.session || !params.ctx || !params.state) {
+    return compactionNotRun();
+  }
+  try {
+    const state = params.state;
+    const messages = toAgenCRuntimeMessages(params.messages);
+    const toolUseContext = buildAgenCToolUseContext(
+      params.session,
+      params.ctx,
+      { querySource: params.querySource },
+    );
+    const request = buildSamplingRequestContract(
+      { ...state, messagesForQuery: [] },
+      params.session,
+      params.ctx,
+    );
+    const compactContext = {
+      ...toolUseContext,
+      options: {
+        ...toolUseContext.options,
+        tools: request.tools,
+        systemPrompt: request.baseInstructions,
+        ...(request.maxOutputTokens !== undefined
+          ? { maxOutputTokens: request.maxOutputTokens }
+          : {}),
+        ...(request.toolChoice !== undefined
+          ? { toolChoice: request.toolChoice }
+          : {}),
+      },
+    };
+    const cacheSafeParams = {
+      systemPrompt: [],
+      userContext: {},
+      systemContext: {},
+      toolUseContext,
+      forkContextMessages: messages,
+    };
+    const { autoCompactIfNeeded } =
+      await import("../services/compact/autoCompact.js");
+    const result = await autoCompactIfNeeded(
+      messages,
+      compactContext,
+      cacheSafeParams,
+      params.querySource,
+      state.autoCompactTracking,
+      state.snipTokensFreed ?? 0,
+      { force: params.force === true, tier: params.tier ?? "standard" },
+    );
+    if (!result.wasCompacted || !result.compactionResult) {
+      // The reason the attempt declined rides along: without it the caller
+      // sees a bare "did not compact" and the turn ends mid-plan with
+      // nothing in the rollout to act on.
+      return compactionNotRun(
+        result.consecutiveFailures,
+        result.skippedReason,
+        result.skippedCode,
+        result.advisoryFailure,
+        result.skippedFailureReason,
+        result.skippedDetails,
+      );
+    }
+    const compactionResult = await toAgenCCompactionResult(
+      result.compactionResult as AgenCCompactionResult,
+    );
+    return {
+      wasCompacted: true,
+      compactionResult,
+      ...(result.consecutiveFailures !== undefined
+        ? { consecutiveFailures: result.consecutiveFailures }
+        : {}),
+    };
+  } catch (error) {
+    throw error;
+  }
+}
+
+function buildAgenCCompactedRolloutItem(
+  result: NonNullable<AgenCAutoCompactResult["compactionResult"]>,
+) {
+  return buildCompactedRolloutPayload({
+    message: result.message,
+    replacementHistory: result.replacementHistory,
+    preCompactTokens: result.preCompactTokens,
+    postCompactTokens: result.postCompactTokens,
+  });
+}
+
+function buildAgenCPostCompactMessages(result: CompactedItem): LLMMessage[] {
+  return (result.replacementHistory ?? []).map(responseItemToLlmMessage);
+}
+
+function buildCompactedRolloutPayload(params: {
+  readonly message: string;
+  readonly replacementHistory?: readonly LLMMessage[];
+  readonly preCompactTokens?: number;
+  readonly postCompactTokens?: number;
+}): CompactedItem {
+  return {
+    message: params.message,
+    ...(params.replacementHistory !== undefined
+      ? {
+          replacementHistory: params.replacementHistory.map((message) =>
+            llmMessageToReplacementResponseItem(message, "compacted"),
+          ),
+        }
+      : {}),
+    ...(params.preCompactTokens !== undefined
+      ? { preCompactTokens: params.preCompactTokens }
+      : {}),
+    ...(params.postCompactTokens !== undefined
+      ? { postCompactTokens: params.postCompactTokens }
+      : {}),
+  };
+}
+
+async function toAgenCCompactionResult(
+  result: AgenCCompactionResult,
+): Promise<NonNullable<AgenCAutoCompactResult["compactionResult"]>> {
+  let replacementHistory: LLMMessage[];
+  try {
+    const { buildPostCompactMessages } =
+      await import("../services/compact/compact.js");
+    replacementHistory = fromAgenCRuntimeMessages(
+      buildPostCompactMessages(
+        toCompactServiceResult(result),
+      ) as AgenCRuntimeMessage[],
+    );
+  } catch (error) {
+    if (result.transaction !== undefined) {
+      throw new CompactionReconstructionRequiredError(
+        result.transaction.attempt_id,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  const postCompactTokens =
+    result.truePostCompactTokenCount ?? result.postCompactTokenCount;
+  return {
+    message:
+      result.userDisplayMessage ??
+      extractMessageText(result.summaryMessages?.at(-1)) ??
+      "Conversation compacted",
+    replacementHistory,
+    ...(result.preCompactTokenCount !== undefined
+      ? { preCompactTokens: result.preCompactTokenCount }
+      : {}),
+    ...(postCompactTokens !== undefined ? { postCompactTokens } : {}),
+    ...(result.transaction !== undefined
+      ? { transaction: result.transaction }
+      : {}),
+  };
+}
+
+/** @internal Regression seam for the turn-owned compaction projection. */
+export async function projectTurnCompactionReplacementHistoryForTests(
+  result: unknown,
+): Promise<LLMMessage[]> {
+  return [
+    ...(await toAgenCCompactionResult(result as AgenCCompactionResult))
+      .replacementHistory,
+  ];
+}
+
+function toCompactServiceResult(
+  result: AgenCCompactionResult,
+): CompactionResult {
+  if (!result.boundaryMarker) {
+    throw new Error("Compaction result is missing its boundary marker");
+  }
+  return {
+    boundaryMarker: result.boundaryMarker,
+    summaryMessages: result.summaryMessages ?? [],
+    attachments: result.attachments ?? [],
+    ...(result.messagesToKeep !== undefined
+      ? { messagesToKeep: result.messagesToKeep }
+      : {}),
+    ...(result.userDisplayMessage !== undefined
+      ? { userDisplayMessage: result.userDisplayMessage }
+      : {}),
+    ...(result.preCompactTokenCount !== undefined
+      ? { preCompactTokenCount: result.preCompactTokenCount }
+      : {}),
+    ...(result.postCompactTokenCount !== undefined
+      ? { postCompactTokenCount: result.postCompactTokenCount }
+      : {}),
+    ...(result.truePostCompactTokenCount !== undefined
+      ? { truePostCompactTokenCount: result.truePostCompactTokenCount }
+      : {}),
+    ...(result.transaction !== undefined
+      ? { transaction: result.transaction }
+      : {}),
+  };
+}
+
+/**
+ * The `auto_compact_failed` warning, with the flattened error chain and
+ * facts as `details` (#2499). The same line goes to the debug log at warn
+ * level, so the cause survives even when the rollout write is what failed.
+ */
+function emitAutoCompactFailed(
+  session: Session,
+  reason: CompactionReason,
+  phase: CompactionPhase,
+  explanation: string,
+  details: CompactionFailureDetails | undefined,
+): void {
+  const message = `${reason}/${phase}: ${explanation}`;
+  const hasDetails = details !== undefined && Object.keys(details).length > 0;
+  logForDebugging(
+    `auto_compact_failed ${message}${hasDetails ? ` ${JSON.stringify(details)}` : ""}`,
+    { level: "warn" },
+  );
+  session.emit({
+    id: session.nextInternalSubId(),
+    msg: {
+      type: "warning",
+      payload: {
+        cause: "auto_compact_failed",
+        message,
+        ...(hasDetails ? { details } : {}),
+      },
+    },
+  });
+}
+
+function compactionNotRun(
+  consecutiveFailures?: number,
+  skippedReason?: string,
+  skippedCode?: CompactionCannotReduceError["code"],
+  advisoryFailure?: "summary_rejected",
+  skippedFailureReason?: CompactionTransactionErrorType["reason"],
+  skippedDetails?: CompactionFailureDetails,
+): AgenCAutoCompactResult {
+  return {
+    wasCompacted: false,
+    ...(consecutiveFailures !== undefined ? { consecutiveFailures } : {}),
+    ...(skippedReason !== undefined ? { skippedReason } : {}),
+    ...(skippedCode !== undefined ? { skippedCode } : {}),
+    ...(advisoryFailure !== undefined ? { advisoryFailure } : {}),
+    ...(skippedFailureReason !== undefined ? { skippedFailureReason } : {}),
+    ...(skippedDetails !== undefined ? { skippedDetails } : {}),
+  };
+}
+
+function getAutoCompactTokenLimit(ctx: TurnContext): number | undefined {
+  if (!isAutoCompactEnabledForNotices()) return undefined;
+
+  const explicit = finitePositive(
+    (ctx.modelInfo as unknown as { autoCompactTokenLimit?: number })
+      .autoCompactTokenLimit,
+  );
+  if (explicit !== undefined) return explicit;
+
+  const effectiveWindow = finitePositive(modelContextWindow(ctx));
+  if (effectiveWindow === undefined) return undefined;
+  return Math.max(
+    1,
+    effectiveWindow > AUTOCOMPACT_NOTICE_BUFFER_TOKENS
+      ? effectiveWindow - AUTOCOMPACT_NOTICE_BUFFER_TOKENS
+      : effectiveWindow,
+  );
+}
+
+function messageHasImageContent(message: LLMMessage | undefined): boolean {
+  if (!message || !Array.isArray(message.content)) return false;
+  return message.content.some(
+    (part) => part.type === "image_url" && part.image_url.url.trim().length > 0,
+  );
+}
+
+function isAutoCompactEnabledForNotices(): boolean {
+  const raw = getSelectedProviderEnvironment().AGENC_DISABLE_AUTO_COMPACT;
+  if (raw === undefined) return true;
+  return !TRUTHY_ENV.has(raw.trim().toLowerCase());
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Compaction helpers
+// ─────────────────────────────────────────────────────────────────────
+
+/** Reason passed to runAutoCompact. */
+export type CompactionReason =
+  "context_limit" | "model_downshift" | "manual" | "reactive_recovery";
+
+/** Phase passed to runAutoCompact. */
+export type CompactionPhase = "pre_turn" | "in_turn" | "post_turn";
+
+/** Whether to inject the initial context on post-compact. */
+export type InitialContextInjection =
+  "before_last_user_message" | "do_not_inject";
+
+interface RunAutoCompactOptions {
+  readonly propagateErrors?: boolean;
+  readonly querySource?: string;
+  readonly onAdvisoryRefusal?: () => void;
+  /**
+   * How many leading `state.messages` the durable rollout already holds.
+   * An in-turn compaction may only offer those to the transaction: it maps
+   * every offered message onto canonical active history, and an assistant
+   * message that has just asked for tools is not canonical yet. Whatever
+   * lies past the count is dropped with the rest of the pre-compaction
+   * history; the loop re-samples from the replacement, as it always did.
+   * Absent, the whole history is offered (pre-turn compaction).
+   */
+  readonly durableMessageCount?: number;
+  /**
+   * Called after a compaction replaced the history, with its new length,
+   * so the caller can move its persist cursor: everything in the
+   * replacement is canonical already and must not be written again.
+   */
+  readonly onDurableHistoryReplaced?: (durableCount: number) => void;
+}
+
+/**
+ * Structural shape of the resolved AgenC auto-compact export.
+ * Kept loose so tests can inject a compact dispatcher without depending
+ * on the full provider request graph.
+ */
+export interface AutoCompactResult {
+  readonly wasCompacted: boolean;
+  readonly compactionResult?: AgenCAutoCompactResult["compactionResult"];
+  readonly consecutiveFailures?: number;
+  readonly skippedReason?: string;
+  readonly skippedCode?: CompactionCannotReduceError["code"];
+  readonly skippedFailureReason?: CompactionTransactionErrorType["reason"];
+  readonly skippedDetails?: CompactionFailureDetails;
+  readonly advisoryFailure?: "summary_rejected";
+  readonly tier?: CompactionLadderTier;
+}
+export type AutoCompactImpl = (
+  ...args: unknown[]
+) => Promise<AutoCompactResult>;
+
+// Test-only override — when set, `runAutoCompact` calls this instead of
+// the normal compact pipeline. Lets unit tests assert the dispatcher was
+// reached with the expected arguments without spinning up the full
+// AgenC compact subsystem. Clear via
+// `setAutoCompactImplForTests(null)` between tests.
+type AutoCompactImplOverrideGlobal = typeof globalThis & {
+  __agencRunTurnAutoCompactImplOverride?: AutoCompactImpl | null;
+};
+
+function autoCompactImplOverrideGlobal(): AutoCompactImplOverrideGlobal {
+  return globalThis as AutoCompactImplOverrideGlobal;
+}
+
+function getAutoCompactImplOverride(): AutoCompactImpl | null {
+  return (
+    autoCompactImplOverrideGlobal().__agencRunTurnAutoCompactImplOverride ??
+    null
+  );
+}
+
+export function setAutoCompactImplForTests(impl: AutoCompactImpl | null): void {
+  autoCompactImplOverrideGlobal().__agencRunTurnAutoCompactImplOverride = impl;
+}
+
+/**
+ * Dispatcher that
+ * picks between inline and remote compact task based on provider info.
+ * AgenC routes the inline path through the turn-owned compact pipeline.
+ *
+ * Behavior:
+ *   - Resolves the compact implementation or test override.
+ *   - Calls the compact pipeline with the session's current messages plus
+ *     per-turn context. Threshold/circuit-breaker logic lives inside
+ *     AgenC; the dispatcher only handles state splicing and telemetry.
+ *   - When `state` is provided and compaction ran, splices the post-
+ *     compact messages back into `state.messages` / `state.messagesForQuery`
+ *     and stamps `state.autoCompactTracking` so the next phase sees the
+ *     compacted view. (Pre-sampling compact runs before the
+ *     first phase iteration; mutating state here is how we guarantee
+ *     `prepareContext` reads the compacted view.)
+ *   - Never swallows errors silently: emits `warning:auto_compact_failed`,
+ *     then either returns false or rethrows for fail-closed callers.
+ *
+ * Returns true when compaction actually ran.
+ */
+async function runAutoCompact(
+  session: Session,
+  ctx: TurnContext,
+  initialContextInjection: InitialContextInjection,
+  reason: CompactionReason,
+  phase: CompactionPhase,
+  state?: TurnState,
+  options: RunAutoCompactOptions = {},
+): Promise<boolean> {
+  // Editor interactions are one scoped model request over an immutable buffer
+  // snapshot. Auto-compaction can read session memory, launch a second model
+  // request, and durably rewrite the shared conversation before that request;
+  // none of those Agent-side effects belong inside the Editor trust boundary.
+  // Keep the guard at the common dispatcher so pre-turn, model-downshift,
+  // mid-turn, and post-tool compaction all fail closed together.
+  // The compaction source is the durable history, never the query
+  // projection. `messagesForQuery` is what the model sees: attachments are
+  // inserted at its head, oversized tool results are swapped for pointers,
+  // old ones are microcompacted. None of that exists in the canonical
+  // rollout, and the durable transaction maps every offered message onto
+  // canonical active history, so a source drawn from the projection failed
+  // that mapping on every mid-turn attempt (observed live: a 1252-byte
+  // attachment at position 1 that the rollout never stored). Offer the
+  // persisted prefix of `state.messages` instead, minus the runtime-only
+  // messages the rollout skips.
+  const history = state?.messages ?? [];
+  const durableCount = Math.max(
+    0,
+    Math.min(options.durableMessageCount ?? history.length, history.length),
+  );
+  const messages = history
+    .slice(0, durableCount)
+    .filter((message) => !excludeFromDurableHistory(message));
+  const shouldKeepUnsentImageTurn =
+    phase === "pre_turn" &&
+    state !== undefined &&
+    state.messagesForQuery.length === 0 &&
+    messageHasImageContent(state.messages.at(-1));
+  const querySource =
+    reason === "model_downshift"
+      ? "model_downshift"
+      : sessionQuerySourceForTurn(session, options.querySource);
+  const force = shouldForceAutoCompact(reason, phase);
+  let committedAttemptId: string | undefined;
+  let replacementStarted = false;
+  try {
+    const autoCompactImplOverride = getAutoCompactImplOverride();
+    const policy = resolveCompactionLadderPolicy(ctx.config);
+    // After a committed compaction every message in the replacement is
+    // canonical, so a later tier in the same call may offer all of it.
+    let offeredCount = durableCount;
+    let unsentImageTurnKept = false;
+    const offered = (): LLMMessage[] =>
+      (state?.messages ?? history)
+        .slice(0, Math.max(0, offeredCount - (unsentImageTurnKept ? 1 : 0)))
+        .filter((message) => !excludeFromDurableHistory(message));
+    const attempt = async (
+      tier: CompactionLadderTier,
+    ): Promise<AgenCAutoCompactResult> => {
+      const offeredMessages =
+        tier === "standard" && offeredCount === durableCount ? messages : offered();
+      const attempted = autoCompactImplOverride
+        ? await autoCompactImplOverride(
+            offeredMessages,
+            { session, ctx, querySource, tier },
+            state?.autoCompactTracking,
+            state?.snipTokensFreed ?? 0,
+            initialContextInjection,
+            { force, tier },
+          )
+        : await runAgenCAutoCompact({
+            session,
+            ctx,
+            state,
+            messages: offeredMessages,
+            querySource,
+            reason,
+            phase,
+            initialContextInjection,
+            force,
+            tier,
+          });
+      return { ...attempted, tier };
+    };
+    const emitDegraded = (message: string): void => {
+      session.emit({
+        id: session.nextInternalSubId(),
+        msg: {
+          type: "warning",
+          payload: {
+            cause: "auto_compact_degraded",
+            message: `${reason}/${phase}: ${message}`,
+          },
+        },
+      });
+    };
+    const recordTier = (tier: CompactionLadderTier): void => {
+      if (!state) return;
+      const attempted = state.compactionLadder?.tiersAttempted ?? [];
+      state.compactionLadder = { tiersAttempted: [...attempted, tier] };
+    };
+    const applyCommitted = async (committed: AgenCAutoCompactResult): Promise<void> => {
+      if (!state) return;
+      if (!committed.compactionResult) {
+        throw new Error(
+          "autoCompactIfNeeded reported success without a compactionResult",
+        );
+      }
+      const cr = committed.compactionResult;
+      committedAttemptId = cr.transaction?.attempt_id;
+      // A legacy projection/write may partially succeed before throwing, too.
+      // From this point onward a failure is never an unchanged-history no-op.
+      replacementStarted = true;
+      const compactedRollout = buildAgenCCompactedRolloutItem(cr);
+      // Honor the rollout-persistence suspension invariant. Every other
+      // durable write in the turn engine is gated on this flag
+      // (session.emit at session.ts, persistTurnRolloutBaseline /
+      // persistNewResponseItems below). When a forked / background-agent
+      // turn runs on the source session under
+      // withRolloutPersistenceSuspended(), an auto-compact crossing the
+      // token threshold MUST NOT leak the fork's `compacted`
+      // replacementHistory into the source session's durable rollout —
+      // doing so makes the fork's summarized history the baseline on a
+      // later --resume and silently destroys the user's real conversation.
+      if (
+        cr &&
+        cr.transaction === undefined &&
+        !session.isRolloutPersistenceSuspended?.() &&
+        session.rolloutStore !== null &&
+        session.rolloutStore !== undefined
+      ) {
+        session.rolloutStore.appendRollout(
+          { type: "compacted", payload: compactedRollout },
+          { durable: true },
+        );
+      }
+      const compacted =
+        cr.transaction === undefined
+          ? buildAgenCPostCompactMessages(compactedRollout)
+          : cr.transaction.committed.replacement_history.map((message) =>
+              responseItemToLlmMessage(message),
+            );
+      const unsentImageTurn =
+        cr.transaction === undefined && shouldKeepUnsentImageTurn
+          ? state.messages.at(-1)
+          : undefined;
+      const applyProjection = (): void => {
+        // Replace both the full history view and the per-iteration
+        // projection so `prepareContext` (next phase) sees the same
+        // post-compact replacement history the rollout recorded.
+        state.messages = unsentImageTurn
+          ? [...compacted, { ...unsentImageTurn }]
+          : compacted;
+        state.messagesForQuery = [...compacted];
+        if (unsentImageTurn) {
+          state.messagesForQuery.push({ ...unsentImageTurn });
+        }
+        options.onDurableHistoryReplaced?.(compacted.length);
+        // A commit ends the ladder episode: the next decline may climb again.
+        state.compactionLadder = undefined;
+        unsentImageTurnKept = unsentImageTurn !== undefined;
+        // Stamp auto-compact tracking so the commit phase emits the
+        // boundary marker (runtime/src/phases/commit.ts).
+        state.autoCompactTracking = {
+          compacted: true,
+          turnId: `auto-${reason}-${phase}-${Date.now().toString(36)}`,
+          turnCounter: 0,
+          consecutiveFailures: 0,
+        };
+      };
+      if (cr.transaction !== undefined) {
+        const rolloutStore = session.rolloutStore;
+        if (rolloutStore === null || rolloutStore === undefined) {
+          throw new Error("transactional compaction lost its rollout owner");
+        }
+        const attemptId = cr.transaction.attempt_id;
+        const cleanup = (): void => cleanupSessionAfterCompaction(session);
+        try {
+          await finalizeCompactionTransaction({
+            store: rolloutStore,
+            attemptId,
+            applyProjection,
+            cleanup,
+          });
+        } catch (error) {
+          if (error instanceof CompactionCleanupPendingError) {
+            session.registerCompactionCleanupRetry(attemptId, cleanup);
+          }
+          throw error;
+        }
+      } else {
+        applyProjection();
+        cleanupSessionAfterCompaction(session);
+      }
+    };
+
+    let result = await attempt("standard");
+    if (!result.wasCompacted) {
+      const deferredRefusal =
+        (result.skippedCode === "no_shrink" || result.advisoryFailure === "summary_rejected") &&
+        options.onAdvisoryRefusal !== undefined;
+      if (deferredRefusal) {
+        // The cheap advisory path: the caller continues while the next full
+        // request still fits, and asks again (without deferral) if not.
+        options.onAdvisoryRefusal?.();
+        return false;
+      }
+      // Degraded ladder (#2497): a decline the standard plan lost is retried
+      // with a more aggressive summary, then a model-free emergency
+      // compaction, each at most once per episode. A turn only ends in
+      // `compact_failed` when every tier declines.
+      if (state && ladderAppliesToReason(reason) && ladderAppliesToDecline(result)) {
+        const tiers = nextLadderTiers(policy, result, state.compactionLadder?.tiersAttempted ?? []);
+        for (const tier of tiers) {
+          recordTier(tier);
+          emitDegraded(`tier=${tier} attempting after ${describeCompactionDecline(result)}`);
+          result = await attempt(tier);
+          if (result.wasCompacted) break;
+        }
+      }
+    }
+    while (result.wasCompacted && state) {
+      await applyCommitted(result);
+      offeredCount = state.messages.length;
+      const tier = result.tier ?? "standard";
+      const cr = result.compactionResult;
+      if (tier !== "standard") {
+        emitDegraded(
+          `tier=${tier} compacted ${cr?.preCompactTokens ?? "?"}->${cr?.postCompactTokens ?? "?"} tokens`,
+        );
+      }
+      const limit = getPreSamplingAutoCompactTokenLimit(ctx);
+      if (
+        limit === undefined ||
+        !ladderAppliesToReason(reason) ||
+        getActiveContextTokenUsage(session, ctx, state) < limit
+      ) {
+        return true;
+      }
+      // Still at the limit after a commit: escalate once more. A decline
+      // here is not a failure — the history did shrink; let the loop sample.
+      const next = strongerTierThan(tier, policy, state.compactionLadder?.tiersAttempted ?? []);
+      if (next === undefined) return true;
+      recordTier(next);
+      emitDegraded(`tier=${next} attempting: history still above the limit after ${tier}`);
+      result = await attempt(next);
+      if (!result.wasCompacted) return true;
+    }
+    if (result.wasCompacted) return true;
+
+    if (result.consecutiveFailures !== undefined && state) {
+      const previousTracking = state.autoCompactTracking;
+      state.autoCompactTracking = {
+        compacted: previousTracking?.compacted ?? false,
+        turnId:
+          previousTracking?.turnId ??
+          `auto-${reason}-${phase}-${Date.now().toString(36)}`,
+        turnCounter: previousTracking?.turnCounter ?? 0,
+        consecutiveFailures: result.consecutiveFailures,
+      };
+    }
+
+    /*
+     * A dispatcher that ran and declined still owes an explanation. Its
+     * failure path catches the error, counts a strike and answers with a
+     * bare "did not compact", so the turn loop could only report
+     * `mid_turn_compact_skipped` — the reason was computed and then
+     * dropped, leaving a turn that ended mid-plan with nothing to act on.
+     */
+    if (result.skippedReason !== undefined) {
+      emitAutoCompactFailed(
+        session,
+        reason,
+        phase,
+        result.skippedReason,
+        result.skippedDetails,
+      );
+    }
+    return false;
+  } catch (error) {
+    // Never silently swallow compact failures. Emit a structured
+    // warning carrying the reason/phase so downstream observability can
+    // distinguish model-downshift compacts from context-limit compacts.
+    emitAutoCompactFailed(
+      session,
+      reason,
+      phase,
+      error instanceof Error ? error.message : String(error),
+      compactionFailureDetails(error),
+    );
+    // Expected unchanged-history refusals return typed results above. A thrown
+    // error is not evidence that no write occurred: cancellation, persistence,
+    // reconstruction, and unexpected pre-sampling failures must propagate.
+    if (
+      options.propagateErrors === true ||
+      replacementStarted ||
+      committedAttemptId !== undefined ||
+      error instanceof CompactionReconstructionRequiredError ||
+      error instanceof CompactionTransactionError ||
+      session.abortController.signal.aborted ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw error;
+    }
+    return false;
+  }
+}
+
+function cleanupSessionAfterCompaction(session: Session): void {
+  // Compaction dropped every recalled memory along with the history it was
+  // attached to, so the cumulative recall budget starts over.
+  resetRelevantMemoryBudget(session);
+  const direct = session as unknown as {
+    readonly readFileState?: { clear(): void };
+    readonly clearSearchIndexes?: () => void;
+    readonly clearToolIndexes?: () => void;
+  };
+  const state = session.state.unsafePeek() as unknown as {
+    readonly readFileState?: { clear(): void };
+  };
+  runPostCompactCleanup({
+    clearReadFileState: () =>
+      (direct.readFileState ?? state.readFileState)?.clear(),
+    clearProviderResponseId: () => session.clearProviderResponseId(),
+    clearSearchIndexes: direct.clearSearchIndexes,
+    clearToolIndexes: direct.clearToolIndexes,
+    resetMicrocompactState,
+  });
+}
+
+function shouldForceAutoCompact(
+  reason: CompactionReason,
+  phase: CompactionPhase,
+): boolean {
+  return reason === "context_limit" && phase === "in_turn";
+}
+
+/**
+ * When the user switches to a model with a smaller context window and
+ * total token usage reaches the new auto-compact limit, compact
+ * against the PREVIOUS model's context before continuing.
+ *
+ * Returns true when compaction ran, false otherwise.
+ */
+export async function maybeRunPreviousModelInlineCompact(
+  session: Session,
+  ctx: TurnContext,
+  _totalUsageTokens: number,
+  state?: TurnState,
+): Promise<boolean> {
+  // A1 fix: there is no models-manager lookup for the previous model's
+  // context window yet, so
+  // we accept an optional pre-resolved `contextWindow` (and/or
+  // `modelInfo`) carried alongside `previousTurnSettings.model`. The
+  // new context window always comes from the CURRENT turn's
+  // `ctx.modelInfo`, not from the previous turn. This makes the
+  // model-downshift branch reachable instead of comparing
+  // `oldContextWindow > oldContextWindow`, which can never be true.
+  const previousTurnSettings = (
+    session.state as unknown as {
+      unsafePeek?: () => {
+        previousTurnSettings?: {
+          model: string;
+          contextWindow?: number;
+          modelInfo?: Partial<ModelInfo> & {
+            contextWindow?: number;
+            effectiveContextWindowPercent?: number;
+            autoCompactTokenLimit?: number;
+          };
+        };
+      };
+    }
+  ).unsafePeek?.()?.previousTurnSettings;
+  if (!previousTurnSettings) return false;
+  const previousModel =
+    typeof previousTurnSettings.model === "string" &&
+    previousTurnSettings.model.length > 0
+      ? previousTurnSettings.model
+      : undefined;
+  if (previousModel === undefined) return false;
+
+  const newContextWindow = modelContextWindow(ctx);
+  const oldContextWindow =
+    effectivePreviousModelContextWindow(previousTurnSettings);
+  if (oldContextWindow === undefined || newContextWindow === undefined) {
+    return false;
+  }
+  const totalUsageTokens = _totalUsageTokens;
+  const newAutoCompactLimit = getPreSamplingAutoCompactTokenLimit(ctx);
+  const previousModelLimitReached =
+    (newAutoCompactLimit !== undefined &&
+      totalUsageTokens > newAutoCompactLimit) ||
+    totalUsageTokens >= newContextWindow;
+  const shouldRun =
+    previousModelLimitReached &&
+    previousModel !== ctx.modelInfo.slug &&
+    oldContextWindow > newContextWindow;
+  if (!shouldRun) return false;
+
+  const previousModelContext = turnContextForPreviousModel(
+    ctx,
+    previousTurnSettings,
+    previousModel,
+  );
+  return await runAutoCompact(
+    session,
+    previousModelContext,
+    "do_not_inject",
+    "model_downshift",
+    "pre_turn",
+    state,
+    { propagateErrors: true },
+  );
+}
+
+function turnContextForPreviousModel(
+  ctx: TurnContext,
+  previousTurnSettings: {
+    readonly model: string;
+    readonly contextWindow?: number;
+    readonly modelInfo?: Partial<ModelInfo> & {
+      readonly contextWindow?: number;
+      readonly effectiveContextWindowPercent?: number;
+      readonly autoCompactTokenLimit?: number;
+    };
+  },
+  previousModel: string,
+): TurnContext {
+  const previousModelInfo = {
+    ...(ctx.modelInfo as unknown as Record<string, unknown>),
+    ...((previousTurnSettings.modelInfo ?? {}) as Record<string, unknown>),
+    slug: previousModel,
+    ...(previousTurnSettings.contextWindow !== undefined
+      ? { contextWindow: previousTurnSettings.contextWindow }
+      : {}),
+  } as unknown as TurnContext["modelInfo"];
+  return {
+    ...ctx,
+    modelInfo: previousModelInfo,
+    collaborationMode: {
+      ...ctx.collaborationMode,
+      model: previousModel,
+    },
+  };
+}
+
+function effectivePreviousModelContextWindow(previousTurnSettings: {
+  readonly contextWindow?: number;
+  readonly modelInfo?: Partial<ModelInfo> & {
+    readonly contextWindow?: number;
+    readonly effectiveContextWindowPercent?: number;
+  };
+}): number | undefined {
+  const contextWindow = finitePositive(
+    previousTurnSettings.contextWindow ??
+      previousTurnSettings.modelInfo?.contextWindow,
+  );
+  if (contextWindow === undefined) return undefined;
+  const percent =
+    finitePositive(
+      previousTurnSettings.modelInfo?.effectiveContextWindowPercent,
+    ) ?? 100;
+  return Math.floor((contextWindow * percent) / 100);
+}
+
+/**
+ * Runs
+ * (a) previous-model inline compact on model downshift and
+ * (b) auto-compact when total-usage-tokens reaches the current
+ * model's auto-compact limit.
+ *
+ * Returns true when any compaction ran.
+ */
+async function runPreSamplingCompact(
+  session: Session,
+  ctx: TurnContext,
+  querySource: string,
+  state?: TurnState,
+  options: Pick<RunAutoCompactOptions, "onAdvisoryRefusal"> = {},
+): Promise<boolean> {
+  const activeContextTokensBefore = getActiveContextTokenUsage(
+    session,
+    ctx,
+    state,
+  );
+  let preSamplingCompacted = await maybeRunPreviousModelInlineCompact(
+    session,
+    ctx,
+    // Model downshift is a separate safety path, not the local proactive gate.
+    usesLocalToolProfile(ctx.modelProviderId)
+      ? getActiveContextTokenUsage(session, ctx, state, { includeOutput: true })
+      : activeContextTokensBefore,
+    state,
+  );
+  const autoCompactLimit = getPreSamplingAutoCompactTokenLimit(ctx);
+  if (
+    autoCompactLimit !== undefined &&
+    activeContextTokensBefore >= autoCompactLimit
+  ) {
+    const contextLimitCompacted = await runAutoCompact(
+      session,
+      ctx,
+      "do_not_inject",
+      "context_limit",
+      "pre_turn",
+      state,
+      { propagateErrors: true, querySource, ...options },
+    );
+    preSamplingCompacted = preSamplingCompacted || contextLimitCompacted;
+  }
+  return preSamplingCompacted;
+}
+
+function getActiveContextTokenUsage(
+  session: Session,
+  ctx: TurnContext,
+  state?: TurnState,
+  options: { readonly includeOutput?: boolean } = {},
+): number {
+  if (state === undefined) {
+    return getTotalTokenUsage(session);
+  }
+  const messages =
+    state.messagesForQuery.length > 0 ? state.messagesForQuery : state.messages;
+  if (messages.length === 0) return getTotalTokenUsage(session);
+  // Pre-sampling compaction runs before query preparation, so
+  // `messagesForQuery` may still be empty. Build a read-only projection with
+  // the seed history in that slot, then use the same request constructor as
+  // provider dispatch. This keeps durable system history, current
+  // instructions, deferred-tool filtering, tool choice, context limits, and
+  // output reservations aligned with the request admission will authorize.
+  const accountingState =
+    state.messagesForQuery.length > 0
+      ? state
+      : { ...state, messagesForQuery: [...messages] };
+  const request = buildSamplingRequestContract(accountingState, session, ctx);
+  return estimateMessagesTokens(toAgenCRuntimeMessages(request.input), {
+    provider: ctx.provider ?? session.services.provider,
+    options: {
+      mainLoopModel: ctx.modelInfo.slug,
+      ...(request.contextWindowTokens !== undefined
+        ? { contextWindowTokens: request.contextWindowTokens }
+        : {}),
+      ...(request.maxOutputTokens !== undefined
+        ? { maxOutputTokens: request.maxOutputTokens }
+        : {}),
+      ...(request.baseInstructions.length > 0
+        ? { systemPrompt: request.baseInstructions }
+        : {}),
+      tools: request.tools,
+      ...(request.toolChoice !== undefined
+        ? { toolChoice: request.toolChoice }
+        : {}),
+    },
+  }, {
+    // Keep input (including its safety margin) on the same scale as the
+    // headroom-reserving proactive threshold. Output remains fully accounted
+    // by hard admission and can be clamped there; no request limit changes.
+    inputOnly: options.includeOutput !== true && usesLocalToolProfile(ctx.modelProviderId),
+  });
+}
+
+function getPreSamplingAutoCompactTokenLimit(
+  ctx: TurnContext,
+): number | undefined {
+  if (!isAutoCompactEnabledForNotices()) return undefined;
+  const explicit = finitePositive(
+    (ctx.modelInfo as unknown as { autoCompactTokenLimit?: number })
+      .autoCompactTokenLimit,
+  );
+  if (explicit !== undefined) return explicit;
+  const contextWindowTokens = finitePositive(modelContextWindow(ctx));
+  if (contextWindowTokens === undefined) return undefined;
+  return getAutoCompactThreshold({
+    options: {
+      mainLoopModel: ctx.modelInfo.slug,
+      contextWindowTokens,
+    },
+  });
+}
+
+function getTotalTokenUsage(session: Session): number {
+  const peek = (
+    session.state as unknown as {
+      unsafePeek?: () => {
+        totalTokenUsage?: number | { totalTokens?: number };
+      };
+    }
+  ).unsafePeek?.();
+  const field = peek?.totalTokenUsage;
+  if (typeof field === "number") return Number.isFinite(field) ? field : 0;
+  const totalTokens = field?.totalTokens;
+  return typeof totalTokens === "number" && Number.isFinite(totalTokens)
+    ? totalTokens
+    : 0;
+}
+
+// Shared with run-turn.ts and its sibling modules.
+export {
+  getAutoCompactTokenLimit,
+  runAutoCompact,
+  runPreSamplingCompact,
+  getActiveContextTokenUsage,
+  getPreSamplingAutoCompactTokenLimit,
+};

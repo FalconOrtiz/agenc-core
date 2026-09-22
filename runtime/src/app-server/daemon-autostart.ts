@@ -34,6 +34,11 @@ import {
   resolveRuntimePackageRootFromUrl,
 } from "./daemon-runtime-info.js";
 import {
+  isDaemonHeartbeatFresh,
+  readAgenCDaemonHeartbeat,
+  resolveAgenCDaemonHeartbeatPath,
+} from "./daemon-heartbeat.js";
+import {
   findLinuxAgenCDaemonProcesses,
   inspectLinuxAgenCDaemonProcess,
   readAgenCDaemonProcessStart,
@@ -69,6 +74,12 @@ const AGENC_DAEMON_BUILD_SKEW_STOP_TIMEOUT_MS = 5_000;
 const AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS = 1_000;
 const AGENC_DAEMON_FORCE_STOP_GRACE_MS = 2_000;
 const AGENC_DAEMON_STOP_POLL_MS = 50;
+/**
+ * Off Linux an unbound daemon is never signalled; a beating one is given this
+ * long to exit on its own (a cancelled startup leaving, #2232) before the
+ * refusal stands.
+ */
+const AGENC_DAEMON_UNBOUND_EXIT_WAIT_MS = 30_000;
 /**
  * Restart-cycle bound for the two self-restart paths (legacy identity-less
  * daemon, build-identity skew). When the condition that forced a restart is a
@@ -155,6 +166,8 @@ export interface AgenCDaemonAutostartOptions {
     targetHome: string,
   ) => Promise<readonly number[]> | readonly number[];
   readonly terminateOrphanDaemonPid?: (pid: number) => Promise<void> | void;
+  /** How long to wait for a beating unbound daemon to exit off Linux; test seam. */
+  readonly unboundDaemonExitWaitMs?: number;
   readonly inspectLegacyDaemonProcess?: (
     pid: number,
   ) =>
@@ -816,6 +829,16 @@ async function terminatePidlessAgenCDaemonPid(
   options: AgenCDaemonAutostartOptions,
 ): Promise<void> {
   if (hostPlatform(host) !== "linux") {
+    if (
+      await waitForBeatingUnboundDaemonToExit(
+        identity,
+        daemonHome,
+        host,
+        options,
+      )
+    ) {
+      return;
+    }
     throw instanceProofFailed(
       identity.pid,
       "an unbound daemon cannot be signalled on this platform",
@@ -856,6 +879,42 @@ async function terminatePidlessAgenCDaemonPid(
     options,
     AGENC_DAEMON_ORPHAN_STOP_TIMEOUT_MS,
   );
+}
+
+/**
+ * A daemon that is unbound yet beating is alive on purpose: still starting,
+ * or leaving after a cancelled startup. Off Linux it cannot be signalled, so
+ * instead of refusing at once, wait a bounded time for it to exit; that turns
+ * the minutes of "cannot be signalled" retries of #2232 into seconds. A stale
+ * heartbeat (hung), one that keeps beating past the budget, or a pid that is
+ * still running at the end keeps the original refusal. A daemon that binds
+ * meanwhile is left for the next connect to adopt.
+ */
+async function waitForBeatingUnboundDaemonToExit(
+  identity: AgenCDaemonProcessIdentity,
+  daemonHome: string,
+  host: AgenCDaemonAutostartHost,
+  options: AgenCDaemonAutostartOptions,
+): Promise<boolean> {
+  const heartbeatPath = resolveAgenCDaemonHeartbeatPath(daemonHome);
+  const beating = (): boolean => {
+    const heartbeat = readAgenCDaemonHeartbeat(heartbeatPath);
+    return (
+      heartbeat !== null &&
+      heartbeat.pid === identity.pid &&
+      isDaemonHeartbeatFresh(heartbeat, Date.now())
+    );
+  };
+  if (!beating()) return false;
+  const deadline =
+    Date.now() +
+    (options.unboundDaemonExitWaitMs ?? AGENC_DAEMON_UNBOUND_EXIT_WAIT_MS);
+  while (Date.now() < deadline) {
+    if (!host.isPidRunning(identity.pid)) return true;
+    if (!beating()) return false;
+    await host.sleep(AGENC_DAEMON_STOP_POLL_MS);
+  }
+  return !host.isPidRunning(identity.pid);
 }
 
 async function terminateAgenCDaemonPid(
@@ -1341,14 +1400,21 @@ async function failStartedAgenCDaemonReplacement(params: {
   try {
     await cleanupUnverifiedStartedAgenCDaemon(params);
   } catch (cleanupError) {
+    // Both causes belong in the message: the CLI prints only `error.message`,
+    // and the startup failure (which carries the daemon's own stderr, e.g. a
+    // native module that needs a newer glibc) is what the operator must see.
     throw new AggregateError(
       [params.error, cleanupError],
       `AgenC daemon startup failed and replacement cleanup could not be verified${
         params.spawnedPid === null ? "" : ` (pid ${params.spawnedPid})`
-      }`,
+      }: ${describeAutostartFailure(params.error)}; cleanup: ${describeAutostartFailure(cleanupError)}`,
     );
   }
   throw params.error;
+}
+
+function describeAutostartFailure(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function cleanupUnverifiedStartedAgenCDaemon(params: {
@@ -1704,6 +1770,13 @@ async function waitForAgenCDaemonReady(
   return host.isPidRunning(target.pid) ? "timeout" : "exited";
 }
 
+/**
+ * The socket must accept a connection, not merely exist. A daemon that was
+ * killed without cleanup (SIGKILL, OOM, power loss) leaves its socket inode and
+ * cookie behind; judged by presence alone, a replacement looks ready the
+ * instant it is spawned, fails the identity proof it has not had time to
+ * publish, and is terminated, on every cycle.
+ */
 async function isAgenCDaemonPidAndCookieReady(
   target: AgenCDaemonConnectionTarget,
   host: AgenCDaemonCliHost,
@@ -1718,12 +1791,13 @@ async function isAgenCDaemonPidAndCookieReady(
     if (isAgenCWindowsNamedPipePath(socketPath)) {
       return canConnectToUnixSocket(socketPath);
     }
-    return (await lstat(socketPath)).isSocket();
+    if (!(await lstat(socketPath)).isSocket()) return false;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === "ENOENT") return false;
     throw error;
   }
+  return canConnectToUnixSocket(socketPath);
 }
 
 function silentIo(): AgenCDaemonCliIo {

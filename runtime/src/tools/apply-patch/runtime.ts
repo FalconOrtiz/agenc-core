@@ -1,7 +1,7 @@
 /**
- * Ports the donor apply-patch runtime onto AgenC filesystem tools.
+ * Apply-patch runtime built on AgenC filesystem tools.
  *
- * Shape differences from upstream:
+ * Design notes:
  *   - Filesystem calls use Node fs/promises and AgenC path allowlists.
  *   - Permission and session-read integration is exposed through the
  *     tool wrapper; this module owns the primitive patch application.
@@ -44,6 +44,7 @@ import {
 } from "./limits.js";
 import {
   ApplyPatchRuntimeError,
+  markApplyPatchPreEffect,
   type AffectedPaths,
   type AppliedPatch,
   type ApplyPatchArgs,
@@ -51,21 +52,6 @@ import {
   type ApplyPatchHunk,
   type UpdateFileChunk,
 } from "./types.js";
-import {
-  beginWorkspaceMutation,
-  cancelWorkspaceMutation,
-  commitWorkspaceMutation,
-  completeWorkspaceTopologyMutation,
-  prepareWorkspaceMutation,
-  reconcileUnknownMutation,
-  releaseWorkspaceTopologyMutation,
-  reserveWorkspaceTopologyMutation,
-  workspaceAuthoritativeRead,
-  workspaceMutationAdmissionToolResult,
-  workspaceMutationBlockedToolResult,
-  WorkspaceMutationRejectedError,
-  type WorkspaceTopologyMutationReservation,
-} from "../../workspace/mutation-coordinator.js";
 import {
   captureWorkspaceFilePathTransactionGuard,
   WorkspaceFileMutationPreEffectConflictError,
@@ -772,6 +758,26 @@ async function applyHunksToFiles(
   readonly affected: AffectedPaths;
   readonly mutationMetadata: readonly MutationMetadataEntry[];
 }> {
+  const effect = { crossed: false };
+  try {
+    return await applyHunksToFilesInner(hunks, opts, control, effect);
+  } catch (error) {
+    if (!effect.crossed) {
+      throw markApplyPatchPreEffect(error);
+    }
+    throw error;
+  }
+}
+
+async function applyHunksToFilesInner(
+  hunks: readonly ApplyPatchHunk[],
+  opts: ApplyPatchRuntimeOptions,
+  control: SeekSequenceControl,
+  effect: { crossed: boolean },
+): Promise<{
+  readonly affected: AffectedPaths;
+  readonly mutationMetadata: readonly MutationMetadataEntry[];
+}> {
   if (hunks.length === 0) {
     throw new ApplyPatchRuntimeError("No files were modified.");
   }
@@ -802,9 +808,7 @@ async function applyHunksToFiles(
       }
       return pending.content;
     }
-    const editorRead = workspaceAuthoritativeRead(pathAbs);
-    const content =
-      editorRead?.content ?? (await readFileToUpdate(pathAbs, control));
+    const content = await readFileToUpdate(pathAbs, control);
     assertApplyPatchActive(control, "source reading");
     return content;
   };
@@ -817,11 +821,6 @@ async function applyHunksToFiles(
       return pending.deleted
         ? { existed: false, content: "" }
         : { existed: true, content: pending.content };
-    }
-    const editorRead = workspaceAuthoritativeRead(pathAbs);
-    if (editorRead !== null) {
-      parseTextDocument(editorRead.content, pathAbs, control);
-      return { existed: true, content: editorRead.content };
     }
     try {
       const bytes = await readBoundedFile(pathAbs, control);
@@ -973,109 +972,11 @@ async function applyHunksToFiles(
     });
   }
 
-  assertApplyPatchActive(control, "transaction admission");
+  assertApplyPatchActive(control, "mutation boundary");
 
-  // PHASE 2 — reserve every path through the workspace coherence boundary
-  // before touching disk. A dirty live editor buffer becomes a shadow
-  // proposal; a stale buffer blocks the whole multi-file transaction.
-  //
-  // A proposal is intentionally single-path. Multi-path patches therefore
-  // take one topology fence first: if any target is loaded in Editor, the
-  // whole patch is rejected before a source-only delete or destination-only
-  // write can escape as a misleading partial proposal.
-  let batchTopology: WorkspaceTopologyMutationReservation | null = null;
-  let batchTopologySettled = false;
-  const releaseBatchTopology = async (): Promise<void> => {
-    if (batchTopology === null || batchTopologySettled) return;
-    batchTopologySettled = true;
-    await releaseWorkspaceTopologyMutation(batchTopology);
-  };
-  const completeBatchTopology = async (
-    status: "applied" | "unknown_outcome",
-  ): Promise<void> => {
-    if (batchTopology === null || batchTopologySettled) return;
-    batchTopologySettled = true;
-    await completeWorkspaceTopologyMutation(batchTopology, status);
-  };
-  const requiresTopologyFence =
-    plannedOps.length > 1 ||
-    plannedOps.some((operation) => operation.kind === "remove");
-  if (requiresTopologyFence) {
-    const uniqueTargets = [
-      ...new Set(plannedOps.map((operation) => operation.path)),
-    ].map((path) => ({ path }));
-    assertApplyPatchActive(control, "topology reservation");
-    try {
-      batchTopology = await reserveWorkspaceTopologyMutation(
-        uniqueTargets,
-        "apply_patch",
-      );
-    } catch (error) {
-      throw new WorkspaceMutationRejectedError(
-        workspaceMutationBlockedToolResult(
-          `apply_patch was not started because its ${
-            plannedOps.length > 1 ? "multi-path" : "delete"
-          } transaction ` +
-            `crosses an active Editor revision: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-        ),
-      );
-    }
-    try {
-      assertApplyPatchActive(control, "topology reservation");
-    } catch (error) {
-      await releaseBatchTopology();
-      throw error;
-    }
-  }
-  const admissions: Array<
-    Awaited<ReturnType<typeof prepareWorkspaceMutation>>
-  > = [];
-  const toolCallId =
-    typeof opts.rawArgs?.__callId === "string"
-      ? opts.rawArgs.__callId
-      : undefined;
-  try {
-    for (const op of plannedOps) {
-      assertApplyPatchActive(control, "workspace admission");
-      const admission = await prepareWorkspaceMutation(
-        {
-          path: op.path,
-          source: "apply_patch",
-          beforeText: op.beforeContent,
-          afterText: op.kind === "write" ? op.content : "",
-          ...(opts.sessionId !== undefined
-            ? { sessionId: opts.sessionId }
-            : {}),
-          ...(toolCallId !== undefined ? { toolCallId } : {}),
-        },
-        {
-          ...(batchTopology !== null
-            ? { topologyReservation: batchTopology }
-            : {}),
-        },
-      );
-      const rejection = workspaceMutationAdmissionToolResult(admission);
-      if (rejection !== null) {
-        throw new WorkspaceMutationRejectedError(rejection);
-      }
-      admissions.push(admission);
-      assertApplyPatchActive(control, "workspace admission");
-    }
-  } catch (error) {
-    for (const prior of admissions) cancelWorkspaceMutation(prior);
-    await releaseBatchTopology();
-    throw error;
-  }
-  try {
-    assertApplyPatchActive(control, "workspace admission");
-    for (const admission of admissions) beginWorkspaceMutation(admission);
-  } catch (error) {
-    for (const admission of admissions) cancelWorkspaceMutation(admission);
-    await releaseBatchTopology();
-    throw error;
-  }
+  // PHASE 2 — the mutation boundary is crossed once the first target is
+  // touched; the rollback machinery below owns every path from here on.
+  effect.crossed = true;
 
   // Snapshot every touched path, then commit with rollback.
   const backups = new Map<string, FileBackup>();
@@ -1182,10 +1083,6 @@ async function applyHunksToFiles(
       }
     } catch (error) {
       if (touchedPaths.size === 0) {
-        for (const admission of admissions) {
-          cancelWorkspaceMutation(admission);
-        }
-        await releaseBatchTopology();
         throw new ApplyPatchRuntimeError(
           `apply_patch stopped before writing any target path. ${errorMessage(
             error,
@@ -1198,53 +1095,8 @@ async function applyHunksToFiles(
         rollbackCandidates,
         opts.__testRestoreBackup,
       );
-      const restoreByPath = new Map(
-        restoreResults.map((result) => [result.path, result] as const),
-      );
-      const reconciliationFailures: Array<{
-        readonly path: string;
-        readonly error: unknown;
-      }> = [];
-      const uncoordinatedUnknownPaths = new Set<string>();
-
-      // Every reservation must reach a terminal state even if an earlier
-      // rollback audit fails. Duplicate-path operations have distinct tokens,
-      // so reconcile each admission rather than only each unique path.
-      for (let index = 0; index < plannedOps.length; index += 1) {
-        const op = plannedOps[index]!;
-        const admission = admissions[index]!;
-        const restoreResult = restoreByPath.get(op.path);
-        if (restoreResult === undefined || restoreResult.restored) {
-          cancelWorkspaceMutation(admission);
-          continue;
-        }
-        if (admission.decision !== "allow") {
-          cancelWorkspaceMutation(admission);
-          uncoordinatedUnknownPaths.add(op.path);
-          continue;
-        }
-        try {
-          await reconcileUnknownMutation(
-            admission.token,
-            restoreResult.observed,
-            {
-              ...(opts.sessionId !== undefined
-                ? { sessionId: opts.sessionId }
-                : {}),
-              ...(toolCallId !== undefined ? { toolCallId } : {}),
-            },
-          );
-        } catch (reconciliationError) {
-          reconciliationFailures.push({
-            path: op.path,
-            error: reconciliationError,
-          });
-        }
-      }
-
       const unverified = restoreResults.filter((result) => !result.restored);
       if (unverified.length === 0) {
-        await releaseBatchTopology();
         throw new ApplyPatchRuntimeError(
           `apply_patch failed while writing and was rolled back; every touched ` +
             `file target was verified restored to its captured contents and ` +
@@ -1263,87 +1115,11 @@ async function applyHunksToFiles(
           )}${restoreFailure})`;
         })
         .join("; ");
-      const reconciliationDetail =
-        reconciliationFailures.length === 0
-          ? "Every coordinated path was durably marked unknown_outcome."
-          : `Unknown-outcome reconciliation also failed for ${
-              reconciliationFailures.length
-            } admission(s): ${reconciliationFailures
-              .map(
-                (failure) => `${failure.path}: ${errorMessage(failure.error)}`,
-              )
-              .join("; ")}.`;
-      const uncoordinatedDetail =
-        uncoordinatedUnknownPaths.size === 0
-          ? ""
-          : ` No workspace coordinator was active for: ${[
-              ...uncoordinatedUnknownPaths,
-            ].join(", ")}.`;
-      let topologyDetail = "";
-      try {
-        await completeBatchTopology("unknown_outcome");
-      } catch (topologyError) {
-        topologyDetail =
-          ` The multi-path fence could not persist its unknown outcome: ` +
-          `${errorMessage(topologyError)}.`;
-      }
       throw new ApplyPatchRuntimeError(
         `apply_patch failed while writing and rollback was incomplete. ` +
           `${unverified.length} path(s) could not be verified restored and ` +
           `must be re-read before another mutation: ${unverifiedDetails}. ` +
-          `${reconciliationDetail}${uncoordinatedDetail}${topologyDetail} Original write ` +
-          `failure: ${errorMessage(error)}`,
-      );
-    }
-
-    const auditFailures: Array<{
-      readonly path: string;
-      readonly error: unknown;
-    }> = [];
-    for (let index = 0; index < plannedOps.length; index += 1) {
-      const op = plannedOps[index]!;
-      const admission = admissions[index]!;
-      try {
-        await commitWorkspaceMutation(
-          admission,
-          op.kind === "write" ? op.content : "",
-          {
-            ...(opts.sessionId !== undefined
-              ? { sessionId: opts.sessionId }
-              : {}),
-            ...(toolCallId !== undefined ? { toolCallId } : {}),
-          },
-        );
-      } catch (error) {
-        auditFailures.push({ path: op.path, error });
-      } finally {
-        // A successful commit consumes the token; cancellation is idempotent.
-        // On a failed commit this guarantees no later editor sync is blocked,
-        // while the loop continues to reconcile every file already changed.
-        cancelWorkspaceMutation(admission);
-      }
-    }
-    try {
-      await completeBatchTopology(
-        auditFailures.length === 0 ? "applied" : "unknown_outcome",
-      );
-    } catch (error) {
-      auditFailures.push({
-        path: opts.cwd,
-        error: new Error(
-          `multi-path workspace fence audit failed: ${errorMessage(error)}`,
-        ),
-      });
-    }
-    if (auditFailures.length > 0) {
-      const details = auditFailures
-        .map(
-          ({ path, error }) =>
-            `${path}: ${error instanceof Error ? error.message : String(error)}`,
-        )
-        .join("; ");
-      throw new ApplyPatchRuntimeError(
-        `apply_patch changed files on disk, but ${auditFailures.length} workspace audit outcome(s) are unknown. Re-read every affected file before another mutation. ${details}`,
+          `Original write failure: ${errorMessage(error)}`,
       );
     }
 
@@ -1393,8 +1169,14 @@ export async function applyPatchText(
   patch: string,
   opts: ApplyPatchRuntimeOptions,
 ): Promise<ApplyPatchResult> {
-  const control = createRuntimeControl(opts);
-  assertApplyPatchActive(control, "payload parsing");
-  const parsed = parsePatch(patch, "lenient", control);
+  let control: SeekSequenceControl;
+  let parsed: ApplyPatchArgs;
+  try {
+    control = createRuntimeControl(opts);
+    assertApplyPatchActive(control, "payload parsing");
+    parsed = parsePatch(patch, "lenient", control);
+  } catch (error) {
+    throw markApplyPatchPreEffect(error);
+  }
   return applyParsedPatch(parsed, opts, control);
 }

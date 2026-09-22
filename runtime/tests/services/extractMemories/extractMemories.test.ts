@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,9 @@ import {
 import { formatMemoryManifest, scanMemoryFiles } from "../../memory/index.js";
 import { resolveAgentRuntimeOptions } from "../../session/runtime-options.js";
 import { createControlledPromise } from "../../helpers/controlled-async.js";
+import { AsyncLock } from "../../utils/async-lock.js";
+import type { RolloutItem } from "../../session/rollout-item.js";
+import { recordInitialHistoryOnResume } from "../../session/agent-task-lifecycle.js";
 
 vi.mock("bun:bundle", () => ({ feature: () => false }));
 vi.mock("../../tools.js", () => ({}));
@@ -36,6 +39,9 @@ function ctx(cwd: string): TurnContext {
     cwd,
     depth: 0,
     sessionSource: "cli_main",
+    sandboxPolicy: { value: "danger_full_access" },
+    fileSystemSandboxPolicy: { allowRead: [], denyRead: [], allowWrite: [], denyWrite: [] },
+    networkSandboxPolicy: { allowlist: [], denylist: [], allowManagedDomainsOnly: false },
   } as unknown as TurnContext;
 }
 
@@ -119,28 +125,32 @@ describe("auto memory path resolution", () => {
   });
 
   it("uses shared project-key sanitization for automatic memory directories", async () => {
-    const configHome = join(tmpdir(), "agenc-config-test");
+    const fixture = await mkdtemp(join(tmpdir(), "agenc-memory-key-"));
+    const workspace = join(fixture, "project");
+    const configHome = join(fixture, "config");
+    await mkdir(workspace);
+    await mkdir(join(workspace, ".git"));
     const longPath = `/${"deep/".repeat(50)}project`;
     const longKey = sanitizePathForProjectKey(longPath);
 
-    expect(sanitizePathForProjectKey("/tmp/foo")).toBe("-tmp-foo");
-    expect(
-      longKey.startsWith(
-        longPath.replace(/[^a-zA-Z0-9]/gu, "-").slice(0, 200),
-      ),
-    ).toBe(true);
-    expect(longKey).toMatch(/-[a-z0-9]+$/u);
-    await expect(
-      resolveAutoMemoryDirectory({
-        env: {},
-        cwd: "/tmp/foo",
-        configHomeDir: configHome,
-        settings: {},
-      }),
-    ).resolves.toEqual({
-      enabled: true,
-      path: `${join(configHome, "projects", "-tmp-foo", "memory")}${sep}`,
-    });
+    expect(sanitizePathForProjectKey("/tmp/foo")).toMatch(/^v2-.*-[a-f0-9]{64}$/u);
+    expect(longKey).toMatch(/^v2-.*-[a-f0-9]{64}$/u);
+    expect(longKey.length).toBeLessThanOrEqual(132);
+    try {
+      await expect(
+        resolveAutoMemoryDirectory({
+          env: {},
+          cwd: workspace,
+          configHomeDir: configHome,
+          settings: {},
+        }),
+      ).resolves.toEqual({
+        enabled: true,
+        path: `${join(configHome, "projects", sanitizePathForProjectKey(workspace), "memory")}${sep}`,
+      });
+    } finally {
+      await rm(fixture, { recursive: true, force: true });
+    }
   });
 
   it("canonicalizes linked worktrees before building automatic project keys", async () => {
@@ -845,6 +855,74 @@ describe("extract memories service", () => {
     });
   });
 
+  it("logs approval deferral once and does not retry the same memory batch", async () => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    const delegateFn = vi.fn(async (options: { deferInteractiveApprovals: (tool: string) => void }) => {
+      options.deferInteractiveApprovals("Write");
+      return { kind: "sync_completed", result: { outcome: "cancelled" } };
+    });
+    initExtractMemories({ env: {}, minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      delegateFn: delegateFn as never,
+      ensureAgentControl: (() => ({ control: {}, registry: {} })) as never,
+    });
+    const messages: LLMMessage[] = [{ role: "user", content: "remember my preferences" }];
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+    expect(delegateFn).toHaveBeenCalledOnce();
+    expect(warnings.filter((entry) => entry.message.includes("approval required"))).toEqual([{
+      cause: "memory_extraction_skipped",
+      message: "approval required for Write; background memory stopped without requesting input",
+    }]);
+  });
+
+  it.each(["workspace_write", "read_only"] as const)("skips an unwritable memory root before dispatch in %s", async (mode) => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const scan = vi.fn(async () => []);
+    initExtractMemories({ env: {}, minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild, scanMemoryFiles: scan,
+    });
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const context = extractionContext({ cwd: workspace, session,
+      messages: [{ role: "user", content: "remember my preferences" }],
+    });
+    const restricted = { ...context, ctx: { ...context.ctx,
+      sandboxPolicy: { value: mode },
+      fileSystemSandboxPolicy: { allowRead: [workspace], denyRead: [], allowWrite: [workspace], denyWrite: [] },
+    } as TurnContext };
+    await executeExtractMemories(restricted);
+    await executeExtractMemories(restricted);
+    expect(runChild).not.toHaveBeenCalled();
+    expect(scan).not.toHaveBeenCalled();
+    expect(warnings.filter((entry) => entry.message.includes("memory directory is not writable"))).toHaveLength(1);
+    expect(warnings.some((entry) => entry.cause === "memory_extraction_failed")).toBe(false);
+  });
+
+  it("allows an explicitly writable memory root without granting other paths", async () => {
+    const runChild = vi.fn(async (_request: ExtractMemoriesChildRequest) => ({ outcome: "completed" as const }));
+    initExtractMemories({ env: {}, minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }), runChild,
+    });
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const context = extractionContext({ cwd: workspace,
+      messages: [{ role: "user", content: "remember my preferences" }],
+    });
+    const policy = { allowRead: [workspace, memoryDir], denyRead: [], allowWrite: [workspace, memoryDir], denyWrite: [] };
+    await executeExtractMemories({ ...context, ctx: { ...context.ctx,
+      sandboxPolicy: { value: "workspace_write" }, fileSystemSandboxPolicy: policy,
+    } as TurnContext });
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(policy.allowWrite).toEqual([workspace, memoryDir]);
+    const request = runChild.mock.calls[0]![0] as ExtractMemoriesChildRequest;
+    expect(await request.toolPolicy({ name: "Write" }, { file_path: join(workspace, "unrelated.md"), content: "denied" })).toMatchObject({ behavior: "deny" });
+  });
+
   it("runs the child on every third eligible turn by default and reports each deferral", async () => {
     const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
     const warnings: Array<{ cause: string; message: string }> = [];
@@ -1096,5 +1174,475 @@ describe("memory manifest scan", () => {
     expect(manifest).toContain("Use terse responses");
     expect(manifest).not.toContain("MEMORY.md");
     expect(manifest).not.toContain("secret.md");
+  });
+});
+
+describe("extraction cadence across a daemon restart", () => {
+  let root: string;
+  let memoryDir: string;
+  const cadenceMessages: LLMMessage[] = [
+    { role: "user", content: "remember the cadence" },
+    { role: "assistant", content: "ok" },
+  ];
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "agenc-extract-memory-restart-"));
+    memoryDir = join(root, "memory");
+    await mkdir(memoryDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  type Warning = { cause: string; message: string };
+
+  /** A session whose state lock and rollout recorder outlive the process. */
+  function durableSession(opts: {
+    readonly conversationId: string;
+    readonly rollout: RolloutItem[];
+    readonly warnings?: Warning[];
+    readonly record?: (item: RolloutItem) => Promise<void>;
+  }): Session {
+    let subId = 0;
+    return {
+      conversationId: opts.conversationId,
+      services: {
+        runtimeOptions: defaultRuntimeOptions,
+        rollout: {
+          record: async (item: unknown) => {
+            if (opts.record) await opts.record(item as RolloutItem);
+            opts.rollout.push(item as RolloutItem);
+          },
+        },
+      },
+      state: new AsyncLock<Record<string, unknown>>({}),
+      nextInternalSubId: () => String(subId++),
+      emit: (event: { msg: { type: string; payload: unknown } }) => {
+        if (event.msg.type === "warning") {
+          opts.warnings?.push(event.msg.payload as Warning);
+        }
+      },
+    } as unknown as Session;
+  }
+
+  /**
+   * The daemon restarts: the session object is rebuilt and resumed from the
+   * rollout the previous process wrote (the JSONL round trip drops undefined
+   * keys), and the caller starts a fresh extraction service.
+   */
+  async function resumedSession(opts: {
+    readonly conversationId: string;
+    readonly rollout: RolloutItem[];
+    readonly warnings?: Warning[];
+  }): Promise<Session> {
+    const session = durableSession(opts);
+    const replayed = opts.rollout.map(
+      (item) => JSON.parse(JSON.stringify(item)) as RolloutItem,
+    );
+    await recordInitialHistoryOnResume(session, replayed, {
+      currentModel: "test-model",
+    });
+    return session;
+  }
+
+  function startExtractionService(
+    runChild: NonNullable<Parameters<typeof initExtractMemories>[0]["runChild"]>,
+    minEligibleTurns?: number,
+  ): void {
+    initExtractMemories({
+      env: {},
+      ...(minEligibleTurns !== undefined ? { minEligibleTurns } : {}),
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+    });
+  }
+
+  function persistedCadences(rollout: readonly RolloutItem[]) {
+    return rollout.map((item) =>
+      item.type === "session_state" ? item.payload.memoryExtraction : item.type,
+    );
+  }
+
+  it("a restart between the second and third eligible turns still extracts on the third", async () => {
+    const rollout: RolloutItem[] = [];
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const firstWarnings: Warning[] = [];
+    const first = durableSession({
+      conversationId: "conv-restart",
+      rollout,
+      warnings: firstWarnings,
+    });
+    startExtractionService(runChild);
+    for (let turn = 0; turn < 2; turn += 1) {
+      await executeExtractMemories(
+        extractionContext({ cwd: root, messages: cadenceMessages, session: first }),
+      );
+    }
+    expect(runChild).not.toHaveBeenCalled();
+    expect(firstWarnings.map((warning) => warning.message)).toEqual([
+      expect.stringContaining("deferred by eligible-turn cadence (1/3"),
+      expect.stringContaining("deferred by eligible-turn cadence (2/3"),
+    ]);
+    expect(persistedCadences(rollout)).toEqual([
+      { memoryRoot: memoryDir, processedVisibleCount: 0, turnsSinceLastExtraction: 1 },
+      { memoryRoot: memoryDir, processedVisibleCount: 0, turnsSinceLastExtraction: 2 },
+    ]);
+
+    const secondWarnings: Warning[] = [];
+    const second = await resumedSession({
+      conversationId: "conv-restart",
+      rollout,
+      warnings: secondWarnings,
+    });
+    startExtractionService(runChild);
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session: second }),
+    );
+
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(secondWarnings).toEqual([]);
+    expect(persistedCadences(rollout).at(-1)).toEqual({
+      memoryRoot: memoryDir,
+      processedVisibleCount: 2,
+      turnsSinceLastExtraction: 0,
+    });
+  });
+
+  it("does not offer the child history the previous process already extracted", async () => {
+    const rollout: RolloutItem[] = [];
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const first = durableSession({ conversationId: "conv-cursor", rollout });
+    startExtractionService(runChild, 1);
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session: first }),
+    );
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(runChild.mock.calls[0]![0].prompt).toContain("~2 model-visible");
+
+    const second = await resumedSession({ conversationId: "conv-cursor", rollout });
+    startExtractionService(runChild, 1);
+    await executeExtractMemories(
+      extractionContext({
+        cwd: root,
+        messages: [
+          ...cadenceMessages,
+          { role: "user", content: "one more durable fact" },
+        ],
+        session: second,
+      }),
+    );
+
+    expect(runChild).toHaveBeenCalledTimes(2);
+    expect(runChild.mock.calls[1]![0].prompt).toContain("~1 model-visible");
+  });
+
+  it("waits the full cadence for a session with nothing persisted, as before", async () => {
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const warnings: Warning[] = [];
+    const session = await resumedSession({
+      conversationId: "conv-fresh",
+      rollout: [],
+      warnings,
+    });
+    startExtractionService(runChild);
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session }),
+    );
+
+    expect(runChild).not.toHaveBeenCalled();
+    expect(warnings.map((warning) => warning.message)).toEqual([
+      expect.stringContaining("deferred by eligible-turn cadence (1/3"),
+    ]);
+  });
+
+  it("writes the cadence only when a decision changed it", async () => {
+    const rollout: RolloutItem[] = [];
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const session = durableSession({ conversationId: "conv-quiet", rollout });
+    startExtractionService(runChild, 1);
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session }),
+    );
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(rollout).toHaveLength(1);
+
+    // The same history again: no new model-visible messages, nothing to write.
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session }),
+    );
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(rollout).toHaveLength(1);
+  });
+
+  it("reports a cadence write failure without failing the extraction", async () => {
+    const runChild = vi.fn(async () => ({ outcome: "completed" as const }));
+    const warnings: Warning[] = [];
+    const session = durableSession({
+      conversationId: "conv-broken-rollout",
+      rollout: [],
+      warnings,
+      record: async () => {
+        throw new Error("disk full");
+      },
+    });
+    startExtractionService(runChild, 1);
+    await executeExtractMemories(
+      extractionContext({ cwd: root, messages: cadenceMessages, session }),
+    );
+
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(warnings).toEqual([
+      {
+        cause: "memory_extraction_state_not_persisted",
+        message: expect.stringContaining("disk full"),
+      },
+    ]);
+  });
+});
+
+describe("skill candidates ride the extraction child", () => {
+  let root: string;
+  let memoryDir: string;
+  let agencHome: string;
+
+  const candidate = {
+    name: "run-hermetic-vitest",
+    description: "Run one runtime test file through the hermetic vitest runner.",
+    whenToUse: "When a runtime change needs its tests run in isolation.",
+    body: "# Purpose\n\nRun tests in isolation.\n\n## Steps\n\n1. node scripts/run-hermetic-vitest.mjs run <file>\n\n## Verification\n\nSummary line passes.\n\n## Pitfalls\n\nNever use the real AGENC_HOME.\n",
+    evidence: ["Three runner invocations, each checked against the summary line."],
+  };
+  const replyWithCandidate = (entry: Record<string, unknown> = candidate) =>
+    `Memory updated.\n\n\`\`\`skill-candidates\n${JSON.stringify({ skillCandidates: [entry] })}\n\`\`\`\n`;
+  const messages: LLMMessage[] = [
+    { role: "user", content: "run the runtime tests for this change" },
+    { role: "assistant", content: "done, all green" },
+  ];
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "agenc-extract-skillcand-"));
+    memoryDir = join(root, "memory");
+    agencHome = join(root, "agenc-home");
+    await mkdir(memoryDir, { recursive: true });
+    await mkdir(agencHome, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("asks the child for candidates and writes the one it returns as an inactive draft", async () => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    const runChild = vi.fn(async (_request: ExtractMemoriesChildRequest) => ({
+      outcome: "completed" as const,
+      finalMessage: replyWithCandidate(),
+    }));
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+      skillCandidatesHome: agencHome,
+      listInstalledSkillNames: async () => ["verify", "already-there"],
+    });
+
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+
+    expect(runChild).toHaveBeenCalledOnce();
+    const prompt = runChild.mock.calls[0]![0].prompt;
+    expect(prompt).toContain("## Skill candidates (drafts for the user to review)");
+    expect(prompt).toContain("at least 3 tool calls");
+    expect(prompt).toContain("Installed skills: already-there, verify.");
+    expect(prompt).toContain("```skill-candidates");
+
+    const draftDir = join(agencHome, "skill-candidates", "run-hermetic-vitest");
+    const skill = await readFile(join(draftDir, "SKILL.md"), "utf8");
+    expect(skill).toContain('name: "run-hermetic-vitest"');
+    expect(skill).toContain("## Verification");
+    const record = JSON.parse(await readFile(join(draftDir, "candidate.json"), "utf8")) as {
+      provenance: { sessionId?: string; createdAt: string };
+      evidence: string[];
+    };
+    expect(record.provenance.sessionId).toBe(
+      (session as unknown as { conversationId: string }).conversationId,
+    );
+    expect(record.provenance.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/u);
+    expect(record.evidence).toHaveLength(1);
+    const ledger = (await readFile(join(agencHome, "skill-candidates", "ledger.jsonl"), "utf8"))
+      .trim()
+      .split("\n");
+    expect(ledger).toHaveLength(1);
+    expect(JSON.parse(ledger[0]!)).toMatchObject({
+      slug: "run-hermetic-vitest",
+      action: "proposed",
+    });
+    // A draft is not a skill: nothing lands where the loader looks.
+    await expect(stat(join(agencHome, "skills"))).rejects.toThrow();
+    expect(warnings.at(-1)).toEqual({
+      cause: "skill_candidate_proposed",
+      message:
+        "draft skill written for review: run-hermetic-vitest (agenc skills candidates list)",
+    });
+  });
+
+  it("skips a candidate that duplicates an installed skill or trips validation, and says why", async () => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild: vi.fn(async () => ({
+        outcome: "completed" as const,
+        finalMessage:
+          "```skill-candidates\n" +
+          JSON.stringify({
+            skillCandidates: [candidate, { ...candidate, name: "Not A Slug" }],
+          }) +
+          "\n```\n",
+      })),
+      skillCandidatesHome: agencHome,
+      listInstalledSkillNames: async () => ["run-hermetic-vitest"],
+    });
+
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+
+    await expect(stat(join(agencHome, "skill-candidates", "run-hermetic-vitest"))).rejects.toThrow();
+    const causes = warnings.map((warning) => warning.cause);
+    expect(causes).not.toContain("skill_candidate_proposed");
+    expect(causes.filter((cause) => cause === "skill_candidate_skipped")).toHaveLength(2);
+    expect(warnings.map((warning) => warning.message)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Not A Slug: name is not a kebab-case slug"),
+        "run-hermetic-vitest: a skill with this name is already installed",
+      ]),
+    );
+  });
+
+  it("neither asks for nor writes candidates when AGENC_SKILL_CANDIDATES=0", async () => {
+    const warnings: Array<{ cause: string; message: string }> = [];
+    const session = sessionWithBus(warnings);
+    const runChild = vi.fn(async () => ({
+      outcome: "completed" as const,
+      finalMessage: replyWithCandidate(),
+    }));
+    initExtractMemories({
+      env: { AGENC_SKILL_CANDIDATES: "0" },
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+      skillCandidatesHome: agencHome,
+      listInstalledSkillNames: async () => [],
+    });
+
+    await executeExtractMemories(extractionContext({ cwd: root, messages, session }));
+
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(runChild.mock.calls[0]![0].prompt).not.toContain("Skill candidates");
+    await expect(stat(join(agencHome, "skill-candidates"))).rejects.toThrow();
+    expect(warnings.map((warning) => warning.cause)).not.toContain("skill_candidate_proposed");
+  });
+
+  it("stays off when an injected env names no AgenC home", async () => {
+    const runChild = vi.fn(async () => ({
+      outcome: "completed" as const,
+      finalMessage: replyWithCandidate(),
+    }));
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      runChild,
+      listInstalledSkillNames: async () => [],
+    });
+
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+
+    expect(runChild).toHaveBeenCalledOnce();
+    expect(runChild.mock.calls[0]![0].prompt).not.toContain("Skill candidates");
+    await expect(stat(join(agencHome, "skill-candidates"))).rejects.toThrow();
+  });
+
+  it("reads the candidate block from the real delegate result", async () => {
+    const delegateFn = vi.fn(async () => ({
+      kind: "sync_completed" as const,
+      result: {
+        threadId: "child-thread",
+        durationMs: 0,
+        outcome: "completed" as const,
+        finalMessage: replyWithCandidate(),
+      },
+      thread: {},
+    }));
+    const ensureAgentControl = vi.fn(() => ({ control: {}, registry: {} }));
+    initExtractMemories({
+      env: {},
+      minEligibleTurns: 1,
+      resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }),
+      delegateFn: delegateFn as never,
+      ensureAgentControl: ensureAgentControl as never,
+      skillCandidatesHome: agencHome,
+      listInstalledSkillNames: async () => [],
+    });
+
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+
+    expect(delegateFn).toHaveBeenCalledOnce();
+    await expect(
+      stat(join(agencHome, "skill-candidates", "run-hermetic-vitest", "SKILL.md")),
+    ).resolves.toBeDefined();
+  });
+});
+
+describe("extraction batches and failed runs", () => {
+  let root = "";
+  let memoryDir = "";
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "agenc-extract-batches-"));
+    memoryDir = join(root, "memory");
+    await mkdir(memoryDir, { recursive: true });
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+  const conversation = (count: number): LLMMessage[] =>
+    Array.from({ length: count }, (_, index) => ({
+      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
+      content: `turn ${index}: something durable about the project`,
+    }));
+
+  it("covers at most twelve messages per run and drains the rest on later runs", async () => {
+    const runChild = vi.fn(async (_request: ExtractMemoriesChildRequest) => ({ outcome: "completed" as const }));
+    initExtractMemories({ env: {}, minEligibleTurns: 1, resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }), runChild });
+    const messages = conversation(30);
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+    expect(runChild.mock.calls.map((call) => call[0].messages.length)).toEqual([12, 12, 6]);
+    expect(runChild.mock.calls[0]![0].messages[0]!.content).toContain("turn 0:");
+    expect(runChild.mock.calls[2]![0].messages[0]!.content).toContain("turn 24:");
+    expect(runChild.mock.calls[0]![0].prompt).toContain("~12 model-visible");
+    await executeExtractMemories(extractionContext({ cwd: root, messages }));
+    expect(runChild).toHaveBeenCalledTimes(3);
+  });
+
+  it("drops a batch after two failed runs and continues with the newer messages", async () => {
+    const outcomes: ExtractMemoriesChildResult[] = [
+      { outcome: "errored", error: new Error("subagent exceeded maxTurns (5)") },
+      { outcome: "errored", error: new Error("subagent exceeded maxTurns (5)") },
+      { outcome: "completed" },
+    ];
+    const runChild = vi.fn(async (_request: ExtractMemoriesChildRequest) => outcomes.shift() ?? { outcome: "completed" as const });
+    initExtractMemories({ env: {}, minEligibleTurns: 1, resolveMemoryDirectory: async () => ({ enabled: true, path: memoryDir }), runChild });
+    const first = conversation(4);
+    await executeExtractMemories(extractionContext({ cwd: root, messages: first }));
+    await executeExtractMemories(extractionContext({ cwd: root, messages: first }));
+    expect(runChild.mock.calls.map((call) => call[0].messages.length)).toEqual([4, 4]);
+    const later = [...first, ...conversation(2).map((message, index) => ({ ...message, content: `turn ${index + 4}: newer` }))];
+    await executeExtractMemories(extractionContext({ cwd: root, messages: later }));
+    expect(runChild).toHaveBeenCalledTimes(3);
+    expect(runChild.mock.calls[2]![0].messages.map((message) => message.content)).toEqual(["turn 4: newer", "turn 5: newer"]);
   });
 });

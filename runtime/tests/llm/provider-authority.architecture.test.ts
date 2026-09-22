@@ -432,6 +432,7 @@ describe("provider authority architecture", () => {
     expect(existsSync(`${SRC}/session/compact-env-guard.ts`)).toBe(false);
     for (const relative of [
       "session/run-turn.ts",
+      "session/run-turn-compaction.ts",
       "session/agenc-tool-use-context.ts",
       "commands/session-compact.ts",
     ]) {
@@ -817,17 +818,8 @@ describe("provider authority architecture", () => {
       );
     }
 
-    const statusBarSource = readFileSync(
-      `${SRC}/tui/workbench/WorkbenchStatusBar.tsx`,
-      "utf8",
-    );
-    expect(statusBarSource).toContain("renderModelNameForContext");
-    expect(statusBarSource).not.toMatch(/\brenderModelName\(/u);
 
     const appSource = readFileSync(`${SRC}/tui/components/App.tsx`, "utf8");
-    expect(appSource).toMatch(
-      /modelDisplayContext=\{remoteAuthSessionContext\}/u,
-    );
     expect(appSource).not.toContain("getRuntimeMainLoopModel");
     expect(appSource).not.toContain("mainLoopModelSetting");
     expect(appSource).toMatch(

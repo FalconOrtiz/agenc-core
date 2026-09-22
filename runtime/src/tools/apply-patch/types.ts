@@ -1,7 +1,7 @@
 /**
- * Ports the donor apply-patch data model onto AgenC tool primitives.
+ * Apply-patch data model built on AgenC tool primitives.
  *
- * Shape differences from upstream:
+ * Design notes:
  *   - Paths are plain strings until the runtime resolves them against
  *     the active workspace root.
  *   - Parse/runtime failures throw Error subclasses instead of returning
@@ -96,8 +96,25 @@ export class ApplyPatchInputError extends Error {
 }
 
 export class ApplyPatchRuntimeError extends Error {
-  constructor(message: string) {
+  /**
+   * True when the failure happened before any workspace mutation began.
+   * The tool surface uses this to attach `confirmed_no_effect` so a
+   * planning refusal (unread file, missing path, bad context) does not
+   * poison the session's mutation gate (#2190).
+   */
+  readonly preEffect: boolean;
+
+  constructor(message: string, options?: { readonly preEffect?: boolean }) {
     super(message);
     this.name = "ApplyPatchRuntimeError";
+    this.preEffect = options?.preEffect === true;
   }
+}
+
+/** Tag a planning-phase failure so the tool can settle it as no-effect. */
+export function markApplyPatchPreEffect(error: unknown): unknown {
+  if (error instanceof ApplyPatchRuntimeError && !error.preEffect) {
+    return new ApplyPatchRuntimeError(error.message, { preEffect: true });
+  }
+  return error;
 }

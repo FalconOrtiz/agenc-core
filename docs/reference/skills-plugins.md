@@ -179,9 +179,10 @@ that session only.
 
 #### Constraints
 
-- The parser accepts only `agenc skills list` and optional `--json`.
-  `agenc skills`, `agenc skills --help`, `agenc skills install <name>`, and any
-  extra flag return `null` from `parseAgenCSkillsCliArgs` and fall through
+- The parser accepts `agenc skills list` with optional `--json`, and the
+  `agenc skills candidates ...` commands below. `agenc skills`,
+  `agenc skills --help`, `agenc skills install <name>`, and any extra flag
+  after `list` return `null` from `parseAgenCSkillsCliArgs` and fall through
   to the default CLI route, which treats the tokens as a **session prompt**.
   Use `agenc help skills` for syntax.
 - Top-level `agenc help` / `agenc --help` does not list this command.
@@ -195,6 +196,55 @@ that session only.
   `/skills` and remain absent from `agenc skills list`.
 - Duplicate `origin:name` keys keep the first row (local snapshot before
   the bundled-registry fallback).
+
+### Skill candidates
+
+The runtime can draft a skill from a session. The memory-extraction child
+(`services/extractMemories`, see [memory.md](memory.md)) already reviews a
+finished stretch of conversation on every third eligible turn. The same run
+is told to look for one more thing: a procedure that was carried out and then
+checked (at least 3 tool calls leading to a verified outcome, such as a test
+run or a build) that no installed skill covers. It answers with a fenced
+`skill-candidates` block at the end of its final reply, at most 2 entries per
+run. The parent validates each entry (kebab-case name, one-line description
+and when-to-use, a body under 16 KiB, at least one line of evidence, and the
+memory secrets scan over every field) and writes each survivor as a draft:
+
+```text
+$AGENC_HOME/skill-candidates/<name>/SKILL.md      frontmatter + body, ready to move
+$AGENC_HOME/skill-candidates/<name>/candidate.json provenance: session, created, model, evidence
+$AGENC_HOME/skill-candidates/ledger.jsonl         {slug, action, at, sessionId} per event
+```
+
+A draft is inert. `skill-candidates` is a sibling of `$AGENC_HOME/skills`; it
+is not one of the roots in [Load paths](#load-paths-discoverskillroots) and
+the loader only walks downward from a root, so a draft never reaches the
+skill listing, the command catalog, or the model. A name that already
+belongs to an installed skill or an existing draft is skipped and logged. The
+session log carries the outcome as `warning` events with cause
+`skill_candidate_proposed` or `skill_candidate_skipped`.
+
+Review with the CLI:
+
+```text
+agenc skills candidates list [--json]
+agenc skills candidates show <name>
+agenc skills candidates accept <name>
+agenc skills candidates reject <name>
+```
+
+`list` prints one line per draft (name, created, description, evidence
+count); `--json` emits `{ schemaVersion: 1, kind: "agenc.skills.candidates",
+root, candidates, errors }`. `show` prints the SKILL.md. `accept` moves the
+directory to `$AGENC_HOME/skills/<name>/`, drops `candidate.json`, and appends
+`accepted` to the ledger; it refuses when any installed skill (any origin,
+built-ins included) or an existing directory already has that name. `reject`
+deletes the directory and appends `rejected`. Unlike `list`, a malformed
+`candidates` command is an error (exit 1), not a session prompt.
+
+`AGENC_SKILL_CANDIDATES=0` turns proposals off. Proposals also stop whenever
+memory extraction does (`AGENC_DISABLE_EXTRACT_MEMORIES`, `--bare`, auto
+memory disabled), since they ride that child run.
 
 ---
 
@@ -519,6 +569,10 @@ HTTP(S) tarball and remote mcpb installs fetch through
 | Redirects | Manual follow of 301 / 302 / 303 / 307 / 308, at most 5 hops |
 | Redirect URL | Same `origin` as the previous hop; `http:` / `https:` only; userinfo forbidden |
 
+These defaults come from `PLUGIN_ARCHIVE_FETCH_POLICY` in the plugin resolver.
+Resolver options can override `downloadTimeoutMs` and `maxDownloadBytes`.
+Redirect limits, protocols, origin checks, and credential rules are fixed.
+
 A cross-origin `Location` fails with
 `plugin archive redirects must stay on <origin>: <redacted-url>` and is not
 fetched. Extraction quotas (depth 32, 4096 files, 200 MiB) stay in
@@ -653,11 +707,12 @@ from each skill directory's `SKILL.md` frontmatter.
 
 Remote plugin resolution (`resolvePluginSource` in
 `runtime/src/plugins/resolution.ts`) verifies an Ed25519 publisher signature
-against a local keyring. Marketplace install through either the CLI or the
+against the operator keyring plus AgenC's built-in official publisher root.
+Marketplace install through either the CLI or the
 `/plugins` menu sets `requireSignature` when the marketplace `sourceType` is
 not `local` (`installRequiresSignature` in `catalog-cli.ts`). The official
 `agenc-plugins` catalog is a URL marketplace, so this gate applies to it.
-There is no `agenc plugin sign` command and no shipped default keyring.
+There is no `agenc plugin sign` command and no generated default keyring file.
 
 #### When verification runs
 
@@ -712,6 +767,13 @@ same-named workspace directory. The shipped CLI cannot opt out.
 Default path: `$AGENC_HOME/plugin-publishers.json`. The resolver accepts an
 in-process `publishersPath` override; there is no operator CLI for it.
 
+AgenC includes the legacy and approved rollover `tetsuo-ai` public keys,
+so signed plugins from the shipped marketplace work in a clean profile. The
+default keyring can add third-party publishers or explicitly replace that entry.
+An in-process `publishersPath` override is authoritative and does not use the
+built-in fallback. Missing or malformed keyrings still fail closed for every
+other publisher.
+
 ```json
 {
   "publishers": {
@@ -722,13 +784,35 @@ in-process `publishersPath` override; there is no operator CLI for it.
 }
 ```
 
-A publisher entry may be that base64 string directly. A parsed keyring without
-a usable entry for the named publisher throws
-`plugin publisher is not trusted: <name>`. Missing, unreadable, or malformed
-keyrings surface their filesystem or JSON error. A well-formed public key and
-signature that do not verify throw
-`plugin signature verification failed for publisher <name>`; malformed key
-material can surface a crypto parsing error.
+A publisher entry may be that base64 string directly. Rollover-aware clients
+also accept `{"publicKey":"<legacy key>","publicKeys":["<legacy key>","<new key>"]}`
+or `{"publicKeys":["<legacy key>","<new key>"]}`. The union is deduplicated and
+limited to sixteen distinct keys; a supplied list must contain 1-16 entries.
+Every supplied value must be a canonical base64 DER-SPKI Ed25519 public key.
+All values are checked before verifying a signature: one malformed key rejects
+the entire publisher entry even if another key would verify. The legacy
+`publicKey` field is retained for older clients, which ignore `publicKeys` and
+therefore cannot verify packages signed only by the new key.
+
+An explicit entry with
+an empty or unusable value is authoritative and throws
+`plugin publisher is not trusted: <name>`; it never falls back to the shipped
+root. A missing default keyring uses the built-in root only for `tetsuo-ai`.
+Missing keyrings for other publishers, unreadable files, and malformed JSON
+surface their filesystem or JSON error. A well-formed public key and signature
+that do not verify throw
+`plugin signature verification failed for publisher <name>`.
+
+The built-in rollover retains historical signatures; it does not override an
+operator's explicit old-only pin. Such users must deliberately verify and add
+the new fingerprint to their keyring. Core never fetches trust keys from the
+catalog, promotes a downloaded key, or rewrites operator trust. Cached plugin
+payloads are reverified against current trust during resolution.
+
+Official decoded DER-SPKI SHA-256 fingerprints:
+
+- Legacy: `8174e96296289bd8eed26b832296309015216afe544a7f15097356b10aa1b932`
+- Rollover: `d3cd019ab546d8512619fabc80cb4b363c66d1a70bfa25a35bbef5aacf3836c3`
 
 #### Signature file
 
@@ -761,7 +845,7 @@ payload.
 | Symptom | What to check |
 | --- | --- |
 | `plugin signature is required` | A required install lacks `.agenc-plugin/signature.json`. Direct local `plugin install ./dir` does not take this path. |
-| `plugin publisher is not trusted` | The parsed `$AGENC_HOME/plugin-publishers.json` has no usable key for that publisher. Missing, unreadable, or malformed keyrings report their underlying error instead. |
+| `plugin publisher is not trusted` | The selected keyring has an explicit unusable entry, or has no usable key for a non-built-in publisher. A missing default keyring is supported only for the built-in `tetsuo-ai` root; other missing, unreadable, or malformed keyrings report their underlying error. |
 | `signatureVerified: false` after marketplace install | Expected only for a local marketplace or a custom caller that disabled the requirement. A successful non-local marketplace install returning false violates the shipped path's invariant. |
 | `plugin update` without `--source` accepts an unsigned tree | Install metadata records a waiver or has neither `signatureRequired: true` nor the legacy `signatureVerified: true` signal. Reinstall the plugin from its marketplace to establish the current requirement. |
 | `plugin update --source <remote>` rejects an unsigned tree after a local install | The replacement source uses the remote resolver default. Sign the replacement or keep using a local source. |

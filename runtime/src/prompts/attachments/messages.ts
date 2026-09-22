@@ -57,7 +57,7 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
       const planFilePath = sanitizeSystemReminderContent(
         attachment.planFilePath,
       );
-      return userContextMessage(
+      return permissionModeMessage("plan",
         `<system-reminder>\n${planModeBody(attachment.variant, planFilePath, attachment.planExists)}\n</system-reminder>`,
       );
     }
@@ -65,7 +65,7 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
       const planFilePath = sanitizeSystemReminderContent(
         attachment.planFilePath,
       );
-      return userContextMessage(
+      return permissionModeMessage("plan",
         `<system-reminder>\n${planModeReentryBody(planFilePath, attachment.planExists)}\n</system-reminder>`,
       );
     }
@@ -73,7 +73,7 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
       const planFilePath = sanitizeSystemReminderContent(
         attachment.planFilePath,
       );
-      return userContextMessage(
+      return permissionModeMessage("plan_exit",
         `<system-reminder>\n${planModeExitBody(planFilePath, attachment.planExists)}\n</system-reminder>`,
       );
     }
@@ -85,12 +85,12 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
       );
     }
     case "auto_mode": {
-      return userContextMessage(
+      return permissionModeMessage("auto",
         `<system-reminder>\n${autoModeBody(attachment.variant)}\n</system-reminder>`,
       );
     }
     case "auto_mode_exit": {
-      return userContextMessage(
+      return permissionModeMessage("auto_exit",
         `<system-reminder>\n## Exited Auto Mode\n\nYou have exited auto mode. The user may now want to interact more directly. You should ask clarifying questions when the approach is ambiguous rather than making assumptions.\n</system-reminder>`,
       );
     }
@@ -326,11 +326,42 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
     case "skill_listing": {
       const content = sanitizeSystemReminderContent(attachment.content);
       return userContextMessage(
-        wrapSystemReminder(`${SKILL_LISTING_REMINDER_HEADER}\n\n${content}`),
+        wrapSystemReminder(`${SKILL_LISTING_REMINDER_HEADER} ${SKILL_LOADING_GUIDANCE}\n\n${content}`),
       );
+    }
+    case "skill_relevance": {
+      const content = sanitizeSystemReminderContent(attachment.content);
+      return userContextMessage(
+        wrapSystemReminder(`${SKILL_RELEVANCE_REMINDER_HEADER} ${SKILL_LOADING_GUIDANCE}\n\n${content}`),
+      );
+    }
+    case "instruction_update": {
+      const sections: string[] = [];
+      if (attachment.workspaceText !== undefined) {
+        sections.push(
+          `${INSTRUCTION_UPDATE_WORKSPACE_HEADER}\n\n${sanitizeSystemReminderContent(attachment.workspaceText)}`,
+        );
+      }
+      if (attachment.memoryText !== undefined) {
+        sections.push(
+          `${INSTRUCTION_UPDATE_MEMORY_HEADER}\n\n${sanitizeSystemReminderContent(attachment.memoryText)}`,
+        );
+      }
+      if (sections.length === 0) return null;
+      return userContextMessage(wrapSystemReminder(sections.join("\n\n")));
     }
   }
 }
+
+/** Opening sentences of the `instruction_update` reminder. */
+export const INSTRUCTION_UPDATE_WORKSPACE_HEADER =
+  "The workspace instructions changed since this session started. This version replaces the one at the start of the prompt:";
+export const INSTRUCTION_UPDATE_MEMORY_HEADER =
+  "The persistent memory index changed since this session started. This version replaces the one at the start of the prompt:";
+
+/** Opening sentence of the per-request `skill_relevance` reminder. */
+export const SKILL_RELEVANCE_REMINDER_HEADER =
+  "Skills relevant to this request that the listing above did not include.";
 
 /**
  * Opening sentence of the rendered `skill_listing` reminder. The producer
@@ -338,7 +369,20 @@ function renderAttachment(attachment: Attachment): LLMMessage | null {
  * already in front of the model on this request.
  */
 export const SKILL_LISTING_REMINDER_HEADER =
-  "The following skills are available for use with the Skill tool. If a skill matches the user's request, invoke the Skill tool before responding.";
+  "The following skills are available for use with the Skill tool.";
+
+const SKILL_LOADING_GUIDANCE =
+  "If a skill fits, use Skill when it is callable. Otherwise, if system.searchTools is callable, find and select Skill there, then wait for its schema before invoking it. Never call a listed skill name as a tool or invent an unavailable call. A [plugin: id] label identifies the plugin that provides that skill. An @plugin-id mention selects that plugin; use its listed skill names, which may differ from the plugin name. Discover its MCP tools separately with system.searchTools when callable; an empty tool search does not mean its listed skills are unavailable.";
+
+function permissionModeMessage(
+  permissionModeReminder: NonNullable<LLMMessage["runtimeOnly"]>["permissionModeReminder"],
+  text: string,
+): LLMMessage {
+  return {
+    ...userContextMessage(text),
+    runtimeOnly: { mergeBoundary: "user_context", permissionModeReminder },
+  };
+}
 
 function userContextMessage(text: string): LLMMessage {
   return {

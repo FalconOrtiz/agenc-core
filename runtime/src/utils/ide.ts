@@ -1,10 +1,5 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import axios from 'axios'
 import { execa } from 'execa'
-import { createWriteStream } from 'node:fs'
-import { chmod, mkdtemp, rm } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { pipeline } from 'node:stream/promises'
 import capitalize from 'lodash-es/capitalize.js'
 import memoize from 'lodash-es/memoize.js'
 import { createConnection } from 'net'
@@ -47,7 +42,6 @@ import {
 import { sleep } from './sleep.js'
 import { jsonParse } from './slowOperations.js'
 import { getExecutionAuthoritySettings } from './settings/settings.js'
-import { resolveSessionTempRoot } from '../session/runtime-options.js'
 
 function isProcessRunning(pid: number): boolean {
   try {
@@ -133,8 +127,8 @@ type IdeConfig = {
 const supportedIdeConfigs: Record<IdeType, IdeConfig> = {
   cursor: {
     ideKind: 'vscode',
-    displayName: 'Cursor', // branding-scan: allow real editor display name
-    processKeywordsMac: ['Cursor Helper', 'Cursor.app'], // branding-scan: allow real editor process names
+    displayName: 'Cursor',
+    processKeywordsMac: ['Cursor Helper', 'Cursor.app'],
     processKeywordsWindows: ['cursor.exe'],
     processKeywordsLinux: ['cursor'],
   },
@@ -839,11 +833,7 @@ export function hasAccessToIDEExtensionDiffFeature(
 }
 
 const PUBLIC_EXTENSION_ID = 'tetsuo-ai.agenc-code'
-const INTERNAL_EXTENSION_ID = 'tetsuo-ai.agenc-code-internal'
-const EXTENSION_ID =
-  process.env.USER_TYPE === 'ant'
-    ? INTERNAL_EXTENSION_ID
-    : PUBLIC_EXTENSION_ID
+const EXTENSION_ID = PUBLIC_EXTENSION_ID
 
 export async function isIDEExtensionInstalled(
   ideType: IdeType,
@@ -877,9 +867,6 @@ async function installIDEExtension(ideType: IdeType): Promise<string | null> {
     const command = await getVSCodeIDECommand(ideType)
 
     if (command) {
-      if (process.env.USER_TYPE === 'ant') {
-        return await installFromArtifactory(command)
-      }
       let version = await getInstalledVSCodeExtensionVersion(command)
       // If it's not installed or the version is older than the one we have bundled,
       if (!version || lt(version, getAgenCCodeVersion())) {
@@ -971,7 +958,7 @@ function getVSCodeIDECommandByParentProcess(): string | null {
         // Check for known applications and extract the path up to and including .app
         const appNames = {
           'Visual Studio Code.app': 'code',
-          'Cursor.app': 'cursor', // branding-scan: allow real editor bundle name
+          'Cursor.app': 'cursor',
           'Windsurf.app': 'windsurf',
           'Visual Studio Code - Insiders.app': 'code',
           'VSCodium.app': 'codium',
@@ -1076,7 +1063,7 @@ async function detectRunningIDEsImpl(): Promise<IdeType[]> {
     if (platform === 'macos') {
       // On macOS, use ps with process name matching
       const result = await execa(
-        'ps aux | grep -E "Visual Studio Code|Code Helper|Cursor Helper|Windsurf Helper|IntelliJ IDEA|PyCharm|WebStorm|PhpStorm|RubyMine|CLion|GoLand|Rider|DataGrip|AppCode|DataSpell|Aqua|Gateway|Fleet|Android Studio" | grep -v grep', // branding-scan: allow real editor process name
+        'ps aux | grep -E "Visual Studio Code|Code Helper|Cursor Helper|Windsurf Helper|IntelliJ IDEA|PyCharm|WebStorm|PhpStorm|RubyMine|CLion|GoLand|Rider|DataGrip|AppCode|DataSpell|Aqua|Gateway|Fleet|Android Studio" | grep -v grep',
         { shell: true, reject: false },
       )
       const stdout = result.stdout ?? ''
@@ -1091,7 +1078,7 @@ async function detectRunningIDEsImpl(): Promise<IdeType[]> {
     } else if (platform === 'windows') {
       // On Windows, use tasklist with findstr for multiple patterns
       const result = await execa(
-        'tasklist | findstr /I "Code.exe Cursor.exe Windsurf.exe idea64.exe pycharm64.exe webstorm64.exe phpstorm64.exe rubymine64.exe clion64.exe goland64.exe rider64.exe datagrip64.exe appcode.exe dataspell64.exe aqua64.exe gateway64.exe fleet.exe studio64.exe"', // branding-scan: allow real editor process name
+        'tasklist | findstr /I "Code.exe Cursor.exe Windsurf.exe idea64.exe pycharm64.exe webstorm64.exe phpstorm64.exe rubymine64.exe clion64.exe goland64.exe rider64.exe datagrip64.exe appcode.exe dataspell64.exe aqua64.exe gateway64.exe fleet.exe studio64.exe"',
         { shell: true, reject: false },
       )
       const stdout = result.stdout ?? ''
@@ -1194,7 +1181,7 @@ export function getIdeClientName(
 
 const EDITOR_DISPLAY_NAMES: Record<string, string> = {
   code: 'VS Code',
-  cursor: 'Cursor', // branding-scan: allow real editor display name
+  cursor: 'Cursor',
   windsurf: 'Windsurf',
   antigravity: 'Antigravity',
   vi: 'Vim',
@@ -1385,107 +1372,3 @@ const detectHostIP = memoize(
   },
   (isIdeRunningInWindows, port) => `${isIdeRunningInWindows}:${port}`,
 )
-
-async function installFromArtifactory(command: string): Promise<string> {
-  const artifactoryBaseUrl =
-    process.env.AGENC_INTERNAL_ARTIFACTORY_BASE_URL
-  if (!artifactoryBaseUrl) {
-    throw new Error('Internal artifactory base URL is not configured')
-  }
-  const npmrcAuthPrefix = `//${artifactoryBaseUrl.replace(/^https?:\/\//, '')}/api/npm/npm-all/:_authToken=`
-  // Read auth token from ~/.npmrc
-  const npmrcPath = join(homedir(), '.npmrc')
-  let authToken: string | null = null
-  const fs = getFsImplementation()
-
-  try {
-    const npmrcContent = await fs.readFile(npmrcPath, {
-      encoding: 'utf8',
-    })
-    const lines = npmrcContent.split('\n')
-    for (const line of lines) {
-      // Look for the artifactory auth token line
-      if (line.startsWith(npmrcAuthPrefix)) {
-        authToken = line.slice(npmrcAuthPrefix.length).trim()
-        break
-      }
-    }
-  } catch (error) {
-    logError(error as Error)
-    throw new Error(`Failed to read npm authentication: ${error}`)
-  }
-
-  if (!authToken) {
-    throw new Error('No artifactory auth token found in ~/.npmrc')
-  }
-
-  // Fetch the version from artifactory
-  const versionUrl = `${artifactoryBaseUrl}/armorcode-agenc-code-internal/agenc-vscode-releases/stable`
-
-  try {
-    const versionResponse = await axios.get(versionUrl, {
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-      },
-    })
-
-    const version = String(versionResponse.data).trim()
-    if (!version) {
-      throw new Error('No version found in artifactory response')
-    }
-    if (!/^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$/u.test(version)) {
-      throw new Error('Invalid extension version in artifactory response')
-    }
-
-    // Download the .vsix file from artifactory
-    const vsixUrl = `${artifactoryBaseUrl}/armorcode-agenc-code-internal/agenc-vscode-releases/${version}/agenc-code.vsix`
-    const stagingRoot = await mkdtemp(
-      join(resolveSessionTempRoot(), 'agenc-code-vsix-'),
-    )
-
-    try {
-      await chmod(stagingRoot, 0o700)
-      const tempVsixPath = join(stagingRoot, 'agenc-code.vsix')
-      const vsixResponse = await axios.get(vsixUrl, {
-        headers: {
-          Authorization: `Bearer ${authToken}`,
-        },
-        responseType: 'stream',
-      })
-
-      // Write executable extension content only inside the private staging
-      // directory and refuse to replace a pre-existing path.
-      await pipeline(
-        vsixResponse.data,
-        createWriteStream(tempVsixPath, { flags: 'wx', mode: 0o600 }),
-      )
-
-      // Install the .vsix file
-      // Add delay to prevent code command crashes
-      await sleep(500)
-
-      const result = await execFileNoThrowWithCwd(
-        command,
-        ['--force', '--install-extension', tempVsixPath],
-        {
-          env: getInstallationEnv(),
-        },
-      )
-
-      if (result.code !== 0) {
-        throw new Error(`${result.code}: ${result.error} ${result.stderr}`)
-      }
-
-      return version
-    } finally {
-      await rm(stagingRoot, { recursive: true, force: true }).catch(() => {})
-    }
-  } catch (error) {
-    if (axios.isAxiosError(error)) {
-      throw new Error(
-        `Failed to fetch extension version from artifactory: ${error.message}`,
-      )
-    }
-    throw error
-  }
-}

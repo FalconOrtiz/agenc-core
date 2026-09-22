@@ -6,7 +6,9 @@
  * later daemon rows.
  */
 
+import { LiveApprovalBroker } from "./live-approval-broker.js";
 import { spawn, type ChildProcess } from "node:child_process";
+import { enterDaemonWorkingDirectory } from "./daemon-working-directory.js";
 import { randomUUID } from "node:crypto";
 import { createDaemonWorkflowController } from "./workflow/daemon-wiring.js";
 import { DaemonWorkflowStartService } from "./workflow/run-start-service.js";
@@ -17,12 +19,21 @@ import {
   openSync,
   readFileSync,
   statSync,
+  renameSync,
 } from "node:fs";
 import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, isIP } from "node:net";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { resolveHomeContext } from "../config/home.js";
+import { LocalWhisperService } from "../audio/whisper.js";
+import { RemoteService } from "../remote/service.js";
+import { createRemoteBackend } from "../remote/backend.js";
+import { remoteAuthSessionTokenSync } from "../auth/session-state.js";
+import { OwnerTelegramService } from "../gateway/owner-telegram.js";
+import { createOwnerTelegramStorage } from "../gateway/owner-telegram-storage.js";
+import { RemoteError } from "../remote/types.js";
+import { assertSafeRemoteSessionPolicy } from "../remote/session-policy.js";
 import {
   AgenCDaemonAgentManager,
   type AgenCDaemonAgentRunSnapshot,
@@ -54,6 +65,22 @@ import {
   writeDaemonRuntimeInfo,
 } from "./daemon-runtime-info.js";
 import {
+  AGENC_DAEMON_HEARTBEAT_FRESH_MS,
+  AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME,
+  claimAbandonedDaemonHeartbeat,
+  type DaemonHeartbeat,
+  describeAbandonedDaemonExit,
+  describeClaimedDaemonExit,
+  describeUnboundDaemonHeartbeat,
+  heartbeatAgeSeconds,
+  installAgenCDaemonHeartbeat,
+  isDaemonHeartbeatFresh,
+  readAgenCDaemonHeartbeat,
+  reportLastDaemonHeartbeat,
+  resolveAgenCDaemonHeartbeatPath,
+  resolveAgenCDaemonPreviousHeartbeatPath,
+} from "./daemon-heartbeat.js";
+import {
   findLinuxAgenCDaemonProcesses,
   inspectLinuxAgenCDaemonProcess,
   isAgenCDaemonInstanceIdentity,
@@ -73,7 +100,6 @@ import {
   type AgenCRealtimeHeadersProvider,
 } from "./realtime-transport.js";
 import {
-  AGENC_DAEMON_PROTOCOL_VERSION,
   JSON_RPC_VERSION,
   type AgentStatus,
   type AgentToolOutputLog,
@@ -131,16 +157,19 @@ import {
   type AgenCDaemonStartupGuardReceiver,
 } from "./daemon-startup-guard.js";
 import { createPermissionAuditFileLogger } from "../permissions/permission-audit-log.js";
+import { readRecoverableCommandEnvironment } from "./client-env-snapshot.js";
 import { loadCanonicalDaemonConfig } from "../config/repository.js";
 import { resolveProviderBaseURL } from "../config/env.js";
 import {
+  resolveAgentRuntimeOptions,
   resolveSessionTempRootAtIngress,
   validateAgentRuntimeOptions,
   type AgentRuntimeOptions,
 } from "../session/runtime-options.js";
+import { RoutineService } from "../routines/service.js";
+import { createDaemonRoutineExecutor } from "../routines/daemon-executor.js";
 import type { AgenCConfig, AgentRunRetentionConfig } from "../config/schema.js";
-import { CodePredictionService } from "../services/code-prediction/service.js";
-import { BUILT_IN_PROVIDER_BASE_URLS } from "../llm/registry/provider-info.js";
+import { BUILT_IN_PROVIDER_BASE_URLS, resolveBuiltInProviderSlug } from "../llm/registry/provider-info.js";
 import {
   prepareMcpSseServerReconfigurationFromConfig,
   resolveMcpServeDefaults,
@@ -161,6 +190,7 @@ import {
   pruneSessionStateSnapshots,
   pruneTerminalAgentRuns,
   SESSION_SNAPSHOT_HARD_CAP,
+  type RolloutPruningReport,
   type RolloutRetentionPolicy,
 } from "../state/pruning.js";
 import { StateSqliteHealthStatsReader } from "../state/health-stats.js";
@@ -178,6 +208,7 @@ import {
   discoverStateDatabasePaths,
   LOGS_DATABASE_FILENAME,
   openStateDatabasePaths,
+  type StateFreePageReclaim,
   resolveStateDatabasePaths,
   STATE_DATABASE_FILENAME,
   type StateDatabasePaths,
@@ -197,8 +228,9 @@ import {
   type SizeCappedFileLogSink,
 } from "../utils/logger.js";
 import { isRecord } from "../utils/record.js";
+import { logForDebugging } from "../utils/debug.js";
+import { installAgenCDaemonErrorLogSink } from "./daemon-error-log.js";
 import { startHeapWatchdog } from "../services/heapWatchdog/heapWatchdog.js";
-import { workspaceMutationCoordinators } from "../workspace/mutation-coordinator.js";
 
 const AGENC_DAEMON_PID_FILENAME = "daemon.pid";
 const AGENC_DAEMON_COOKIE_FILENAME = "daemon.cookie";
@@ -265,6 +297,10 @@ export const AGENC_DAEMON_WEBSOCKET_PORT_ENV = "AGENC_DAEMON_WEBSOCKET_PORT";
 const AGENC_DAEMON_WEBSOCKET_PATH_ENV = "AGENC_DAEMON_WEBSOCKET_PATH";
 const AGENC_DAEMON_STARTUP_DEBUG_ENV = "TUI_E2E_DEBUG";
 const DEFAULT_DAEMON_REQUEST_TIMEOUT_MS = 2_000;
+// Identity, health, reload and shutdown use the protocol 1.0 control surface
+// (no newer method-capability floor). Older peers must still return the full
+// authenticated instance proof. Session clients negotiate the current version.
+const AGENC_DAEMON_CONTROL_PROTOCOL_VERSION = "1.0.0";
 const DEFAULT_DAEMON_STOP_TIMEOUT_MS = 10_000;
 /**
  * Env override (ms) for how long the daemon readiness waits block, plus the
@@ -312,6 +348,36 @@ export function resolveAgenCDaemonReadyTimeoutMs(
   return DEFAULT_DAEMON_READY_TIMEOUT_MS;
 }
 
+/**
+ * Env override (ms) for the total time `daemon start` keeps waiting for a
+ * spawned daemon that is still hydrating past the readiness budget.
+ */
+export const AGENC_DAEMON_START_MAX_WAIT_MS_ENV =
+  "AGENC_DAEMON_START_MAX_WAIT_MS";
+
+/**
+ * Bound for that extended wait. A home with hundreds of sessions takes longer
+ * than {@link DEFAULT_DAEMON_READY_TIMEOUT_MS} to open its state and recover
+ * its runs (observed: 60 s for 877 sessions). Cancelling such a daemon at the
+ * deadline and letting the caller start another one produced a loop in which
+ * no daemon ever finished starting. While the startup log keeps advancing the
+ * wait continues, in readiness-budget steps, up to this total.
+ */
+export const DEFAULT_DAEMON_START_MAX_WAIT_MS = 600_000;
+
+export function resolveAgenCDaemonStartMaxWaitMs(
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const envValue = env[AGENC_DAEMON_START_MAX_WAIT_MS_ENV];
+  if (envValue !== undefined && envValue.trim().length > 0) {
+    const parsed = Number(envValue);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return DEFAULT_DAEMON_START_MAX_WAIT_MS;
+}
+
 const DEFAULT_DAEMON_WEBSOCKET_URL = new URL(
   AGENC_PORTAL_DEFAULT_LOCAL_DAEMON_ENDPOINT,
 );
@@ -319,6 +385,11 @@ const DEFAULT_DAEMON_WEBSOCKET_URL = new URL(
 // ceiling. Startup cancellation checkpoints bracket that query and every
 // other slow phase, so the parent allowance includes bounded cleanup margin.
 const AGENC_DAEMON_STARTUP_CANCELLATION_TIMEOUT_MS = 60_000;
+// A daemon whose startup was cancelled has served nobody, so its cleanup only
+// has to be safe, not complete: each task gets this long before the run moves
+// on. Without the bound one hung task kept a cancelled daemon alive for eight
+// minutes while every autostart refused to replace it (#2232).
+const AGENC_DAEMON_STARTUP_CANCEL_CLEANUP_TASK_TIMEOUT_MS = 5_000;
 export const AGENC_DAEMON_WEBSOCKET_DEFAULT_HOST =
   DEFAULT_DAEMON_WEBSOCKET_URL.hostname;
 export const AGENC_DAEMON_WEBSOCKET_DEFAULT_PORT = Number(
@@ -368,12 +439,20 @@ export interface AgenCDaemonCliHost {
 export interface RunAgenCDaemonCliOptions {
   readonly io?: AgenCDaemonCliIo;
   readonly host?: AgenCDaemonCliHost;
+  /**
+   * Make a foreground daemon work from its home instead of the caller's
+   * directory (#2149). Set by the real CLI entry; library callers and tests
+   * that run the daemon inside their own process leave it unset.
+   */
+  readonly enterDaemonHome?: boolean;
   readonly signalProcess?: AgenCSignalProcess;
   readonly beforeDaemonReady?: () => void | Promise<void>;
   /** @internal Reload/shutdown interposition contract-test seam. */
   readonly beforeDaemonReloadAdoption?: () => void | Promise<void>;
   /** @internal Deterministic lifecycle-cleanup interposition test seam. */
   readonly beforeDaemonAuthorityCleanup?: () => void | Promise<void>;
+  /** Test seam: per-task bound for the cleanup of a cancelled startup. */
+  readonly startupCancelCleanupTaskTimeoutMs?: number;
   readonly runner?: AgenCBackgroundAgentRunner;
   readonly nativePeerCredentialBinding?: AgenCNativePeerCredentialBinding;
   readonly nativePeerCredentialAddonPath?: string;
@@ -453,10 +532,15 @@ export interface AgenCDaemonWebSocketListenOptions {
 export class AgenCDaemonRpcShutdownCoordinator {
   #pendingAcknowledgements = 0;
   #completed = false;
-  readonly #onAcknowledgementFlushed: () => void;
+  readonly #onShutdownReady: () => void;
+  readonly #acknowledgementTimeoutMs: number;
 
-  constructor(onAcknowledgementFlushed: () => void) {
-    this.#onAcknowledgementFlushed = onAcknowledgementFlushed;
+  constructor(onShutdownReady: () => void, acknowledgementTimeoutMs = 5_000) {
+    if (!Number.isSafeInteger(acknowledgementTimeoutMs) || acknowledgementTimeoutMs <= 0) {
+      throw new TypeError("daemon shutdown acknowledgement timeout must be a positive integer");
+    }
+    this.#onShutdownReady = onShutdownReady;
+    this.#acknowledgementTimeoutMs = acknowledgementTimeoutMs;
   }
 
   get blocksRequests(): boolean {
@@ -480,24 +564,45 @@ export class AgenCDaemonRpcShutdownCoordinator {
       message.method === "daemon.shutdown" &&
       !isDaemonErrorResponse(response) &&
       this.#pendingAcknowledgements > 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await send(response);
+      const sending = send(response);
+      if (acceptedShutdown) {
+        await Promise.race([
+          sending,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error(
+              `daemon shutdown acknowledgement exceeded ${this.#acknowledgementTimeoutMs} ms`,
+            )), this.#acknowledgementTimeoutMs);
+          }),
+        ]);
+      } else {
+        await sending;
+      }
     } catch (error) {
       if (acceptedShutdown && !this.#completed) {
-        // Release only this response's acceptance. Another concurrent
-        // acknowledgement remains counted and continues to block requests.
+        // Shutdown acceptance already fenced daemon ingress and cannot be
+        // rolled back by a disconnected requester. Give any other pending
+        // acknowledgement its flush opportunity; if none remain, clean up
+        // even though every requester lost its connection.
         this.#pendingAcknowledgements -= 1;
+        if (this.#pendingAcknowledgements === 0) {
+          this.#completed = true;
+          this.#onShutdownReady();
+        }
       }
       throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
     if (!acceptedShutdown || this.#completed) return;
 
     // The transport's write callback is the causal flush barrier. Cleanup
-    // cannot begin before at least one authenticated acknowledgement reaches
-    // it, and a failed concurrent send cannot reopen a completed shutdown.
+    // waits for an acknowledgement to reach it or for all sends to fail. A
+    // failed concurrent send cannot reopen a completed shutdown.
     this.#pendingAcknowledgements -= 1;
     this.#completed = true;
-    this.#onAcknowledgementFlushed();
+    this.#onShutdownReady();
   }
 }
 
@@ -649,6 +754,47 @@ export function resolveAgenCDaemonCookiePath(
  */
 export const AGENC_DAEMON_SPAWN_STDERR_FILENAME = "daemon-spawn-stderr.log";
 
+/**
+ * The previous spawn's stderr capture. Each spawn moves the current file here
+ * before it opens a fresh one, so a daemon that died silently and was
+ * replaced by an autostart three seconds later still leaves its last words
+ * on disk instead of having them truncated by the spawn that replaced it.
+ */
+export const AGENC_DAEMON_SPAWN_STDERR_PREVIOUS_FILENAME =
+  "daemon-spawn-stderr.prev.log";
+
+export function resolveAgenCDaemonSpawnStderrPreviousPath(
+  env: NodeJS.ProcessEnv = process.env,
+  userHome = homedir(),
+): string {
+  return join(
+    resolveAgenCDaemonHome(env, userHome),
+    AGENC_DAEMON_SPAWN_STDERR_PREVIOUS_FILENAME,
+  );
+}
+
+/**
+ * Open the stderr capture for a daemon spawn: keep the previous capture as
+ * the `.prev.log` sibling, then open the current path truncated. Best-effort:
+ * a failure to keep or to open returns `"ignore"` and the spawn proceeds
+ * without the capture, as before.
+ */
+export function openDaemonSpawnStderrCapture(
+  path: string,
+  previousPath: string,
+): number | "ignore" {
+  try {
+    renameSync(path, previousPath);
+  } catch {
+    /* no previous capture, or it cannot be kept; the current one still opens */
+  }
+  try {
+    return openSync(path, "w", 0o600);
+  } catch {
+    return "ignore";
+  }
+}
+
 export function resolveAgenCDaemonSpawnStderrPath(
   env: NodeJS.ProcessEnv = process.env,
   userHome = homedir(),
@@ -657,6 +803,31 @@ export function resolveAgenCDaemonSpawnStderrPath(
     resolveAgenCDaemonHome(env, userHome),
     AGENC_DAEMON_SPAWN_STDERR_FILENAME,
   );
+}
+
+/**
+ * Milliseconds since the daemon last wrote to a startup log (the spawn stderr
+ * capture or the daemon log), or undefined when neither file exists. A daemon
+ * that is hydrating writes to one of them every few seconds; a hung one goes
+ * quiet.
+ */
+function daemonStartupLogAgeMs(
+  host: AgenCDaemonCliHost,
+  now = Date.now(),
+): number | undefined {
+  let latest: number | undefined;
+  for (const path of [
+    resolveAgenCDaemonSpawnStderrPath(host.env, host.userHome),
+    resolveAgenCDaemonLogPath(host.env, host.userHome),
+  ]) {
+    try {
+      const { mtimeMs } = statSync(path);
+      if (latest === undefined || mtimeMs > latest) latest = mtimeMs;
+    } catch {
+      /* a missing capture is no evidence either way */
+    }
+  }
+  return latest === undefined ? undefined : Math.max(0, now - latest);
 }
 
 const DAEMON_SPAWN_STDERR_TAIL_BYTES = 2_048;
@@ -785,6 +956,79 @@ export function installAgenCDaemonLogSink(options: {
       target.debug = original.debug;
       sink.close();
     },
+  };
+}
+
+type DaemonExitDiagnosticsProcess = Pick<NodeJS.Process, "on" | "off" | "pid" | "kill">;
+
+const DAEMON_EXIT_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
+
+/**
+ * Record how the detached daemon's process ends, in its own log, before the
+ * process is gone.
+ *
+ * The soak saw a daemon exit mid-turn with no line in `daemon.log`, no crash
+ * report and nothing in the system log; the app autostarted a replacement in
+ * three seconds and the only trace was a turn that ended with "connection
+ * closed" (#2199). Node prints an uncaught exception to stderr and dies on a
+ * signal without a word; neither reaches the log sink. This writes one line
+ * for each: the exit code on `exit`, the signal on SIGTERM/SIGINT/SIGHUP
+ * (then re-raised so the default termination and its exit code stand), and
+ * the error with its stack on an uncaught exception or unhandled rejection
+ * (then exit 1, as node would). Writes never throw: a sink already closed by
+ * cleanup swallows the line rather than failing the exit.
+ */
+export function installAgenCDaemonExitDiagnostics(options: {
+  readonly sink: Pick<SizeCappedFileLogSink, "write">;
+  readonly proc?: DaemonExitDiagnosticsProcess;
+  readonly now?: () => string;
+  readonly exit?: (code: number) => void;
+}): () => void {
+  const proc = options.proc ?? (process as DaemonExitDiagnosticsProcess);
+  const now = options.now ?? (() => new Date().toISOString());
+  const exit = options.exit ?? ((code: number) => process.exit(code));
+  const line = (text: string): void => {
+    try {
+      options.sink.write(`agenc: daemon ${text} (pid ${proc.pid}) at ${now()}\n`);
+    } catch {
+      /* the sink may already be closed; the exit must not fail on its own log */
+    }
+  };
+  const describe = (thrown: unknown): string =>
+    thrown instanceof Error ? (thrown.stack ?? thrown.message) : String(thrown);
+  const onExit = (code: number): void => line(`process exit code=${code}`);
+  const onUncaught = (error: unknown): void => {
+    line(`uncaught exception: ${describe(error)}`);
+    exit(1);
+  };
+  const onRejection = (reason: unknown): void => {
+    line(`unhandled rejection: ${describe(reason)}`);
+    exit(1);
+  };
+  const signalHandlers = new Map<NodeJS.Signals, () => void>();
+  const removeSignalHandlers = (): void => {
+    for (const [signal, handler] of signalHandlers) proc.off(signal, handler);
+    signalHandlers.clear();
+  };
+  for (const signal of DAEMON_EXIT_SIGNALS) {
+    const handler = (): void => {
+      line(`received ${signal}`);
+      // Re-raise with our handlers gone so the default termination, and the
+      // exit code that goes with it, stands.
+      removeSignalHandlers();
+      proc.kill(proc.pid, signal);
+    };
+    signalHandlers.set(signal, handler);
+    proc.on(signal, handler);
+  }
+  proc.on("exit", onExit);
+  proc.on("uncaughtException", onUncaught);
+  proc.on("unhandledRejection", onRejection);
+  return () => {
+    removeSignalHandlers();
+    proc.off("exit", onExit);
+    proc.off("uncaughtException", onUncaught);
+    proc.off("unhandledRejection", onRejection);
   };
 }
 
@@ -924,10 +1168,12 @@ async function runAgenCDaemonAction(
     }
     case "run":
       return runAgenCDaemonForeground(host, io, {
+        enterDaemonHome: options.enterDaemonHome,
         signalProcess: options.signalProcess,
         beforeDaemonReady: options.beforeDaemonReady,
         beforeDaemonReloadAdoption: options.beforeDaemonReloadAdoption,
         beforeDaemonAuthorityCleanup: options.beforeDaemonAuthorityCleanup,
+        startupCancelCleanupTaskTimeoutMs: options.startupCancelCleanupTaskTimeoutMs,
         runner: options.runner,
         nativePeerCredentialBinding: options.nativePeerCredentialBinding,
         nativePeerCredentialAddonPath: options.nativePeerCredentialAddonPath,
@@ -1322,7 +1568,32 @@ async function startAgenCDaemon(
   const targetPid = decision.pid;
   const waitForReady =
     options.waitForDaemonReady ?? defaultWaitForAgenCDaemonReady;
-  const ready = await waitForReady(host, false);
+  let ready = await waitForReady(host, false);
+  if (!ready) {
+    // A daemon that is alive and still writing its startup log at the
+    // deadline is hydrating, not hung. Keep waiting in readiness-budget
+    // steps while the log advances, up to DEFAULT_DAEMON_START_MAX_WAIT_MS;
+    // a quiet log or a dead pid falls through to the failure path below.
+    const budgetMs = resolveAgenCDaemonReadyTimeoutMs(host.env);
+    const extensions = Math.max(
+      0,
+      Math.ceil(resolveAgenCDaemonStartMaxWaitMs(host.env) / budgetMs) - 1,
+    );
+    for (
+      let extension = 1;
+      !ready && extension <= extensions && host.isPidRunning(targetPid);
+      extension += 1
+    ) {
+      const ageMs = daemonStartupLogAgeMs(host);
+      if (ageMs === undefined || ageMs > budgetMs) break;
+      io.stderr.write(
+        `agenc: daemon process (pid ${targetPid}) is still starting; its ` +
+          `startup log advanced ${Math.round(ageMs / 1000)} s ago, waiting ` +
+          `another ${Math.round(budgetMs / 1000)} s (${extension}/${extensions})\n`,
+      );
+      ready = await waitForReady(host, false);
+    }
+  }
   if (!ready) {
     const wasRunning = host.isPidRunning(targetPid);
     if (wasRunning) {
@@ -1630,10 +1901,12 @@ async function stopAgenCDaemon(
               }
             }
           } catch (error) {
-            io.stderr.write(
-              `agenc: refusing Linux numeric shutdown for pid ${boundPid} because its authenticated instance could not be rebound: ${formatCleanupError(error)}\n`,
-            );
-            return 1;
+            if (!(await waitForBoundPidExit(host, bound.process, 0))) {
+              io.stderr.write(
+                `agenc: refusing Linux numeric shutdown for pid ${boundPid} because its authenticated instance could not be rebound: ${formatCleanupError(error)}\n`,
+              );
+              return 1;
+            }
           }
         }
         await lifecycle.acquire();
@@ -1788,6 +2061,15 @@ async function stopAgenCDaemon(
       ) {
         removeDaemonRuntimeInfo(runtimeInfoPath, runtimeInfo.instanceId);
       }
+    }
+    if (
+      !reportLastDaemonHeartbeat(
+        io,
+        resolveAgenCDaemonHeartbeatPath(daemonHome),
+        pid,
+      )
+    ) {
+      reportKeptDaemonExit(io, daemonHome);
     }
     io.stdout.write(`AgenC daemon stopped (pid ${pid})\n`);
     return 0;
@@ -1961,6 +2243,76 @@ async function waitForBoundPidExit(
   return processStart === null || processStart !== expected.processStart;
 }
 
+/**
+ * The spawn capture that belongs to this exit, or null. Every spawn rotates
+ * the capture but only an unexplained exit rotates the heartbeat, so the two
+ * agree at the autostart that replaced the dead daemon and drift apart at the
+ * next restart. A capture written after the dead daemon's last beat is a later
+ * spawn's, and naming it here would send an operator to the wrong file.
+ */
+function spawnStderrCaptureOfExit(
+  heartbeat: DaemonHeartbeat,
+  path: string,
+): string | null {
+  let writtenAtMs: number;
+  try {
+    writtenAtMs = statSync(path).mtimeMs;
+  } catch {
+    return null; // never captured, or already cleaned up
+  }
+  // The dead daemon stopped writing when it died, which is its last beat plus
+  // at most the beats it never sent.
+  const lastItCouldHaveWrittenMs =
+    Date.parse(heartbeat.at) + AGENC_DAEMON_HEARTBEAT_FRESH_MS;
+  return writtenAtMs <= lastItCouldHaveWrittenMs ? path : null;
+}
+
+/**
+ * The unexplained exit the running daemon replaced, kept until it is
+ * diagnosed. The heartbeat says what the dead process last reported about
+ * itself; the spawn capture holds whatever it managed to write to stderr.
+ */
+function reportReplacedDaemonExit(
+  host: AgenCDaemonCliHost,
+  io: AgenCDaemonCliIo,
+): void {
+  const daemonHome = resolveAgenCDaemonHome(host.env, host.userHome);
+  const previousPath = resolveAgenCDaemonPreviousHeartbeatPath(daemonHome);
+  const heartbeat = readAgenCDaemonHeartbeat(previousPath);
+  if (heartbeat === null) return;
+  io.stdout.write(
+    `  replaced: ${describeAbandonedDaemonExit(heartbeat, Date.now())}\n`,
+  );
+  const spawnStderrPath = spawnStderrCaptureOfExit(
+    heartbeat,
+    resolveAgenCDaemonSpawnStderrPreviousPath(host.env, host.userHome),
+  );
+  io.stdout.write(
+    `  evidence: ${previousPath}` +
+      `${spawnStderrPath === null ? "" : `, ${spawnStderrPath}`} ` +
+      `(remove ${AGENC_DAEMON_PREVIOUS_HEARTBEAT_FILENAME} once the exit is diagnosed)\n`,
+  );
+}
+
+/**
+ * The kept exit, for the branches that report a daemon which is not running.
+ * They read the live heartbeat path, which the claim empties, so a daemon that
+ * was replaced and then stopped or died without beating would otherwise leave
+ * those branches with nothing to say (#2199).
+ */
+function reportKeptDaemonExit(
+  io: AgenCDaemonCliIo,
+  daemonHome: string,
+): boolean {
+  const keptPath = resolveAgenCDaemonPreviousHeartbeatPath(daemonHome);
+  const heartbeat = readAgenCDaemonHeartbeat(keptPath);
+  if (heartbeat === null) return false;
+  io.stderr.write(
+    `agenc: ${describeClaimedDaemonExit({ heartbeat, keptPath }, Date.now())}\n`,
+  );
+  return true;
+}
+
 async function statusAgenCDaemon(
   host: AgenCDaemonCliHost,
   io: AgenCDaemonCliIo,
@@ -2000,18 +2352,49 @@ async function statusAgenCDaemon(
         : pidSnapshot !== null && host.isPidRunning(pidSnapshot)
           ? pidSnapshot
           : null;
+    const daemonHome = resolveAgenCDaemonHome(host.env, host.userHome);
+    const heartbeatPath = resolveAgenCDaemonHeartbeatPath(daemonHome);
     if (legacyPid === null) {
       const socketPath = resolveAgenCDaemonSocketPath(host.env, host.userHome);
       if (await canConnectToUnixSocket(socketPath)) {
+        // A daemon that is serving but has not committed its identity yet
+        // (still recovering its agent runs) is beating; say so instead of
+        // leaving the operator with "indeterminate" (#2225).
+        const heartbeat = readAgenCDaemonHeartbeat(heartbeatPath);
+        const nowMs = Date.now();
+        if (
+          heartbeat !== null &&
+          host.isPidRunning(heartbeat.pid) &&
+          isDaemonHeartbeatFresh(heartbeat, nowMs)
+        ) {
+          io.stdout.write(describeUnboundDaemonHeartbeat(heartbeat, nowMs));
+          return 1;
+        }
         io.stderr.write(
           "agenc: daemon control socket is active but no process identity is recorded; status is indeterminate\n",
         );
         return 1;
       }
+      if (!reportLastDaemonHeartbeat(io, heartbeatPath, null)) {
+        reportKeptDaemonExit(io, daemonHome);
+      }
       io.stdout.write("AgenC daemon stopped\n");
       return 1;
     }
     if ((host.platform ?? process.platform) !== "linux") {
+      const heartbeat = readAgenCDaemonHeartbeat(heartbeatPath);
+      if (heartbeat !== null && heartbeat.pid === legacyPid) {
+        const nowMs = Date.now();
+        if (isDaemonHeartbeatFresh(heartbeat, nowMs)) {
+          io.stdout.write(describeUnboundDaemonHeartbeat(heartbeat, nowMs));
+          return 1;
+        }
+        io.stderr.write(
+          `agenc: daemon status is indeterminate for unbound pid ${legacyPid}; ` +
+            `its last heartbeat is ${heartbeatAgeSeconds(heartbeat, nowMs)} s old (at ${heartbeat.at}), so the process may be hung\n`,
+        );
+        return 1;
+      }
       io.stderr.write(
         `agenc: daemon status is indeterminate for unbound pid ${legacyPid}; no portable instance identity is available\n`,
       );
@@ -2075,6 +2458,25 @@ async function statusAgenCDaemon(
       // Leave the pid-only line in place; the daemon is up but health.stats
       // is unavailable (older daemon, missing cookie, socket race, timeout).
     }
+    // The project state databases are read from disk, not over the socket, so
+    // their footprint is reported even when health.stats is unavailable. A
+    // database that keeps growing is how a long-lived home gets slow to start
+    // and heavy to recover (#2228); this line makes that growth visible.
+    try {
+      const databasesLine = formatAgenCDaemonStateDatabasesLine(
+        measureAgenCDaemonStateDatabases(
+          resolveAgenCDaemonHome(host.env, host.userHome),
+        ),
+      );
+      if (databasesLine !== null) io.stdout.write(`${databasesLine}\n`);
+    } catch {
+      // A projects directory that cannot be listed is not a status failure.
+    }
+    // The autostart hides the event: the app reconnects within seconds and the
+    // user's only trace is a turn that ended with connection closed. Status is
+    // where they can still learn that a daemon was replaced, and where its
+    // last words are (#2199).
+    reportReplacedDaemonExit(host, io);
     return 0;
   }
   io.stdout.write("AgenC daemon stopped\n");
@@ -2100,8 +2502,8 @@ async function requestAgenCDaemonHealthStats(
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: AGENC_DAEMON_PROTOCOL_VERSION,
-          protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION },
+          protocolVersion: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION,
+          protocol: { version: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION },
           clientName: "agenc-daemon-cli",
           authCookie,
           capabilities: {},
@@ -2162,8 +2564,8 @@ export async function requestAgenCDaemonInstanceIdentity(
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: AGENC_DAEMON_PROTOCOL_VERSION,
-          protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION },
+          protocolVersion: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION,
+          protocol: { version: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION },
           clientName: "agenc-daemon-instance-probe",
           authCookie,
           capabilities: {},
@@ -2207,8 +2609,8 @@ export async function requestAgenCDaemonShutdown(
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: AGENC_DAEMON_PROTOCOL_VERSION,
-          protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION },
+          protocolVersion: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION,
+          protocol: { version: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION },
           clientName: "agenc-daemon-shutdown",
           authCookie,
           capabilities: {},
@@ -2221,6 +2623,9 @@ export async function requestAgenCDaemonShutdown(
         params: { instanceId: expected.instanceId },
       },
     ],
+    (response, responseIndex) => {
+      if (responseIndex === 0) assertDaemonInstanceBeforeControl(response, expected, "shutdown");
+    },
   );
   const initializeResponse = responses[0];
   if (initializeResponse === undefined) {
@@ -2229,20 +2634,6 @@ export async function requestAgenCDaemonShutdown(
   assertExpectedDaemonResponse(initializeResponse, 1, "initialize");
   if (isDaemonErrorResponse(initializeResponse)) {
     throw new Error(initializeResponse.error.message);
-  }
-  const observed = (
-    initializeResponse as AgenCDaemonSuccessResponse<"initialize">
-  ).result.daemonIdentity;
-  if (
-    !isAgenCDaemonInstanceIdentity(observed) ||
-    observed.instanceId !== expected.instanceId ||
-    observed.pid !== expected.pid ||
-    observed.processStart !== expected.processStart ||
-    observed.runtimeVersion !== expected.runtimeVersion ||
-    observed.commit !== expected.commit ||
-    observed.buildTime !== expected.buildTime
-  ) {
-    throw new Error("daemon instance changed before shutdown");
   }
   const shutdownResponse = responses[1];
   if (shutdownResponse === undefined) {
@@ -2260,6 +2651,19 @@ export async function requestAgenCDaemonShutdown(
     result.instanceId !== expected.instanceId
   ) {
     throw new Error("daemon returned a malformed shutdown acknowledgement");
+  }
+}
+
+function assertDaemonInstanceBeforeControl(
+  response: AgenCDaemonResponse,
+  expected: AgenCDaemonInstanceIdentity,
+  action: "shutdown" | "reload",
+): void {
+  assertExpectedDaemonResponse(response, 1, "initialize");
+  if (isDaemonErrorResponse(response)) throw new Error(response.error.message);
+  const observed = (response as AgenCDaemonSuccessResponse<"initialize">).result.daemonIdentity;
+  if (!isAgenCDaemonInstanceIdentity(observed) || !sameAgenCDaemonInstanceIdentity(observed, expected)) {
+    throw new Error(`daemon instance changed before ${action}`);
   }
 }
 
@@ -2282,6 +2686,60 @@ export function formatAgenCDaemonHealthStatsLines(
     );
   }
   return lines;
+}
+
+export interface AgenCDaemonStateDatabaseFootprint {
+  /** Projects whose state database (plus WAL) occupies any bytes on disk. */
+  readonly projects: number;
+  readonly totalBytes: number;
+  readonly largestBytes: number;
+  /** Project directory name of the largest database, when there is one. */
+  readonly largestProject: string | null;
+}
+
+function fileSizeOrZero(path: string): number {
+  return statSync(path, { throwIfNoEntry: false })?.size ?? 0;
+}
+
+/**
+ * Sum every project's state database and its WAL under `<home>/projects`.
+ * Read from disk so `status` can report it without the daemon's help.
+ */
+export function measureAgenCDaemonStateDatabases(
+  daemonHome: string,
+  sizeOf: (path: string) => number = fileSizeOrZero,
+): AgenCDaemonStateDatabaseFootprint {
+  let projects = 0;
+  let totalBytes = 0;
+  let largestBytes = 0;
+  let largestProject: string | null = null;
+  for (const paths of discoverStateDatabasePaths(daemonHome)) {
+    const bytes =
+      sizeOf(paths.stateDbPath) + sizeOf(`${paths.stateDbPath}-wal`);
+    if (bytes === 0) continue;
+    projects += 1;
+    totalBytes += bytes;
+    if (bytes > largestBytes) {
+      largestBytes = bytes;
+      largestProject = basename(paths.projectDir);
+    }
+  }
+  return { projects, totalBytes, largestBytes, largestProject };
+}
+
+/** The status line for the footprint, or null when no project has a database. */
+export function formatAgenCDaemonStateDatabasesLine(
+  footprint: AgenCDaemonStateDatabaseFootprint,
+): string | null {
+  if (footprint.projects === 0) return null;
+  const largest =
+    footprint.largestProject === null
+      ? ""
+      : ` (largest ${formatDaemonMebibytes(footprint.largestBytes)}: ${footprint.largestProject})`;
+  return (
+    `  databases: ${footprint.projects} project state DB(s), ` +
+    `${formatDaemonMebibytes(footprint.totalBytes)} on disk${largest}`
+  );
 }
 
 function formatDaemonUptime(uptimeMs: number): string {
@@ -2435,8 +2893,8 @@ async function requestAgenCDaemonReload(
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: AGENC_DAEMON_PROTOCOL_VERSION,
-          protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION },
+          protocolVersion: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION,
+          protocol: { version: AGENC_DAEMON_CONTROL_PROTOCOL_VERSION },
           clientName: "agenc-daemon-cli",
           authCookie,
           capabilities: {},
@@ -2450,19 +2908,7 @@ async function requestAgenCDaemonReload(
       },
     ],
     (response, responseIndex) => {
-      if (responseIndex !== 0) return;
-      assertExpectedDaemonResponse(response, 1, "initialize");
-      if (isDaemonErrorResponse(response)) {
-        throw new Error(response.error.message);
-      }
-      const observed = (response as AgenCDaemonSuccessResponse<"initialize">)
-        .result.daemonIdentity;
-      if (
-        !isAgenCDaemonInstanceIdentity(observed) ||
-        !sameAgenCDaemonInstanceIdentity(observed, expected)
-      ) {
-        throw new Error("daemon instance changed before reload");
-      }
+      if (responseIndex === 0) assertDaemonInstanceBeforeControl(response, expected, "reload");
     },
   );
   const initializeResponse = responses[0];
@@ -2588,10 +3034,12 @@ async function runAgenCDaemonForeground(
   host: AgenCDaemonCliHost,
   io: AgenCDaemonCliIo,
   options: {
+    readonly enterDaemonHome?: boolean;
     readonly signalProcess?: AgenCSignalProcess;
     readonly beforeDaemonReady?: () => void | Promise<void>;
     readonly beforeDaemonReloadAdoption?: () => void | Promise<void>;
     readonly beforeDaemonAuthorityCleanup?: () => void | Promise<void>;
+    readonly startupCancelCleanupTaskTimeoutMs?: number;
     readonly runner?: AgenCBackgroundAgentRunner;
     readonly nativePeerCredentialBinding?: AgenCNativePeerCredentialBinding;
     readonly nativePeerCredentialAddonPath?: string;
@@ -2604,6 +3052,14 @@ async function runAgenCDaemonForeground(
   } = {},
 ): Promise<number> {
   const startupStartedAt = Date.now();
+  // Leave the caller's directory before anything else: it may not outlive
+  // this process, and a dead cwd breaks every later child spawn (#2149).
+  if (options.enterDaemonHome === true) {
+    enterDaemonWorkingDirectory(
+      resolveAgenCDaemonHome(host.env, host.userHome),
+      io,
+    );
+  }
   writeAgenCDaemonStartupDebug(
     host,
     io,
@@ -2658,6 +3114,7 @@ async function runAgenCDaemonForegroundLocked(
     readonly beforeDaemonReady?: () => void | Promise<void>;
     readonly beforeDaemonReloadAdoption?: () => void | Promise<void>;
     readonly beforeDaemonAuthorityCleanup?: () => void | Promise<void>;
+    readonly startupCancelCleanupTaskTimeoutMs?: number;
     readonly runner?: AgenCBackgroundAgentRunner;
     readonly nativePeerCredentialBinding?: AgenCNativePeerCredentialBinding;
     readonly nativePeerCredentialAddonPath?: string;
@@ -2957,21 +3414,16 @@ async function runAgenCDaemonForegroundLocked(
     cleanup.register("daemon-thread-store", async () => {
       threadStore.close();
     });
-    let codePrediction: CodePredictionService | undefined;
-    const sessionManager = new AgenCDaemonSessionManager({
-      threadStore,
-      onSessionTerminated: (sessionId) =>
-        codePrediction?.disposeSession(sessionId),
-    });
+    const sessionManager = new AgenCDaemonSessionManager({ threadStore });
     // Forward declaration: set once the connection registry below exists. Lets
     // the multiplexer ask the transport to tear down a slow consumer's socket
     // when that client's pending delivery backlog trips the per-client cap.
     let destroyEvictedClientConnection:
-      ((clientId: string) => void) | undefined;
+      ((clientId: string, deliveryKey?: string) => void) | undefined;
     const clientMultiplexer = new AgenCDaemonClientMultiplexer({
       sessionManager,
-      onClientEvicted: (clientId) => {
-        destroyEvictedClientConnection?.(clientId);
+      onClientEvicted: (clientId, deliveryKey) => {
+        destroyEvictedClientConnection?.(clientId, deliveryKey);
       },
     });
     const commandExec = new AgenCCommandExecService({
@@ -2979,9 +3431,10 @@ async function runAgenCDaemonForegroundLocked(
       sessionTempRoot: resolveSessionTempRootAtIngress(host.env),
       allowGpu: activeConfig.sandbox?.allow_gpu === true,
     });
-    cleanup.register("daemon-command-exec", async () => {
+    const closeCommandExec = async () => {
       await commandExec.closeAll("daemon_shutdown");
-    });
+    };
+    const unregisterCommandExecCleanup = cleanup.register("daemon-command-exec", closeCommandExec);
     const csvAgentJobsRepositories = new CsvAgentJobsRepositoryAuthority({
       agencHome: authStartup.daemonHome,
     });
@@ -3030,6 +3483,22 @@ async function runAgenCDaemonForegroundLocked(
       executionAdmissionKernel.close();
     });
     if (host.startupGuardReceiver?.wasRequested() === true) return 1;
+    // Claimed before the heartbeat below writes its first beat: the daemon
+    // this one replaced left its last state there, and overwriting it was how
+    // an exit nothing else recorded became undiagnosable (#2199).
+    const replacedDaemonHome = resolveAgenCDaemonHome(host.env, host.userHome);
+    const replacedDaemon = claimAbandonedDaemonHeartbeat({
+      path: resolveAgenCDaemonHeartbeatPath(replacedDaemonHome),
+      previousPath: resolveAgenCDaemonPreviousHeartbeatPath(replacedDaemonHome),
+      pid: host.pid,
+      isPidRunning: (pid) => host.isPidRunning(pid),
+    });
+    let writeErrorLog = (line: string): void => {
+      io.stderr.write(line);
+    };
+    let writeErrorDebugLog = (line: string): void => {
+      logForDebugging(line);
+    };
     // Only the spawned, detached daemon (AGENC_DAEMON_RUN=1) redirects console
     // output into the size-capped rotating sink; a `--foreground` invocation run
     // directly by a user keeps writing to the inherited terminal.
@@ -3038,12 +3507,44 @@ async function runAgenCDaemonForegroundLocked(
         path: resolveAgenCDaemonLogPath(host.env, host.userHome),
       });
       if (logSink !== null) {
+        writeErrorLog = (line) => logSink.sink.write(line);
+        writeErrorDebugLog = writeErrorLog;
+        const disposeExitDiagnostics = installAgenCDaemonExitDiagnostics({
+          sink: logSink.sink,
+        });
         cleanup.register("daemon-log-sink", () => {
+          disposeExitDiagnostics();
           logSink.dispose();
         });
       }
+      // The heartbeat outlives every handler: a daemon killed without warning
+      // leaves its last pid, memory and event-loop lag on disk for `status`.
+      const disposeHeartbeat = installAgenCDaemonHeartbeat({
+        path: resolveAgenCDaemonHeartbeatPath(
+          resolveAgenCDaemonHome(host.env, host.userHome),
+        ),
+        onError: (error) => {
+          logSink?.sink.write(
+            `agenc: daemon heartbeat write failed: ${formatCleanupError(error)}\n`,
+          );
+        },
+      });
+      cleanup.register("daemon-heartbeat", disposeHeartbeat);
     }
+    // daemon.log appends across daemons, so this is the durable record that a
+    // daemon was replaced; a foreground run writes it to its terminal instead.
+    if (replacedDaemon !== null) {
+      writeErrorLog(
+        `agenc: ${describeClaimedDaemonExit(replacedDaemon, Date.now())}\n`,
+      );
+    }
+    cleanup.register("daemon-error-log-sink", installAgenCDaemonErrorLogSink({
+      path: resolveAgenCDaemonLogPath(host.env, host.userHome),
+      write: writeErrorLog,
+      writeDebug: writeErrorDebugLog,
+    }));
     let shuttingDown = false;
+    let startupCancelled = false;
     let resolveRpcShutdown!: () => void;
     const rpcShutdownCompleted = new Promise<void>((resolve) => {
       resolveRpcShutdown = resolve;
@@ -3056,9 +3557,14 @@ async function runAgenCDaemonForegroundLocked(
       },
     );
     let runner = options.runner;
+    const approvalBroker = new LiveApprovalBroker();
     let configuredRunner: AgenCDelegateBackgroundAgentRunner | undefined;
     if (runner === undefined) {
       configuredRunner = new AgenCDelegateBackgroundAgentRunner({
+        approvalBroker,
+        ...(activeConfig.daemon?.agent_stop_timeout_ms !== undefined
+          ? { agentStopTimeoutMs: activeConfig.daemon.agent_stop_timeout_ms }
+          : {}),
         env: host.env,
         argv: [host.execPath, host.entrypointPath, "--autonomous"],
         executionAdmissionKernel,
@@ -3098,16 +3604,24 @@ async function runAgenCDaemonForegroundLocked(
     cleanup.register("daemon-snapshot-policy", async () => {
       snapshotPolicies.close();
     });
+    let routines: RoutineService | undefined;
+    let remote: RemoteService | undefined;
+    let ownerTelegram: OwnerTelegramService | undefined;
     const agentManager = new AgenCDaemonAgentManager({
+      approvalBroker,
       agencHome: authStartup.daemonHome,
       runner,
       sessionManager,
+      terminateSession: (params) => clientMultiplexer.terminateSession(params),
       threadStore,
       // DAE-02: prefer client/workspace env over frozen OS cwd when params omit cwd.
       defaultCwd: () => resolveDaemonDefaultCwd(host.env),
       snapshotFlush: (snapshot) =>
         writeAgenCDaemonSnapshot(snapshotPath, snapshot),
       broadcastSessionEvent: async (sessionId, event) => {
+        routines?.observeSessionEvent(sessionId, event);
+        remote?.observeSessionEvent(sessionId, event);
+        ownerTelegram?.observeSessionEvent(sessionId, event);
         try {
           snapshotPolicies.recordSessionEvent(sessionId, event);
         } catch (error) {
@@ -3199,24 +3713,12 @@ async function runAgenCDaemonForegroundLocked(
     cleanup.register("daemon-snapshots", async () => {
       await agentManager.flushSnapshots("daemon_shutdown");
     });
-    cleanup.register("daemon-agents", async () => {
+    const stopAgents = async () => {
       await agentManager.stopAll("daemon_shutdown", {
         disposition: "suspend_idle",
       });
-    });
-    codePrediction =
-      runner.resolveCodePredictionSource === undefined
-        ? undefined
-        : new CodePredictionService({
-            resolveSource: (sessionId) =>
-              agentManager.resolveCodePredictionSource(sessionId),
-            config: activeConfig.buffer?.prediction,
-          });
-    if (codePrediction !== undefined) {
-      cleanup.register("daemon-code-prediction", () =>
-        codePrediction.dispose(),
-      );
-    }
+    };
+    const unregisterAgentsCleanup = cleanup.register("daemon-agents", stopAgents);
     // Wire the runner's terminal-status hook into the lifecycle so a
     // completed/errored agent's status transitions out of `running` in
     // `agent.list` immediately, instead of being lost in the race
@@ -3284,11 +3786,13 @@ async function runAgenCDaemonForegroundLocked(
     // startup journal recovery so adopted/re-executed effects observe fully
     // recovered budget state.
     const workflowWiring = createDaemonWorkflowController({
+      approvalBroker,
       agencHome: authStartup.daemonHome,
       primaryCwd,
       kernel: executionAdmissionKernel,
       warn: (message) => io.stderr.write(`agenc: ${message}\n`),
       env: host.env,
+      config: () => activeConfig,
       argv: [host.execPath, host.entrypointPath],
       authBackend: reloadableAuthBackend,
       stateDatabasePaths: () =>
@@ -3297,9 +3801,7 @@ async function runAgenCDaemonForegroundLocked(
           primaryCwd,
         ),
     });
-    cleanup.register("daemon-workflow-controller", () => {
-      workflowWiring.close();
-    });
+    cleanup.register("daemon-workflow-controller", () => workflowWiring.close());
     void workflowWiring.resumeOpenWorkflows().catch((error) => {
       io.stderr.write(
         `agenc: workflow startup recovery failed: ${formatCleanupError(error)}\n`,
@@ -3373,7 +3875,6 @@ async function runAgenCDaemonForegroundLocked(
               }),
             );
             activeConfig = next.config;
-            await codePrediction?.updateConfig(next.config.buffer?.prediction);
             activeMcpServer = preparedMcpChange.adopt();
             adopted = true;
           } finally {
@@ -3403,8 +3904,80 @@ async function runAgenCDaemonForegroundLocked(
       shuttingDown = true;
       resolveRpcShutdown();
     });
-    const dispatcher = new AgenCDaemonJsonRpcDispatcher({
+    try {
+      routines = new RoutineService({
+        home: authStartup.daemonHome,
+        executor: createDaemonRoutineExecutor({
+          agentManager,
+          environment: host.env,
+          defaultProvider: () => resolveBuiltInProviderSlug(activeConfig.model_provider),
+          runtimeOptions: resolveAgentRuntimeOptions(
+            { ...host.env, AGENC_HOME: authStartup.daemonHome },
+            { dangerouslyBypassApprovalsAndSandbox: false, allowUntrustedHooks: false, remoteMode: false, stdinDataMode: false },
+          ),
+        }),
+        onRunFailure: ({ routineId, runId, reason, errorCode, errorName }) => {
+          io.stderr.write(`agenc: routine ${routineId} run ${runId} could not run: ${reason}${errorCode ? ` ${errorCode}` : ""}${errorName ? ` (${errorName})` : ""}\n`);
+        },
+      });
+      routines.start();
+      cleanup.register("daemon-routines", () => routines?.close());
+    } catch {
+      await routines?.close();
+      routines = undefined;
+      io.stderr.write("agenc: local routines are unavailable; routine storage was preserved\n");
+    }
+    const remoteContext = { home: resolveHomeContext({ ...host.env, AGENC_HOME: authStartup.daemonHome }), environment: Object.freeze({ ...host.env }) };
+    const assertRemoteControlSession = async (sessionId: string): Promise<void> => {
+      const session = await sessionManager.getSession(sessionId);
+      if (!session) throw new RemoteError("REMOTE_SESSION_UNAVAILABLE");
+      const snapshot = await runner.getAgentSnapshot?.(session.agentId);
+      assertSafeRemoteSessionPolicy(snapshot?.runtimeSettings, session.metadata?.runtimeOptions);
+    };
+    const createRemoteSession = async (workspacePath: string, title: string, signal: AbortSignal) => {
+        signal.throwIfAborted();
+        const agent = await agentManager.createAgent({
+          cwd: workspacePath, objective: title, deferInitialTurn: true, permissionMode: "default",
+          runtimeOptions: resolveAgentRuntimeOptions(
+            { ...host.env, AGENC_HOME: authStartup.daemonHome },
+            { dangerouslyBypassApprovalsAndSandbox: false, allowUntrustedHooks: false, remoteMode: true, stdinDataMode: false },
+          ),
+        });
+        if (signal.aborted || !agent.sessionId) {
+          await agentManager.stopAgent({ agentId: agent.agentId, reason: "Remote session creation cancelled" });
+          throw new Error("Remote session creation cancelled");
+        }
+        return { sessionId: agent.sessionId, agentId: agent.agentId };
+      };
+    remote = new RemoteService({
+      home: authStartup.daemonHome,
+      backend: createRemoteBackend({ backendUrl: host.env.AGENC_BACKEND_URL || "https://id.agenc.ag", token: () => remoteAuthSessionTokenSync(remoteContext) }),
+      lookupSession: (sessionId) => sessionManager.getSession(sessionId),
+      createConnection: (remoteAccess) => dispatcher.createConnection({ remoteAccess }),
+      createSession: createRemoteSession,
+      assertControlSession: assertRemoteControlSession,
+    });
+    cleanup.register("daemon-browser-remote", () => remote?.close());
+    try {
+      ownerTelegram = new OwnerTelegramService({
+        home: authStartup.daemonHome,
+        storage: createOwnerTelegramStorage(remoteContext.home),
+        lookupSession: (sessionId) => sessionManager.getSession(sessionId),
+        createConnection: (remoteAccess) => dispatcher.createConnection({ remoteAccess }),
+        createSession: createRemoteSession,
+        assertControlSession: assertRemoteControlSession,
+      });
+    } catch {
+      // Preserve malformed/unreadable metadata and keep unrelated local sessions usable.
+      ownerTelegram = undefined;
+      io.stderr.write("agenc: Telegram agents are unavailable; existing configuration was preserved\n");
+    }
+    cleanup.register("daemon-owner-telegram", () => ownerTelegram?.close());
+    const dispatcher: AgenCDaemonJsonRpcDispatcher = new AgenCDaemonJsonRpcDispatcher({
+      remote,
+      ownerTelegram,
       agentManager,
+      routines,
       clientMultiplexer,
       sessionManager,
       fuzzyAllowedRoots: [primaryCwd],
@@ -3421,7 +3994,10 @@ async function runAgenCDaemonForegroundLocked(
       },
       health,
       realtime,
+      whisper: new LocalWhisperService({ home: authStartup.daemonHome, env: host.env }),
       runInspection: new AgenCDaemonRunInspectionService({
+        effectivePermissionMode: (runId) => workflowWiring.controller.currentPermissionMode(runId),
+        pendingApprovals: (runId) => approvalBroker.list(runId),
         stateDatabasePaths: () =>
           discoverAgenCDaemonStateDatabasePaths(
             authStartup.daemonHome,
@@ -3431,10 +4007,6 @@ async function runAgenCDaemonForegroundLocked(
       }),
       workflow: workflowStartService,
       csvJobReview: new AgenCCsvJobReviewStateService(csvAgentJobsRepositories),
-      workspaceMutations: workspaceMutationCoordinators.forHome(
-        authStartup.daemonHome,
-      ),
-      ...(codePrediction !== undefined ? { codePrediction } : {}),
       daemonIdentity,
       initializeAuthenticator: (params) =>
         cookieAuthenticator.authenticateInitializeParams(params),
@@ -3442,7 +4014,10 @@ async function runAgenCDaemonForegroundLocked(
     const connections = new Map<string, AgenCDaemonJsonRpcConnection>();
     const socketConnections = new Map<
       string,
-      { readonly send: (message: JsonObject) => Promise<void> }
+      {
+        readonly send: (message: JsonObject) => Promise<void>;
+        readonly terminate: () => void;
+      }
     >();
     const connectionFor = (
       connectionKey: string,
@@ -3462,9 +4037,6 @@ async function runAgenCDaemonForegroundLocked(
       connections.delete(connectionKey);
       socketConnections.delete(connectionKey);
       void connection?.close().catch(() => {});
-      for (const clientId of connection?.trackedClientIds ?? []) {
-        void clientMultiplexer.removeClient(clientId).catch(() => {});
-      }
     };
     // Tear down the transport for a slow consumer the multiplexer evicted for an
     // unbounded pending delivery backlog. The multiplexer already removed the
@@ -3476,13 +4048,17 @@ async function runAgenCDaemonForegroundLocked(
     // co-located clients) untouched. Destroying the socket ends the backpressured
     // peer so it stops pinning daemon heap; it can reconnect and replay through
     // the normal detached-buffer path.
-    destroyEvictedClientConnection = (clientId: string): void => {
+    destroyEvictedClientConnection = (clientId, deliveryKey): void => {
       for (const [connectionKey, connection] of connections) {
-        if (!connection.trackedClientIds.includes(clientId)) {
+        if (
+          (deliveryKey !== undefined && connection.cancellationScope !== deliveryKey) ||
+          !connection.trackedClientIds.includes(clientId)
+        ) {
           continue;
         }
         const wasSoleClient = connection.untrackClientId(clientId);
         if (wasSoleClient) {
+          socketConnections.get(connectionKey)?.terminate();
           closeConnection(connectionKey);
         }
         return;
@@ -3541,6 +4117,7 @@ async function runAgenCDaemonForegroundLocked(
         );
         socketConnections.set(connectionKey, {
           send: (notification) => context.send(notification),
+          terminate: () => context.terminate(),
         });
         const connection = connectionFor(connectionKey);
         const verifiedIdentity = daemonVerifiedIdentityForContext(context);
@@ -3588,6 +4165,7 @@ async function runAgenCDaemonForegroundLocked(
         );
         socketConnections.set(connectionKey, {
           send: (notification) => context.send(notification),
+          terminate: () => context.terminate(),
         });
         const response = await connectionFor(connectionKey).dispatch(message);
         await rpcShutdown.send(message, response, context.send);
@@ -3616,20 +4194,12 @@ async function runAgenCDaemonForegroundLocked(
     cleanup.register("daemon-fuzzy-file-index", async () => {
       await dispatcher.close();
     });
-    cleanup.register("daemon-connections", async () => {
-      const activeConnections = [...connections.values()];
-      connections.clear();
-      socketConnections.clear();
-      await Promise.all(
-        activeConnections.map((connection) => connection.close()),
-      );
-    });
     cleanup.register("daemon-authority", async () => {
       await options.beforeDaemonAuthorityCleanup?.();
       await runAgenCDaemonAuthorityCleanup({
         host,
         lifecycleLockHeld: !lifecycleLockReleased,
-        closeSocket: () => socketServer.close(),
+        closeSocket: () => socketServer.close({ drainTimeoutMs: 5_000 }),
         removeMetadata: () =>
           removeOwnedForegroundDaemonMetadata({
             expected: daemonIdentity,
@@ -3639,10 +4209,34 @@ async function runAgenCDaemonForegroundLocked(
       });
     });
     cleanup.register("daemon-websocket", async () => {
-      await webSocketServer.close();
+      await webSocketServer.close({ drainTimeoutMs: 5_000 });
     });
     cleanup.register("daemon-mcp-server", async () => {
       await activeMcpServer.close();
+    });
+    // Shutdown already fenced new RPC work. Cancel connection jobs and stop
+    // daemon-owned execution before transport.close drains their handlers;
+    // otherwise a runner-backed request waits for a stop scheduled behind it.
+    // Keep the earlier registrations until construction reaches this point so
+    // startup failures still release partially constructed actors.
+    unregisterAgentsCleanup();
+    cleanup.register("daemon-agents", stopAgents);
+    unregisterCommandExecCleanup();
+    cleanup.register("daemon-command-exec", closeCommandExec);
+    cleanup.register("daemon-connections", async () => {
+      const activeConnections = [...connections.values()];
+      connections.clear();
+      socketConnections.clear();
+      const results = await Promise.allSettled(
+        activeConnections.map((connection) => connection.close()),
+      );
+      const failed = results.filter((result) => result.status === "rejected");
+      if (failed.length > 0) {
+        throw new AggregateError(
+          failed.map((result) => result.reason),
+          "daemon connection cleanup failed",
+        );
+      }
     });
 
     const signalProcess = options.signalProcess ?? process;
@@ -3790,36 +4384,49 @@ async function runAgenCDaemonForegroundLocked(
         exitCode = 1;
       } else {
         cleanupContext = { reason: "daemon_shutdown" };
-        exitCode = termination.kind === "startup_cancel" ? 1 : 0;
+        startupCancelled = termination.kind === "startup_cancel";
+        exitCode = startupCancelled ? 1 : 0;
       }
     } finally {
       shuttingDown = true;
-      shutdownSignal.dispose();
-      // Any reload admitted before the ingress fence must either finish or
-      // reject its prepared resources before MCP/socket cleanup begins.
-      await reloadChain.catch(() => null);
-      const results = await cleanup.run(cleanupContext);
-      cleanupHandled = true;
-      const failed = results.filter((result) => !result.ok);
-      if (failed.length > 0) {
-        for (const failure of failed) {
-          io.stderr.write(
-            `agenc: cleanup[${failure.name}] failed: ${formatCleanupError(failure.error)}\n`,
-          );
-        }
-        if (exitCode === 0) exitCode = 1;
-      }
-      if (host.startupGuardReceiver?.wasRequested() === true) {
-        try {
-          await host.startupGuardReceiver.acknowledgeAfterCleanup(
-            failed.length === 0,
-          );
-        } catch (error) {
-          io.stderr.write(
-            `agenc: startup cancellation acknowledgement failed: ${formatCleanupError(error)}\n`,
-          );
+      try {
+        // Any reload admitted before the ingress fence must either finish or
+        // reject its prepared resources before MCP/socket cleanup begins.
+        await reloadChain.catch(() => null);
+        const results = await cleanup.run(
+          cleanupContext,
+          startupCancelled
+            ? {
+                taskTimeoutMs:
+                  options.startupCancelCleanupTaskTimeoutMs ??
+                  AGENC_DAEMON_STARTUP_CANCEL_CLEANUP_TASK_TIMEOUT_MS,
+              }
+            : {},
+        );
+        cleanupHandled = true;
+        const failed = results.filter((result) => !result.ok);
+        if (failed.length > 0) {
+          for (const failure of failed) {
+            io.stderr.write(
+              `agenc: cleanup[${failure.name}] failed: ${formatCleanupError(failure.error)}\n`,
+            );
+          }
           if (exitCode === 0) exitCode = 1;
         }
+        if (host.startupGuardReceiver?.wasRequested() === true) {
+          try {
+            await host.startupGuardReceiver.acknowledgeAfterCleanup(
+              failed.length === 0,
+            );
+          } catch (error) {
+            io.stderr.write(
+              `agenc: startup cancellation acknowledgement failed: ${formatCleanupError(error)}\n`,
+            );
+            if (exitCode === 0) exitCode = 1;
+          }
+        }
+      } finally {
+        shutdownSignal.dispose();
       }
     }
     return exitCode;
@@ -4122,6 +4729,36 @@ function describeSnapshotRetention(
   return `${configured} (hard cap ${SESSION_SNAPSHOT_HARD_CAP} rows per session)`;
 }
 
+function describeStateReclaim(
+  report: StateFreePageReclaim,
+  stateDbPath: string,
+): string {
+  const pages = report.freePagesBefore - report.freePagesAfter;
+  const mib = ((pages * report.pageSize) / (1024 * 1024)).toFixed(1);
+  const how = report.mode === "full" ? "full vacuum, now incremental" : "incremental";
+  return `daemon state reclaimed ${pages} free page(s) (${mib} MiB, ${how}) in ${stateDbPath}`;
+}
+
+/**
+ * A retention sweep deletes session directories permanently and unattended, so
+ * the ids it removed must survive in the log. Sessions are named, not counted:
+ * "which of my sessions went" is the only question this line has to answer.
+ */
+function describeRolloutRetentionPrune(
+  report: RolloutPruningReport,
+  projectDir: string,
+): string {
+  const NAMED = 20;
+  const ids = report.prunedSessionIds.slice(0, NAMED).join(", ");
+  const rest = report.prunedSessionIds.length - NAMED;
+  const named = ids.length > 0 ? `: ${ids}${rest > 0 ? `, and ${rest} more` : ""}` : "";
+  return (
+    `daemon rollout retention deleted ${report.prunedSessions} session(s) ` +
+    `(${report.prunedRolloutFiles} rollout file(s), ${report.prunedMirrorRows} mirror row(s)) ` +
+    `in ${projectDir}${named}`
+  );
+}
+
 function recoverAgenCDaemonStartupState(
   daemonHome: string,
   cwd: string,
@@ -4159,6 +4796,12 @@ function recoverAgenCDaemonStartupState(
           driver,
           config.agent?.retention,
         );
+        // Before the socket opens is the one moment a full VACUUM cannot stall a
+        // client; a database created without auto-vacuum is converted here once.
+        const reclaimed = driver.reclaimFreePages({ allowFullVacuum: true });
+        if (reclaimed.mode !== "none") {
+          log(describeStateReclaim(reclaimed, pathSet.stateDbPath));
+        }
         const prunedSnapshots =
           prunedRuns.prunedSnapshots +
           prunedPerSession.prunedSnapshots +
@@ -4332,14 +4975,20 @@ function uniqueStateDatabasePaths(
 
 /**
  * Project the rollout/session disk-retention window out of the agent retention
- * config. Returns undefined (sweep stays DISABLED) unless `rollout_days` is set
- * — the conservative default, since the sweep deletes user data.
+ * config. Returns undefined (sweep stays DISABLED) when `rollout_days` is unset
+ * or 0. The config default is 30 days (#2228); the sweep deletes user data, so
+ * 0 is the documented way to keep every session.
  */
-function rolloutRetentionPolicy(
+export function rolloutRetentionPolicy(
   retention: AgentRunRetentionConfig | undefined,
 ): RolloutRetentionPolicy | undefined {
   const days = retention?.rollout_days;
-  if (days === undefined) return undefined;
+  // 0 (or anything that is not a positive number) keeps every session: a
+  // zero-day window handed to the sweep would delete everything but the
+  // active session at the first tick.
+  if (days === undefined || !Number.isFinite(days) || days <= 0) {
+    return undefined;
+  }
   return { retention_days: days };
 }
 
@@ -4421,8 +5070,17 @@ class AgenCDaemonSnapshotPolicyRegistry {
   }
 
   flushPeriodic(): void {
+    const errors: unknown[] = [];
     for (const entry of this.#policies.values()) {
-      entry.policy.flushPeriodic();
+      try {
+        entry.policy.flushPeriodic();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) {
+      for (const error of errors) this.#onError(error);
+      throw new AggregateError(errors, "daemon periodic snapshot flush failed");
     }
   }
 
@@ -4442,21 +5100,28 @@ class AgenCDaemonSnapshotPolicyRegistry {
       clearInterval(this.#periodicTimer);
       this.#periodicTimer = undefined;
     }
-    for (const entry of this.#policies.values()) {
+    const errors: unknown[] = [];
+    for (const [key, entry] of this.#policies) {
       // Flush dirty sessions synchronously before the state DB goes away.
       try {
         entry.policy.close();
+        entry.driver.close();
+        this.#policies.delete(key);
       } catch (error) {
+        errors.push(error);
         this.#onError(error);
       }
-      entry.driver.close();
     }
     for (const store of this.#threadStores.values()) {
       store.close();
     }
-    this.#policies.clear();
-    this.#sessionPolicyKeys.clear();
+    for (const [sessionId, key] of this.#sessionPolicyKeys) {
+      if (!this.#policies.has(key)) this.#sessionPolicyKeys.delete(sessionId);
+    }
     this.#threadStores.clear();
+    if (errors.length > 0) {
+      throw new AggregateError(errors, "daemon snapshot policies retained unpersisted sessions");
+    }
   }
 
   recordSessionEvent(sessionId: string, event: JsonObject): void {
@@ -4686,6 +5351,10 @@ class AgenCDaemonSnapshotPolicyRegistry {
           `daemon snapshot retention pruned ${report.prunedSnapshots} row(s) ` +
             `across ${report.prunedSessionIds.length} session(s) in ${paths.projectDir}`,
         ),
+      onReclaimReport: (report) =>
+        this.#log(describeStateReclaim(report, paths.stateDbPath)),
+      onRolloutPruneReport: (report) =>
+        this.#log(describeRolloutRetentionPrune(report, paths.projectDir)),
     });
     const entry = { driver, policy };
     this.#policies.set(paths.stateDbPath, entry);
@@ -4831,6 +5500,8 @@ function recoveryMetadataForRun(
   const canonicalSource = run.resumeSource;
   const runtimeOptions = runtimeOptionsForRecoveredRun(run);
   return {
+    ...(typeof run.metadata?.routineId === "string" ? { routineId: run.metadata.routineId } : {}),
+    ...(typeof run.metadata?.routineRunId === "string" ? { routineRunId: run.metadata.routineRunId } : {}),
     ...(canonicalSource !== undefined
       ? {
           agentPath: canonicalSource.agentPath,
@@ -4857,7 +5528,8 @@ function recoveryMetadataForRun(
   };
 }
 
-async function restoreRecoveredAgentRuntime(
+/** @internal Shared startup recovery seam, exported for hermetic regression coverage. */
+export async function restoreRecoveredAgentRuntime(
   runner: AgenCBackgroundAgentRunner,
   run: RecoveredAgentRun,
   options: {
@@ -4870,12 +5542,21 @@ async function restoreRecoveredAgentRuntime(
   readonly restoreAttemptId?: string;
 }> {
   const resumeSource = run.resumeSource;
+  // Routine invocations are one-shot. Rehydrating their ordinary runtime here
+  // would replay tools/startup hooks before the routine owner records interruption.
+  if (typeof run.metadata?.routineId === "string" || typeof run.metadata?.routineRunId === "string") {
+    resumeSource?.close();
+    return { available: false };
+  }
   const runtimeOptions = runtimeOptionsForRecoveredRun(run);
   if (!isRecoveredRunRuntimeRestorable(run) || resumeSource === undefined) {
     resumeSource?.close();
     return { available: false };
   }
-  if (runtimeOptions === null) {
+  const commandEnvironment = readRecoverableCommandEnvironment(
+    run.metadata?.commandEnvironment,
+  );
+  if (runtimeOptions === null || commandEnvironment === undefined) {
     resumeSource.close();
     return { available: false };
   }
@@ -4898,6 +5579,7 @@ async function restoreRecoveredAgentRuntime(
       explicitColdResume: true,
       restoreAttemptId,
       runtimeOptions,
+      envOverrides: commandEnvironment,
       ...(resumeSource.activeStartupActivationResumeEventId !== undefined
         ? { resumeStartupActivationPending: true }
         : {}),
@@ -5737,7 +6419,10 @@ async function writeAgenCDaemonSnapshot(
 
 export { ensureAgenCDaemonCookie } from "./transport/auth.js";
 
-export function createNodeDaemonCliHost(): AgenCDaemonCliHost {
+export function createNodeDaemonCliHost(
+  deps: { readonly spawnProcess?: typeof spawn } = {},
+): AgenCDaemonCliHost {
+  const spawnProcess = deps.spawnProcess ?? spawn;
   const entrypointPath = process.argv[1] ?? "";
   const userHome = homedir();
   const spawnedStartupGuards = new Map<
@@ -5757,30 +6442,31 @@ export function createNodeDaemonCliHost(): AgenCDaemonCliHost {
     platform: process.platform,
     ...(startupGuardReceiver === undefined ? {} : { startupGuardReceiver }),
     spawnDetachedDaemon: (env) => {
+      const daemonHome = resolveAgenCDaemonHome(env, userHome);
+      // The child works from its home, never from this caller's directory,
+      // which may be a scratch or eval workspace that is deleted while the
+      // daemon keeps running (#2149).
+      try {
+        mkdirSync(daemonHome, { recursive: true, mode: 0o700 });
+      } catch {
+        /* the pid path below fails with a clearer error if the home is unusable */
+      }
       if (!hasOperatorHeapSnapshotOption(env)) {
-        mkdirSync(
-          join(resolveAgenCDaemonHome(env, userHome), "oom-snapshots"),
-          {
-            recursive: true,
-            mode: 0o700,
-          },
-        );
+        mkdirSync(join(daemonHome, "oom-snapshots"), {
+          recursive: true,
+          mode: 0o700,
+        });
       }
       // Capture the child's raw stderr until its log sink takes over: a
       // crash before the sink installs (loader failure, fatal V8 error,
-      // top-level throw) is otherwise unobservable. A plain file fd keeps
-      // this short-lived parent decoupled (no pipe); truncated per spawn so
-      // it only ever holds the latest attempt's early stderr.
-      let stderrFd: number | "ignore" = "ignore";
-      try {
-        stderrFd = openSync(
-          resolveAgenCDaemonSpawnStderrPath(env, userHome),
-          "w",
-          0o600,
-        );
-      } catch {
-        /* capture is best-effort; spawn proceeds without it */
-      }
+      // top-level throw) is otherwise unobservable, and the fd stays the
+      // daemon's stderr for its whole life, so a late fatal lands here too.
+      // A plain file fd keeps this short-lived parent decoupled (no pipe).
+      // The previous attempt's capture is kept as the `.prev.log` sibling.
+      const stderrFd = openDaemonSpawnStderrCapture(
+        resolveAgenCDaemonSpawnStderrPath(env, userHome),
+        resolveAgenCDaemonSpawnStderrPreviousPath(env, userHome),
+      );
       const startupGuardToken = randomUUID();
       const childEnv = {
         ...env,
@@ -5788,11 +6474,12 @@ export function createNodeDaemonCliHost(): AgenCDaemonCliHost {
       };
       let child: ChildProcess;
       try {
-        child = spawn(
+        child = spawnProcess(
           process.execPath,
           buildAgenCDaemonChildNodeArgs(entrypointPath, childEnv, userHome),
           {
             detached: true,
+            cwd: daemonHome,
             env: childEnv,
             // stdout stays detached from this short-lived parent; the
             // foreground daemon installs its own size-capped rotating log sink

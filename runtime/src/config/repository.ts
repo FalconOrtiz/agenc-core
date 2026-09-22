@@ -771,7 +771,6 @@ function sanitizeRepositoryLayer(
   for (const path of [
     ["browser", "executable_path"],
     ["browser", "profile_dir"],
-    ["buffer", "neovim", "executable"],
     ["llm", "xai", "remote_mcp"],
   ] as const) {
     removeNestedPath(
@@ -791,19 +790,6 @@ function sanitizeRepositoryLayer(
         layer,
         ignored,
         "project/local configuration cannot weaken browser isolation",
-      );
-    }
-  }
-
-  if (isPlainRecord(raw.buffer) && isPlainRecord(raw.buffer.prediction)) {
-    const prediction = raw.buffer.prediction;
-    if (prediction.enabled !== "off") {
-      removeNestedPath(
-        raw,
-        ["buffer", "prediction"],
-        layer,
-        ignored,
-        "project/local configuration cannot enable or route source-code prediction",
       );
     }
   }
@@ -1498,6 +1484,15 @@ async function loadLayeredConfigInternal(
     const merged = mergeLayer(config, managed, true, provenance, ignored);
     config = merged.config;
     sources.push(merged.source);
+  }
+
+  if (
+    config.model_provider === "gemini" &&
+    provenance.reasoning_effort?.scope === "default"
+  ) {
+    const { reasoning_effort: _defaultEffort, ...providerDefaults } = config;
+    config = providerDefaults;
+    delete provenance.reasoning_effort;
   }
 
   config = mergeConfigs(config, {

@@ -89,6 +89,84 @@ describe("bootstrapLocalRuntimeSession session-ingress startup wiring", () => {
     }
   });
 
+  it("cancels stalled MCP startup before prewarm and rejects bootstrap", async () => {
+    const providerMod = await import("../llm/provider.js");
+    vi.spyOn(providerMod, "createProvider").mockImplementation(() => ({
+      name: "stub",
+      chat: async () => ({
+        content: "ok", toolCalls: [],
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+      }),
+    }) as never);
+    const entered = Promise.withResolvers<AbortSignal | undefined>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(Session.prototype, "startMcpManager").mockImplementation(
+      async (_manager, options) => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        entered.resolve(options?.signal);
+        await release.promise;
+      },
+    );
+    const prewarm = vi.spyOn(
+      ConversationThreadManager.prototype, "runStartupPrewarm",
+    ).mockResolvedValue("ready");
+    const outcome = bootstrapLocalRuntimeSession({
+      apiKey: "test-key",
+      conversationId: "mcp_startup_timeout",
+      env: {
+        ...process.env, AGENC_HOME: home, AGENC_WORKSPACE: workspace, HOME: home,
+      },
+    }).then(
+      (boot) => ({ boot, error: undefined }),
+      (error: unknown) => ({ boot: undefined, error }),
+    );
+    try {
+      const signal = await entered.promise;
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(signal?.aborted).toBe(true);
+      expect(prewarm).not.toHaveBeenCalled();
+      vi.useRealTimers();
+      expect((await outcome).error).toMatchObject({
+        message: "MCP startup exceeded 60000ms",
+      });
+    } finally {
+      vi.useRealTimers();
+      release.resolve();
+      const result = await outcome;
+      await result.boot?.shutdown();
+    }
+  });
+
+  it("cancels bootstrap while startup prewarm is stuck", async () => {
+    const providerMod = await import("../llm/provider.js");
+    vi.spyOn(providerMod, "createProvider").mockImplementation(() => ({
+      name: "stub", chat: async () => ({ content: "ok", toolCalls: [],
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+      }),
+    }) as never);
+    const entered = Promise.withResolvers<Session>();
+    const release = Promise.withResolvers<"ready">();
+    vi.spyOn(ConversationThreadManager.prototype, "runStartupPrewarm").mockImplementation(async (session) => {
+      entered.resolve(session);
+      return release.promise;
+    });
+    const controller = new AbortController();
+    const outcome = bootstrapLocalRuntimeSession({
+      apiKey: "test-key", conversationId: "cancel_startup_prewarm", signal: controller.signal,
+      env: { ...process.env, AGENC_HOME: home, AGENC_WORKSPACE: workspace, HOME: home },
+    }).then((boot) => ({ boot, error: undefined }), (error: unknown) => ({ boot: undefined, error }));
+    try {
+      const session = await entered.promise;
+      controller.abort(new Error("cancelled startup prewarm"));
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect((await outcome).error).toMatchObject({ message: "cancelled startup prewarm" });
+    } finally {
+      release.resolve("ready");
+      await (await outcome).boot?.shutdown();
+    }
+  });
+
   it("binds Grok ACP to the scrubbed client child environment", async () => {
     const providerMod = await import("../llm/provider.js");
     let capturedOptions:
@@ -229,84 +307,6 @@ describe("bootstrapLocalRuntimeSession session-ingress startup wiring", () => {
     }
   });
 
-  it("defers MCP and prewarm startup across Editor turns until ordinary Agent submit", async () => {
-    const providerMod = await import("../llm/provider.js");
-    vi.spyOn(providerMod, "createProvider").mockImplementation(
-      () =>
-        ({
-          name: "stub",
-          chat: async () => ({
-            content: "ok",
-            toolCalls: [],
-            usage: {
-              promptTokens: 1,
-              completionTokens: 1,
-              totalTokens: 2,
-            },
-          }),
-        }) as never,
-    );
-    const sequence: string[] = [];
-    const mcpStart = vi
-      .spyOn(Session.prototype, "startMcpManager")
-      .mockImplementation(async () => {
-        sequence.push("mcp");
-      });
-    const prewarm = vi
-      .spyOn(ConversationThreadManager.prototype, "runStartupPrewarm")
-      .mockImplementation(async () => {
-        sequence.push("prewarm");
-        return "ready";
-      });
-
-    let shutdown: (() => Promise<void>) | null = null;
-    try {
-      const boot = await bootstrapLocalRuntimeSession({
-        apiKey: "test-key",
-        conversationId: "editor_deferred_startup",
-        deferAgentStartupSideEffects: true,
-        env: {
-          ...process.env,
-          AGENC_HOME: home,
-          AGENC_WORKSPACE: workspace,
-          HOME: home,
-        },
-      });
-      shutdown = boot.shutdown;
-      const submit = vi.fn(async (message: string) => {
-        sequence.push(`turn:${message}`);
-      });
-      boot.session.installTurnDriverHooks({ submit: submit as never });
-      const editorInteraction = {
-        interactionId: "interaction-bootstrap-effects-ask",
-        kind: "ask" as const,
-        policy: "read_only" as const,
-        editorInstanceId: "editor-bootstrap-effects",
-        bufferHandle: 13,
-        changedtick: 6,
-        contentSha256: "f".repeat(64),
-        path: join(workspace, "example.ts"),
-        range: {
-          start: { line: 1, column: 0 },
-          end: { line: 1, column: 1 },
-        },
-      };
-
-      expect(mcpStart).not.toHaveBeenCalled();
-      expect(prewarm).not.toHaveBeenCalled();
-      await boot.session.submit("editor", { editorInteraction });
-      expect(sequence).toEqual(["turn:editor"]);
-
-      await boot.session.submit("agent");
-      expect(sequence).toEqual(["turn:editor", "mcp", "turn:agent"]);
-      expect(prewarm).not.toHaveBeenCalled();
-    } finally {
-      await shutdown?.().catch(() => {
-        /* best effort */
-      });
-    }
-  });
-
   it("activates restored-session startup effects once, in order, before the first ordinary submit", async () => {
     const providerMod = await import("../llm/provider.js");
     vi.spyOn(providerMod, "createProvider").mockImplementation(
@@ -405,6 +405,41 @@ describe("bootstrapLocalRuntimeSession session-ingress startup wiring", () => {
       await shutdown?.().catch(() => {
         /* best effort */
       });
+    }
+  });
+
+  it("emits a visible cron storage warning when persisted jobs cannot be restored", async () => {
+    const providerMod = await import("../llm/provider.js");
+    const chat = vi.fn();
+    vi.spyOn(providerMod, "createProvider").mockReturnValue({ name: "stub", chat } as never);
+    vi.spyOn(Session.prototype, "startMcpManager").mockResolvedValue(undefined);
+    const cronTasks = await import("../utils/cronTasks.js");
+    vi.spyOn(cronTasks, "readCronTasks").mockRejectedValue(
+      Object.assign(new Error("descriptor-confined I/O is unsupported on darwin"), { code: "DESCRIPTOR_UNSUPPORTED" }),
+    );
+    const modelFacingTools = await import("./model-facing-tools.js");
+    const startCron = vi.spyOn(modelFacingTools, "startCronSchedulerRunner").mockResolvedValue(undefined);
+    vi.spyOn(modelFacingTools, "resumeInterruptedAgentJobs").mockResolvedValue(0);
+    const boot = await bootstrapLocalRuntimeSession({
+      apiKey: "test-key", conversationId: "cron_restore_unavailable",
+      deferSessionStartHooks: true, deferAgentStartupSideEffects: true,
+      env: { ...process.env, AGENC_HOME: home, AGENC_WORKSPACE: workspace, HOME: home },
+    });
+    const events: unknown[] = [];
+    boot.session.eventLog.subscribe((event) => events.push(event));
+    boot.session.installTurnDriverHooks({ submit: (async () => {}) as never });
+    try {
+      await boot.session.submit("ordinary work");
+      expect(events).toContainEqual(expect.objectContaining({ msg: {
+        type: "warning", payload: {
+          cause: "cron_storage_unavailable",
+          message: expect.stringContaining("descriptor-confined I/O is unsupported on darwin"),
+        },
+      } }));
+      expect(startCron).not.toHaveBeenCalled();
+      expect(chat).not.toHaveBeenCalled();
+    } finally {
+      await boot.shutdown();
     }
   });
 

@@ -2,6 +2,12 @@ import type { HomeContext } from '../../config/home.js'
 import { createMacOsKeychainStorage } from './macOsKeychainStorage.js'
 import { createLinuxSecretStorage } from './linuxSecretStorage.js'
 import { createWindowsCredentialStorage } from './windowsCredentialStorage.js'
+import { SecureStorageUnavailableError } from './unavailable.js'
+
+export {
+  isSecureStorageUnavailableMessage,
+  SecureStorageUnavailableError,
+} from './unavailable.js'
 
 /** Account identity and role metadata associated with the stored OAuth tokens. */
 export interface OAuthAccountMetadata {
@@ -61,6 +67,8 @@ export interface RemoteRuntimeAuthSecureStorage {
 
 /** Channel and surface credentials owned by the standalone gateway process. */
 export interface GatewaySecureStorage {
+  readonly ownerControlBotToken?: string
+  readonly ownerControlAgentTokens?: Readonly<Record<string, string>>
   readonly environment?: Readonly<Record<string, string>>
   readonly generatedTokens?: {
     readonly hooks?: string
@@ -98,6 +106,8 @@ export interface SecureStorageData {
       serverUrl: string
       accessToken: string
       refreshToken?: string
+      /** Explicit-login generation; delayed refreshes must not overwrite a newer login. */
+      authorizationGeneration?: string
       expiresAt: number
       scope?: string
       clientId?: string
@@ -174,10 +184,14 @@ export interface SecureStorageMigrationIdentity {
 const unavailableSecureStorage: SecureStorage = {
   name: 'unavailable-secure-storage',
   read: () => {
-    throw new Error('Native secure storage is unavailable on this platform')
+    throw new SecureStorageUnavailableError(
+      'Native secure storage is unavailable on this platform',
+    )
   },
   readAsync: async () => {
-    throw new Error('Native secure storage is unavailable on this platform')
+    throw new SecureStorageUnavailableError(
+      'Native secure storage is unavailable on this platform',
+    )
   },
   update: () => ({
     success: false,

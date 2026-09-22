@@ -82,6 +82,7 @@ export interface LocalSkillMetadata {
   readonly argNames?: readonly string[];
   /** Root of the owning plugin when the skill ships inside one. */
   readonly pluginRoot?: string;
+  readonly pluginId?: string;
   readonly whenToUse?: string;
   readonly version?: string;
   readonly model?: string;
@@ -165,6 +166,7 @@ interface SkillRoot {
   readonly loadedFrom: Exclude<LoadedFrom, "bundled" | "mcp">;
   /** Root of the owning plugin when this root ships inside one. */
   readonly pluginRoot?: string;
+  readonly pluginId?: string;
 }
 
 interface SkillWithContent {
@@ -232,6 +234,14 @@ const MAX_SCAN_DEPTH = 12;
 const MAX_ACTIVE_PATHS = 256;
 const INVOKED_MAIN_AGENT_ID = "__main__";
 const SKILL_LISTING_DEFAULT_CHAR_BUDGET = 8_000;
+/**
+ * Ceiling for the context-scaled listing. One percent of a 1M-token window
+ * is 40,000 chars (about 10,000 tokens) in every request of every session,
+ * measured on 2026-09-11 with 1,801 installed skills; the ranked listing plus
+ * the per-request relevance reminder does the same job in a fraction of that.
+ * `SLASH_COMMAND_TOOL_CHAR_BUDGET` still overrides both the scale and the cap.
+ */
+const SKILL_LISTING_MAX_CHAR_BUDGET = 12_000;
 const SKILL_LISTING_DESC_MAX_CHARS = 250;
 const SKILL_LISTING_CONTEXT_PERCENT = 0.01;
 const CHARS_PER_TOKEN = 4;
@@ -400,6 +410,7 @@ export async function discoverSkillRoots(
         : "plugin" as const,
       loadedFrom: "plugin" as const,
       pluginRoot: root.pluginRoot,
+      pluginId: root.pluginId,
     })),
   );
 
@@ -708,6 +719,7 @@ async function loadSkillFile(
     ...(root.pluginRoot !== undefined
       ? { pluginRoot: root.pluginRoot }
       : {}),
+    ...(root.pluginId !== undefined ? { pluginId: root.pluginId } : {}),
     contentLength: markdown.length,
     ...(() => {
       const aliases = implicitAliasesForSkillName(skillName);
@@ -992,6 +1004,7 @@ export interface SkillListingEntry {
   readonly loadedFrom?: string;
   readonly scope?: string;
   readonly root?: string;
+  readonly pluginId?: string;
 }
 
 const SKILL_LISTING_SCOPE_RANK: Readonly<Record<string, number>> = {
@@ -1060,8 +1073,8 @@ function skillRelevance(
   tokens: readonly string[],
 ): number {
   if (tokens.length === 0) return 0;
-  const nameParts = new Set(skill.name.toLowerCase().split(/[^a-z0-9]+/u));
-  const name = skill.name.toLowerCase();
+  const name = `${skill.name} ${skill.pluginId ?? ""}`.toLowerCase();
+  const nameParts = new Set(name.split(/[^a-z0-9]+/u));
   const description = `${skill.description ?? ""} ${skill.whenToUse ?? ""}`.toLowerCase();
   let score = 0;
   let fromDescription = 0;
@@ -1106,7 +1119,12 @@ export function buildSkillListingWithinBudget(
   skills: readonly SkillListingEntry[],
   contextWindowTokens?: number,
   request?: string | null,
-): { readonly listing: string; readonly stats: SkillListingStats } {
+): {
+  readonly listing: string;
+  readonly stats: SkillListingStats;
+  /** Names of the skills whose lines made it into the listing. */
+  readonly listedNames: readonly string[];
+} {
   const commands = skills.filter((skill) => !skill.disableModelInvocation);
   const tokensForStats = requestMatchTokens(request);
   const emptyStats = (budgetChars: number): SkillListingStats => ({
@@ -1118,7 +1136,11 @@ export function buildSkillListingWithinBudget(
     ranked: false,
   });
   if (commands.length === 0) {
-    return { listing: "", stats: emptyStats(getListingCharBudget(contextWindowTokens)) };
+    return {
+      listing: "",
+      stats: emptyStats(getListingCharBudget(contextWindowTokens)),
+      listedNames: [],
+    };
   }
   const budget = getListingCharBudget(contextWindowTokens);
   const fullLines = commands.map(formatSkillListingLine);
@@ -1135,6 +1157,7 @@ export function buildSkillListingWithinBudget(
         usedChars: fullTotal,
         ranked: false,
       },
+      listedNames: commands.map((skill) => skill.name),
     };
   }
 
@@ -1167,6 +1190,7 @@ export function buildSkillListingWithinBudget(
     )
     .map((entry) => entry.skill);
   const lines = bundled.map(formatSkillListingLine);
+  const listedNames = bundled.map((skill) => skill.name);
   let used = lines.reduce((sum, line) => sum + line.length + 1, 0);
   const reserve = formatHiddenSkillsLine(rest.length).length + 1;
   let shown = 0;
@@ -1176,6 +1200,7 @@ export function buildSkillListingWithinBudget(
     // than one line, so the listing never degrades to a bare count.
     if (shown > 0 && used + line.length + reserve > budget) break;
     lines.push(line);
+    listedNames.push(skill.name);
     used += line.length + 1;
     shown += 1;
   }
@@ -1192,6 +1217,49 @@ export function buildSkillListingWithinBudget(
       usedChars: listing.length,
       ranked: tokensForStats.length > 0,
     },
+    listedNames,
+  };
+}
+
+/**
+ * The skills a request is about that are not yet in front of the model:
+ * relevance-ranked lines for up to `limit` invocable skills outside
+ * `exclude`, or nothing when the request carries no matchable words.
+ */
+export function rankSkillsForRequest(
+  skills: readonly SkillListingEntry[],
+  request: string | null | undefined,
+  exclude: ReadonlySet<string>,
+  limit: number,
+): { readonly lines: readonly string[]; readonly names: readonly string[] } {
+  const tokens = requestMatchTokens(request);
+  if (tokens.length === 0 || limit <= 0) return { lines: [], names: [] };
+  // An explicit plugin mention must identify its member skills even when an
+  // older retained listing already showed those skills without their owner.
+  const mentionedPlugins = new Set(
+    [...(request ?? "").matchAll(/(?:^|[\s(])@([a-z0-9][a-z0-9:_-]*)/giu)]
+      .map((match) => match[1]!.toLowerCase()),
+  );
+  const ranked = skills
+    .filter((skill) => !skill.disableModelInvocation && (
+      !exclude.has(skill.name) ||
+      (skill.pluginId !== undefined && mentionedPlugins.has(skill.pluginId.toLowerCase()))
+    ))
+    .map((skill, index) => ({
+      skill,
+      index,
+      rank: skillListingRank(skill),
+      relevance: skillRelevance(skill, tokens),
+    }))
+    .filter((entry) => entry.relevance > 0)
+    .sort(
+      (a, b) =>
+        b.relevance - a.relevance || a.rank - b.rank || a.index - b.index,
+    )
+    .slice(0, limit);
+  return {
+    lines: ranked.map((entry) => formatSkillListingLine(entry.skill)),
+    names: ranked.map((entry) => entry.skill.name),
   };
 }
 
@@ -1199,8 +1267,11 @@ function getListingCharBudget(contextWindowTokens?: number): number {
   const envBudget = Number(process.env.SLASH_COMMAND_TOOL_CHAR_BUDGET);
   if (Number.isFinite(envBudget) && envBudget > 0) return envBudget;
   if (contextWindowTokens && Number.isFinite(contextWindowTokens)) {
-    return Math.floor(
-      contextWindowTokens * CHARS_PER_TOKEN * SKILL_LISTING_CONTEXT_PERCENT,
+    return Math.min(
+      SKILL_LISTING_MAX_CHAR_BUDGET,
+      Math.floor(
+        contextWindowTokens * CHARS_PER_TOKEN * SKILL_LISTING_CONTEXT_PERCENT,
+      ),
     );
   }
   return SKILL_LISTING_DEFAULT_CHAR_BUDGET;
@@ -1211,6 +1282,7 @@ function getSkillListingDescription(
     readonly description?: string;
     readonly whenToUse?: string;
     readonly loadedFrom?: string;
+    readonly pluginId?: string;
   },
 ): string {
   const raw = skill.whenToUse
@@ -1221,7 +1293,10 @@ function getSkillListingDescription(
     skill.loadedFrom === "mcp" && sanitized.length > 0
       ? `[untrusted MCP metadata] ${sanitized}`
       : sanitized;
-  return truncate(description, SKILL_LISTING_DESC_MAX_CHARS);
+  const owner = skill.pluginId === undefined
+    ? ""
+    : `[plugin: ${truncate(sanitizeSkillListingMetadata(skill.pluginId), 96)}] `;
+  return `${owner}${truncate(description, SKILL_LISTING_DESC_MAX_CHARS)}`;
 }
 
 function formatSkillListingLine(
@@ -1230,6 +1305,7 @@ function formatSkillListingLine(
     readonly description?: string;
     readonly whenToUse?: string;
     readonly loadedFrom?: string;
+    readonly pluginId?: string;
   },
 ): string {
   return `- ${skill.name}: ${getSkillListingDescription(skill)}`;
@@ -1811,13 +1887,15 @@ function buildSchedulePrompt(args: string): string {
 
 Help the user schedule, update, list, or run local AgenC scheduled agent jobs.
 
-Use CronCreate, CronList, and CronDelete. If the user asks for remote cloud-hosted agents, explain that this local runtime only has the local cron surface available.
+If the user specifically means AgenC Desktop Routines, discover the authenticated desktop_routine_* tools with system.searchTools and use those to operate the app's actual Routine records. If those tools are unavailable, explain that Desktop Routine management is unavailable in this session; do not silently create a Cron job instead. Preserve revision checks and ordinary approvals; read-only/plan sessions may inspect but must not change or run Routines.
+
+For conversation-local scheduling rather than Desktop Routines, use CronCreate, CronList, and CronDelete. If the user asks for remote cloud-hosted agents, explain that this local runtime does not provide remote cloud scheduling.
 
 ## User Request
 
 ${args || "Ask the user what they want to schedule: create, list, update, or run."}
 
-For create/update requests, collect the cron expression, prompt, timezone, durability, and whether the job should recur before calling the cron tool.`;
+For Cron create/update requests, collect the cron expression, prompt, timezone, durability, and whether the job should recur before calling the cron tool.`;
 }
 
 function buildApiPrompt(args: string): string {

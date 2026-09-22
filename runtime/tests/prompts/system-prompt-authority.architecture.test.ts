@@ -24,4 +24,18 @@ describe("system prompt authority architecture", () => {
       );
     }
   });
+
+  test("passes captured client identity to startup and retains it across model switches and rollout replay", () => {
+    const bootstrap = source("../../src/bin/bootstrap.ts");
+    const session = source("../../src/session/session.ts");
+    const replay = source("../../src/conversation/thread-manager.ts");
+    const renderer = source("../../src/prompts/client-rendering.ts");
+    expect(bootstrap).toMatch(/assembleBaseInstructionsForModel\(\{\s*session:\s*\{\s*services:\s*\{[^}]*providerEnvironment/su);
+    expect(session).toMatch(/assembleBaseInstructionsForModel\(\{\s*session:\s*this,/u);
+    const replayBody = replay.slice(replay.indexOf("async function applyRolloutReconstructionToSession("), replay.indexOf("function emitSynthesizedEvents("));
+    expect(replayBody).toContain("...current");
+    expect(replayBody).not.toContain("sessionConfiguration:");
+    expect(renderer).not.toContain("process.env");
+    expect(renderer).not.toMatch(/getCurrentRuntimeSession|peekAmbientRuntimeSession/u);
+  });
 });

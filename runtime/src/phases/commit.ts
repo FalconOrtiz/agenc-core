@@ -31,6 +31,8 @@
  * @module
  */
 
+import { basename } from "node:path";
+
 import type { Session } from "../session/session.js";
 import type { TurnContext } from "../session/turn-context.js";
 import type {
@@ -96,20 +98,40 @@ function cloneCompletedToolResult(
   };
 }
 
-function emitSavedMemoryMessage(
+/**
+ * Memory extraction is housekeeping, so it reports on the diagnostic
+ * channel the rest of the memory subsystem already uses
+ * (`emitExtractionWarning` in services/extractMemories, cause
+ * `memory_extraction_skipped`).
+ *
+ * It used to emit an `agent_message`, which is the channel the model's own
+ * text arrives on. A line reading `Saved memory: /private/tmp/…/projects/
+ * v2--Users-…/memory/user_language.md` therefore appeared in the chat as
+ * something the assistant had said, directly under its real answer. Being an
+ * assistant message it was also persisted into the transcript and replayed as
+ * conversation history, and the desktop builds turn notifications from that
+ * same event type.
+ *
+ * The file name says which memory was written; the absolute path was internal
+ * detail that only ever reached the user by mistake.
+ */
+function emitSavedMemoryNotice(
   session: Session,
   paths: readonly string[],
 ): void {
   if (paths.length === 0) return;
-  const message =
-    paths.length === 1
-      ? `Saved memory: ${paths[0]}`
-      : `Saved memories: ${paths.join(", ")}`;
+  const names = paths.map((path) => basename(path));
   session.emit({
     id: session.nextInternalSubId(),
     msg: {
-      type: "agent_message",
-      payload: { message },
+      type: "warning",
+      payload: {
+        cause: "memory_saved",
+        message:
+          names.length === 1
+            ? `Saved memory: ${names[0]}`
+            : `Saved memories: ${names.join(", ")}`,
+      },
     },
   });
 }
@@ -355,10 +377,6 @@ function launchTerminalBackgroundHooks(
   session: Session,
   querySource: string,
 ): void {
-  // Editor interactions are an explicit, fail-closed authority boundary.
-  // PromptSuggestion and AutoDream can launch background agents and write
-  // durable state, so they must not inherit an Editor turn implicitly.
-  if (ctx.editorInteraction !== undefined) return;
   if (lastAssistantIsApiError(state)) return;
 
   const hookContext = buildTerminalHookContext(
@@ -449,7 +467,6 @@ export async function commit(
     // T6 I-24b: re-append session metadata so --resume readers that
     // scan the last 16KB of the rollout still find the session
     // header even after many compacts have pushed it out of range.
-    // Port of agenc sessionStorage.ts::reAppendSessionMetadata.
     session.rolloutStore?.store.reAppendSessionMetadata();
     // Mark the boundary as consumed so subsequent iterations don't
     // re-emit until the next successful compact mutates the turnId.
@@ -470,7 +487,7 @@ export async function commit(
     state.transition === undefined &&
     !state.needsFollowUp;
 
-  if (turnIsTerminating && ctx.editorInteraction === undefined) {
+  if (turnIsTerminating) {
     launchTerminalBackgroundHooks(
       state,
       ctx,
@@ -519,28 +536,23 @@ export async function commit(
     } else {
       state.stopHookActive = false;
       state.stopHookBlockingCount = 0;
-      if (ctx.editorInteraction === undefined) {
-        const messages = state.messages.map(cloneMessage);
-        const completedToolResults = state.completedToolResults.map(
-          cloneCompletedToolResult,
-        );
-        ensureExtractMemoriesInitialized();
-        void executeExtractMemories(
-          {
-            messages,
-            completedToolResults,
-            ctx,
-            session,
-            signal,
-          },
-          (paths) => emitSavedMemoryMessage(session, paths),
-        ).catch(() => {});
-      }
+      const messages = state.messages.map(cloneMessage);
+      const completedToolResults = state.completedToolResults.map(
+        cloneCompletedToolResult,
+      );
+      ensureExtractMemoriesInitialized();
+      void executeExtractMemories(
+        {
+          messages,
+          completedToolResults,
+          ctx,
+          session,
+          signal,
+        },
+        (paths) => emitSavedMemoryNotice(session, paths),
+      ).catch(() => {});
     }
   } else if (turnIsTerminating) {
-    // Stop hooks may inject model-facing messages and force another sample.
-    // Editor requests have their own bounded read/proposal loop, so they
-    // terminate without consulting the shared Agent stop-hook pipeline.
     state.stopHookActive = false;
     state.stopHookBlockingCount = 0;
   }

@@ -31,7 +31,7 @@ import {
   sanitizePathForProjectKey,
 } from "../services/extractMemories/memory-paths.js";
 import { getAttachmentTrackingState } from "../session/attachment-state.js";
-import { sanitizePath } from "../utils/path.js";
+import { projectStorageKey } from "../utils/project-storage-key.js";
 import {
   enterCanonicalSettingsAuthority,
   resetCanonicalSettingsAuthorityForTesting,
@@ -50,6 +50,7 @@ beforeEach(async () => {
   repo = join(tempRoot, "repo");
   mkdirSync(home, { recursive: true });
   mkdirSync(repo, { recursive: true });
+  mkdirSync(join(repo, ".git"));
   oldProjectRoot = getProjectRoot();
   oldAgencHome = process.env.AGENC_HOME;
   process.env.AGENC_HOME = home;
@@ -86,7 +87,7 @@ describe("project memory root", () => {
   it("resolves the same directory for the prompt, the extraction child and recall", async () => {
     installMemoryAuthority();
     const expected =
-      join(home, "projects", sanitizePath(repo), "memory") + sep;
+      join(home, "projects", projectStorageKey(repo), "memory") + sep;
 
     // Prompt, permissions and MEMORY.md loading.
     expect(getProjectMemoryPath()).toBe(expected);
@@ -140,7 +141,7 @@ describe("project memory root", () => {
 
   it("uses one project-key sanitizer for memory and extraction", () => {
     const longPath = `/${"deep/".repeat(60)}project`;
-    expect(sanitizePathForProjectKey(repo)).toBe(sanitizePath(repo));
-    expect(sanitizePathForProjectKey(longPath)).toBe(sanitizePath(longPath));
+    expect(sanitizePathForProjectKey(repo)).toBe(projectStorageKey(repo));
+    expect(sanitizePathForProjectKey(longPath)).toBe(projectStorageKey(longPath));
   });
 });

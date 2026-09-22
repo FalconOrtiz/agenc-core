@@ -1062,3 +1062,72 @@ describe("hasPermissionsToUseTool — abort signal", () => {
     ).rejects.toThrow(/aborted/);
   });
 });
+
+describe("hasPermissionsToUseTool — plan mode denies tools that change something", () => {
+  it("denies a mutating tool in plan mode and points at ExitPlanMode", async () => {
+    const { context } = buildHarness({ mode: "plan" });
+    const result = await hasPermissionsToUseTool(
+      makeTool({ name: "Write" }),
+      { path: "/tmp/x", content: "y" },
+      context,
+    );
+    expect(result.behavior).toBe("deny");
+    if (result.behavior === "deny") {
+      expect(result.message).toContain("Plan mode: Write would change something");
+      expect(result.message).toContain("ExitPlanMode");
+    }
+    const shell = await hasPermissionsToUseTool(
+      makeTool({ name: "system.bash" }),
+      { command: "rm -rf build" },
+      context,
+    );
+    expect(shell.behavior).toBe("deny");
+  });
+
+  it("lets a shell command the read-only classifier accepts through the plan gate (#2205)", async () => {
+    const { context } = buildHarness({ mode: "plan" });
+    for (const command of ["ls -la", "git log --oneline -5", "grep -rn TODO src", "wc -l README.md"]) {
+      const result = await hasPermissionsToUseTool(
+        makeTool({ name: "system.bash" }),
+        { command },
+        context,
+      );
+      expect(result.behavior, command).not.toBe("deny");
+    }
+    const exec = await hasPermissionsToUseTool(
+      makeTool({ name: "exec_command" }),
+      { cmd: "git status --short" },
+      context,
+    );
+    expect(exec.behavior).not.toBe("deny");
+    for (const command of ["echo x > notes.txt", "rm -rf build", "ls | tee listing.txt", "npm install"]) {
+      const result = await hasPermissionsToUseTool(
+        makeTool({ name: "system.bash" }),
+        { command },
+        context,
+      );
+      expect(result.behavior, command).toBe("deny");
+      if (result.behavior === "deny") expect(result.message).toContain("Plan mode");
+    }
+  });
+
+  it("lets read-only and plan-mode tools through in plan mode", async () => {
+    const { context } = buildHarness({ mode: "plan" });
+    for (const tool of [
+      makeTool({ name: "system.gitStatus", isReadOnly: true }),
+      makeTool({ name: "system.gitLog", metadata: { mutating: false } }),
+      makeTool({ name: "ExitPlanMode" }),
+      makeTool({ name: "AskUserQuestion" }),
+      makeTool({ name: "TodoWrite" }),
+    ]) {
+      const result = await hasPermissionsToUseTool(tool, {}, context);
+      expect(result.behavior, tool.name).not.toBe("deny");
+    }
+  });
+
+  it("does not deny outside plan mode", async () => {
+    const { context } = buildHarness({ mode: "default" });
+    const result = await hasPermissionsToUseTool(makeTool({ name: "Write" }), {}, context);
+    expect(result.behavior).not.toBe("deny");
+  });
+});

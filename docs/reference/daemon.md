@@ -1,11 +1,38 @@
 # Daemon reference
 
-The local **app-server** control plane for AgenC **0.17.0**. One daemon per
+The local **app-server** control plane for AgenC **0.18.0**. One daemon per
 `AGENC_HOME`. Clients (TUI, print CLI, gateway, remote, SDK, background
 agents) attach over a local socket and speak JSON-RPC.
 
 Architecture map: [`../ARCHITECTURE.md`](../ARCHITECTURE.md). Embedding API:
-[`../sdk.md`](../sdk.md).
+[`../sdk.md`](../sdk.md). Session disk retention:
+[`#session-rollout-retention`](#session-rollout-retention).
+
+## Connection and session ownership
+
+Closing a connection permanently rejects new RPC work and removes its logical
+clients and attachments. Authentication or attachment work completing afterward
+cannot restore that connection. A reconnect may reuse a logical client ID;
+cleanup from the previous physical connection cannot detach the replacement.
+
+A session's `agentId` alone does not grant runtime control. Prompt, cancellation,
+and runtime inspection/mutation require the session to belong to the agent's
+authoritative session list. Use `agent.create` and `agent.attach` for a live
+runtime binding.
+
+Use `session.cancelTurn` with `expectedTurnId` to interrupt the observed turn.
+The TUI defers pre-start cancellation until it correlates its own submitted
+message with a daemon turn. Closing an SDK client settles its local prompt
+waiters without issuing turn cancellation.
+
+Session termination revokes new attachments immediately and awaits resource
+cleanup. Concurrent terminators share cleanup; a later termination request can
+retry a failed finalizer. Agent stop likewise shares teardown, and daemon
+shutdown waits for existing stops. An accepted daemon shutdown still completes
+if its acknowledgement cannot reach the requester.
+
+Implementation findings and regression strategy:
+[`daemon/session control-plane audit`](../design/daemon-session-control-plane-audit.md).
 
 ## Process ownership
 
@@ -30,15 +57,33 @@ Further restarts wait 250 ms, then 1 s, then 4 s. After the cap it throws
 opens the TUI and shows the `daemon-autostart-failed` status notice. Background
 agents and reconnectable sessions stay unavailable until `agenc daemon start`
 succeeds. Inspect with `agenc daemon status`; stop a wedged process with
-`agenc daemon stop`.
+`agenc daemon stop`. Off Linux an unbound daemon is never signalled; if its
+heartbeat is fresh (still starting, or leaving after a cancelled startup),
+autostart waits up to 30 s for it to exit before refusing. A daemon whose
+startup was cancelled bounds each cleanup task to 5 s so it cannot linger.
 
 Ready-wait timeout for clients that start the daemon
 (`AGENC_DAEMON_READY_TIMEOUT_MS`):
 
 | Client                                                         | Default      |
 | -------------------------------------------------------------- | ------------ |
-| Published launcher (`packages/agenc`)                          | **2000** ms  |
+| Published launcher (`packages/agenc`)                          | **45000** ms |
 | Runtime daemon autostart / `agenc daemon` / SDK socket connect | **45000** ms |
+
+The launcher and SDK use one deadline from the initial probe through readiness.
+The SDK includes its socket connection and initialize handshake. The launcher's
+old 2s default covered only polling after the starter finished; the 45s total
+budget now includes that starter. Both pass the remaining budget to the nested
+daemon-start command.
+
+Timeout or caller cancellation terminates the owned starter, with `SIGKILL`
+after 100 ms if needed. Waiting for `close` can add up to 1s. Cleanup failure is
+reported rather than treated as proof of termination. An existing or already
+detached daemon is not signalled by this cleanup. Custom launcher
+`spawnDaemonFn` callbacks must honor the supplied `signal` and register bounded
+child cleanup with `registerCleanup(promise)` if they manage their own child.
+An unresolved callback alone cannot expose a hidden child for termination.
+The launcher still continues to the requested command after autostart failure.
 
 ```bash
 AGENC_DAEMON_READY_TIMEOUT_MS=45000
@@ -66,6 +111,17 @@ agenc daemon reload                # in-place config reload
 agenc daemon restart
 agenc daemon stop
 ```
+
+`agenc daemon status` distinguishes three states. `running (pid N)` with uptime,
+memory and the project state databases on disk (count, total, largest): the daemon is bound and answering. `alive but not yet bound (pid N)`
+with its last heartbeat: the process is beating but has not published its
+identity record, because it is still starting (recovering its agent runs, which
+takes a while under memory pressure) or the record was removed; lifecycle
+commands wait for the record, and the exit code stays 1 until it appears.
+`stopped`, with the previous daemon's last heartbeat when one was left behind:
+a daemon that vanished without any handler running (an OS SIGKILL, for
+instance) leaves that heartbeat, so the last known pid, memory and event-loop
+lag survive the exit.
 
 Packaging units under `packaging/` (systemd, launchd, Windows service) run
 `agenc daemon start --foreground`.
@@ -121,8 +177,14 @@ const client = await connect(); // socket + cookie under AGENC_HOME
 
 ## Protocol
 
+The daemon's local socket and the MCP stdio server accept at most 16 MiB of
+UTF-8 payload per JSON line, excluding the LF, CRLF, or CR delimiter. A line
+exactly at the limit is valid. An oversized line closes the input before JSON
+parsing or dispatch, including when the terminating newline arrives in the
+chunk that crosses the limit. Multiple bounded lines can share a chunk.
+
 - Envelope: **JSON-RPC 2.0** over newline-delimited messages.
-- Protocol version constant: **`1.9.0`**
+- Protocol version constant: **`1.15.0`**
   (`AGENC_DAEMON_PROTOCOL_VERSION` in `runtime/src/app-server/protocol/index.ts`).
 - Clients send `initialize` with the protocol version. Negotiation compares the
   numeric major and minor versions: the server accepts the same major when the
@@ -148,10 +210,20 @@ const client = await connect(); // socket + cookie under AGENC_HOME
   wait for that event before they report success.
   Protocol 1.9 adds the internal `session.shell.execute` method for admitted
   shell commands on the live daemon-owned session.
+  Protocol 1.11 adds `session.statusLine.execute`; protocol 1.12 adds the
+  effective permission mode and pending tool approvals to run inspection;
+  protocol 1.13 adds `session.processes.list` / `session.processes.stop`;
+  protocol 1.14 adds `session.goal`.
   Protocols 1.0 through 1.2 advertise `session.mcp.status: false`,
   reject that method, and never receive `event.mcp_status_changed`. Update if
   necessary, then run `agenc daemon restart` so the daemon uses the installed
   protocol version.
+- **Protocol 1.15 is the first non-additive revision.** It removes the
+  `workspace.editor.*` methods and the status-line `vimMode` presentation field
+  along with the embedded editor. Negotiation compares versions, not method
+  sets, so a 1.0 through 1.14 client still completes `initialize` against a
+  1.15 daemon; those specific calls answer `METHOD_NOT_FOUND`. No published
+  package used them.
 
 ### Public methods (`AGENC_DAEMON_METHODS`)
 
@@ -176,6 +248,11 @@ const client = await connect(); // socket + cookie under AGENC_HOME
 | `fs.fuzzy_search`                                                                                           | Workspace fuzzy file search                                                                                        |
 | `commandExec.start` / `commandExec.write` / `commandExec.resize` / `commandExec.terminate`                  | Reserved PTY/command-exec. `start` is advertised `false`                                                           |
 | `health.ping` / `health.ready` / `health.stats`                                                             | Liveness and stats                                                                                                 |
+| `session.statusLine.execute`                                                                                | Render the configured custom status line for the owning live session (protocol 1.11)                               |
+| `session.processes.list` / `session.processes.stop`                                                         | Inspect and acknowledge-stop the session's own background processes (protocol 1.13)                                |
+| `session.goal`                                                                                              | Set, inspect, pause, resume, or clear the session goal. See [goal.md](goal.md) (protocol 1.14)                      |
+| `routine.*`                                                                                                 | Daemon-owned local routines. See [autonomy.md](autonomy.md)                                                        |
+| `remote.*` / `telegram.*`                                                                                   | Remote pairing and the Telegram gateway. Not yet expanded here; see [gateway.md](../gateway.md)                     |
 | `daemon.reload`                                                                                             | Reload configuration                                                                                               |
 | `daemon.shutdown`                                                                                           | Ask the daemon process to exit                                                                                     |
 | `auth.login` / `auth.whoami` / `auth.logout`                                                                | Auth backend                                                                                                       |
@@ -194,17 +271,13 @@ and
 
 ### Internal methods (`AGENC_DAEMON_INTERNAL_METHODS`)
 
-Not part of the public 54-method SDK surface. The TUI and workbench use them
-over the same JSON-RPC socket. Embedders should not call these unless they are
-reimplementing the workbench. Source:
+Not part of the public 54-method SDK surface. The TUI uses them over the same
+JSON-RPC socket. Embedders should not call these unless they are reimplementing
+the TUI. Source:
 `runtime/src/app-server/protocol/index.ts`.
 
 | Group | Methods |
 | --- | --- |
-| Editor lock / sync | `workspace.editor.acquire`, `sync`, `staleAuthority.refresh`, `heartbeat`, `release` |
-| Topology | `workspace.editor.topology.reserve`, `complete`, `release`, `recovered.list`, `recovered.resolve` |
-| Proposals / changes | `workspace.editor.proposal.get`, `status`, `apply`, `discard`, `changes.list` |
-| Code prediction | `workspace.editor.predict`, `cancelPrediction`, `predictionFeedback` |
 | Compaction / rewind | `session.partialCompactFromMessage`, `rollbackCompaction`, `extendCompactionRollbackRetention`, `rewindConversationToMessage`, `previewFileRewind`, `rewindFilesToMessage` |
 | Session controls | `session.setModel`, `setPermissionMode`, `applyConfig`, `session.permissions.mutateRule`, `session.shell.execute` |
 | Hooks / MCP | `session.hooks.status`, `session.hooks.setDisabled`, `session.mcp.reconnectServer`, `session.mcp.enableServer`, `session.mcp.disableServer` |
@@ -216,8 +289,6 @@ compact returns optional `attemptId` (`compact-<uuid-v4>`) and `displayText`
 forwards those fields after it emits `transcript_epoch` and `history_replaced`.
 `rollbackCompaction` and `extendCompactionRollbackRetention` take that same
 ID. Operator recovery: [CP-0006](../design/critical-path/0006-compaction-transaction.md#rollback-and-retention).
-
-Workbench BUFFER and Neovim behavior: [`../embedded-neovim-buffer.md`](../embedded-neovim-buffer.md).
 
 `session.setPermissionMode` mutates the live session permission registry.
 Switching to `bypassPermissions` requires explicit consent for the
@@ -260,16 +331,16 @@ part of the public SDK method set.
 `clientMessageId`. Reusing it with the same content is idempotent; reusing it
 with different content is rejected. A retry response reports
 `duplicateState: "completed" | "incomplete"` and never invents success for a
-crash tail without a durable terminal event. Only `turn_complete` (code 0)
-and `turn_aborted` (code 130) are those terminals. A mid-turn `error` is
+crash tail without a durable terminal event. The terminals are `turn_complete`
+(code 0), `turn_aborted` (code 130), and `turn_failed` (code 1). A mid-turn `error` is
 session telemetry, not a closer; see [Mid-turn error events](#mid-turn-error-events).
 Callers that require strict
 single-turn admission pass `ifBusy: "reject"`. That flag refuses only an
 in-flight or queued turn (`pendingMessageSubmissionCount`,
 `pendingShellExecutionCount`, or a live `session.activeTurn`). It does
 **not** treat a `pending_init` deferred session as busy. `agent.create`
-with `deferInitialTurn: true` (Editor cold-start, restored agents with no
-initial content) parks the thread in `pending_init` until the first
+with `deferInitialTurn: true` (restored agents with no initial content)
+parks the thread in `pending_init` until the first
 accepted message; refusing that message deadlocks the session. The flag
 cannot be combined with `initialContent` or other first-turn metadata
 (`runtime/src/app-server/daemon-dispatcher.ts`). Without `ifBusy`, the
@@ -277,6 +348,12 @@ legacy FIFO/co-driving behavior is unchanged for 1.0/1.1 clients.
 Hidden-user submissions persist a non-rendering `message_submission` marker
 with a SHA-256 content fingerprint, so their idempotency identity also survives
 a process crash without duplicating the hidden prompt in that marker.
+
+When `clientMessageId` is omitted, the daemon assigns a collision-resistant
+ID with a random UUID suffix. Concurrent requests remain separate submissions
+even if they have identical content or arrive in the same millisecond. Treat
+the generated ID as opaque. Clients that need retry deduplication must provide
+their own stable `clientMessageId` before the first attempt.
 
 `session.transcript.v2` returns `schemaVersion: 2`, `runId`, `historyEpoch`,
 `asOfSequence`, and stable identity-bearing messages. Canonical messages carry
@@ -308,8 +385,8 @@ Older 1.2 clients ignore the additive field.
 | --- | --- |
 | `turnId` | The open `turn_started` |
 | `committedSequence` | Durable sequence of that turn's terminal event (placement anchor) |
-| `outcome` | `completed` (`turn_complete`) or `aborted` (`turn_aborted`) |
-| `durationMs` | Completed turns only: `turn_complete.durationMs`, else `completedAt - startedAt` when both stamps are finite and ≥ 0 |
+| `outcome` | `completed` (`turn_complete`), `aborted` (`turn_aborted`), or `errored` (`turn_failed`) |
+| `durationMs` | Terminal `durationMs`, else `completedAt - startedAt` when both stamps are finite and non-negative |
 | `inputTokens` / `outputTokens` / `totalTokens` | Sum of enclosed `token_count.promptTokens` / `completionTokens` / `totalTokens` |
 | `model` / `provider` | Last nonempty strings on those same `token_count` events |
 
@@ -324,8 +401,8 @@ Constraints:
   the same mismatched-terminal guard the message scan already applies.
 - `error` events are telemetry, not terminals. A stop-hook throw or similar
   mid-turn failure does not close the accumulator; later `token_count` and
-  the real `turn_complete` / `turn_aborted` still belong to that turn.
-- `durationMs` is not emitted for aborted turns.
+  the matching terminal still belong to that turn.
+- Timing is omitted when the terminal has no usable duration or completion stamp.
 - A `token_count` with no finite non-negative token field is ignored,
   including its model/provider. Cache, reasoning, and search counters
   on that event are not copied.
@@ -372,7 +449,7 @@ history.
 | Markers missing after compact or rewind | Expected. Rows exist only for turns that closed after the current `historyEpoch`. |
 | Duration missing on a completed turn | The terminal lacked `durationMs` and a usable `completedAt - startedAt` pair. |
 | Tokens or model missing | No enclosed `token_count` carried a finite non-negative token field. |
-| `outcome: "errored"` or tokens cut off at a mid-turn `error` | The connected daemon closed the accumulator on the first `error`. Current main keeps the turn open until `turn_complete` / `turn_aborted`. See [Mid-turn error events](#mid-turn-error-events). |
+| Tokens cut off at a mid-turn diagnostic `error` | The connected daemon closed the accumulator too early. Current readers wait for an explicit terminal. See [Mid-turn error events](#mid-turn-error-events). |
 
 #### Mid-turn error events
 
@@ -381,7 +458,7 @@ Raw session `error` events are diagnostic telemetry. Stop-hook throws
 cause) emit them while the ladder continues
 (`runtime/src/phases/stop-hooks.ts`). The recursion cap emits
 `stop_hook_loop` and then allows the turn to terminate. In every case
-the submission closer is still `turn_complete` or `turn_aborted`. A real
+the submission closer is an explicit turn terminal. A real
 run failure is reported separately as `RunAgentProgressEvent.run_error` or a
 canonical `run_terminal` failure.
 
@@ -403,19 +480,16 @@ Constraints:
   SDK throws `AgencDuplicateSubmissionIncompleteError`.
 - A later turn's terminal is never attributed to an earlier crash tail.
   The next `user_message` or `message_submission` ends the persisted scan.
-- Current writers never emit `turnResults.outcome: "errored"`. The
-  protocol union in `runtime/src/app-server/protocol/index.ts` (and the
-  generated SDK mirror) still lists it so type-sync stays exact and older
-  daemons that closed on the first `error` remain representable.
+- Failed turns emit `turnResults.outcome: "errored"`. A settled duplicate
+  retry returns `terminal.code === 1` without rerunning the prompt.
 - The live event-log bridge passes every raw session `error` through
   `projectTelemetryErrorAsSessionOnly`. The resulting
   `statusProjection: "session_only"` keeps the diagnostic visible without
   changing agent or run status.
 - Terminal run failures use an explicit path. `run_error` and failed
   `run_terminal` records produce `event.agent_status` with `status: "error"`.
-  The TUI adapter converts that notification to an `error` transcript event
-  with `payload.terminal: true`. Runtime-settings authority failures carry
-  the same marker.
+  The TUI adapter converts a turn-scoped failure notification to `turn_failed`.
+  Runtime-settings authority failures use the same explicit event locally.
 - An unmarked raw session error remains visible in the transcript, but it does
   not clear the TUI's active turn or stop the streaming reducer.
 
@@ -436,9 +510,38 @@ when `turn_complete` was still ahead in the journal.
 | Symptom | What to check |
 | --- | --- |
 | Retry reports `completed` with `terminal.code === 1` after a hook throw | Connected daemon predates the mid-turn error closer. |
-| `AgencDuplicateSubmissionIncompleteError` after an `error` event | Expected until a matching `turn_complete` or `turn_aborted`. |
+| `AgencDuplicateSubmissionIncompleteError` after a diagnostic `error` event | Expected until a matching explicit turn terminal. |
 | A raw session `error` also emits `event.agent_status: error` | The connected daemon predates the diagnostic-error projection or bypassed the live event bridge. Current writers reserve that status notification for a terminal run failure. |
-| The TUI spinner stops on a diagnostic error | Check that the transcript event lacks `payload.terminal: true`. Only explicit terminal errors clear the active turn. |
+| The TUI spinner stops on a diagnostic error | Check for a matching `turn_failed`, `turn_complete`, or `turn_aborted`. A raw `error` must not clear the active turn. |
+
+#### Failed-turn events
+
+`turn_failed` is an additive durable event. Its payload requires a nonempty
+`turnId`, a stable `code` matching `[a-z][a-z0-9_]{0,63}`, and a `message`
+bounded to 2,000 UTF-16 code units. Optional `completedAt` and `durationMs`
+are finite, non-negative milliseconds. The event closes only the matching
+turn and returns exit code 1 through live submission tracking, persisted
+retries, the SDK, and the one-shot CLI.
+
+`runtime/src/contracts/turn-terminal.ts` defines the classifier. The SDK uses
+an exact generated copy checked by `check:sdk-generated-types`. A failed
+turn does not by itself kill a reusable daemon run. The daemon sends its
+canonical `turn_failed` as `event.session_event` and returns to idle.
+Fatal thread cleanup closes an open turn before writing `run_terminal`;
+it does not write a second terminal if the kernel already closed that turn.
+
+Journal reads alone recognize two old terminal representations, `error`
+with cause `background_agent_error` or `review_task_failed`, a nonempty
+matching turn ID, and a string message. No other cause is terminal, and
+live `error` events never use this compatibility rule. The audit found
+these old writers in thread-status projection and the spawned review-task
+catch path. Stop hooks, compaction, editor diagnostics, and stream retries
+remain non-terminal.
+
+No journal rewrite or schema-version change is required. Deploy reader
+support before enabling new writers. If writers are rolled back after a
+journal contains `turn_failed`, retain the additive reader support so the
+failed turn is not reconstructed as an unfinished turn.
 
 `session.resolveToolCall` accepts two strict protocol-1.0 request shapes. The
 earlier `{ sessionId, toolCallId?, reviewer? }` shape can settle only a legacy
@@ -559,6 +662,15 @@ All 18 names in `AGENC_DAEMON_NOTIFICATION_METHODS`:
 | Sync | `event.event_gap` (retention eviction or replay required; do not skip) |
 | Realtime (typed; start is advertised `false`) | `thread/realtime/started`, `itemAdded`, `transcript/delta`, `transcript/done`, `outputAudio/delta`, `sdp`, `error`, `closed` |
 
+Completed agents retain detached events for five minutes, with a global limit
+of 128 agents and 8 MiB of UTF-8 data, including agent IDs. An individual
+buffer over 1 MiB requires durable replay. Attaching after cache eviction or
+expiry emits `event.event_gap` with `retiredCount: 0`,
+`retiredCountKnown: false`, and `coordinatesAvailable: false`: the cache cannot
+prove how many events are missing. Use `run.replay` with the run ID and the
+client's last durable sequence (or zero for a full replay). Existing count
+gaps omit `retiredCountKnown` and carry a positive, known `retiredCount`.
+
 `event.mcp_status_changed` is an invalidation, not a state dump. Its strict
 payload is `{ sessionId, revision }`. Fetch `session.mcp.status` for the
 sanitized server/tool projection. A daemon replacement starts a new revision
@@ -607,17 +719,22 @@ current Ledger action is documented in
 ## Interactive session survival
 
 A keep-alive (interactive / desktop) session must stay promptable after
-a capped turn. Bounded stops (`no_progress`, `max_turns`,
-`max_budget_usd`, `compact_failed`, and `editor_request_failed`) complete
-the **turn** with an honest message and leave the run available. The daemon mapper used to promote those stops
+a capped turn. Bounded stops (`no_progress`, `effect_review_required`,
+`deadline_reached`, `max_turns`, `max_budget_usd`, `compact_failed`,
+and `empty_response`) emit canonical `turn_failed` with the stop reason
+as the code and leave the run available. Before an unattended (`agenc -p`)
+turn stops with `empty_response`, the runtime re-samples an empty model
+response up to three times with backoff (`empty_response_retry` warnings);
+an attended session retries once, immediately. The daemon mapper used to promote those stops
 to `run_error`, after which every later prompt answered
 `no longer running (status: error)` while the durable run might still
 be healthy underneath.
 
-The daemon-backed CLI one-shot path currently maps the resulting
-`turn_complete` to exit code 0 without inspecting its bounded `stopReason`.
-The compatibility `runAgent` path with `keepAlive: false` instead reports a
-bounded stop as failure.
+The daemon-backed CLI one-shot path returns exit code 1 for these failed
+turns. The compatibility `runAgent` path with `keepAlive: false` also reports
+failure. A keep-alive worker records an `errored` task receipt before
+returning to idle. A later prompt can succeed without changing the failed
+outcome of the earlier task.
 
 `TaskCreate` accepts a subject-only call. `description` defaults to the
 subject instead of failing validation. A model that retried a missing
@@ -637,25 +754,49 @@ and `phaseEventToProgressEvent` mapped `stopReason: "error"` to
 `no longer running (status: error)` after one turn, even when the
 durable run was still healthy.
 
-Those paths now emit `warning` with the same cause and yield
+Mid-turn threshold failures and pre-sampling throws emit `warning` with
+the same cause and yield
 `stopReason: "compact_failed"`. `warning` is not a status event.
-The daemon mapper treats `compact_failed` like the other bounded
-stops (`no_progress`, `max_turns`, `max_budget_usd`):
-`turn_complete`, not `run_error`. The user-facing message prefers
+Every `compact_failed` stop emits canonical `turn_failed` with code
+`compact_failed`. Prepared-request fit checks can fail without a separate
+threshold warning.
+This closes the failed turn without killing the reusable run. The user-facing message prefers
 the compact error text (for a skip,
 `mid_turn_compact_skipped: lastSamplePromptTokens=<n> limit=<n>`).
 
+The `auto_compact_failed` warning that precedes it names the cause. A
+durable commit failure reads
+`durable compaction commit failed: <cause> (code=…, syscall=…, path=…); replacement history <n> bytes (<m> messages), payload bundles <k> (<c> chunks, <b> canonical bytes), summary <s> bytes`,
+and the warning payload carries the same facts as `details`, a flat record
+of strings, numbers, booleans and nulls (`error_*`, `cause_*`,
+`root_cause_*` for the error chain; the size facts by name). The rollout
+schema is additive, so readers that predate `details` ignore it. The same
+line is written to the debug log at `warn`, so the cause survives even when
+the rollout write is what failed (#2499).
+
+A typed `no_shrink` result is different. The proposed summary did not meet
+the minimum reduction, and durable history is unchanged. AgenC defers
+repeated advisory attempts and prepares the next full sampling request.
+The turn can continue only while that request fits the effective context
+window, including current instructions, visible tools, tool results, and
+reserved output. If it no longer fits, AgenC attempts necessary compaction
+once, prepares the request again, and requires it to fit or fails the turn
+with `compact_failed`. Other failures do not qualify for `no_shrink`
+deferral. Existing retry and pre-sampling failure handling remain in place,
+as do normal model-admission checks.
+
 | Path | When the turn ends | Event |
 | --- | --- | --- |
-| Mid-turn sampling loop | Thrown compact **or** `autoCompactIfNeeded` returns `wasCompacted: false` after the outer token gate | `warning` cause `mid_turn_compact_failed` |
-| Pre-sampling | Thrown compact only. A no-op continues the turn. | `warning` cause `pre_sampling_compact_failed` |
-| Post-tool checkpoint | A no-op does **not** terminate. The loop continues to commit. | none |
+| Mid-turn sampling loop | Thrown compact or no committed result after the outer token gate, except a safely deferred `no_shrink`. | `warning` cause `mid_turn_compact_failed`, then `turn_failed` code `compact_failed` |
+| Pre-sampling | Thrown compact only. A no-op continues the turn. | `warning` cause `pre_sampling_compact_failed`, then `turn_failed` code `compact_failed` |
+| Post-tool checkpoint | After the outer token gate, compact returns no committed result, except a safely deferred `no_shrink`. | `warning` cause `mid_turn_compact_failed`, then `turn_failed` code `compact_failed` |
+| Provider context refusal (413) | Every compaction ladder tier declined the bounded collapse, or the collapse was already attempted for this overflow. A tier that declines steps down first (`warning` cause `auto_compact_degraded`, prefixed `reactive_recovery/in_turn`). | `warning` cause `context_collapse_ladder_exhausted` (when tiers ran), then `error` cause `prompt_too_long_exhausted` |
 
 Keep-alive (interactive / desktop / `keepAlive` subagent) sessions
 stay promptable. A later `message.send` can start a new turn. The
-daemon-backed `--print` / `--no-tui` path currently maps this
-`turn_complete` to exit code 0. The compatibility `runAgent` path with
-`keepAlive: false` reports it as failure. `--autonomous` keepalive calls
+daemon-backed `--print` / `--no-tui` path exits 1 for this `turn_failed`.
+The compatibility `runAgent` path with `keepAlive: false` also reports
+failure. `--autonomous` keepalive calls
 `setContextBlocked(true)` after `compact_failed` (same as hard
 `error`) and will not schedule another tick.
 
@@ -675,20 +816,17 @@ message, not daemon run death.
 
 See the [CP-0006 compact-skip contract](../design/critical-path/0006-compaction-transaction.md#compact-skip-and-session-survival).
 
-### Editor request failure stays per-turn
+### Compaction transaction wall budget
 
-Editor Explain and Edit requests can stop for three request-scoped reasons.
-The request may reach its sampling or tool limit, an Edit may finish without
-a valid `EditorProposal`, or the provider may return a context, media, or
-output limit that Editor mode cannot recover from. These paths emit a
-`warning` with their specific cause and yield
-`stopReason: "editor_request_failed"`.
-
-The daemon maps `editor_request_failed` to `turn_complete`, so the next
-`message.send` can start a new turn. The TUI displays the warning and blocks
-autonomous keepalive until the user sends another prompt. Child-agent turns
-cannot carry an Editor interaction. If the stop reason reaches `runAgent`
-despite that contract, `runAgent` fails the child run.
+A transactional compact — `/compact` or automatic — has a 900 s
+whole-transaction wall budget (`MAX_COMPACTION_WALL_MS`). The former
+300 s bound cut off a measured grok-4.6 summarizer. Expiry records
+`compaction_failed` with `reason: "wall_time_exceeded"` after intent,
+leaves history unchanged, and still follows the compact-skip turn
+mapping above. A summarizer that ignores abort for 5 s becomes
+`recovery_interrupted`. There is no env or `config.toml` override.
+Operator contract:
+[CP-0006 wall budget](../design/critical-path/0006-compaction-transaction.md#compaction-transaction-wall-budget).
 
 ### Telemetry errors stay session-only
 
@@ -724,7 +862,7 @@ and its in-memory attach replay.
 | --- | --- |
 | `stop_hook_threw` | `phases/stop-hooks.ts` (hook throw, or `shouldBlock` with a blank reason) |
 | `stream_disconnected` | Stream reconnect in `session/run-turn.ts`. Live `emitError({ streamError: true })` is typed `stream_error` (never a bookkeeping status event). A `type: "error"` record with this cause used to latch. |
-| `max_turns` | Legacy journal `error` records (bounded stops now complete the turn) |
+| `max_turns` | Legacy journal `error` records (bounded stops now emit `turn_failed`) |
 | `user_prompt_submit_hook_blocked` | Legacy prompt-hook `error` records |
 | `mid_turn_compact_failed` / `pre_sampling_compact_failed` | Legacy compact-skip `error` records |
 
@@ -742,10 +880,10 @@ that marker clears `activeTurn` and stops the Working spinner
 An unmarked session `error` keeps the turn open.
 
 This projection does not revive a session that already has a durable
-`run_error`. It also does not change bounded-stop exit handling: the
-daemon-backed one-shot CLI currently exits 0 on the resulting
-`turn_complete`, while the compatibility `runAgent` path with
-`keepAlive: false` reports failure.
+`run_error`. Bounded stops use the separate canonical `turn_failed`
+terminal, which returns exit code 1 through the daemon-backed one-shot
+CLI. The compatibility `runAgent` path with `keepAlive: false` also
+reports failure.
 
 ### Prompt hook blocks stay per-prompt
 
@@ -773,9 +911,6 @@ as every other session `error`. Throw and stop were already warnings.
 Start throws `PROMPT_BLOCKED`, shuts down the unpublished bootstrap,
 and never publishes the agent.
 
-Editor submissions skip UserPromptSubmit entirely. See the
-[UserPromptSubmit hook contract](hooks.md#userpromptsubmit).
-
 The lifecycle refresh path may briefly report `runtimeAvailable=false`
 (registration race, post-turn snapshot gap). The reaper waits
 **60 seconds** (`RUNTIME_UNAVAILABLE_GRACE_MS`) of continuous
@@ -783,6 +918,19 @@ unavailability before treating a live agent as stale. Any successful
 snapshot clears the stamp. A daemon-restart recovery that restored the
 record without an attached runtime (`recovered === true` and no
 runtime) is immediately reapable because it cannot resume on its own.
+
+### Agent session termination
+
+Agent stop, runner termination, daemon shutdown, stale-agent reaping, and
+failed-create rollback terminate sessions through the client multiplexer.
+Termination removes session routes, client attachments, and buffered
+capability events. Late events cannot recreate a closed session's route
+or reach status observers.
+
+If a termination hook throws after the session closes, routing is still
+removed and the error is reported. Agent shutdown attempts every owned
+session before reporting termination errors. A failed termination that
+leaves the session live keeps its routing so termination can be retried.
 
 ### Admission step identity on keep-alive turns
 
@@ -825,7 +973,8 @@ See [execution-admission-kernel.md](../design/execution-admission-kernel.md#mode
 | --- | --- |
 | `PROMPT_BLOCKED` on `message.send` / `message.stream` | A `UserPromptSubmit` hook refused this prompt. The session should stay promptable. Confirm `agent.status` is not `error`, then send an allowed follow-up. See [hooks.md](hooks.md#userpromptsubmit). |
 | `no longer running (status: error)` right after a hook denial, stop-hook throw, or stream reconnect | Unexpected after the `session_only` projection. Look for a real `event.agent_status`, `run_error`, or failed `run_terminal`. Session `error` events stay visible as `event.session_event` and do not latch the run. See [telemetry errors](#telemetry-errors-stay-session-only). |
-| `no longer running (status: error)` after a compact skip or compact throw | Unexpected on a keep-alive session. Confirm the event is `warning` with `mid_turn_compact_failed` / `pre_sampling_compact_failed`, or a legacy `error` with `statusProjection: "session_only"`. The daemon-backed one-shot CLI currently exits 0 on the resulting `turn_complete`; the compatibility `runAgent` path fails. Autonomous keepalive ticks stop after `compact_failed` by design. |
+| `no longer running (status: error)` after a compact skip or compact throw | Unexpected on a keep-alive session. Current writers emit a compact warning and canonical `turn_failed` with code `compact_failed`; legacy diagnostic `error` events carry `statusProjection: "session_only"`. The daemon-backed one-shot CLI exits 1, and the compatibility `runAgent` path fails. Autonomous keepalive ticks stop after `compact_failed` by design. |
+| Compact runs ~15 min then `compaction_failed` / `wall_time_exceeded` | The whole-transaction 900 s wall budget fired. History should be unchanged. Manual `/compact` retries; two durable auto failures for the same digest suppress later autos. Distinct from `provider_timeout` and `mid_turn_compact_skipped`. See [compaction transaction wall budget](#compaction-transaction-wall-budget). |
 | Follow-up `message.send` after `mid_turn_compact_skipped` | Expected to start a new turn on a keep-alive session. The prior turn closed with `stopReason: "compact_failed"`. |
 | `AdmissionStepConflictError` | The same `(runId, stepId)` was acquired with different normalized admission data. Compare the `stepId`, provider, model, token bounds, and budget identity in `agenc run evidence`. |
 | A crash-resumed nudge or empty-response retry conflicts | Verify the latest turn checkpoint contains the expected sample ordinal and resume-prompt kind. |
@@ -836,6 +985,113 @@ See [execution-admission-kernel.md](../design/execution-admission-kernel.md#mode
 | Open reports `resumableState contains unversioned fields` | The checkpoint carries a key outside the versioned slice. New fields need a new checkpoint version and rollout schema. A recovery-journal accept does not prove the resume reader will. See [recovery journal vs checkpoint reader](../design/durable-runs-effects-events.md#recovery-journal-vs-checkpoint-reader). |
 | Post-compact checkpoint reports `compactionHistory requires prefix hash version 3` | The rollout pairs marker-bearing replacement history with checkpoint v2/v3. Preserve the rollout and let the atomic upgrader validate it; do not change checkpoint or hash versions by hand. See [checkpoint prefix items](../design/durable-runs-effects-events.md#checkpoint-prefix-items). |
 | Older binary refuses `rollout schema v5` | Expected. Schema 5 is newer than a schema-4 runtime. Upgrade the runtime; do not rewrite the header by hand. |
+| `daemon rollout retention deleted N session(s)` in `daemon.log` | Expected when `agent.retention.rollout_days` is a positive window (default 30) and a session's newest rollout mtime is past it. The named ids are already gone from `<projectDir>/sessions/`. Set `rollout_days = 0` to keep every session. See [session rollout retention](#session-rollout-retention). |
+| Startup dies on `pending effect review without retained canonical journal evidence` | Unexpected after the quarantine remap. The run should appear in `agenc state recovery quarantine list --state active`. Confirm `reasonCode` is `source_changed` and the source digest is 64 zero hex digits, then abandon with that sha if the journal is gone for good. See [session rollout retention](#session-rollout-retention). |
+| A session you still needed disappeared after ~30 idle days | Expected under the default window. "Idle" is newest rollout **file mtime**, not last prompt metadata. Export or reopen the session before the cutoff, or set `rollout_days = 0`. A pending effect review or unreleased compaction pin keeps the directory. |
+
+## Session rollout retention
+
+Session directories under `<projectDir>/sessions/<id>/` are not rotated.
+Without a window they grow without bound. The daemon's throttled sweep
+deletes a session directory whose **newest rollout file mtime** is
+strictly older than `agent.retention.rollout_days`.
+
+This is permanent disk deletion of user session data. SQLite snapshot and
+terminal-run pruning (`completed_days`, `failed_days`, `snapshot_*`) is a
+separate pass and does not remove rollout files.
+
+### Config
+
+Default `agent.retention.rollout_days` is **30**. `0` (or any non-positive
+value) disables the sweep and keeps every session.
+
+```toml
+[agent.retention]
+rollout_days = 30
+```
+
+```bash
+agenc config set agent.retention.rollout_days 0
+agenc config get agent.retention.rollout_days
+```
+
+A fresh config and an upgrade that never set the key both receive 30.
+`agenc daemon reload` pushes the live window through
+`updateRolloutRetention`; a restart also picks it up.
+
+### When it runs
+
+The sweep piggy-backs the snapshot-policy periodic timer (default
+**30 s**). It is **not** a startup path. Each pass deletes at most **50**
+session directories (`DEFAULT_ROLLOUT_PRUNE_MAX_DELETIONS`) so a backlog
+drains across ticks.
+
+The daemon sweep does not pin a live session by id. In-use sessions are
+spared by newest-rollout mtime and by a live rollout lock.
+
+### What one deletion removes
+
+- The session directory (rollout JSONL, `index.json`, sidecars), renamed
+  aside then removed so a half-deleted name is never visible
+- `thread_rollout_items` mirror rows for those rollout paths
+- Journal bindings retired with reason `retention` before the files go
+
+A corrupt, incomplete, or non-monotonic canonical rollout fails closed:
+the sweep leaves that session on disk rather than invent a cursor tail.
+
+### What the sweep keeps
+
+| Keep | Gate |
+| --- | --- |
+| Newest rollout mtime at or after the cutoff | Age |
+| A live process holds the session's rollout lock | `sessionHasLiveRolloutLock` |
+| `run_effects.review_status = 'pending'` for that session | `sessionHasPendingEffectReview` |
+| An unreleased compaction retention pin | `compaction_retention_pins.state != 'released'` |
+| Directory has no rollout files | Not a session the sweep owns |
+| `rollout_days` unset, `0`, or non-finite | Sweep disabled |
+
+A pending effect review pins the journal because review and startup
+recovery need it as evidence. Before that keep, a short soak window
+deleted a session whose run still had `review_status = pending`, and the
+next start could not recover the missing journal.
+
+### Logging
+
+A pass that deleted nothing is silent. A pass that deleted sessions logs
+named ids (first **20**, then "and N more"):
+
+```text
+daemon rollout retention deleted N session(s) (F rollout file(s), M mirror row(s)) in <projectDir>: <id>, ...
+```
+
+Grep `daemon.log` for `daemon rollout retention deleted`. The directories
+are already gone; the log is the surviving inventory.
+
+### Startup if the journal is already gone
+
+If a pending review's canonical journal is missing (older sweep, manual
+delete, or loss), `recoverPendingEffectReviewsOnStartup` **quarantines**
+the run (`reasonCode: "source_changed"`, `sourceKind: "run_journal"`) and
+lets the daemon start. It does **not** refuse startup. The sentinel
+source digest is 64 zero hex digits (`MISSING_RECOVERY_SOURCE_SHA256`).
+The incident is recorded once and reused across restarts.
+
+```bash
+agenc state recovery quarantine list --state active --json
+agenc state recovery quarantine show <quarantine-id> --json
+```
+
+Abandon requires the recorded run id and that sentinel sha. See
+[cli.md](cli.md#state). This is not a keep-on-disk guarantee: settle or
+export a session you still need before the window expires.
+
+### Not this sweep
+
+- `agent.retention.completed_days` / `failed_days` / `snapshot_*` prune
+  SQLite snapshot and terminal-run rows at startup and on the same timer
+- Compaction rollback retention (`/compact-retain`) is [CP-0006](../design/critical-path/0006-compaction-transaction.md#rollback-and-retention)
+- SDK `event.event_gap` reason `retention` is a replay gap after a
+  binding was retired, not the timer itself
 
 ## What the daemon owns
 
@@ -851,7 +1107,8 @@ See [execution-admission-kernel.md](../design/execution-admission-kernel.md#mode
   typed client actions, independent from transcript attachment.
 - **Command exec / PTY** — `commandExec.*` for interactive shell surfaces.
 - **Health & recovery** — `health.*`, startup recovery of in-flight tool
-  calls and agent runs (`runtime/src/state/recovery.ts`), pruning policies.
+  calls and agent runs (`runtime/src/state/recovery.ts`), pruning policies,
+  and the [session rollout retention](#session-rollout-retention) sweep.
   Journal quarantine/deferred (schema v18, live DB through v27) is operator
   CLI `agenc state recovery …`, not a daemon RPC. See [cli.md](cli.md).
 - **Auth / key vending** — auth handlers + provider-key vending for managed
@@ -906,6 +1163,7 @@ agenc budget status    # configured policy only; usage is agenc run status <run-
 | Checkpoint slice and reader       | `runtime/src/session/turn-checkpoint-slice.ts`, `runtime/src/session/turn-state.ts`, `runtime/src/session/durable-checkpoint-reader.ts` |
 | Additive recovery-journal shape   | `runtime/src/state/recovery-journal-schema.ts` (`isTurnCheckpointShape`, `objectShape`) |
 | Rollout schema upgrade            | `runtime/src/session/durable-checkpoint-upgrade.ts`, `runtime/src/session/rollout-store.ts` (`promoteDurableCheckpointSchema`) |
+| Session rollout retention         | `pruneRolloutSessions` / `sessionHasPendingEffectReview` in `runtime/src/state/pruning.ts`; timer in `runtime/src/state/snapshot-policy.ts`; `rolloutRetentionPolicy` / `describeRolloutRetentionPrune` in `daemon-cli.ts`; `recoverPendingEffectReviewsOnStartup` in `startup-run-journal-recovery.ts` |
 | In-turn resume gates              | `runtime/src/conversation/thread-manager.ts` (`resumeTurnFromCheckpoint`) |
 | Step uniqueness / conflict        | `runtime/src/state/execution-admission.ts`          |
 | Launcher autostart                | `packages/agenc/src/launcher.mjs`                   |

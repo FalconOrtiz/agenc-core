@@ -1,21 +1,12 @@
 /**
- * Ports donor runtime thread/conversation orchestration onto AgenC's
- * TypeScript session, agent, and rollout primitives.
+ * Thread/conversation orchestration over AgenC's session, agent, and
+ * rollout primitives.
  *
- * Source anchors:
- *   - `core/src/thread_manager.rs`
- *   - `core/src/codex_thread.rs` // branding-scan: allow upstream source filename
- *   - `core/src/thread_rollout_truncation.rs`
- *   - `core/src/session_startup_prewarm.rs`
- *   - `core/src/session/rollout_reconstruction.rs`
- *
- * Shape difference from upstream:
+ * Design notes:
  *   - The lower-level thread handle, rollout truncation, replay, and
  *     bootstrap prewarm pieces already live in `runtime/src/agents/` and
  *     `runtime/src/session/`. This module is the checklist-owned
  *     conversation surface that composes those pieces for the live CLI path.
- *
- * Cross-cuts deliberately NOT carried:
  *   - Provider websocket prewarm is exposed through an optional provider
  *     startup hook; current adapters that do not implement it are skipped.
  */
@@ -68,6 +59,14 @@ export type ConversationPrewarmState =
 export interface ConversationStartupPrewarmParams {
   readonly session: Session;
   readonly threadId: ThreadId;
+  /**
+   * When true the prewarm must NOT attempt the durable-turn resume; the
+   * embedder drives it later through
+   * {@link ConversationThreadManager.runDeferredDurableTurnResume}. Every
+   * other prewarm step (fresh default turn, provider warm-up, agent-task
+   * registration) still runs inline. See #2239.
+   */
+  readonly deferDurableTurnResume?: boolean;
 }
 
 export type ConversationStartupPrewarm = (
@@ -78,6 +77,14 @@ export interface ConversationThreadManagerOptions {
   readonly threadManager?: ThreadManager;
   readonly prewarm?: ConversationStartupPrewarm;
   readonly now?: () => number;
+  /**
+   * Hand the durable-turn resume to the embedder instead of driving it from
+   * the startup prewarm. Daemon-owned sessions set this so the resumed turn
+   * runs only after the daemon has installed its approval bridge and
+   * registered the agent; without it the resumed turn has no approval
+   * resolver and every tool that needs approval is refused (#2239).
+   */
+  readonly deferDurableTurnResume?: boolean;
 }
 
 export interface ConversationReplayOptions {
@@ -131,6 +138,14 @@ export class ConversationThreadManager extends ThreadManager {
   readonly threadManager: ThreadManager;
   private readonly prewarm: ConversationStartupPrewarm;
   private readonly now: () => number;
+  private readonly deferDurableTurnResume: boolean;
+  /**
+   * Sessions whose startup prewarm skipped the durable resume because the
+   * embedder owns it. Membership is consumed by the first
+   * `runDeferredDurableTurnResume` so the orphaned turn is driven at most
+   * once per session.
+   */
+  private readonly pendingDurableTurnResumes = new WeakSet<Session>();
   private readonly sessionTurnLocks = new WeakMap<Session, AsyncLock<void>>();
   private forkSequence = 0;
   private readonly records = new Map<
@@ -147,6 +162,7 @@ export class ConversationThreadManager extends ThreadManager {
     });
     this.prewarm = opts.prewarm ?? defaultStartupPrewarm;
     this.now = opts.now ?? (() => Date.now());
+    this.deferDurableTurnResume = opts.deferDurableTurnResume === true;
     this.threadManager.subscribeThreadCreated((threadId) => {
       this.refreshRecordFromThreadId(threadId);
     });
@@ -336,6 +352,7 @@ export class ConversationThreadManager extends ThreadManager {
     rolloutItems: ReadonlyArray<RolloutItem>,
     opts: ConversationReplayOptions = {},
   ): Promise<ConversationReplayResult> {
+    session.restoreUserStopFromRollout(rolloutItems);
     const checkpointProjection = checkpointProjectionFor(
       session,
       "root-reconstruction",
@@ -498,8 +515,20 @@ export class ConversationThreadManager extends ThreadManager {
     const record = this.upsertRecord(thread);
     record.prewarm = "running";
     delete record.prewarmError;
+    // Claim the deferral BEFORE the prewarm runs: `defaultStartupPrewarm`
+    // reads the same flag and skips the resume, so the pending marker and the
+    // skip must be decided from one value.
+    if (this.deferDurableTurnResume) {
+      this.pendingDurableTurnResumes.add(session);
+    }
     try {
-      await this.prewarm({ session, threadId: thread.threadId });
+      await this.prewarm({
+        session,
+        threadId: thread.threadId,
+        ...(this.deferDurableTurnResume
+          ? { deferDurableTurnResume: true }
+          : {}),
+      });
       record.prewarm = "ready";
     } catch (error) {
       record.prewarm = "failed";
@@ -507,6 +536,47 @@ export class ConversationThreadManager extends ThreadManager {
         error instanceof Error ? error.message : String(error);
     }
     return record.prewarm;
+  }
+
+  /**
+   * Drive the durable-turn resume that `runStartupPrewarm` skipped because
+   * this manager was constructed with `deferDurableTurnResume`.
+   *
+   * The daemon calls this after `#installDaemonApprovalBridge` has published
+   * `services.approvalResolver` and the agent is registered, so a resumed
+   * turn that needs approval reaches a client instead of the arbiter's
+   * default deny (#2239). It never throws: like the startup prewarm, a
+   * failure is recorded on the thread record.
+   *
+   * Runs at most once per session. Returns the neutral no-op outcome when
+   * nothing was deferred (fresh start, non-deferring embedder, second call).
+   */
+  async runDeferredDurableTurnResume(
+    session: Session,
+  ): Promise<DurableResumeAttempt> {
+    if (!this.pendingDurableTurnResumes.delete(session)) {
+      return { resumed: false };
+    }
+    const thread = this.threadManager.hasThread(session.conversationId)
+      ? this.threadManager.getThread(session.conversationId)
+      : this.registerRootSession(session);
+    const record = this.upsertRecord(thread);
+    try {
+      const attempt = await attemptDurableTurnResume(session);
+      if (attempt.freshTurnAllowed === false) {
+        // Same disposition the inline prewarm gives this case: the failure is
+        // reported on the record, the session keeps the fresh turn the
+        // prewarm already created.
+        record.prewarmError =
+          "durable resume halted after an incomplete checkpoint provider restore: " +
+          (attempt.failureDetail ?? "provider state could not be restored");
+      }
+      return attempt;
+    } catch (error) {
+      record.prewarmError =
+        error instanceof Error ? error.message : String(error);
+      return { resumed: false };
+    }
   }
 
   snapshot(threadId: ThreadId): ConversationThreadSnapshot {
@@ -1152,9 +1222,27 @@ export async function resumeTurnFromCheckpoint(
   }
 }
 
+/**
+ * Resume-continue the orphaned in-flight turn surfaced by this session's
+ * reconstruction, if any. Returns the neutral no-op outcome when the session
+ * has no stashed reconstruction.
+ *
+ * Split out of `defaultStartupPrewarm` so the daemon can run this ONE step
+ * after its approval bridge is installed while the rest of the prewarm still
+ * happens inline inside bootstrap (#2239).
+ */
+async function attemptDurableTurnResume(
+  session: Session,
+): Promise<DurableResumeAttempt> {
+  const reconstruction = lastReconstructionBySession.get(session);
+  if (reconstruction === undefined) return { resumed: false };
+  return resumeTurnFromCheckpoint(session, reconstruction);
+}
+
 async function defaultStartupPrewarm({
   session,
   threadId,
+  deferDurableTurnResume,
 }: ConversationStartupPrewarmParams): Promise<void> {
   // GOAL #4b Stage 1 — if reconstruction surfaced an orphaned in-flight turn
   // with a valid durable checkpoint (and the build/prefix/lease gates pass),
@@ -1162,11 +1250,19 @@ async function defaultStartupPrewarm({
   // Absence and clean rejection retain the existing fresh-turn behavior.
   // An incomplete provider rollback stops startup before a fresh context can
   // use state whose authority is no longer provable.
-  const reconstruction = lastReconstructionBySession.get(session);
+  //
+  // `deferDurableTurnResume` hands exactly this step to the embedder. The
+  // session still gets its fresh default turn and provider prewarm here, so a
+  // deferring embedder that never drives the resume is no worse off than a
+  // session with no resumable turn.
+  const reconstruction =
+    deferDurableTurnResume === true
+      ? undefined
+      : lastReconstructionBySession.get(session);
   if (reconstruction !== undefined) {
     let attempt: DurableResumeAttempt | undefined;
     try {
-      attempt = await resumeTurnFromCheckpoint(session, reconstruction);
+      attempt = await attemptDurableTurnResume(session);
     } catch {
       // Resume is strictly best-effort; never let it block boot. Fall
       // through to the legacy fresh-turn prewarm.

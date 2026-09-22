@@ -4,6 +4,11 @@
  * @module
  */
 
+import { resolveReasoningEffort } from "../reasoning-effort.js";
+import {
+  anthropicFastModeRequested,
+  anthropicSupportsFastMode,
+} from "../providers/anthropic/fast-mode.js";
 import type {
   LLMChatOptions,
   LLMMessage,
@@ -18,8 +23,8 @@ import {
 import {
   coerceUsage,
   collectRequestMetrics,
-  normalizeFinishReason,
   normalizeToolCalls,
+  requireMappedFinishReason,
   parseAnthropicToolChoice,
   prepareMessagesForWire,
   toAnthropicMessageContent,
@@ -32,7 +37,12 @@ import {
   decodeMcpToolNameFromWire,
   encodeMcpToolNameForWire,
 } from "./mcp-tool-naming.js";
-import { isAlwaysOnThinkingAnthropicModel } from "../../utils/model/alwaysOnThinking.js";
+import {
+  anthropicAcceptsSamplingParameters,
+  anthropicEffort,
+  anthropicManualBudgetTokens,
+  anthropicThinkingControl,
+} from "../../utils/model/anthropicThinkingControl.js";
 
 export interface AnthropicMessagesRequestOptions {
   readonly model: string;
@@ -227,6 +237,7 @@ export function buildAnthropicMessagesRequest(
   const systemMessageHasCacheControl = systemMessages.some((message) =>
     hasEphemeralCacheControl(message)
   );
+  const maxTokens = input.maxTokens ?? 4096;
 
   const body: Record<string, unknown> = {
     model: input.model,
@@ -301,7 +312,7 @@ export function buildAnthropicMessagesRequest(
           content: normalizeAnthropicMessageContent(message),
         };
       }),
-    max_tokens: input.maxTokens ?? 4096,
+    max_tokens: maxTokens,
   };
 
   const wireMessages = body.messages as Array<Record<string, unknown>>;
@@ -349,8 +360,15 @@ export function buildAnthropicMessagesRequest(
   // Task 28: the Fable/Mythos 5 family removed sampling parameters —
   // sending `temperature` returns a 400 (provider docs, verified
   // 2026-07-08). Opus-family behavior is unchanged.
-  const alwaysOnThinking = isAlwaysOnThinkingAnthropicModel(input.model);
-  if (input.options?.temperature !== undefined && !alwaysOnThinking) {
+  const thinkingControl = anthropicThinkingControl(input.model);
+  const alwaysOnThinking = thinkingControl === "always_on";
+  // `temperature` is "deprecated for this model" (400) on Opus 5, Sonnet 5,
+  // Opus 4.8 and Opus 4.7 as well (probed 2026-09-11); the 4.6 generation
+  // and older still take it.
+  if (
+    input.options?.temperature !== undefined &&
+    anthropicAcceptsSamplingParameters(input.model)
+  ) {
     body.temperature = input.options.temperature;
   }
   if (
@@ -404,17 +422,45 @@ export function buildAnthropicMessagesRequest(
   // family — thinking is always on and any explicit configuration other
   // than `{type:"adaptive"}` (incl. `disabled` and `enabled`/budget_tokens)
   // returns a 400; omitting the param runs adaptive thinking. Depth is the
-  // effort parameter's job on that family. Opus-family (>= 4.6) behavior
-  // below is unchanged.
+  // effort parameter's job on that family.
+  //
+  // Opus 5, Sonnet 5, Opus 4.8 and Opus 4.7 return the same 400 for
+  // `enabled` + `budget_tokens` ("Use thinking.type.adaptive and
+  // output_config.effort"); they and the 4.6 generation take adaptive
+  // thinking, with depth steered by effort. Only Opus 4.5, Sonnet 4.5,
+  // Haiku 4.5 and older still budget their thinking. Probed live
+  // 2026-09-11; see anthropicThinkingControl.ts.
+  const effortLevels = resolveReasoningEffort({ provider: "anthropic", model: input.model }).levels;
+  const requestedEffort = input.options?.reasoningEffort;
+  const normalizedEffort = (requestedEffort === "max" || requestedEffort === "xhigh") &&
+    !effortLevels.includes(requestedEffort) ? "high" : requestedEffort;
   if (thinkingEnabled && !alwaysOnThinking) {
-    body.thinking = {
-      type: "enabled",
-      budget_tokens:
-        input.options?.reasoningEffort === "high" ||
-          input.options?.reasoningEffort === "xhigh"
-          ? 4096
-          : 2048,
-    };
+    body.thinking = thinkingControl === "adaptive"
+      ? { type: "adaptive" }
+      : {
+          type: "enabled",
+          budget_tokens: anthropicManualBudgetTokens(
+            normalizedEffort,
+            maxTokens,
+          ),
+        };
+  }
+  // The effort dial only means something on the wire as output_config.effort;
+  // Sonnet 4.5 and Haiku 4.5 reject the field, so it stays off for them.
+  const effort = anthropicEffort(normalizedEffort);
+  if (
+    effort !== undefined &&
+    effortLevels.includes(effort)
+  ) {
+    body.output_config = { effort };
+  }
+  // Fast mode rides the session's "priority" service tier. It is sent only
+  // to the models that accept it; the adapter adds the matching beta header.
+  if (
+    anthropicFastModeRequested(input.options) &&
+    anthropicSupportsFastMode(input.model)
+  ) {
+    body.speed = "fast";
   }
   if (input.contextManagement) {
     body.context_management = input.contextManagement;
@@ -462,7 +508,10 @@ export function parseAnthropicMessagesResponse(
           // Decode the encoded `mcp__server__tool` form back to the
           // internal-registry `mcp.server.tool` form before dispatch.
           // Non-MCP names (e.g. `FileEdit`) pass through unchanged.
-          name: decodeMcpToolNameFromWire(String(block.name ?? "")),
+          name: decodeMcpToolNameFromWire(
+            String(block.name ?? ""),
+            request.tools.map((tool) => tool.function.name),
+          ),
           arguments: JSON.stringify(block.input ?? {}),
         }),
       ),
@@ -530,7 +579,7 @@ export function parseAnthropicMessagesResponse(
         toolCalls.length === 0 &&
         structuredOutput
         ? "stop"
-        : normalizeFinishReason(response.stop_reason),
+        : requireMappedFinishReason("anthropic", response.stop_reason),
     requestMetrics: withEndpointMarkers(requestMetrics, "/messages", response),
     ...(structuredOutput ? { structuredOutput } : {}),
     ...(thinking.length > 0 ? { thinking } : {}),

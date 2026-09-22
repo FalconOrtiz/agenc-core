@@ -4,6 +4,7 @@ import {
   externalFileSystemPolicy,
   canReadPathWithCwd,
   canWritePathWithCwd,
+  canWriteRuntimeOwnedPathWithCwd,
   permissionProfileFromRuntimePermissions,
   restrictedFileSystemPolicy,
   unrestrictedFileSystemPolicy,
@@ -24,12 +25,20 @@ import {
   SandboxDeniedError,
   type SandboxPolicy,
 } from "../../permissions/sandbox.js";
+import {
+  matchesSessionPlanFile,
+  sessionPlanFileAuthority,
+} from "../../planning/session-plan-authority.js";
+import { isDurableMemoryWritePath } from "../../permissions/path-validation.js";
 import type { SandboxMode } from "../orchestrator.js";
 import type { Tool } from "../types.js";
 import type { ToolRuntimeAttemptContext } from "./context.js";
 import { analyzeApplyPatchRuntimeWrites } from "./apply-patch.js";
 import { resolveRuntimePathTarget } from "./paths.js";
 import { analyzeShellRuntimeAccess } from "./shell.js";
+import { isSessionCronMemoryMutation } from "./session-cron.js";
+import { cronLockAuthorityRoots, overlapsCronAuthority, protectCronAuthority } from "../../sandbox/cron-authority-protection.js";
+import { desktopAuthorityRoot, overlapsDesktopAuthority, protectDesktopAuthority } from "../../sandbox/desktop-authority-protection.js";
 
 export interface RuntimeSandboxProfileOptions {
   readonly cwd: string;
@@ -46,6 +55,8 @@ interface WriteAnalysis {
   readonly targets: readonly string[];
   readonly indeterminate: boolean;
   readonly knownSafeWhenTargetless: boolean;
+  /** Targets the tool declared through ToolMetadata.fixedWriteTargets. */
+  readonly declared?: readonly string[];
 }
 
 export interface RuntimePlatformSandboxStatus {
@@ -122,11 +133,14 @@ export function permissionProfileForSandboxMode(
  * bubblewrap, and —
  * because the writable roots carry no existing `.git`/`.agenc` carve-outs —
  * fully expressible by the Landlock fallback, so plugin MCP servers keep
- * working on hosts where bubblewrap is unusable.
+ * working on hosts where bubblewrap is unusable. Network authority must come
+ * from the owning broker, never from plugin metadata; absent authority stays
+ * denied. Tightening filesystem access must not discard an operator's grant.
  */
-export function pluginMcpPermissionProfile(metadata: {
-  readonly pluginDataDir: string;
-}): PermissionProfile {
+export function pluginMcpPermissionProfile(
+  metadata: { readonly pluginDataDir: string },
+  approvedNetwork: NetworkSandboxPolicy = "disabled",
+): PermissionProfile {
   return permissionProfileFromRuntimePermissions(
     restrictedFileSystemPolicy(
       [
@@ -135,7 +149,7 @@ export function pluginMcpPermissionProfile(metadata: {
       ],
       { includePlatformDefaults: true },
     ),
-    defaultNetworkForSandboxMode("workspace_write"),
+    approvedNetwork,
   );
 }
 
@@ -285,7 +299,17 @@ export function permissionProfileForRuntimeContext(
         network,
       })
     : permissionProfileFromRuntimePermissions(fileSystem, network);
-  return applyRuntimeAdditionalPermissions(profile, context, options.cwd);
+  return protectCronAuthority(protectDesktopAuthority(
+    applyRuntimeAdditionalPermissions(profile, context, options.cwd),
+    runtimeDesktopAuthorityRoot(context),
+  ));
+}
+
+function runtimeDesktopAuthorityRoot(context: ToolRuntimeAttemptContext): string {
+  const session = context.invocation.session as {
+    readonly services?: { readonly configStore?: { readonly homeContext?: { readonly path?: string } } };
+  } | undefined;
+  return desktopAuthorityRoot(session?.services?.configStore?.homeContext?.path);
 }
 
 function applyRuntimeAdditionalPermissions(
@@ -378,7 +402,23 @@ export function enforceRuntimeSandboxAttempt(
     return;
   }
   if (!toolMayMutate(input.tool)) return;
-  const writes = analyzeWrites(input.tool, input.args, cwd);
+  const writes = isSessionCronMemoryMutation(input.tool, input.args, input.context)
+    ? { targets: [], indeterminate: false, knownSafeWhenTargetless: false }
+    : analyzeWrites(input.tool, input.args, cwd);
+  const authorityRoot = runtimeDesktopAuthorityRoot(input.context);
+  const cronAuthorityRoots = cronLockAuthorityRoots();
+  for (const target of writes.targets) {
+    if (cronAuthorityRoots.some((root) => overlapsCronAuthority(target, root))) {
+      throw new SandboxDeniedError("Cron locks are reserved for the native host", {
+        denial: "filesystem", target, policy,
+      });
+    }
+    if (overlapsDesktopAuthority(target, authorityRoot)) {
+      throw new SandboxDeniedError("Desktop authority records are reserved for the native host", {
+        denial: "filesystem", target, policy,
+      });
+    }
+  }
   if (writes.indeterminate) {
     if (
       policy.kind === "workspace_write" &&
@@ -414,7 +454,14 @@ export function enforceRuntimeSandboxAttempt(
         target,
         cwd,
         sessionTempRoot,
-      )
+      ) &&
+      !(shellAccess === null &&
+        (isActiveSessionPlanFile(input.context, target) ||
+          isDurableMemoryWritePath(target)) &&
+        agencHomeCarveOutAllowsWrite(profile.fileSystem, target, cwd, sessionTempRoot)) &&
+      !(shellAccess === null &&
+        (writes.declared ?? []).includes(target) &&
+        canWriteRuntimeOwnedPathWithCwd(profile.fileSystem, target, cwd, sessionTempRoot))
     ) {
       throw new SandboxDeniedError(
         `sandbox workspace_write blocked write outside workspace: ${target}`,
@@ -426,6 +473,38 @@ export function enforceRuntimeSandboxAttempt(
       );
     }
   }
+}
+
+/**
+ * Whether a restricted policy admits a write to one of the AgenC-home paths
+ * the file tools may take outside the workspace: the owning session's plan
+ * file and the durable memory roots. The root read entry is treated as a
+ * write entry so the target's own deny entries still decide. Shell writes
+ * never reach this: `shellAccess === null` gates the callers.
+ */
+export function agencHomeCarveOutAllowsWrite(
+  policy: EngineFileSystemSandboxPolicy,
+  target: string,
+  cwd: string,
+  sessionTempRoot: string,
+): boolean {
+  if (policy.kind !== "restricted") return false;
+  return canWritePathWithCwd({
+    ...policy,
+    entries: policy.entries.map((entry) =>
+      entry.access === "read" && entry.path.kind === "special" &&
+        entry.path.value.kind === "root"
+        ? { ...entry, access: "write" as const }
+        : entry,
+    ),
+  }, target, cwd, sessionTempRoot);
+}
+
+function isActiveSessionPlanFile(
+  context: ToolRuntimeAttemptContext,
+  target: string,
+): boolean {
+  return matchesSessionPlanFile(target, sessionPlanFileAuthority(context.invocation.session));
 }
 
 function canDeferIndeterminateWritesToPlatformSandbox(
@@ -511,11 +590,15 @@ function analyzeWrites(
       knownSafeWhenTargetless: false,
     };
   }
-  const targets = writeTargets(args, cwd);
+  const declared = (tool.metadata?.fixedWriteTargets?.() ?? []).map(
+    (target) => resolveRuntimePathTarget(target, cwd),
+  );
+  const targets = [...new Set([...writeTargets(args, cwd), ...declared])];
   return {
     targets,
     indeterminate: targets.length === 0,
     knownSafeWhenTargetless: false,
+    declared,
   };
 }
 

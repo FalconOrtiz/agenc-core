@@ -29,8 +29,18 @@ the adversarial review:
   test (a `/proc/net/ipv6_route` parse proved fragile across kernels).
 - **Key redaction.** Beyond scanning the patch, the provider key is scanned in
   the agent's stdout result and stderr and redacted from every persisted /
-  digested text artifact; a hit quarantines the run. A too-short key and a
-  model / base URL containing shell metacharacters are rejected up front.
+  digested text artifact; a hit quarantines the run. A too-short key or invalid
+  model is rejected up front. Provider URLs must parse as HTTPS, match the
+  configured egress host and port, and contain no credentials, fragments,
+  backslashes, spaces, or control characters.
+
+The executor passes the provider URL, model, and proxy values in a per-call
+environment map. The Docker child receives those values directly, and
+`docker exec -e NAME` forwards them by name. Configuration never becomes bash
+source or a command-line value. Accepted URL path and query bytes remain
+literal, including dollar signs, parentheses, quotes, and command separators.
+Concurrent calls do not change the executor's environment. Existing secret
+name-only passthrough is retained.
 
 Phase 2a ships the offline agent-run lane (`--network none`, bundled
 in-container mock provider). Phase 2b lets the agent reach a **real** model
@@ -78,8 +88,38 @@ blackholed (`--dns 127.0.0.1`).
 
 A small deny-by-default HTTP `CONNECT` proxy shipped inside the read-only
 overlay (`overlay/proxy/allowlist-proxy.mjs`), run by the overlay's pinned
-`node`. It is added to `assertOverlayLayout()` and folded into
-`computeOverlayDigest()`, so the report attests which proxy enforced egress.
+`node`. The versioned overlay manifest includes both the proxy and its Node
+binary, along with the containment probe and the rest of the overlay.
+
+### Overlay manifest
+
+Every new agent report includes `overlayManifest`, with kind
+`agenc.eval.executor-overlay-manifest`, version `1.0.0`, and mode `offline` or
+`real-provider`. The manifest has two sorted arrays. `files` records each
+overlay-relative POSIX path, SHA-256 digest of the exact bytes, `sizeBytes`, and
+permission `mode` bits (`0o7777`). `links` records each internal symlink's path
+and literal target without recursively following directory aliases.
+
+The inventory includes every regular file under `node/`, `runtime/`, `mock/`,
+and `proxy/`. That includes the Node binary and distribution, compatibility
+libraries, runtime entrypoint, chunks and dependencies, raw runtime `VERSION`,
+mock provider, proxy, probe, and added helper files. Required entrypoints must
+be regular files. The runtime `VERSION` must exist and be nonempty. Unexpected
+top-level entries, special files, broken links, and links outside the overlay
+are rejected before a task container starts.
+
+The manifest digest uses the canonical JSON domain
+`agenc.eval.executor-overlay-manifest.v1`. Real-provider reports use that same
+digest for `egress.sidecarOverlayDigest` and the overlay input to
+`environmentDigest`. Offline reports use it in their environment digest too.
+The complete manifest is part of `reportDigest`. Changing a sidecar program,
+probe, runtime file, dependency, Node binary, library, or internal link changes
+the attestation.
+
+This records the staged inputs before execution. The operator must keep the
+host overlay unchanged during the run. A read-only container mount does not
+prevent a host process from editing the source directory, and the manifest
+does not claim authenticity against a malicious host.
 
 Config via env (delivered by `-e`): `AGENC_PROXY_ALLOW_HOST` (exact host),
 `AGENC_PROXY_ALLOW_PORT` (443), `AGENC_PROXY_PIN_IPS` (host-resolved A

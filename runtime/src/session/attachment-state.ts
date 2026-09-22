@@ -1,8 +1,7 @@
 /**
  * Per-session attachment-tracking state.
  *
- * Hand-port of agenc `bootstrap/state.ts:1622-1626 + :1333-1346`,
- * scoped to the AgenC session via WeakMap. Matches the existing AgenC
+ * Scoped to the AgenC session via WeakMap. Matches the existing AgenC
  * pattern in `runtime/src/prompts/memory/attachments.ts:47` (sessionBudgets)
  * and `runtime/src/prompts/memory/auto-save.ts:114`.
  *
@@ -28,6 +27,10 @@
  */
 
 import type { SwarmRoutingDecision } from "../agents/swarm-routing.js";
+import {
+  createAttachmentRetentionLedger,
+  type AttachmentRetentionLedger,
+} from "./attachment-retention.js";
 
 /**
  * Tracking fields owned by the per-turn attachments orchestrator.
@@ -166,6 +169,31 @@ export interface AttachmentTrackingState {
     readonly note: string;
     readonly rolloutIds: readonly string[];
   }>;
+  /**
+   * Every attachment block the model has seen, anchored to the history
+   * message it was shown with, so later projections keep the prompt bytes
+   * in place (see session/attachment-retention.ts).
+   */
+  retainedAttachments: AttachmentRetentionLedger;
+  /**
+   * Skill names already in front of the model through the session listing or
+   * a per-request relevance block; the skill listing producer never repeats
+   * them.
+   */
+  listedSkillNames: Set<string>;
+  /** Exact root-human turn already covered by a listing/relevance evaluation. */
+  lastSkillListingRootTurnId?: string;
+  /**
+   * Workspace-instruction and memory-index texts at the head of the prompt,
+   * frozen for the session so the cached prefix holds (prompts/instruction-head.ts).
+   */
+  instructionHead?: { readonly workspaceText: string; readonly memoryText: string };
+  /** The workspace (turn cwd) the head was taken for; another cwd starts a new head. */
+  instructionHeadScope?: string;
+  /** The latest version of those texts the model has been told about. */
+  instructionAnnounced?: { readonly workspaceText: string; readonly memoryText: string };
+  /** A change waiting to be delivered by the instruction_update producer. */
+  pendingInstructionUpdate?: { readonly workspaceText?: string; readonly memoryText?: string };
 }
 
 const sessionAttachmentState = new WeakMap<object, AttachmentTrackingState>();
@@ -194,6 +222,8 @@ export function getAttachmentTrackingState(
       surfacedRelevantMemoryBytes: 0,
       memoryMode: "enabled",
       memoryCitations: [],
+      retainedAttachments: createAttachmentRetentionLedger(),
+      listedSkillNames: new Set(),
     };
     sessionAttachmentState.set(sessionKey, state);
   }
@@ -210,6 +240,12 @@ export function resetRelevantMemoryBudget(sessionKey: object): void {
   if (state === undefined) return;
   state.surfacedRelevantMemoryBytes = 0;
   state.surfacedRelevantMemoryPaths.clear();
+  // The compacted history is new bytes anyway: start the instruction head
+  // from the current files instead of carrying a stale snapshot forward.
+  state.instructionHead = undefined;
+  state.instructionHeadScope = undefined;
+  state.instructionAnnounced = undefined;
+  state.pendingInstructionUpdate = undefined;
 }
 
 /** Clears all tracking state for a session. Test-only. */

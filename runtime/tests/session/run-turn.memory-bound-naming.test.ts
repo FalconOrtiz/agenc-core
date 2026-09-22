@@ -70,7 +70,10 @@ import { createTestConfigStore } from "../fixtures.js";
 
 const LARGE_TOOL_OUTPUT_BYTES = 80_000; // > clear threshold (6_000).
 const KEEP_RECENT = 5; // mirrors the in-memory keep-recent window.
-const CLEARED_MARKER = "[Old tool result content cleared]";
+import {
+  CLEARED_MARKER,
+  isClearedToolResultMarker,
+} from "./helpers/cleared-tool-result-marker.js";
 const UNTRUSTED_TOOL_RESULT_BOUNDARY =
   "===== AGENC UNTRUSTED TOOL RESULT DATA =====";
 // The shell tool registers as "exec_command" in the live registry. Mirrored
@@ -421,7 +424,7 @@ describe("runTurn — memory-bound-naming in-memory bound (FileRead)", () => {
       const clearedMarkers = history.filter(
         (m) =>
           (m.role === "tool" || m.toolCallId !== undefined) &&
-          messageText(m) === CLEARED_MARKER,
+          isClearedToolResultMarker(messageText(m)),
       );
       expect(clearedMarkers.length).toBeGreaterThan(0);
     },
@@ -475,7 +478,7 @@ describe("runTurn — memory-bound-naming in-memory bound (FileRead)", () => {
       // by later OTHER-path reads, IS cleared — proving clearing actually fired
       // and the active-path retention is path-aware, not just the window.
       const oldOther = byCallId.get("tool_call_turn_2");
-      expect(oldOther).toBe(CLEARED_MARKER);
+      expect(isClearedToolResultMarker(String(oldOther))).toBe(true);
 
       // The most-recent OTHER read (turn TOTAL, within recent-N) stays full.
       const latestOther = byCallId.get(`tool_call_turn_${TOTAL_TURNS}`);

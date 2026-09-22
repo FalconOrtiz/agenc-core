@@ -34,6 +34,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { workflowApprovalFailureCause } from "../../permissions/approval-failure.js";
 
 import {
   type AdmissionKind,
@@ -79,11 +80,13 @@ import {
 } from "../../workflow/evidence-record.js";
 import {
   extractBlockers,
+  ReviewInvocationError,
   ReviewParseError,
   runIndependentReview,
   type ReviewerInvoker,
 } from "../../workflow/independent-review.js";
 import type { ReviewOutput } from "../../session/review.js";
+import type { PermissionMode } from "../../permissions/types.js";
 import {
   parseVerificationVerdict,
   type WorkflowCommandRunner,
@@ -136,6 +139,8 @@ export interface WorkflowEffectEventRef {
  */
 export interface WorkflowRunJournal {
   readonly runId: string;
+  /** Current Session authority, absent when the owned Session is unavailable. */
+  readonly effectivePermissionMode?: PermissionMode;
   /** Subordinate daemon session identity — never substitutes for runId. */
   readonly sessionId: string;
   /** Current durable lifecycle epoch (initial epoch ensured on open). */
@@ -216,6 +221,8 @@ export interface WorkflowRunSessionPolicy {
 }
 
 export interface WorkflowJournalWriter {
+  /** Read only. Never opens a Session or substitutes a frozen requested mode. */
+  currentPermissionMode?(runId: string): PermissionMode | undefined;
   open(
     runId: string,
     context?: {
@@ -229,6 +236,7 @@ export type WorkflowSpawnKind = "plan" | "implement" | "verify_agent" | "review"
 
 export interface WorkflowChildOutcome {
   readonly status: RunTerminalStatus;
+  readonly stopReason?: "approval_required" | "policy_denied";
   readonly finalMessage: string | null;
   /**
    * Reconciled actual usage for the child's own admissions (null = nothing
@@ -328,6 +336,14 @@ export interface VerifiedChangeWorkflowControllerDeps {
   readonly commands: WorkflowCommandRunner;
   readonly spawner: WorkflowAgentSpawner;
   readonly reviewer: ReviewerInvoker;
+  /**
+   * The model the daemon would give a new session, used as the reviewer model
+   * when the caller pins neither `reviewerModel` nor `model`. Without it the
+   * spec froze a placeholder that reached the provider as a model id (desktop
+   * soak, 2026-09-06: a 404 on `default-reviewer` ended a goal in
+   * `unknown_outcome` after every other stage had committed).
+   */
+  readonly defaultReviewerModel?: () => string | undefined;
   readonly evidenceLedger: (spec: WorkflowSpec) => Promise<WorkflowEvidenceLedger>;
   readonly warn: (message: string) => void;
   readonly now?: () => Date;
@@ -360,12 +376,23 @@ export interface WorkflowStartParams {
 
 export interface WorkflowStartResult {
   readonly runId: string;
+  readonly requestedPermissionMode: WorkflowSpec["permissionMode"];
+  readonly effectivePermissionMode?: PermissionMode;
   readonly specDigest: Sha256Digest;
   readonly baseCommit: string;
   readonly baseDirty: WorkflowSpec["baseDirty"];
 }
 
 /** Intake failed before the pipeline began; the terminal result is durable. */
+/** The journaled failure message of a non-committed effect, as a suffix, or "". */
+function describeEffectFailure(result: unknown): string {
+  if (typeof result !== "object" || result === null) return "";
+  const failure = (result as { readonly failure?: unknown }).failure;
+  if (typeof failure !== "object" || failure === null) return "";
+  const message = (failure as { readonly message?: unknown }).message;
+  return typeof message === "string" && message.length > 0 ? `: ${message}` : "";
+}
+
 export class WorkflowIntakeError extends Error {
   constructor(
     readonly runId: string,
@@ -379,6 +406,12 @@ export class WorkflowIntakeError extends Error {
 
 const DEFAULT_MAX_IMPLEMENT_ATTEMPTS = 2;
 const DEFAULT_PERMISSION_MODE: WorkflowSpec["permissionMode"] = "acceptEdits";
+
+export function resolveWorkflowPermissionMode(
+  requested: WorkflowSpec["permissionMode"] | undefined,
+): WorkflowSpec["permissionMode"] {
+  return requested ?? DEFAULT_PERMISSION_MODE;
+}
 /** Bounded per-stage retry budget for stage-level (non-verdict) failures. */
 const MAX_STAGE_ATTEMPTS = 2;
 const ZERO_ESTIMATE = {
@@ -386,13 +419,22 @@ const ZERO_ESTIMATE = {
   maxOutputTokens: 0,
   maxCostUsd: 0,
 } as const;
-const SPAWN_ESTIMATE_INPUT_TOKENS = 1_000_000;
-const SPAWN_ESTIMATE_OUTPUT_TOKENS = 200_000;
 const EVIDENCE_MESSAGE_LIMIT = 20_000;
 
 // ---------------------------------------------------------------------------
 // Internal control flow
 // ---------------------------------------------------------------------------
+
+/** Outcome of closing a run that no live pipeline is driving (see cancelDetached). */
+export type WorkflowDetachedCancelOutcome =
+  | "live"
+  | "not_a_workflow"
+  | "already_terminal"
+  | "cancelled"
+  | "not_recorded";
+
+/** Event id prefix for terminals recorded without a session journal. */
+const WORKFLOW_DETACHED_TERMINAL_EVENT_PREFIX = "workflow-detached-terminal:";
 
 interface WorkflowTerminalIntent {
   readonly status: RunTerminalStatus;
@@ -487,6 +529,14 @@ interface RunContext {
     readonly testResult: RunArtifactPointer;
   };
   verifyVerdict?: string;
+  /**
+   * The verification agent's final message from the latest verify attempt,
+   * read back from the committed child evidence so a resumed run carries it
+   * too. Soak F73: without it the re-implement prompt said only
+   * `Agent verdict: FAIL` and the implementer changed nothing, while the
+   * second verifier re-derived the same defects from scratch.
+   */
+  verifyReport?: string;
   review?: VerifiedChangeReviewRecord;
   reviewNonBlocking?: readonly string[];
   export?: ExportedPatchArtifacts;
@@ -542,7 +592,7 @@ export class VerifiedChangeWorkflowController {
     const journal = await this.#deps.journal.open(runId, {
       repoPath: params.repoPath,
       policy: {
-        permissionMode: params.permissionMode ?? DEFAULT_PERMISSION_MODE,
+        permissionMode: resolveWorkflowPermissionMode(params.permissionMode),
         ...(params.unattendedAllow !== undefined
           ? { unattendedAllow: params.unattendedAllow }
           : {}),
@@ -559,7 +609,12 @@ export class VerifiedChangeWorkflowController {
     const base = await this.#deps.worktrees.captureBaseState(params.repoPath, {
       runId,
     });
-    const spec = freezeWorkflowSpec(runId, params, base);
+    const spec = freezeWorkflowSpec(
+      runId,
+      params,
+      base,
+      this.#deps.defaultReviewerModel?.(),
+    );
     const specDigest = computeSpecDigest(spec);
     const admission = this.#deps.admission({
       runId,
@@ -600,6 +655,7 @@ export class VerifiedChangeWorkflowController {
         terminal.finalMessage ?? terminal.status,
       );
     }
+    const effectivePermissionMode = journal.effectivePermissionMode;
     const pipeline = this.#continue(ctx);
     this.#active.set(runId, pipeline);
     return {
@@ -607,6 +663,8 @@ export class VerifiedChangeWorkflowController {
       specDigest,
       baseCommit: spec.baseCommit,
       baseDirty: spec.baseDirty,
+      requestedPermissionMode: spec.permissionMode,
+      ...(effectivePermissionMode !== undefined ? { effectivePermissionMode } : {}),
     };
   }
 
@@ -615,17 +673,33 @@ export class VerifiedChangeWorkflowController {
     return this.#active.get(runId) ?? Promise.resolve();
   }
 
+  activeRunIds(): readonly string[] {
+    return [...this.#active.keys()];
+  }
+
+  /** Observe live authority without opening or bootstrapping a run. */
+  currentPermissionMode(runId: string): PermissionMode | undefined {
+    return this.#deps.journal.currentPermissionMode?.(runId);
+  }
+
   /** Durable status projection — works after restart, no live state needed. */
   status(runId: string): WorkflowRunStatus | undefined {
     const repo = this.#deps.durability({ runId });
     const effects = repo.listEffects(runId);
     const terminal = repo.getCurrentTerminalResult(runId);
     if (effects.length === 0 && terminal === undefined) return undefined;
-    return projectWorkflowStatus({
+    const projected = projectWorkflowStatus({
       runId,
       effects,
       ...(terminal !== undefined ? { terminal } : {}),
     });
+    const effectivePermissionMode = terminal === undefined
+      ? this.currentPermissionMode(runId)
+      : undefined;
+    return {
+      ...projected,
+      ...(effectivePermissionMode !== undefined ? { effectivePermissionMode } : {}),
+    };
   }
 
   /**
@@ -646,12 +720,88 @@ export class VerifiedChangeWorkflowController {
         if (started) resumed.push(runId);
       } catch (error) {
         if (error instanceof M5WorkflowFailpointError) throw error;
-        this.#deps.warn(
-          `workflow resume failed for ${runId}: ${errorMessage(error)}`,
+        const message = errorMessage(error);
+        this.#deps.warn(`workflow resume failed for ${runId}: ${message}`);
+        // Nothing is driving this run any more and, when the journal itself
+        // failed to open, nothing can journal through its session. Left as
+        // it is, the run reads "running" forever and run.cancel cannot reach
+        // it (a goal that survived a daemon restart used to do exactly
+        // that). Close it durably as failed instead.
+        this.#recordDetachedTerminal(
+          repo,
+          runId,
+          "failed",
+          `workflow resume failed after a daemon restart: ${message}. Any worktree the run created is left in place for review; re-submit the request to continue the work.`,
         );
       }
     }
     return resumed;
+  }
+
+  /**
+   * `run.cancel` reaches a live pipeline through the admission cascade, which
+   * the pipeline observes and terminalizes as cancelled. A run with no live
+   * pipeline in this process (its resume failed, or the process that ran it
+   * is gone) has nothing observing that cascade: the agents-rail row turns
+   * cancelled while the workflow projection stays "running". Close the
+   * projection directly so status and cancel agree.
+   */
+  cancelDetached(runId: string, reason: string): WorkflowDetachedCancelOutcome {
+    if (this.#active.has(runId)) return "live";
+    const repo = this.#deps.durability({ runId });
+    if (repo.getEffect(runId, "workflow.intake") === undefined) {
+      return "not_a_workflow";
+    }
+    if (repo.getCurrentTerminalResult(runId) !== undefined) {
+      return "already_terminal";
+    }
+    return this.#recordDetachedTerminal(
+      repo,
+      runId,
+      "cancelled",
+      `cancelled by run.cancel (${reason}); the run had no live pipeline`,
+    )
+      ? "cancelled"
+      : "not_recorded";
+  }
+
+  /**
+   * Durable-only terminal for a run without a live writer, the same offline
+   * authority run.cancel and child terminals already use. Never throws: a
+   * failure here is logged and the caller reports it, because the run is
+   * already beyond any journal this process can open.
+   */
+  #recordDetachedTerminal(
+    repo: StateRunDurabilityRepository,
+    runId: string,
+    status: "failed" | "cancelled",
+    finalMessage: string,
+  ): boolean {
+    try {
+      if (repo.getCurrentTerminalResult(runId) !== undefined) return true;
+      const epoch = repo.currentEpoch(runId)?.epoch;
+      if (epoch === undefined) return false;
+      repo.recordTerminalResult({
+        epoch,
+        eventId: `${WORKFLOW_DETACHED_TERMINAL_EVENT_PREFIX}${runId}:${epoch}`,
+        result: {
+          runId,
+          status,
+          exitCode: 1,
+          stopReason: null,
+          finalMessage,
+          usage: null,
+          lastSequence: null,
+          finishedAt: this.#nowIso(),
+        },
+      });
+      return true;
+    } catch (error) {
+      this.#deps.warn(
+        `workflow ${runId} could not record its ${status} terminal: ${errorMessage(error)}`,
+      );
+      return false;
+    }
   }
 
   async #resumeRun(
@@ -824,10 +974,13 @@ export class VerifiedChangeWorkflowController {
       },
     });
     if (result.outcome !== "committed") {
+      // The journal keeps the failure; the client used to see only
+      // "workflow intake failed" while the cause sat in run_effects.
+      const failure = describeEffectFailure(result);
       throw new WorkflowHaltError({
         status: result.outcome === "cancelled" ? "cancelled" : "failed",
         stopReason: null,
-        finalMessage: `workflow intake ${result.outcome}`,
+        finalMessage: `workflow intake ${result.outcome}${failure}`,
       });
     }
     if (ctx.ledger === undefined) {
@@ -947,6 +1100,7 @@ export class VerifiedChangeWorkflowController {
         });
       }
       if (implement.outcome === "failed") {
+        this.#haltPermanentChildFailure(implement);
         if (attempt >= spec.maxImplementAttempts) {
           throw new WorkflowHaltError({
             status: "failed",
@@ -1009,8 +1163,8 @@ export class VerifiedChangeWorkflowController {
           }),
         ),
         estimate: ZERO_ESTIMATE,
-        execute: async () =>
-          this.#executeVerificationCommand(ctx, command, attempt),
+        execute: async (signal) =>
+          this.#executeVerificationCommand(ctx, command, attempt, signal),
       });
       const record = result.evidence.command;
       if (result.outcome === "committed" && record !== undefined) {
@@ -1047,7 +1201,17 @@ export class VerifiedChangeWorkflowController {
         attempt,
         spawnKind: "verify_agent",
         childRunId: `${ctx.runId}:verify-agent#${attempt}`,
-        prompt: buildVerifyAgentPrompt(ctx.spec, records),
+        prompt: buildVerifyAgentPrompt(
+          ctx.spec,
+          records,
+          attempt > 1 && ctx.verifyReport !== undefined
+            ? {
+                attempt: attempt - 1,
+                verdict: ctx.verifyVerdict ?? "FAIL",
+                report: ctx.verifyReport,
+              }
+            : undefined,
+        ),
         decorate: (outcome) => {
           const verdict = parseVerificationVerdict(outcome.finalMessage ?? "");
           return {
@@ -1078,6 +1242,7 @@ export class VerifiedChangeWorkflowController {
       });
     }
     if (agent.outcome === "failed") {
+      this.#haltPermanentChildFailure(agent);
       throw new WorkflowHaltError({
         status: "failed",
         stopReason: "step_retries_exhausted",
@@ -1087,6 +1252,7 @@ export class VerifiedChangeWorkflowController {
     const verdict = agent.evidence.verdict ?? "FAIL";
     ctx.verification = { records, allPassed, testResult };
     ctx.verifyVerdict = verdict;
+    ctx.verifyReport = agent.evidence.child?.finalMessage;
     return allPassed && verdict === "PASS";
   }
 
@@ -1094,6 +1260,7 @@ export class VerifiedChangeWorkflowController {
     ctx: RunContext,
     command: { readonly label: string; readonly script: string },
     attempt: number,
+    signal: AbortSignal,
   ): Promise<EffectExecution> {
     const handle = this.#requireHandle(ctx);
     const startedAt = performance.now();
@@ -1104,10 +1271,13 @@ export class VerifiedChangeWorkflowController {
     let truncated = false;
     let durationMs: number;
     try {
+      signal.throwIfAborted();
       const result = await this.#deps.commands.run({
         script: command.script,
         cwd: handle.path,
+        signal,
       });
+      signal.throwIfAborted();
       exitCode = result.exitCode;
       stdout = result.stdout;
       stderr = result.stderr;
@@ -1115,6 +1285,9 @@ export class VerifiedChangeWorkflowController {
       truncated = result.truncated;
       durationMs = result.durationMs;
     } catch (error) {
+      // Preserve admission cancellation for #driveEffect's cancelled result
+      // and held-unknown accounting, including a runner that resolves on abort.
+      if (signal.aborted) throw error;
       // A runner crash is a failing command with diagnostic stderr, never a
       // silently missing record (verification.ts discipline).
       exitCode = 127;
@@ -1166,11 +1339,7 @@ export class VerifiedChangeWorkflowController {
             canonicalizeJson({ stepId, childRunId, reviewer: ctx.spec.reviewerModel }),
           ),
           childRunId,
-          estimate: {
-            maxInputTokens: SPAWN_ESTIMATE_INPUT_TOKENS,
-            maxOutputTokens: SPAWN_ESTIMATE_OUTPUT_TOKENS,
-            maxCostUsd: ctx.spec.budget.maxCostUsd ?? null,
-          },
+          estimate: ZERO_ESTIMATE,
           ...(ctx.spec.reviewerModel !== undefined
             ? { model: ctx.spec.reviewerModel }
             : {}),
@@ -1219,11 +1388,32 @@ export class VerifiedChangeWorkflowController {
                 review.artifact,
               );
             } catch (error) {
-              if (error instanceof ReviewParseError) {
-                // A settled-but-unparseable reviewer is a KNOWN failure —
-                // durable for adoption too, so a crash in the commit window
-                // resumes into the same failed outcome (and its bounded
-                // retry), never into unknown_outcome.
+              const approvalFailure = workflowApprovalFailureCause(error);
+              if (approvalFailure !== undefined) {
+                this.#recordReviewChildTerminal(ctx, childRunId, {
+                  status: "failed",
+                  stopReason: approvalFailure.stopReason,
+                  finalMessage: approvalFailure.message,
+                  usage: null,
+                });
+                return {
+                  outcome: "failed",
+                  evidence: {
+                    stage: "workflow.review", attempt,
+                    failure: { reason: approvalFailure.stopReason, message: approvalFailure.message },
+                  },
+                };
+              }
+              if (
+                error instanceof ReviewParseError ||
+                error instanceof ReviewInvocationError
+              ) {
+                // A settled-but-unparseable reviewer, or one whose single
+                // call failed before any output (soak F76: a 403 on the
+                // reviewer's token), is a KNOWN failure — durable for
+                // adoption too, so a crash in the commit window resumes
+                // into the same failed outcome (and its bounded retry),
+                // never into unknown_outcome.
                 this.#recordReviewChildTerminal(ctx, childRunId, {
                   status: "failed",
                   finalMessage: error.message,
@@ -1235,7 +1425,10 @@ export class VerifiedChangeWorkflowController {
                     stage: "workflow.review",
                     attempt,
                     failure: {
-                      reason: "review_unparseable",
+                      reason:
+                        error instanceof ReviewParseError
+                          ? "review_unparseable"
+                          : "review_invocation_failed",
                       message: error.message,
                     },
                   },
@@ -1522,14 +1715,7 @@ export class VerifiedChangeWorkflowController {
     if (verification === undefined || review === undefined) {
       throw new Error("record assembly requires verification and review context");
     }
-    const usage = ctx.usage.any
-      ? {
-          inputTokens: ctx.usage.input,
-          outputTokens: ctx.usage.output,
-          totalTokens: ctx.usage.input + ctx.usage.output,
-          costUsd: ctx.usage.cost,
-        }
-      : null;
+    const usage = this.#canonicalUsage(ctx);
     return assembleVerifiedChangeRecord({
       runId: ctx.runId,
       specDigest: ctx.specDigest,
@@ -1583,6 +1769,7 @@ export class VerifiedChangeWorkflowController {
         child: {
           childRunId: input.childRunId,
           status: outcome.status,
+          ...(outcome.stopReason !== undefined ? { stopReason: outcome.stopReason } : {}),
           ...(truncate(outcome.finalMessage) !== undefined
             ? { finalMessage: truncate(outcome.finalMessage)! }
             : {}),
@@ -1597,11 +1784,6 @@ export class VerifiedChangeWorkflowController {
           : outcome.status === "cancelled"
             ? "cancelled"
             : "failed";
-      // The child's usage is already reconciled at its durable source (the
-      // child run's own admission reservations charge the shared allocation
-      // scopes), so it rides `rollupUsage` — accumulated into the run's
-      // terminal usage rollup, never re-reconciled against the parent spawn
-      // reservation (that would double-charge the budget).
       const rollupUsage =
         outcome.usage === null
           ? undefined
@@ -1631,11 +1813,7 @@ export class VerifiedChangeWorkflowController {
         }),
       ),
       childRunId: input.childRunId,
-      estimate: {
-        maxInputTokens: SPAWN_ESTIMATE_INPUT_TOKENS,
-        maxOutputTokens: SPAWN_ESTIMATE_OUTPUT_TOKENS,
-        maxCostUsd: spec.budget.maxCostUsd ?? null,
-      },
+      estimate: ZERO_ESTIMATE,
       ...(spec.model !== undefined ? { model: spec.model } : {}),
       ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
       beforeCommitFailpoints: input.beforeCommitFailpoints ?? [
@@ -1672,6 +1850,7 @@ export class VerifiedChangeWorkflowController {
         if (input.decorate !== undefined && child !== undefined) {
           return toEvidence({
             status: child.status as RunTerminalStatus,
+            ...(child.stopReason !== undefined ? { stopReason: child.stopReason } : {}),
             finalMessage: child.finalMessage ?? null,
             usage: child.usage ?? null,
             ...(child.usageHeldUnknown !== undefined
@@ -1776,9 +1955,9 @@ export class VerifiedChangeWorkflowController {
         attempt,
         failure: {
           reason:
-            outcome.status === "cancelled"
+            outcome.stopReason ?? (outcome.status === "cancelled"
               ? "review_cancelled"
-              : "review_unparseable",
+              : "review_unparseable"),
           ...(outcome.finalMessage !== null
             ? { message: outcome.finalMessage }
             : {}),
@@ -1819,6 +1998,7 @@ export class VerifiedChangeWorkflowController {
         child: {
           childRunId,
           status: outcome.status,
+          ...(outcome.stopReason !== undefined ? { stopReason: outcome.stopReason } : {}),
           ...(truncate(outcome.finalMessage) !== undefined
             ? { finalMessage: truncate(outcome.finalMessage)! }
             : {}),
@@ -1872,6 +2052,7 @@ export class VerifiedChangeWorkflowController {
           finalMessage: `${input.stage} attempt ${attempt} has an unresolved unknown outcome`,
         });
       }
+      this.#haltPermanentChildFailure(result);
       if (attempt >= input.maxAttempts) {
         throw new WorkflowHaltError({
           status: "failed",
@@ -1881,6 +2062,16 @@ export class VerifiedChangeWorkflowController {
       }
       attempt += 1;
     }
+  }
+
+  #haltPermanentChildFailure(result: EffectStepResult): void {
+    const stopReason = result.evidence.child?.stopReason ?? result.evidence.failure?.reason;
+    if (stopReason !== "approval_required" && stopReason !== "policy_denied") return;
+    throw new WorkflowHaltError({
+      status: "failed",
+      stopReason,
+      finalMessage: result.evidence.child?.finalMessage ?? result.evidence.failure?.message ?? "Workflow tool approval failed.",
+    });
   }
 
   /**
@@ -2267,14 +2458,14 @@ export class VerifiedChangeWorkflowController {
       }
     }
     try {
-      const usage = ctx.usage.any
-        ? {
-            inputTokens: ctx.usage.input,
-            outputTokens: ctx.usage.output,
-            totalTokens: ctx.usage.input + ctx.usage.output,
-            costUsd: ctx.usage.cost,
-          }
-        : null;
+      let usage: RunUsageTotals | null = null;
+      try {
+        usage = this.#canonicalUsage(ctx);
+      } catch (error) {
+        this.#deps.warn(
+          `workflow ${ctx.runId} canonical usage is unavailable: ${errorMessage(error)}`,
+        );
+      }
       const terminalEvent = ctx.journal.appendTerminal({
         status: terminal.status,
         stopReason: terminal.stopReason,
@@ -2307,6 +2498,20 @@ export class VerifiedChangeWorkflowController {
     }
   }
 
+  #canonicalUsage(ctx: RunContext): RunUsageTotals | null {
+    const summary = ctx.admission.getUsageSummary?.();
+    if (summary !== undefined && summary.runId !== ctx.runId) {
+      throw new Error(`canonical usage belongs to ${summary.runId}, not workflow ${ctx.runId}`);
+    }
+    if (summary === undefined || summary.hasUnknownCost) return null;
+    return {
+      inputTokens: summary.inputTokens,
+      outputTokens: summary.outputTokens,
+      totalTokens: summary.totalTokens,
+      costUsd: summary.costUsd,
+    };
+  }
+
   // -------------------------------------------------------------------------
   // Context guards
   // -------------------------------------------------------------------------
@@ -2337,10 +2542,35 @@ export class VerifiedChangeWorkflowController {
 // Spec freeze + prompts
 // ---------------------------------------------------------------------------
 
+/**
+ * The reviewer model is resolved once, here, and pinned: the caller's
+ * `reviewerModel`, else the caller's `model`, else the model the daemon gives
+ * a new session. A start that can name none is refused instead of freezing a
+ * name the provider has never heard of.
+ */
+function resolveReviewerModel(
+  runId: string,
+  params: WorkflowStartParams,
+  daemonDefaultModel: string | undefined,
+): string {
+  const candidate =
+    params.reviewerModel ?? params.model ?? daemonDefaultModel;
+  const trimmed = candidate?.trim() ?? "";
+  if (trimmed.length === 0) {
+    throw new WorkflowIntakeError(
+      runId,
+      null,
+      "no reviewer model: pass `reviewerModel` or `model`, or configure the daemon's default model",
+    );
+  }
+  return trimmed;
+}
+
 function freezeWorkflowSpec(
   runId: string,
   params: WorkflowStartParams,
   base: BaseState,
+  daemonDefaultModel: string | undefined,
 ): WorkflowSpec {
   return {
     runId,
@@ -2354,9 +2584,8 @@ function freezeWorkflowSpec(
     },
     ...(params.model !== undefined ? { model: params.model } : {}),
     ...(params.provider !== undefined ? { provider: params.provider } : {}),
-    reviewerModel:
-      params.reviewerModel ?? params.model ?? "default-reviewer",
-    permissionMode: params.permissionMode ?? DEFAULT_PERMISSION_MODE,
+    reviewerModel: resolveReviewerModel(runId, params, daemonDefaultModel),
+    permissionMode: resolveWorkflowPermissionMode(params.permissionMode),
     ...(params.unattendedAllow !== undefined
       ? { unattendedAllow: params.unattendedAllow }
       : {}),
@@ -2407,9 +2636,13 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
           `- ${record.label}: exit ${record.exitCode}` +
           (record.timedOut ? " (timed out)" : ""),
       ),
-      "",
-      "Fix the failures above, then stop.",
     );
+    // Soak F73: the verdict alone told the implementer nothing; the report
+    // names the failures it has to fix.
+    if (ctx.verifyReport !== undefined) {
+      lines.push("", "### Verifier's report", ctx.verifyReport);
+    }
+    lines.push("", "Fix every failure reported above, then stop.");
   }
   return lines.join("\n");
 }
@@ -2417,11 +2650,21 @@ function buildImplementPrompt(ctx: RunContext, attempt: number): string {
 function buildVerifyAgentPrompt(
   spec: WorkflowSpec,
   records: readonly VerifiedChangeCommandRecord[],
+  previous?: {
+    readonly attempt: number;
+    readonly verdict: string;
+    readonly report: string;
+  },
 ): string {
   return [
     "You are an ADVERSARIAL verification agent for a proposed code change.",
     "Independently verify the change in the current worktree against the goal.",
     "Re-run spot checks; do not trust the implementer's claims.",
+    // Soak F65: the verifier wrote its fixtures to /tmp and by redirection into
+    // tracked paths, and the sandbox refused both; say where scratch may go.
+    "Write any scratch files or fixtures you need under `tmp/` inside the worktree:",
+    "the sandbox refuses writes outside the workspace (including /tmp) and shell",
+    "redirection into other workspace paths.",
     "",
     "## Goal",
     spec.goal,
@@ -2432,6 +2675,19 @@ function buildVerifyAgentPrompt(
         `- ${record.label}: exit ${record.exitCode}` +
         (record.timedOut ? " (timed out)" : ""),
     ),
+    // Soak F73: a second verifier that starts blind re-derives the previous
+    // findings from scratch; hand it the report and have it re-check those
+    // first, then keep verifying independently.
+    ...(previous !== undefined
+      ? [
+          "",
+          `## Previous verification attempt ${previous.attempt} (verdict ${previous.verdict})`,
+          "The change was re-implemented after this report. Re-check every",
+          "failure it lists first, then continue your own independent verification.",
+          "",
+          previous.report,
+        ]
+      : []),
     "",
     "End your final message with exactly one line:",
     "VERDICT: PASS | FAIL | PARTIAL",

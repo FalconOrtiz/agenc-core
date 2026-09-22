@@ -20,6 +20,7 @@ Order matches `buildDefaultRegistry`.
 | `/help` | | Show help and available commands |
 | `/hello` | | Print a greeting card with the current model and workspace |
 | `/status` | | Show current session and runtime status |
+| `/goal` | | Set an end condition the agent works toward until verified checks and an independent reviewer agree it is met; `/goal` alone shows status. See [goal.md](goal.md) |
 | `/login` | | Sign in with your AgenC account |
 | `/logout` | | Sign out of your AgenC account |
 | `/whoami` | `account` | Show the signed-in AgenC account |
@@ -80,6 +81,30 @@ Sources: `runtime/src/commands/*.ts(x)` modules imported by
 
 ---
 
+## Bridge command policy
+
+`runtime/src/commands/bridge-policy.ts` defines the fixed bridge allowlist
+and the shared `isBridgeSafeCommand` predicate. The CLI, dispatcher, and
+command-object exports use that same predicate. Commands outside the list
+require direct CLI confirmation when `runSlashCommand` receives
+`bridge: true`.
+
+The policy accepts exact canonical names. Raw aliases such as `/reset` for
+`/clear` remain blocked over the bridge. A resolved command object is checked
+by its canonical `name`; its aliases and displayed name cannot grant bridge
+access. Local JSX commands are rejected even when their name is allowlisted.
+Local dispatch without `bridge: true` retains normal alias handling.
+
+Prompt commands are not in the fixed allowlist.
+`isBridgeForwardablePromptCommand` identifies prompt objects for a separate
+prompt-forwarding path. That predicate does not authorize local command
+execution or bypass tool permissions. A parsed name alone never grants
+prompt-forwarding access.
+
+Change the allowlist in the policy module and update the expected names in
+`runtime/tests/commands/bridge-policy.test.ts` when approving another command.
+The adapters and command-object set derive their membership from that list.
+
 ## `/login`
 
 `/login` signs into the AgenC account. The PromptInput footer
@@ -137,9 +162,13 @@ mid-turn outer gate consults only `AGENC_DISABLE_AUTO_COMPACT`. Setting
 `AGENC_DISABLE_COMPACT` alone still trips that gate, then
 `autoCompactIfNeeded` returns `wasCompacted: false`, and the turn ends
 with `mid_turn_compact_skipped` (`warning` cause `mid_turn_compact_failed`,
-`stopReason: "compact_failed"`). Keep-alive sessions stay promptable.
+`stopReason: "compact_failed"`). The canonical terminal is `turn_failed`
+with code `compact_failed`. Keep-alive sessions stay promptable, while
+daemon-backed `--print` / `--no-tui` exits 1.
 Env catalog: [env.md](env.md). Session survival:
 [daemon.md](daemon.md#compact-skip-stays-per-turn).
+The transaction itself has a 900 s wall budget
+([CP-0006](../design/critical-path/0006-compaction-transaction.md#compaction-transaction-wall-budget)).
 
 Successful transactional compaction reports its durable attempt ID in the
 command result. A replacement-history boundary also displays the ID, so it
@@ -206,4 +235,4 @@ an unclassified path, or the journal predates that attestation. Operator detail:
 | Help groups | Presentation metadata in `runtime/src/commands/help-groups.ts` |
 | Plugin-added commands | Plugins can register additional commands outside this minimal registry (see [skills-plugins.md](skills-plugins.md)) |
 
-Related: [cli.md](cli.md) (top-level `agenc` subcommands), [tui-workbench.md](tui-workbench.md).
+Related: [cli.md](cli.md) (top-level `agenc` subcommands).

@@ -1,63 +1,1239 @@
-/**
- * G3: ImagineImage LIVE tool gates + REST path (mocked fetch).
- */
+/** Provider-independent ImagineImage catalog and REST paths (mocked fetch). */
 import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveHomeContext } from "../../../src/config/home.js";
 import { createImagineImageTool } from "../../../src/tools/system/imagine-image.js";
 import { createModelFacingTools } from "../../../src/bin/model-facing-tools.js";
 import { createProvider } from "../../../src/llm/provider.js";
 import type { Session } from "../../../src/session/session.js";
+import {
+  isModelFacingToolRegistered,
+  mediaTestHome as testHome,
+} from "./media-test-helpers.js";
 
-function testHome(workspaceRoot: string) {
-  return resolveHomeContext(
-    {
-      AGENC_HOME: join(workspaceRoot, ".agenc-test-home"),
-      HOME: workspaceRoot,
+type QwenImageProduct = "qwen" | "qwen-token-plan";
+
+function qwenJsonResponse(payload: unknown): Response {
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function qwenImageResult(image: string): Response {
+  return qwenJsonResponse({
+    output: {
+      choices: [{ message: { content: [{ image }] } }],
     },
-    { platformHome: workspaceRoot },
-  );
+  });
+}
+
+function createQwenImagineTool(
+  product: QwenImageProduct,
+  fetchImpl: typeof fetch,
+  workspaceRoot = process.cwd(),
+) {
+  const provider = createProvider(product, {
+    apiKey: product === "qwen" ? "sk-ws-session" : "sk-sp-session",
+    model: "qwen3.8-max",
+  });
+  return createImagineImageTool({
+    workspaceRoot,
+    home: testHome(workspaceRoot),
+    getSession: () => ({ services: { provider } }) as unknown as Session,
+    env: {},
+    fetchImpl,
+  });
+}
+
+function generatedImageUrlFetch(generatedUrl: string, contents: string) {
+  return vi.fn(async (url: string | URL | Request) =>
+    String(url) === generatedUrl
+      ? new Response(Buffer.from(contents), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        })
+      : new Response(JSON.stringify({ data: [{ url: generatedUrl }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }));
+}
+
+function createSessionImagineImageTool(options: {
+  readonly workspaceRoot: string;
+  readonly provider: ReturnType<typeof createProvider>;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly fetchImpl?: typeof fetch;
+}) {
+  return createImagineImageTool({
+    workspaceRoot: options.workspaceRoot,
+    home: testHome(options.workspaceRoot),
+    getSession: () =>
+      ({ services: { provider: options.provider } }) as unknown as Session,
+    env: options.env ?? {},
+    ...(options.fetchImpl === undefined
+      ? {}
+      : { fetchImpl: options.fetchImpl }),
+  });
+}
+
+/**
+ * One mock serving both new backends: MiniMax answers on its own route with
+ * its own envelope, everything else gets the OpenAI-shaped list.
+ */
+function backendAwareImageFetch(): typeof fetch {
+  const b64 = Buffer.from("pixels").toString("base64");
+  return vi.fn(async (url: string | URL) =>
+    String(url).includes("/image_generation")
+      ? {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { image_base64: [b64] },
+            base_resp: { status_code: 0 },
+          }),
+        }
+      : {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [{ b64_json: b64 }],
+            output_format: "png",
+          }),
+        }) as unknown as typeof fetch;
+}
+
+/** URL, bearer and parsed body of the first request a mock received. */
+function firstRequest(fetchImpl: typeof fetch): {
+  url: string;
+  authorization: string;
+  body: Record<string, unknown>;
+} {
+  const call = (fetchImpl as unknown as { mock: { calls: unknown[][] } }).mock
+    .calls[0];
+  const init = call?.[1] as { headers: Record<string, string>; body: string };
+  return {
+    url: String(call?.[0]),
+    authorization: init.headers.authorization,
+    body: JSON.parse(init.body) as Record<string, unknown>,
+  };
+}
+
+/** An OpenAI session whose only media authority is the API-key ingress. */
+function openaiImagineTool(root: string, fetchImpl?: typeof fetch) {
+  return createSessionImagineImageTool({
+    workspaceRoot: root,
+    provider: createProvider("openai", {
+      apiKey: "unused",
+      model: "gpt-6-astra",
+      baseURL: "https://api.openai.com/v1",
+    }),
+    env: { OPENAI_API_KEY: "isolated-openai-key" },
+    ...(fetchImpl === undefined ? {} : { fetchImpl }),
+  });
+}
+
+function minimaxImagineTool(root: string, fetchImpl?: typeof fetch) {
+  return createSessionImagineImageTool({
+    workspaceRoot: root,
+    provider: createProvider("minimax", {
+      apiKey: "unused",
+      model: "MiniMax-M2.5",
+    }),
+    env: { MINIMAX_API_KEY: "isolated-minimax-key" },
+    ...(fetchImpl === undefined ? {} : { fetchImpl }),
+  });
 }
 
 describe("ImagineImage tool", () => {
-  it("is not catalog-registered for non-Grok (Claude/OpenAI) sessions", () => {
-    const tools = createModelFacingTools({
+  it("declares its fixed output directory so the runtime sandbox can verify the write", () => {
+    const tool = createQwenImagineTool("qwen", vi.fn(), "/work/space");
+    expect(tool.metadata?.mutating).toBe(true);
+    expect(tool.metadata?.virtualNoFsWrites).toBeUndefined();
+    expect(tool.metadata?.fixedWriteTargets?.()).toEqual([join("/work/space", ".agenc", "imagine")]);
+  });
+
+  it("is catalog-registered for non-Grok sessions with an independent xAI credential", () => {
+    expect(isModelFacingToolRegistered("ImagineImage", {
       workspaceRoot: process.cwd(),
       getSession: () => null,
       sessionProvider: "openai",
       env: { XAI_API_KEY: "key" },
+    })).toBe(true);
+  });
+
+  it("is catalog-registered for Meta sessions with a native image credential", () => {
+    const tools = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => null,
+      sessionProvider: "meta",
+      sessionBaseURL: "https://api.meta.ai/v1",
+      env: { MODEL_API_KEY: "meta-key" },
     });
-    expect(tools.some((t) => t.name === "ImagineImage")).toBe(false);
+    expect(tools.some((t) => t.name === "ImagineImage")).toBe(true);
+  });
+
+  it("is catalog-registered for either isolated QwenCloud credential", () => {
+    for (const env of [
+      { DASHSCOPE_API_KEY: "sk-ws-test" },
+      { QWEN_TOKEN_PLAN_API_KEY: "sk-sp-test" },
+    ]) {
+      const tools = createModelFacingTools({
+        workspaceRoot: process.cwd(),
+        getSession: () => null,
+        env,
+      });
+      expect(tools.some((tool) => tool.name === "ImagineImage")).toBe(true);
+    }
+  });
+
+  it("is catalog-registered with an isolated Z.ai image credential", () => {
+    const tools = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => null,
+      sessionProvider: "zai",
+      env: { ZAI_API_KEY: "zai-image-key" },
+    });
+    expect(tools.some((tool) => tool.name === "ImagineImage")).toBe(true);
+  });
+
+  it("keeps a deferred ImagineImage across an OpenAI-to-Z.AI provider switch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-switch-"));
+    let session: Session | null = null;
+    const generatedUrl = "https://cdn.bigmodel.cn/generated/switched.png";
+    const fetchImpl = generatedImageUrlFetch(generatedUrl, "switched-png");
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", fetchImpl);
+    try {
+      const tool = createModelFacingTools({
+        workspaceRoot: root,
+        agencHome: join(root, ".agenc-test-home"),
+        getSession: () => session,
+        sessionProvider: "openai",
+        env: {},
+      }).find((candidate) => candidate.name === "ImagineImage");
+      if (tool === undefined) throw new Error("ImagineImage was not registered");
+      expect(tool.metadata?.deferred).toBe(true);
+
+      const provider = createProvider("zai", {
+        apiKey: "late-payg-key",
+        model: "glm-5.3",
+      });
+      session = ({ services: { provider } }) as unknown as Session;
+      const result = await tool.execute({ prompt: "switched session image" });
+
+      expect(result.isError).toBeUndefined();
+      const [, init] = fetchImpl.mock.calls[0] ?? [];
+      expect((init?.headers as Record<string, string>).authorization)
+        .toBe("Bearer late-payg-key");
+    } finally {
+      vi.stubGlobal("fetch", originalFetch);
+    }
+  });
+
+  it("keeps Coding Plan image discovery deferred without treating its key as authority", async () => {
+    const tools = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => null,
+      sessionProvider: "zai",
+      env: {
+        ZAI_API_KEY: "zai-coding-plan-key",
+        ZAI_BASE_URL: "https://api.z.ai/api/coding/paas/v4",
+      },
+    });
+    const tool = tools.find((candidate) => candidate.name === "ImagineImage");
+    if (tool === undefined) throw new Error("ImagineImage was not registered");
+    expect(tool.metadata?.deferred).toBe(true);
+    await expect(tool.execute({ prompt: "must not use coding key" }))
+      .resolves.toMatchObject({ isError: true });
+  });
+
+  it("never treats a native Coding Plan credential as image authority", () => {
+    const provider = createProvider("zai-coding-plan", {
+      apiKey: "coding-plan-key-must-not-be-media",
+      model: "glm-5.3",
+    });
+    const tools = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      sessionProvider: "zai-coding-plan",
+      env: {
+        ZAI_CODING_PLAN_API_KEY: "coding-plan-key-must-not-be-media",
+      },
+    });
+    expect(tools.some((tool) => tool.name === "ImagineImage")).toBe(false);
+  });
+
+  it("uses only an independent PAYG key for images in a Coding Plan session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-plan-isolation-"));
+    const provider = createProvider("zai-coding-plan", {
+      apiKey: "coding-plan-key-must-not-leak",
+      model: "glm-5.3",
+    });
+    const generatedUrl = "https://cdn.bigmodel.cn/generated/isolated.png";
+    const fetchImpl = generatedImageUrlFetch(generatedUrl, "isolated-png");
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider,
+      env: {
+        ZAI_CODING_PLAN_API_KEY: "coding-plan-key-must-not-leak",
+        ZAI_API_KEY: "payg-media-key",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "isolated image" });
+
+    expect(result.isError).toBeUndefined();
+    const [, init] = fetchImpl.mock.calls[0] ?? [];
+    const authorization = (init?.headers as Record<string, string>)
+      .authorization;
+    expect(authorization).toBe("Bearer payg-media-key");
+    expect(authorization).not.toContain("coding-plan-key-must-not-leak");
+  });
+
+  it("keeps a universal schema until a late-bound Z.AI session exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-late-session-"));
+    let session: Session | null = null;
+    const generatedUrl = "https://cdn.bigmodel.cn/generated/late.png";
+    const fetchImpl = generatedImageUrlFetch(generatedUrl, "late-png");
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => session,
+      env: {},
+      fetchImpl,
+    });
+    const properties = tool.inputSchema.properties as Record<string, unknown>;
+    expect(Object.keys(properties)).toEqual([
+      "prompt",
+      "model",
+      "n",
+      "aspect_ratio",
+      "resolution",
+      "quality",
+    ]);
+
+    const provider = createProvider("zai", {
+      apiKey: "late-payg-key",
+      model: "glm-5.3",
+    });
+    session = ({ services: { provider } }) as unknown as Session;
+    const result = await tool.execute({
+      prompt: "late session image",
+      quality: "standard",
+    });
+
+    expect(result.isError).toBeUndefined();
+    const [, init] = fetchImpl.mock.calls[0] ?? [];
+    expect((init?.headers as Record<string, string>).authorization)
+      .toBe("Bearer late-payg-key");
+  });
+
+  it("advertises a Z.ai-specific schema without unsupported count or resolution", () => {
+    const provider = createProvider("zai", {
+      apiKey: "isolated-zai-key",
+      model: "glm-5.3",
+    });
+    const tool = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      agencHome: join(process.cwd(), ".agenc-test-home"),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      sessionProvider: "zai",
+      env: {},
+    }).find((candidate) => candidate.name === "ImagineImage");
+    if (tool === undefined) throw new Error("ImagineImage was not registered");
+    const properties = tool.inputSchema.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+
+    expect(tool.description).toMatch(/exactly one image/u);
+    expect(Object.keys(properties)).toEqual([
+      "prompt",
+      "model",
+      "aspect_ratio",
+      "quality",
+    ]);
+    expect(properties.model?.enum).toEqual([
+      "glm-image",
+      "cogview-4-250304",
+    ]);
+    expect(properties.n).toBeUndefined();
+    expect(properties.resolution).toBeUndefined();
+    expect(properties.quality?.enum).toEqual(["hd", "standard"]);
+  });
+
+  it("keeps each non-Z.ai backend's supported controls in its schema", () => {
+    const metaProvider = createProvider("meta", {
+      apiKey: "meta-session-key-not-used-for-images",
+      model: "muse-spark-1.3",
+    });
+    const metaTool = createImagineImageTool({
+      workspaceRoot: process.cwd(),
+      home: testHome(process.cwd()),
+      getSession: () =>
+        ({ services: { provider: metaProvider } }) as unknown as Session,
+      env: { MODEL_API_KEY: "isolated-meta-image-key" },
+    });
+    const metaProperties = metaTool.inputSchema.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(metaProperties.model?.enum).toEqual(["muse-image-1.0"]);
+    expect(metaProperties.n).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 10,
+    });
+    expect(metaProperties.aspect_ratio).toBeDefined();
+    expect(metaProperties.resolution).toBeUndefined();
+    expect(metaProperties.quality).toBeUndefined();
+
+    const fetchImpl = vi.fn<typeof fetch>();
+    const qwenTool = createQwenImagineTool("qwen", fetchImpl);
+    const qwenProperties = qwenTool.inputSchema.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(qwenProperties.n).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 6,
+    });
+    expect(qwenProperties.resolution?.enum).toEqual(["1k", "2k"]);
+    expect(qwenProperties.quality).toBeUndefined();
+
+    const xaiProvider = createProvider("grok", {
+      apiKey: "isolated-xai-key",
+      model: "grok-4.6",
+      baseURL: "https://api.x.ai/v1",
+    });
+    const xaiTool = createImagineImageTool({
+      workspaceRoot: process.cwd(),
+      home: testHome(process.cwd()),
+      getSession: () =>
+        ({ services: { provider: xaiProvider } }) as unknown as Session,
+      env: {},
+    });
+    const xaiProperties = xaiTool.inputSchema.properties as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(xaiProperties.n).toMatchObject({
+      type: "integer",
+      minimum: 1,
+      maximum: 10,
+    });
+    expect(xaiProperties.resolution?.enum).toEqual(["1k", "2k"]);
+    expect(xaiProperties.quality).toBeUndefined();
   });
 
   it("is catalog-registered for grok + direct xAI with BYOK or any credential probe", () => {
-    const tools = createModelFacingTools({
+    expect(isModelFacingToolRegistered("ImagineImage", {
       workspaceRoot: process.cwd(),
       getSession: () => null,
       sessionProvider: "grok",
       sessionBaseURL: "https://api.x.ai/v1",
       env: { XAI_API_KEY: "key" },
-    });
-    expect(tools.some((t) => t.name === "ImagineImage")).toBe(true);
+    })).toBe(true);
   });
 
-  it("refuses non-grok sessions at execute time (defense-in-depth)", async () => {
+  it("uses a direct Grok factory bearer when no environment key exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-factory-catalog-"));
+    const provider = createProvider("grok", {
+      apiKey: "factory-only-xai-key",
+      model: "grok-4.6",
+      baseURL: "https://api.x.ai/v1",
+    });
+    expect(isModelFacingToolRegistered("ImagineImage", {
+      workspaceRoot: root,
+      agencHome: join(root, ".agenc-test-home"),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {},
+    })).toBe(true);
+  });
+
+  it("keeps an unusable non-direct xAI backend deferred and fail-closed", async () => {
+    const tools = createModelFacingTools({
+      workspaceRoot: process.cwd(),
+      getSession: () => null,
+      env: {
+        XAI_API_KEY: "xai-key",
+        XAI_BASE_URL: "https://openrouter.ai/api/v1",
+      },
+    });
+
+    const tool = tools.find((candidate) => candidate.name === "ImagineImage");
+    if (tool === undefined) throw new Error("ImagineImage was not registered");
+    expect(tool.metadata?.deferred).toBe(true);
+    await expect(tool.execute({ prompt: "must not use proxy credential" }))
+      .resolves.toMatchObject({ isError: true });
+  });
+
+  it("uses independent xAI credentials for a Meta reasoning session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-meta-xai-"));
+    const provider = createProvider("meta", {
+      apiKey: "meta-session-key-must-not-leak",
+      model: "muse-spark-1.3",
+      baseURL: "https://api.meta.ai/v1",
+    });
+    const b64 = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }] }),
+    })) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: { XAI_API_KEY: "xai-media-key" },
+      fetchImpl,
+    });
+    const result = await tool.execute({ prompt: "a cat" });
+    expect(result.isError).toBeUndefined();
+    const [url, init] = (
+      fetchImpl as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0] ?? [];
+    expect(String(url)).toBe("https://api.x.ai/v1/images/generations");
+    const authorization = (init as { headers: { authorization: string } })
+      .headers.authorization;
+    expect(authorization).toBe("Bearer xai-media-key");
+    expect(authorization).not.toContain("meta-session-key-must-not-leak");
+  });
+
+  it("prefers Meta Muse Image and saves its response for a Meta session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-meta-native-"));
+    const provider = createProvider("meta", {
+      apiKey: "meta-session-key-must-not-be-used",
+      model: "muse-spark-1.3",
+      baseURL: "https://session-meta.invalid/v1",
+    });
+    const b64 = Buffer.from("RIFF0000WEBP", "ascii").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }] }),
+    })) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {
+        MODEL_API_KEY: "canonical-meta-image-key",
+        XAI_API_KEY: "unused-xai-key",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "portrait on a quiet street",
+      aspect_ratio: "9:16",
+      n: 1,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      model: string;
+      path: string;
+    };
+    expect(parsed.backend).toBe("meta");
+    expect(parsed.model).toBe("muse-image-1.0");
+    expect(parsed.path).toMatch(/\.webp$/u);
+    expect((await readFile(parsed.path)).length).toBeGreaterThan(0);
+
+    const [url, init] = (
+      fetchImpl as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0] ?? [];
+    expect(String(url)).toBe("https://api.meta.ai/v1/images/generations");
+    expect(
+      (init as { headers: { authorization: string } }).headers.authorization,
+    ).toBe("Bearer canonical-meta-image-key");
+    const body = JSON.parse((init as { body: string }).body) as Record<
+      string,
+      unknown
+    >;
+    expect(body).toEqual({
+      model: "muse-image-1.0",
+      prompt: "portrait on a quiet street",
+      size: "1024x1536",
+      n: 1,
+    });
+  });
+
+  it("files a provider rejection as a confirmed no-effect outcome", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-meta-rejected-"));
+    const fetchImpl = vi.fn(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({
+        error: "The OAuth2 access token could not be validated.",
+      }),
+    })) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { MODEL_API_KEY: "canonical-meta-image-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "robot bookkeeper",
+      aspect_ratio: "16:9",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({
+      error: "The OAuth2 access token could not be validated.",
+    });
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "provider_receipt",
+      evidenceRef: "tool:ImagineImage:meta:http-401",
+    });
+    expect(result.effectDisposition?.evidenceSha256).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("keeps a provider server error and a network failure as unknown outcomes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-meta-unknown-"));
+    const answers = [
+      async () => ({
+        ok: false,
+        status: 502,
+        json: async () => ({ error: { message: "upstream unavailable" } }),
+      }),
+      async () => {
+        throw new Error("socket hang up");
+      },
+    ];
+    const fetchImpl = vi.fn(async () => answers.shift()!()) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { MODEL_API_KEY: "canonical-meta-image-key" },
+      fetchImpl,
+    });
+
+    const serverError = await tool.execute({ prompt: "robot bookkeeper" });
+    expect(serverError.isError).toBe(true);
+    expect(JSON.parse(serverError.content)).toEqual({ error: "upstream unavailable" });
+    expect(serverError.effectDisposition).toBeUndefined();
+
+    const networkError = await tool.execute({ prompt: "robot bookkeeper" });
+    expect(networkError.isError).toBe(true);
+    expect(JSON.parse(networkError.content)).toEqual({ error: "socket hang up" });
+    expect(networkError.effectDisposition).toBeUndefined();
+  });
+
+  it("uses Z.ai GLM-Image synchronously with its own key and trusted URL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-native-"));
+    const provider = createProvider("zai", {
+      apiKey: "isolated-zai-key",
+      model: "glm-5.3",
+    });
+    const generatedUrl = "https://cdn.bigmodel.cn/generated/glm-image.png";
+    const fetchImpl = generatedImageUrlFetch(generatedUrl, "zai-png");
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider,
+      env: {
+        ZAI_API_KEY: "isolated-zai-key",
+        XAI_API_KEY: "must-not-win-for-zai-session",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "a precise scientific frog diagram",
+      aspect_ratio: "16:9",
+      quality: "standard",
+      n: 1,
+    });
+
+    expect(tool.admissionEstimate?.({ prompt: "one" }).maxCostUsd).toBe(0.015);
+    expect(
+      tool.admissionEstimate?.({
+        prompt: "one",
+        model: "cogview-4-250304",
+      }).maxCostUsd,
+    ).toBe(0.01);
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      model: string;
+      path: string;
+      n: number;
+    };
+    expect(parsed).toMatchObject({
+      backend: "zai",
+      model: "glm-image",
+      n: 1,
+    });
+    expect(parsed.path).toMatch(/\.png$/u);
+    expect(await readFile(parsed.path, "utf8")).toBe("zai-png");
+
+    const [url, init] = fetchImpl.mock.calls[0] ?? [];
+    expect(String(url)).toBe(
+      "https://api.z.ai/api/paas/v4/images/generations",
+    );
+    expect((init?.headers as Record<string, string>).authorization).toBe(
+      "Bearer isolated-zai-key",
+    );
+    expect(JSON.parse(String(init?.body))).toEqual({
+      model: "glm-image",
+      prompt: "a precise scientific frog diagram",
+      size: "1728x960",
+      quality: "standard",
+    });
+  });
+
+  it("honors ZAI_BASE_URL without borrowing another provider session key", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-fallback-"));
+    const provider = createProvider("openai", {
+      apiKey: "openai-key-must-not-leak",
+      model: "gpt-5",
+    });
+    const fetchImpl = vi.fn(async (url: string | URL | Request) =>
+      String(url).includes("/images/generations")
+        ? new Response(JSON.stringify({
+            data: [{ url: "https://sfile.chatglm.cn/generated/cogview.png" }],
+          }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(Buffer.from("cogview-webp"), {
+            status: 200,
+            headers: { "content-type": "image/webp" },
+          }));
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {
+        ZAI_API_KEY: "zai-only-media-key",
+        ZAI_BASE_URL: "https://zai-proxy.example/api/paas/v4/",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "a safe fallback",
+      model: "cogview-4-250304",
+      aspect_ratio: "3:4",
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as { path: string };
+    expect(parsed.path).toMatch(/\.webp$/u);
+    expect(await readFile(parsed.path, "utf8")).toBe("cogview-webp");
+    const [url, init] = fetchImpl.mock.calls[0] ?? [];
+    expect(String(url)).toBe(
+      "https://zai-proxy.example/api/paas/v4/images/generations",
+    );
+    const authorization = (init?.headers as Record<string, string>)
+      .authorization;
+    expect(authorization).toBe("Bearer zai-only-media-key");
+    expect(authorization).not.toContain("openai-key-must-not-leak");
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      model: "cogview-4-250304",
+      size: "864x1152",
+      quality: "standard",
+    });
+  });
+
+  it("rejects unsupported Z.ai image requests and untrusted result hosts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-zai-untrusted-"));
+    const provider = createProvider("zai", {
+      apiKey: "isolated-zai-key",
+      model: "glm-5.3",
+    });
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        data: [{ url: "https://attacker.example/generated.png" }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {},
+      fetchImpl,
+    });
+
+    const invalidModel = await tool.execute({
+      prompt: "must not send",
+      model: "grok-imagine-image",
+    });
+    expect(invalidModel.isError).toBe(true);
+    expect(invalidModel.content).toMatch(/glm-image.*cogview-4-250304/u);
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    const invalidCount = await tool.execute({ prompt: "must not send", n: 2 });
+    expect(invalidCount.isError).toBe(true);
+    expect(invalidCount.content).toMatch(/exactly one image/u);
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    // Z.AI picks its size from aspect_ratio, so `resolution` is dropped and
+    // named rather than refused: it is a control the universal schema offers,
+    // and refusing it stalls the run instead of correcting it.
+    const droppedResolution = await tool.execute({
+      prompt: "host validation",
+      resolution: "2k",
+    });
+    expect(droppedResolution.isError).toBe(true);
+    expect(droppedResolution.content).toMatch(/not trusted for the zai backend/u);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const sentBody = JSON.parse(
+      String((fetchImpl.mock.calls[0]?.[1] as { body: string }).body),
+    ) as Record<string, unknown>;
+    expect(sentBody.resolution).toBeUndefined();
+    expect(sentBody.size).toBe("1280x1280");
+  });
+
+  it("fails closed when Z.ai unexpectedly returns more than one image", async () => {
+    const provider = createProvider("zai", {
+      apiKey: "isolated-zai-key",
+      model: "glm-5.3",
+    });
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        data: [
+          { url: "https://cdn.bigmodel.cn/generated/first.png" },
+          { url: "https://cdn.bigmodel.cn/generated/second.png" },
+        ],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
     const tool = createImagineImageTool({
       workspaceRoot: process.cwd(),
       home: testHome(process.cwd()),
-      getSession: () =>
-        ({
-          services: { provider: { name: "openai" } },
-        }) as unknown as Session,
-      env: { XAI_API_KEY: "key" },
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {},
+      fetchImpl,
     });
-    const result = await tool.execute({ prompt: "a cat" });
+
+    const result = await tool.execute({ prompt: "one image only" });
+
     expect(result.isError).toBe(true);
-    expect(result.content).toMatch(/session provider is grok/i);
+    expect(result.content).toMatch(/must return exactly one image/u);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
+
+  it("uses Qwen Image's synchronous PayGo endpoint and downloads immediately", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-qwen-paygo-"));
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (
+        String(url) ===
+        "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/qwen.png"
+      ) {
+        return new Response(Buffer.from("png"), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        });
+      }
+      return qwenImageResult(
+        "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/qwen.png",
+      );
+    });
+    const tool = createQwenImagineTool("qwen", fetchImpl, root);
+
+    const result = await tool.execute({
+      prompt: "a production-ready spaceship",
+      model: "qwen-image-3.0-pro",
+      aspect_ratio: "16:9",
+      resolution: "2k",
+      n: 9,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      path: string;
+    };
+    expect(parsed.backend).toBe("qwen");
+    expect(parsed.path).toMatch(/\.png$/u);
+    expect(await readFile(parsed.path, "utf8")).toBe("png");
+    const [url, init] = fetchImpl.mock.calls[0] ?? [];
+    expect(String(url)).toBe(
+      "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    );
+    expect((init?.headers as Record<string, string>).authorization).toBe(
+      "Bearer sk-ws-session",
+    );
+    expect(JSON.parse(String(init?.body))).toEqual({
+      model: "qwen-image-3.0-pro",
+      input: {
+        messages: [
+          {
+            role: "user",
+            content: [{ text: "a production-ready spaceship" }],
+          },
+        ],
+      },
+      parameters: {
+        prompt_extend: true,
+        n: 6,
+        size: "2720*1536",
+      },
+    });
+
+    const portrait = await tool.execute({
+      prompt: "a portrait-oriented spaceship",
+      model: "qwen-image-3.0-pro",
+      aspect_ratio: "9:16",
+      resolution: "2k",
+    });
+    expect(portrait.isError).toBeUndefined();
+    const portraitRequest = JSON.parse(
+      String(fetchImpl.mock.calls[2]?.[1]?.body),
+    ) as { parameters: { size: string } };
+    expect(portraitRequest.parameters.size).toBe("1536*2720");
+  });
+
+  it("rejects an unverified Qwen Image model on Token Plan", async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const tool = createQwenImagineTool("qwen-token-plan", fetchImpl);
+
+    const result = await tool.execute({
+      prompt: "must not be sent",
+      model: "qwen-image-3.0",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/qwen-image-3\.0-pro.*wan2\.7/u);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("blocks a signed-image redirect that leaves trusted HTTPS hosts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-qwen-redirect-"));
+    const signed =
+      "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/image.png";
+    const fetchImpl = vi.fn(async (url: string | URL | Request) =>
+      String(url).includes("/multimodal-generation/generation")
+        ? qwenImageResult(signed)
+        : new Response(null, {
+            status: 302,
+            headers: { location: "http://127.0.0.1/internal" },
+          }));
+    const tool = createQwenImagineTool("qwen", fetchImpl, root);
+
+    const result = await tool.execute({ prompt: "safe redirect handling" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/credential-free HTTPS/u);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects oversized signed images before buffering the response", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-qwen-oversized-"));
+    const signed =
+      "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/large.png";
+    const fetchImpl = vi.fn(async (url: string | URL | Request) =>
+      String(url).includes("/multimodal-generation/generation")
+        ? qwenImageResult(signed)
+        : new Response("not buffered", {
+            status: 200,
+            headers: {
+              "content-type": "image/png",
+              "content-length": String(20 * 1024 * 1024 + 1),
+            },
+          }));
+    const tool = createQwenImagineTool("qwen", fetchImpl, root);
+
+    const result = await tool.execute({ prompt: "bounded download" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/20 MiB limit/u);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("runs and polls a Token Plan Wan 2.7 image task with its native schema", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-qwen-token-plan-"));
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      const value = String(url);
+      if (value.endsWith("/api/v1/services/aigc/image-generation/generation")) {
+        return qwenJsonResponse({
+          output: { task_id: "task-123", task_status: "PENDING" },
+        });
+      }
+      if (value.endsWith("/api/v1/tasks/task-123")) {
+        return qwenJsonResponse({
+          output: {
+            task_id: "task-123",
+            task_status: "SUCCEEDED",
+            results: [
+              {
+                url: "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/wan.png",
+              },
+            ],
+          },
+        });
+      }
+      if (
+        value ===
+        "https://dashscope-result-sg.oss-ap-southeast-1.aliyuncs.com/wan.png"
+      ) {
+        return new Response(Buffer.from("wan-png"), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    const tool = createQwenImagineTool("qwen-token-plan", fetchImpl, root);
+
+    const result = await tool.execute({
+      prompt: "a detailed frog meme",
+      model: "wan2.7-image-pro",
+      resolution: "2k",
+      n: 8,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      path: string;
+    };
+    expect(parsed.backend).toBe("qwen-token-plan");
+    expect(await readFile(parsed.path, "utf8")).toBe("wan-png");
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    const [createUrl, createInit] = fetchImpl.mock.calls[0] ?? [];
+    expect(String(createUrl)).toBe(
+      "https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/image-generation/generation",
+    );
+    expect(
+      (createInit?.headers as Record<string, string>)["x-dashscope-async"],
+    ).toBe("enable");
+    expect(JSON.parse(String(createInit?.body))).toEqual({
+      model: "wan2.7-image-pro",
+      input: {
+        messages: [
+          { role: "user", content: [{ text: "a detailed frog meme" }] },
+        ],
+      },
+      parameters: {
+        n: 4,
+        size: "2048*2048",
+        enable_sequential: false,
+        watermark: false,
+        thinking_mode: true,
+      },
+    });
+  });
+
+  it("fails a terminal UNKNOWN Token Plan image task instead of polling forever", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL | Request) =>
+      qwenJsonResponse(
+        String(url).includes("/api/v1/tasks/")
+          ? {
+              output: {
+                task_status: "UNKNOWN",
+                code: "InvalidTask",
+                message: "task disappeared",
+              },
+            }
+          : { output: { task_id: "missing", task_status: "PENDING" } },
+      ));
+    const tool = createQwenImagineTool("qwen-token-plan", fetchImpl);
+
+    const result = await tool.execute({ prompt: "will fail" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/task disappeared/u);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to Meta when the configured xAI media host is unusable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-invalid-xai-meta-"));
+    const provider = createProvider("openai", {
+      apiKey: "openai-session-key-must-not-leak",
+      model: "gpt-5",
+    });
+    const b64 = Buffer.from("RIFF0000WEBP", "ascii").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }] }),
+    })) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {
+        XAI_API_KEY: "xai-key-for-invalid-host",
+        XAI_BASE_URL: "https://openrouter.ai/api/v1",
+        MODEL_API_KEY: "meta-media-key",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "safe backend fallback" });
+
+    expect(result.isError).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const [url, init] = (
+      fetchImpl as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls[0] ?? [];
+    expect(url).toBe("https://api.meta.ai/v1/images/generations");
+    expect(
+      (init as { headers: { authorization: string } }).headers.authorization,
+    ).toBe("Bearer meta-media-key");
+  });
+
+  it("does not save an error response returned by an image URL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-download-error-"));
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (String(url) === "https://scontent.example.fbcdn.net/generated.webp") {
+        return {
+          ok: false,
+          status: 502,
+          arrayBuffer: async () => new ArrayBuffer(0),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ url: "https://scontent.example.fbcdn.net/generated.webp" }],
+        }),
+      };
+    }) as unknown as typeof fetch;
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { MODEL_API_KEY: "meta-media-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "download failure" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/Image download HTTP 502/u);
+  });
+
+  it("fails closed instead of using a non-Grok reasoning session key for xAI", async () => {
+    const provider = createProvider("openai", {
+      apiKey: "openai-session-key-must-not-leak",
+      model: "gpt-5",
+      baseURL: "https://api.openai.com/v1",
+    });
+    const fetchImpl = vi.fn();
+    const tool = createImagineImageTool({
+      workspaceRoot: process.cwd(),
+      home: testHome(process.cwd()),
+      getSession: () => ({ services: { provider } }) as unknown as Session,
+      env: {},
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const result = await tool.execute({ prompt: "must not run" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/media backend credential/i);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { error: "Image generation requires an active subscription." },
+    { error: { message: "Image generation requires an active subscription." } },
+    { message: "Image generation requires an active subscription." },
+  ])("preserves the provider's image refusal reason: %j", async (payload) => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-refusal-"));
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(payload), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { XAI_API_KEY: "test-xai-media-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "one image" });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({
+      error: "Image generation requires an active subscription.",
+    });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(String(fetchImpl.mock.calls[0]?.[0]))
+      .toBe("https://api.x.ai/v1/images/generations");
+    // The provider refused the request, so nothing was generated: the
+    // refusal settles as a confirmed no-effect outcome instead of gating
+    // the session behind /resolve.
+    expect(result.effectDisposition).toMatchObject({
+      disposition: "confirmed_no_effect",
+      evidenceKind: "provider_receipt",
+      evidenceRef: "tool:ImagineImage:xai:http-403",
+    });
+  });
+
+  it("redacts credentials before bounding an image refusal", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-refusal-redaction-"));
+    const bearer = "test-xai-media-key";
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({
+        error: `Rejected ${bearer}. Bearer other-secret-token. ${"detail ".repeat(1_000)}`,
+      }), { status: 400 }),
+    );
+    const tool = createImagineImageTool({
+      workspaceRoot: root,
+      home: testHome(root),
+      getSession: () => null,
+      env: { XAI_API_KEY: bearer },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "one image" });
+    const { error } = JSON.parse(result.content) as { error: string };
+
+    expect(result.isError).toBe(true);
+    expect(error).toContain("Rejected [REDACTED]. Bearer [REDACTED]");
+    expect(error).not.toContain(bearer);
+    expect(error).not.toContain("other-secret-token");
+    expect(error.length).toBeLessThanOrEqual(4_096);
+    expect(error).toMatch(/\.\.\.$/u);
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ error: "  " }, { error: {} }, {}])(
+    "keeps an HTTP fallback when the image refusal has no message: %j",
+    async (payload) => {
+      const root = await mkdtemp(join(tmpdir(), "imagine-refusal-empty-"));
+      const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify(payload), { status: 400 }),
+      );
+      const tool = createImagineImageTool({
+        workspaceRoot: root,
+        home: testHome(root),
+        getSession: () => null,
+        env: { XAI_API_KEY: "test-xai-media-key" },
+        fetchImpl,
+      });
+
+      const result = await tool.execute({ prompt: "one image" });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content)).toEqual({ error: "Imagine HTTP 400" });
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    },
+  );
 
   it("accepts session OAuth bearer when BYOK env is unset (subscription path)", async () => {
     // Session provider already holds /grok-login bearer as factory apiKey —
@@ -176,5 +1352,373 @@ describe("ImagineImage tool", () => {
 
     await expect(running).rejects.toBe(reason);
     expect(requestSignal?.aborted).toBe(true);
+  });
+
+  it("generates with GPT Image for an OpenAI session holding an API key", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-openai-"));
+    const provider = createProvider("openai", {
+      apiKey: "chatgpt-oauth-bearer-must-not-leak",
+      model: "gpt-6-astra",
+      baseURL: "https://api.openai.com/v1",
+    });
+    const b64 = Buffer.from("openai-png").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }], output_format: "png" }),
+    })) as unknown as typeof fetch;
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider,
+      env: {
+        OPENAI_API_KEY: "isolated-openai-key",
+        XAI_API_KEY: "must-not-win-for-openai-session",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "a grey square",
+      aspect_ratio: "16:9",
+      quality: "low",
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      model: string;
+      path: string;
+    };
+    expect(parsed).toMatchObject({ backend: "openai", model: "gpt-image-2" });
+    expect(parsed.path).toMatch(/\.png$/u);
+    expect(await readFile(parsed.path, "utf8")).toBe("openai-png");
+
+    const sent = firstRequest(fetchImpl);
+    expect(sent.url).toBe("https://api.openai.com/v1/images/generations");
+    // The session bearer is a ChatGPT OAuth grant, which cannot call this
+    // endpoint at all. Only the API-key ingress may authorize it.
+    expect(sent.authorization).toBe("Bearer isolated-openai-key");
+    expect(sent.body).toEqual({
+      model: "gpt-image-2",
+      prompt: "a grey square",
+      n: 1,
+      size: "1536x1024",
+      quality: "low",
+    });
+  });
+
+  it("saves the format GPT Image reports rather than assuming PNG", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-openai-jpeg-"));
+    const b64 = Buffer.from("openai-jpeg").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }], output_format: "jpeg" }),
+    })) as unknown as typeof fetch;
+    const tool = openaiImagineTool(root, fetchImpl);
+
+    const result = await tool.execute({ prompt: "a grey square" });
+
+    const parsed = JSON.parse(result.content) as { path: string };
+    expect(parsed.path).toMatch(/\.jpg$/u);
+  });
+
+  it("generates with MiniMax Image for a MiniMax session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-minimax-"));
+    const b64 = Buffer.from("minimax-jpeg").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "req-1",
+        data: { image_base64: [b64] },
+        base_resp: { status_code: 0, status_msg: "success" },
+      }),
+    })) as unknown as typeof fetch;
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("minimax", {
+        apiKey: "minimax-session-key",
+        model: "MiniMax-M2.5",
+      }),
+      env: { MINIMAX_API_KEY: "isolated-minimax-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "a grey square",
+      aspect_ratio: "16:9",
+      n: 1,
+    });
+
+    expect(result.isError).toBeUndefined();
+    const parsed = JSON.parse(result.content) as {
+      backend: string;
+      model: string;
+      path: string;
+    };
+    expect(parsed).toMatchObject({ backend: "minimax", model: "image-01" });
+    expect(parsed.path).toMatch(/\.jpg$/u);
+    expect(await readFile(parsed.path, "utf8")).toBe("minimax-jpeg");
+
+    const sent = firstRequest(fetchImpl);
+    // MiniMax names this route differently from every OpenAI-shaped backend.
+    expect(sent.url).toBe("https://api.minimax.io/v1/image_generation");
+    expect(sent.authorization).toBe("Bearer isolated-minimax-key");
+    expect(sent.body).toEqual({
+      model: "image-01",
+      prompt: "a grey square",
+      n: 1,
+      response_format: "base64",
+      aspect_ratio: "16:9",
+    });
+  });
+
+  it("treats a MiniMax HTTP 200 carrying a failure status as an error", async () => {
+    // MiniMax answers 200 for invalid params and quota failures alike; the
+    // outcome is in base_resp, so an HTTP-only check saves nothing and
+    // reports success.
+    const root = await mkdtemp(join(tmpdir(), "imagine-minimax-fail-"));
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        id: "req-2",
+        data: null,
+        base_resp: { status_code: 1008, status_msg: "insufficient balance" },
+      }),
+    })) as unknown as typeof fetch;
+    const tool = minimaxImagineTool(root, fetchImpl);
+
+    const result = await tool.execute({ prompt: "a grey square" });
+
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain("insufficient balance");
+  });
+
+  it("refuses a URL from a backend that was asked for inline bytes", async () => {
+    // OpenAI and MiniMax are both asked for base64, and neither has a
+    // registered download host, so a URL must fail closed rather than be
+    // fetched from whatever host answered.
+    const root = await mkdtemp(join(tmpdir(), "imagine-openai-url-"));
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [{ url: "https://api.x.ai/generated/openai.png" }],
+      }),
+    })) as unknown as typeof fetch;
+    const tool = openaiImagineTool(root, fetchImpl);
+
+    const result = await tool.execute({ prompt: "a grey square" });
+
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain("not trusted");
+    // Only the generation call happened: no download was attempted.
+    expect(
+      (fetchImpl as unknown as { mock: { calls: unknown[][] } }).mock.calls,
+    ).toHaveLength(1);
+  });
+
+  it("keeps each backend's own quality vocabulary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-quality-"));
+    const fetchImpl = backendAwareImageFetch();
+    const openaiTool = openaiImagineTool(root, fetchImpl);
+    const minimaxTool = minimaxImagineTool(root, fetchImpl);
+
+    // hd/standard is the universal schema's vocabulary, which a model sees
+    // before a Session attaches. OpenAI grades quality differently but the
+    // two map cleanly, so it is translated rather than refused.
+    const hd = await openaiTool.execute({ prompt: "x", quality: "hd" });
+    expect(hd.isError).toBeUndefined();
+    expect(firstRequest(fetchImpl).body.quality).toBe("high");
+
+    // A value no backend vocabulary contains is still refused.
+    const bogus = await openaiTool.execute({ prompt: "x", quality: "ultra" });
+    expect(bogus.isError).toBe(true);
+    expect(String(bogus.content)).toContain("OpenAI quality must be");
+
+    // MiniMax has no quality control, so the field is dropped and named.
+    const dropped = await minimaxTool.execute({ prompt: "x", quality: "high" });
+    expect(dropped.isError).toBeUndefined();
+    expect(
+      (JSON.parse(dropped.content) as { ignoredControls?: string[] })
+        .ignoredControls,
+    ).toEqual(["quality"]);
+  });
+
+  it("refuses controls the new backends do not have", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-controls-"));
+    const fetchImpl = backendAwareImageFetch();
+    const minimaxTool = minimaxImagineTool(root, fetchImpl);
+
+    // 2:1 is in this tool's shared vocabulary but MiniMax rejects it, and
+    // MiniMax has no resolution tier. Both are dropped and named rather than
+    // refused, so the run proceeds instead of stalling on a control the
+    // advertised schema itself offered.
+    const aspect = await minimaxTool.execute({ prompt: "x", aspect_ratio: "2:1" });
+    expect(aspect.isError).toBeUndefined();
+    expect(
+      (JSON.parse(aspect.content) as { ignoredControls?: string[] })
+        .ignoredControls,
+    ).toEqual(["aspect_ratio"]);
+    expect(firstRequest(fetchImpl).body.aspect_ratio).toBeUndefined();
+
+    const resolution = await minimaxTool.execute({ prompt: "x", resolution: "2k" });
+    expect(resolution.isError).toBeUndefined();
+    expect(
+      (JSON.parse(resolution.content) as { ignoredControls?: string[] })
+        .ignoredControls,
+    ).toEqual(["resolution"]);
+
+    // An unknown model is still refused: it cannot be silently substituted.
+    const model = await minimaxTool.execute({ prompt: "x", model: "image-99" });
+    expect(model.isError).toBe(true);
+    expect(String(model.content)).toContain("MiniMax image model must be");
+  });
+
+  it("clamps a MiniMax batch to the nine images it will return", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-minimax-clamp-"));
+    const b64 = Buffer.from("m").toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: { image_base64: [b64] },
+        base_resp: { status_code: 0 },
+      }),
+    })) as unknown as typeof fetch;
+    const tool = minimaxImagineTool(root, fetchImpl);
+
+    await tool.execute({ prompt: "x", n: 10 });
+
+    expect(firstRequest(fetchImpl).body.n).toBe(9);
+  });
+
+  it("offers xAI's second-generation image model", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-xai-20-"));
+    const b64 = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64");
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [{ b64_json: b64 }] }),
+    })) as unknown as typeof fetch;
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("grok", {
+        apiKey: "unused",
+        model: "grok-4.6",
+        baseURL: "https://api.x.ai/v1",
+      }),
+      env: { XAI_API_KEY: "real-byok-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({
+      prompt: "a grey square",
+      model: "grok-imagine-image-2.0",
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(
+      (JSON.parse(result.content) as { model: string }).model,
+    ).toBe("grok-imagine-image-2.0");
+  });
+
+  it("advertises the controls each new backend actually has", () => {
+    const root = process.cwd();
+    const openaiSchema = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("openai", {
+        apiKey: "unused",
+        model: "gpt-6-astra",
+        baseURL: "https://api.openai.com/v1",
+      }),
+      env: { OPENAI_API_KEY: "isolated-openai-key" },
+    }).inputSchema as {
+      properties: Record<string, { enum?: readonly string[]; maximum?: number }>;
+    };
+    expect(Object.keys(openaiSchema.properties).sort()).toEqual([
+      "aspect_ratio",
+      "model",
+      "n",
+      "prompt",
+      "quality",
+    ]);
+    expect(openaiSchema.properties.model?.enum).toContain("gpt-image-2");
+    expect(openaiSchema.properties.quality?.enum).toEqual([
+      "low",
+      "medium",
+      "high",
+      "auto",
+    ]);
+
+    const minimaxSchema = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("minimax", {
+        apiKey: "unused",
+        model: "MiniMax-M2.5",
+      }),
+      env: { MINIMAX_API_KEY: "isolated-minimax-key" },
+    }).inputSchema as {
+      properties: Record<string, { enum?: readonly string[]; maximum?: number }>;
+    };
+    expect(Object.keys(minimaxSchema.properties).sort()).toEqual([
+      "aspect_ratio",
+      "model",
+      "n",
+      "prompt",
+    ]);
+    expect(minimaxSchema.properties.n?.maximum).toBe(9);
+    // The advertised ratios are the ones MiniMax will accept, not the union.
+    expect(minimaxSchema.properties.aspect_ratio?.enum).not.toContain("2:1");
+  });
+
+  it("never gates the session on an argument it refused before requesting", async () => {
+    // Repro from the desktop app: the tool registry is built before the
+    // Session attaches, so the model sees the universal schema and sends
+    // resolution/quality that the resolved backend has no notion of. A bare
+    // isError from a side-effecting tool is filed as an unknown outcome and
+    // blocks every later side-effecting call behind /resolve (#2190), which
+    // is what happened: one stray `resolution: "1k"` bricked the session.
+    const root = await mkdtemp(join(tmpdir(), "imagine-refusal-"));
+    const fetchImpl = vi.fn();
+    const openai = openaiImagineTool(root, fetchImpl as unknown as typeof fetch);
+    const minimax = minimaxImagineTool(root, fetchImpl as unknown as typeof fetch);
+    const zai = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("zai", { apiKey: "k", model: "glm-5.3" }),
+      env: { ZAI_API_KEY: "isolated-zai-key" },
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const cases: Array<[string, Promise<{ isError?: boolean; effectDisposition?: { disposition?: string } }>]> = [
+      ["openai model", openai.execute({ prompt: "x", model: "gpt-image-99" })],
+      ["openai quality", openai.execute({ prompt: "x", quality: "ultra" })],
+      ["minimax model", minimax.execute({ prompt: "x", model: "image-99" })],
+      ["aspect vocabulary", openai.execute({ prompt: "x", aspect_ratio: "5:1" })],
+      ["resolution vocabulary", openai.execute({ prompt: "x", resolution: "9k" })],
+      // The pre-existing backends carried the same defect.
+      ["zai model", zai.execute({ prompt: "x", model: "glm-nope" })],
+      ["zai n", zai.execute({ prompt: "x", n: 3 })],
+    ];
+    for (const [name, pending] of cases) {
+      const result = await pending;
+      expect(result.isError, name).toBe(true);
+      expect(result.effectDisposition?.disposition, name).toBe(
+        "confirmed_no_effect",
+      );
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("refuses a missing prompt before any request, and says so", async () => {
+    // #2190: a bare error from a mutating tool gates the session behind /resolve.
+    const fetchImpl = vi.fn(async () => new Response("unreachable", { status: 500 }));
+    const result = await createQwenImagineTool("qwen", fetchImpl).execute({});
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain("prompt is required");
+    expect(result.effectDisposition?.disposition).toBe("confirmed_no_effect");
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
