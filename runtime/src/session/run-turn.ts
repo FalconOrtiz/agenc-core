@@ -60,7 +60,10 @@ import {
   LEDGER_WALLET_CLI_ROUTING_GUIDANCE,
 } from "../elicitation/ledger-wallet-cli.js";
 import { startCodeModeTurnWorker } from "../tools/code-mode/turn-host.js";
-import { createTurnFailedEvent } from "../contracts/turn-terminal.js";
+import {
+  APPROVAL_DENIED_ABORT_REASON,
+  createTurnFailedEvent,
+} from "../contracts/turn-terminal.js";
 import {
   createTokenAccountingConfigurationRevision,
   createTokenAccountingRequest,
@@ -379,6 +382,41 @@ class RegularTurnTask implements SessionTask {
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/**
+ * The transcript text for a turn the user ended by denying approval. It
+ * says what was denied and, for a denied unsandboxed retry, that the call
+ * had already run once inside the sandbox.
+ */
+function approvalDeniedExplanation(
+  denied: readonly { readonly toolName: string; readonly metadata?: Record<string, unknown> }[],
+): string {
+  const names = (stage: "before_execution" | "sandbox_escalation") => [
+    ...new Set(
+      denied
+        .filter((result) =>
+          (result.metadata?.approvalDeniedStage === "sandbox_escalation") ===
+          (stage === "sandbox_escalation"))
+        .map((result) => result.toolName),
+    ),
+  ];
+  const sentences: string[] = [];
+  const beforeExecution = names("before_execution");
+  if (beforeExecution.length > 0) {
+    sentences.push(
+      `Approval was denied for ${beforeExecution.join(", ")}. The turn stopped without running the denied action.`,
+    );
+  }
+  const retried = names("sandbox_escalation");
+  if (retried.length > 0) {
+    sentences.push(
+      `Approval was denied to run ${retried.join(", ")} again without the sandbox. ` +
+        `${retried.join(", ")} already ran once inside the sandbox, which blocked it; ` +
+        "anything that attempt changed before the block remains, and the turn stopped without the unsandboxed retry.",
+    );
+  }
+  return sentences.join(" ");
+}
 
 function mergeSignals(
   a: AbortSignal | undefined,
@@ -3207,7 +3245,9 @@ async function* runTurnKernelInner(
     }
     const workflowApprovalFailure = isWorkflowApprovalSession(session)
       ? state.completedToolResults
-          .filter((result) => result.isError === true)
+          // A person's denial ends the turn as their stop, below, in a
+          // workflow too. Only an automatic refusal is a workflow failure.
+          .filter((result) => result.isError === true && result.metadata?.approvalDenied !== true)
           .map((result) => workflowApprovalFailureFromMetadata(result.metadata?.approvalFailure))
           .find((failure) => failure !== undefined)
       : undefined;
@@ -3226,19 +3266,24 @@ async function* runTurnKernelInner(
       );
       if (approvalDeniedTools.length > 0) {
         session.markStoppedByUser();
-        const toolNames = [...new Set(approvalDeniedTools.map((result) => result.toolName))];
-        lastContent = `Approval was denied for ${toolNames.join(", ")}. The turn stopped without running the denied action.`;
+        lastContent = approvalDeniedExplanation(approvalDeniedTools);
         const reasons = [...new Set(approvalDeniedTools.flatMap((result) => {
           const failure = result.metadata?.approvalFailure;
           if (typeof failure !== "object" || failure === null || !("reason" in failure)) return [];
           return typeof failure.reason === "string" && failure.reason.trim().length > 0 ? [failure.reason] : [];
         }))];
         if (reasons.length > 0) lastContent += ` ${reasons.join("\n")}`;
+        // A denial the user made is their decision, not a failure: the turn
+        // stops the way a user Stop does (the session already holds as
+        // stopped by the user) and waits for the next prompt. A call denied
+        // before execution never ran; a denied unsandboxed retry keeps the
+        // effect records of the sandboxed attempt that did run. The stable
+        // reason lets clients say what was denied instead of "errored".
         const error = new Error(lastContent);
         state.messages.push({ role: "assistant", content: lastContent });
         await syncSessionState();
-        emitTurnComplete(lastContent, "error", error);
-        yield { type: "turn_complete", content: lastContent, usage, stopReason: "error", error };
+        emitTurnAborted(APPROVAL_DENIED_ABORT_REASON);
+        yield { type: "turn_complete", content: lastContent, usage, stopReason: "cancelled", error };
         return { reason: "aborted_tools", error };
       }
       await commit(state, ctx, session, signal, {

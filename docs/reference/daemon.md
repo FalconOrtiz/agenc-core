@@ -334,6 +334,23 @@ with different content is rejected. A retry response reports
 crash tail without a durable terminal event. The terminals are `turn_complete`
 (code 0), `turn_aborted` (code 130), and `turn_failed` (code 1). A mid-turn `error` is
 session telemetry, not a closer; see [Mid-turn error events](#mid-turn-error-events).
+The daemon projects `turn_complete` and `turn_aborted` to `event.agent_status`
+with `status: "idle"` and the original event in `turnEvent`; `runStatus` is
+`completed` for `turn_complete` and `stopped` for `turn_aborted`. Clients read
+`turnEvent` first: an idle agent does not say whether its turn completed.
+Denying a permission request is the user's decision, not a failure: the turn
+ends as `turn_aborted` with reason `approval_denied`, the denied call's
+`tool_call_completed` carries `metadata.approvalDenied: true`, and the session
+waits for the next prompt as after a Stop. `metadata.approvalDeniedStage` says
+what was denied. `before_execution`: the call never ran and records no effect.
+`sandbox_escalation`: under `on_failure` the call already ran once inside the
+sandbox, the sandbox blocked it, and the user denied running it again without
+the sandbox; that attempt keeps its effect records (`effect_intent` and
+`effect_result`), and anything it changed before the block remains. Only a
+person's Deny ends the turn this way (`permission_decision.decidedBy: "user"`).
+A resolver that refuses on its own, or a non-interactive client's auto-denial,
+records `decidedBy: "runtime"` or no user provenance, and the model keeps the
+turn to report what was not permitted.
 Callers that require strict
 single-turn admission pass `ifBusy: "reject"`. That flag refuses only an
 in-flight or queued turn (`pendingMessageSubmissionCount`,
@@ -363,6 +380,14 @@ their own stable `clientMessageId` before the first attempt.
 cursor. Compaction, rewind, rollback, and clear each advance `historyEpoch` and
 replace the active projection. The same scan may also emit additive
 `activeTurn` and `turnResults` (below).
+Its additive `events` list carries durable notices (`token_count`,
+`session_usage`, `turn_failed`, `turn_aborted`) and `approval_denied`, one per
+call the user denied: `turnId`, `callId`, `toolName`, `stage`
+(`before_execution` or `sandbox_escalation`), and `input` reduced to the
+fields that name the call's target (`command`, `cmd`, `file_path`, `path`,
+`url`, `pattern`, `query`, each at most 1000 characters). A reopened client
+can say what was denied without the call's full arguments. Clients ignore
+notice types they do not know.
 
 Live notifications carry the same `eventId`, `sequence`, `runId`,
 `historyEpoch`, `turnId`, `clientMessageId`, and `messageId` correlation where

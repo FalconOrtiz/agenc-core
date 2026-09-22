@@ -462,28 +462,41 @@ function effectiveApprovalPolicyForTool(
     : fallback;
 }
 
+/**
+ * When an approval was refused. `before_execution`: the call never ran.
+ * `sandbox_escalation`: the call already ran once inside the sandbox, the
+ * sandbox blocked it, and the refused approval was for running it again
+ * without the sandbox.
+ */
+export type ApprovalRejectionStage = "before_execution" | "sandbox_escalation";
+
 export class ApprovalRejectedError extends Error {
   readonly kind = "approval_rejected" as const;
   readonly decision: ReviewDecision;
   /** Where the decision came from; absent for callers that predate it. */
   readonly source?: RequestApprovalResult["source"];
+  readonly stage: ApprovalRejectionStage;
   constructor(
     message: string,
     decision: ReviewDecision,
     source?: RequestApprovalResult["source"],
+    stage: ApprovalRejectionStage = "before_execution",
   ) {
     super(message);
     this.name = "ApprovalRejectedError";
     this.decision = decision;
     if (source !== undefined) this.source = source;
+    this.stage = stage;
   }
 }
 
 /**
- * True for a resolver denial: the session's approval resolver (a live
- * prompt or an automated policy) said no. Such results end the turn after
- * the batch so the model cannot loop on the same call, the way a user
- * rejection does in the reference harness.
+ * True for a denial a person made on the session's approval prompt. Such
+ * results end the turn after the batch so the model cannot loop on the same
+ * call, the way a user rejection does in the reference harness. A resolver
+ * denial without user provenance (the live broker refusing a request itself,
+ * a non-interactive client's auto-denial) is a policy answer: the model keeps
+ * the turn and can say what was not permitted.
  *
  * A default denial (no resolver exists at all) is deliberately excluded:
  * nobody could ever approve, so ending the turn would only cut off the
@@ -492,7 +505,11 @@ export class ApprovalRejectedError extends Error {
  * says not to retry, and the identical-failing-call guard stops any loop.
  */
 export function approvalDenialEndsTurn(err: ApprovalRejectedError): boolean {
-  return err.decision.kind === "denied" && err.source === "resolver";
+  return (
+    err.decision.kind === "denied" &&
+    err.decision.decidedBy === "user" &&
+    err.source === "resolver"
+  );
 }
 
 function resolveApprovalSignal(
@@ -922,10 +939,13 @@ export async function orchestrateToolCall<T>(
         stage: "sandbox_escalation",
       });
       if (!isApprovalAccepted(approval.decision)) {
+        // The sandboxed attempt above already ran; only the unsandboxed
+        // retry is refused, and its effect records stay as they are.
         throw new ApprovalRejectedError(
           approvalRejectionMessage(approval, escalationCtx.toolName),
           approval.decision,
           approval.source,
+          "sandbox_escalation",
         );
       }
     }

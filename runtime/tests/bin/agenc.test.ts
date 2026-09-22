@@ -13,6 +13,7 @@
  * provider + rollout on disk). These tests cover the extracted units
  * that back the integration.
  */
+import { notificationFromDaemonEvent } from "../../src/app-server/background-agent-runner/daemon-events.js";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as memoryPrompt from "../../src/memory/memdir.js";
 import { VERSION } from "../../src/version.js";
@@ -227,6 +228,8 @@ function installDaemonCliDepsForTest(
       };
       readonly emit: (event: unknown) => void;
     }) => void;
+    /** The `terminal` a protocol 1.2 daemon returns with `message.stream`. */
+    readonly messageStreamTerminal?: { readonly code: number; readonly message?: string };
     /** Answers `session.goal` (print-mode `/goal`). */
     readonly onSessionGoal?: (params: Record<string, unknown>) => unknown;
     readonly createConnectedTuiClientError?: Error;
@@ -451,6 +454,9 @@ function installDaemonCliDepsForTest(
               ? params.streamId
               : "stream_test",
           acceptedAt: "2026-05-06T00:00:01.000Z",
+          ...(options.messageStreamTerminal !== undefined
+            ? { terminal: options.messageStreamTerminal }
+            : {}),
         };
       }
       throw new Error(`unexpected daemon request: ${method}`);
@@ -2360,6 +2366,69 @@ describe("main() smoke", () => {
       } finally {
         process.argv = previousArgv;
       }
+    });
+  });
+
+  describe("approval-denied stop", () => {
+    // The denial terminal as the daemon projects it: event.agent_status with
+    // the embedded turn_aborted, not a bare session event.
+    const deniedStatus = (sessionId: string, agentId: string, turnId: string) =>
+      notificationFromDaemonEvent(sessionId, agentId, {
+        id: `denied-${turnId}`, eventId: `denied-${turnId}`, type: "turn_aborted",
+        payload: { turnId, reason: "approval_denied" },
+      });
+
+    it("exits 2 with the tool-denied marker when the projected denial status settles the run", async () => {
+      const agentId = "agent_denied_stop";
+      const sessionId = "session_denied_stop";
+      const permissionRequestId = "req-denied-stop";
+      await withOneShotTestEnvironment("agenc-denied-stop-", async ({ cwd, run, stdout, stderr }) => {
+        const daemon = installDaemonCliDepsForTest({
+          agentId, sessionId, cwd,
+          oneShotEvents: [
+            { method: "event.permission_request", params: {
+              sessionId, eventId: "perm_evt", agentId, requestId: permissionRequestId,
+              toolName: "Write", permissions: ["tool.use"],
+            } },
+          ],
+          onToolDecision: ({ method, requestId, emit }) => {
+            if (method === "tool.deny" && requestId === permissionRequestId) {
+              emit(deniedStatus(sessionId, agentId, "turn-1"));
+            }
+          },
+        });
+        expect(await run(() => oneShotCLI("write the notes"), 4000)).toBe(2);
+        expect(daemon.requests.some((request) => request.method === "tool.deny")).toBe(true);
+        expect(stderr()).toContain("tool denied in non-interactive mode");
+        // Read as a stop, not as a completed turn whose answer is the reason.
+        expect(stdout()).not.toContain("approval_denied");
+        expect(stderr()).not.toContain("approval_denied");
+      });
+    });
+
+    it.each(["notification", "rpc"] as const)("exits 2 on a continued session when the denial arrives by %s first", async (first) => {
+      await withOneShotTestEnvironment(`agenc-denied-${first}-`, async ({ cwd, run, stderr }) => {
+        const home = process.env.AGENC_HOME!;
+        const sessionId = `conv-denied-${first}`;
+        const sessionDir = join(getProjectDir(cwd, undefined, home), "sessions", sessionId);
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(
+          join(sessionDir, `rollout-2026-09-12T10-00-00-000Z-${sessionId}.jsonl`),
+          `${JSON.stringify({ type: "session_meta", payload: { sessionId, timestamp: "2026-09-12T10:00:00.000Z", cwd, originator: "agenc-cli", agencVersion: VERSION, rolloutSchemaVersion: 3 } })}\n` +
+            `${JSON.stringify({ type: "response_item", payload: { role: "user", content: "first step" } })}\n`,
+        );
+        installDaemonCliDepsForTest({
+          agentId: "agent_denied_continue", sessionId, cwd, liveAgent: false, oneShotEvents: [],
+          // RPC first: the message.stream response carries the terminal and no
+          // notification settles the run before it.
+          ...(first === "rpc" ? { messageStreamTerminal: { code: 130, message: "approval_denied" } } : {}),
+          onMessageStream: ({ params, emit }) => {
+            if (first === "notification") emit(deniedStatus(sessionId, "agent_denied_continue", params.streamId!));
+          },
+        });
+        expect(await run(() => oneShotCLI("second step", [], undefined, { kind: "latest" }), 4000)).toBe(2);
+        expect(stderr()).toContain("tool denied in non-interactive mode");
+      });
     });
   });
 
