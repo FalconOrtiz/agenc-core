@@ -143,6 +143,7 @@ import {
   type SessionAttachResult,
   type SessionCancelTurnParams,
   type SessionTranscriptV2Params,
+  type SessionResolveToolCallAttestationParams,
   type SessionResolveToolCallEvidenceParams,
   type SessionResolveToolCallLegacyParams,
   type SessionResolveToolCallParams,
@@ -527,6 +528,7 @@ export interface AgenCDaemonDispatcherOptions {
     | "removeClientIfUnused"
     | "terminateSession"
     | "removeClient"
+    | "attachedClientIds"
   >;
   readonly sessionManager?: Pick<
     AgenCDaemonSessionManager,
@@ -648,6 +650,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         | "removeClientIfUnused"
         | "terminateSession"
         | "removeClient"
+        | "attachedClientIds"
       >
     | undefined;
   readonly #sessionManager:
@@ -1175,12 +1178,7 @@ export class AgenCDaemonJsonRpcDispatcher {
           ),
         );
       case "session.resolveToolCall":
-        return successResponse(
-          id,
-          await this.#agentManager.resolveSessionToolCall(
-            validateSessionResolveToolCallParams(params),
-          ),
-        );
+        return this.#resolveSessionToolCall(id, connection, params);
       case "session.mcp.status":
         return successResponse(
           id,
@@ -1608,6 +1606,43 @@ export class AgenCDaemonJsonRpcDispatcher {
         this.#registerAttachedClient(connection, attachParams, sessionId, attachmentOwner),
     );
     return successResponse(id, result);
+  }
+
+  /**
+   * A review lifts the session's mutation gate, so it must come from a
+   * client this connection attached to that very session: another local
+   * client that only knows the ids cannot clear someone else's gate. The
+   * recorded reviewer is derived from the connection, never from the body.
+   * Remote connections never reach this method (see remote/access.ts).
+   */
+  async #resolveSessionToolCall(
+    id: RequestId,
+    connection: AgenCDaemonJsonRpcConnection,
+    params: JsonObject,
+  ): Promise<AgenCDaemonResponse> {
+    const validated = validateSessionResolveToolCallParams(params);
+    const attachedClientIds =
+      this.#clientMultiplexer === undefined
+        ? []
+        : await this.#clientMultiplexer.attachedClientIds(validated.sessionId);
+    const ownClientId = connection.trackedClientIds.find((clientId) =>
+      attachedClientIds.includes(clientId),
+    );
+    if (connection.remoteAccess !== undefined || ownClientId === undefined) {
+      return errorResponse(
+        id,
+        -32000,
+        `session.resolveToolCall requires a client attached to session ${validated.sessionId} on this connection`,
+        { code: "SESSION_NOT_ATTACHED" },
+      );
+    }
+    return successResponse(
+      id,
+      await this.#agentManager.resolveSessionToolCall({
+        ...validated,
+        reviewer: trustedReviewer(connection.daemonSocketIdentity, ownClientId),
+      }),
+    );
   }
 
   async #createSession(
@@ -3179,6 +3214,21 @@ function validateSessionCancelTurnParams(
   return validated as SessionCancelTurnParams;
 }
 
+/**
+ * The reviewer recorded for an operator review: the verified local user when
+ * the transport proved one, plus the attached client id this connection
+ * registered. A request body cannot choose it.
+ */
+function trustedReviewer(
+  identity: AuthDaemonSocketIdentity | undefined,
+  clientId: string,
+): string {
+  const uid = identity?.peerUid ?? identity?.privateSocketOwnerUid;
+  return typeof uid === "number"
+    ? `local-user:uid=${uid}:client=${clientId}`
+    : `local-client:${clientId}`;
+}
+
 function validateSessionResolveToolCallParams(
   params: JsonObject,
 ): SessionResolveToolCallParams {
@@ -3190,6 +3240,7 @@ function validateSessionResolveToolCallParams(
       "disposition",
       "evidenceRef",
       "evidenceSha256",
+      "attestation",
       "reviewer",
     ],
   });
@@ -3198,6 +3249,7 @@ function validateSessionResolveToolCallParams(
     "disposition",
     "evidenceRef",
     "evidenceSha256",
+    "attestation",
   ].some((field) => Object.prototype.hasOwnProperty.call(validated, field));
   if (!hasEvidenceFields) {
     if (validated.toolCallId !== undefined) {
@@ -3213,12 +3265,34 @@ function validateSessionResolveToolCallParams(
     return validated as SessionResolveToolCallLegacyParams;
   }
   validateRequiredString(validated, "session.resolveToolCall", "toolCallId");
-  validateRequiredString(validated, "session.resolveToolCall", "evidenceRef");
-  validateRequiredString(
+  const attesting = Object.prototype.hasOwnProperty.call(
     validated,
-    "session.resolveToolCall",
-    "evidenceSha256",
+    "attestation",
   );
+  if (attesting) {
+    // An attestation is the operator's own statement; it never travels
+    // with a separate evidence document, so the two shapes cannot mix.
+    if (validated.attestation !== "operator") {
+      throw invalidParams(
+        "session.resolveToolCall attestation must be operator",
+      );
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(validated, "evidenceRef") ||
+      Object.prototype.hasOwnProperty.call(validated, "evidenceSha256")
+    ) {
+      throw invalidParams(
+        "session.resolveToolCall takes either an operator attestation or evidenceRef and evidenceSha256, not both",
+      );
+    }
+  } else {
+    validateRequiredString(validated, "session.resolveToolCall", "evidenceRef");
+    validateRequiredString(
+      validated,
+      "session.resolveToolCall",
+      "evidenceSha256",
+    );
+  }
   const disposition = validated.disposition;
   if (
     disposition !== "confirmed_committed" &&
@@ -3228,6 +3302,9 @@ function validateSessionResolveToolCallParams(
     throw invalidParams(
       "session.resolveToolCall disposition must be confirmed_committed, confirmed_no_effect, or remains_unknown",
     );
+  }
+  if (attesting) {
+    return validated as SessionResolveToolCallAttestationParams;
   }
   if (!/^[0-9a-f]{64}$/u.test(String(validated.evidenceSha256))) {
     throw invalidParams(
