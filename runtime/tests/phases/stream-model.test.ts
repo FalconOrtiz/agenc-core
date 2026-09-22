@@ -622,7 +622,7 @@ describe("streamModel — live assistant text sanitization", () => {
     }
   });
 
-  test("a stream that produced a chunk warns on quiet idle and does not abort", async () => {
+  test("a stream that produced a chunk warns on quiet idle then aborts from the last byte", async () => {
     vi.useFakeTimers();
     const external = new AbortController();
     try {
@@ -668,13 +668,14 @@ describe("streamModel — live assistant text sanitization", () => {
       expect(providerSignal?.aborted).toBe(false);
 
       await vi.advanceTimersByTimeAsync(200);
-      expect(providerSignal?.aborted).toBe(false);
+      expect(providerSignal?.aborted).toBe(true);
+      expect(providerSignal?.reason).toBe(STREAM_IDLE_ABORT_REASON);
       expect(
         events.some((event) => event.msg.type === "stream_error"),
-      ).toBe(false);
+      ).toBe(true);
 
-      external.abort();
-      await outcome;
+      const error = await outcome;
+      expect((error as Error).message).toMatch(/^stream_idle: no data for 100ms/);
     } finally {
       vi.useRealTimers();
     }
