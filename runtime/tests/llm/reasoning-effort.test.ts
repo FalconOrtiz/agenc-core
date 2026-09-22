@@ -12,6 +12,8 @@ import catalog from "./desktop-effort-catalog.json";
 import { sessionConfigurationFromAgenCConfig } from "../../src/session/configuration.js";
 import { buildChatCompletionsRequest } from "../../src/llm/wire/chat-completions.js";
 import { mergeProviderModelLayer } from "../../src/config/provider-model-authority.js";
+import { defaultConfig } from "../../src/config/schema.js";
+import { StaticModelsManager } from "../../src/llm/models-manager.js";
 
 describe("provider-scoped effort contract", () => {
   it.each(listRegisteredModelCatalogEntries())("preserves $provider/$model", entry => {
@@ -92,6 +94,82 @@ it.each(catalog.filter(row => row.provider === "anthropic"))(
     }
   });
 
+
+// Opus 5.5 is not in the Desktop fixture yet. Before it had its own effort
+// row, the empty contract seeded a configured max as xhigh, clamped it to
+// high, and the wire then dropped output_config.effort altogether. The turn
+// passes the session model's registry levels, as stream-model does.
+it("carries every Claude Opus 5.5 tier from config seed to the wire", async () => {
+  const row = { provider: "anthropic", model: "claude-opus-5-5" };
+  const levels = ["low", "medium", "high", "xhigh", "max"] as const;
+  expect(resolveReasoningEffort(row).levels).toEqual(levels);
+  const modelInfo = await new StaticModelsManager({
+    config: defaultConfig(),
+    fallbackProvider: "anthropic",
+  }).getModelInfo(row.model);
+  for (const effort of levels) {
+    const seed = sessionConfigurationFromAgenCConfig({ config: { reasoning_effort: effort },
+      workspaceRoot: process.cwd(), ...row }).collaborationMode.reasoningEffort;
+    expect(seed).toBe(effort);
+    const normalized = resolveSessionReasoningEffort(seed, modelInfo.supportedReasoningLevels, row);
+    expect(normalized).toBe(effort);
+    const body = buildAnthropicMessagesRequest({ model: row.model, messages: [], tools: [],
+      maxTokens: 4096, options: { reasoningEffort: normalized } });
+    expect(body.output_config).toEqual({ effort });
+    expect(body.thinking).toBeUndefined();
+  }
+});
+
+it("offers Bedrock effort levels exactly where the Converse adapter sends effort", () => {
+  const opus55 = { provider: "amazon-bedrock", model: "anthropic.claude-opus-5-5" };
+  expect(resolveReasoningEffort(opus55).levels).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  // Opus 5 and non-Claude models get no effort field on Converse, so no levels.
+  expect(resolveReasoningEffort({ provider: "amazon-bedrock", model: "anthropic.claude-opus-5" }).levels)
+    .toEqual([]);
+  expect(resolveReasoningEffort({ provider: "amazon-bedrock", model: "amazon.nova-pro-v1:0" }).levels)
+    .toEqual([]);
+});
+
+it("reads Bedrock effort from the registered contract that session and spawn validation use", async () => {
+  const modelInfo = await new StaticModelsManager({
+    config: defaultConfig(),
+    fallbackProvider: "amazon-bedrock",
+  }).getModelInfo("global.anthropic.claude-opus-5-5");
+  const row = { provider: "amazon-bedrock", model: "global.anthropic.claude-opus-5-5" };
+  expect(resolveReasoningEffort(row)).toMatchObject({
+    registered: true,
+    levels: modelInfo.supportedReasoningLevels,
+    defaultLevel: modelInfo.defaultReasoningLevel,
+  });
+  // A configured max reaches the adapter unclamped, as stream-model passes it.
+  expect(resolveSessionReasoningEffort("max", modelInfo.supportedReasoningLevels, row)).toBe("max");
+  // A Claude model without a registered Bedrock contract gets no levels, so
+  // the adapter sends it no effort field either.
+  expect(resolveReasoningEffort({ provider: "amazon-bedrock", model: "global.anthropic.claude-fable-5-1" }))
+    .toMatchObject({ registered: false, levels: [] });
+});
+
+it("seeds and sends a configured max for a Bedrock profile an override maps to Opus 5.5", async () => {
+  const profile =
+    "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6";
+  const config = {
+    ...defaultConfig(),
+    reasoning_effort: "max" as const,
+    modelOverrides: { "claude-opus-5-5": profile },
+  };
+  const seed = sessionConfigurationFromAgenCConfig({
+    config, workspaceRoot: process.cwd(), provider: "amazon-bedrock", model: profile,
+  }).collaborationMode.reasoningEffort;
+  expect(seed).toBe("max");
+  const modelInfo = await new StaticModelsManager({
+    config,
+    fallbackProvider: "amazon-bedrock",
+  }).getModelInfo(profile);
+  expect(resolveSessionReasoningEffort(seed, modelInfo.supportedReasoningLevels, {
+    provider: "amazon-bedrock",
+    model: profile,
+  })).toBe("max");
+});
 
 it.each([
   { provider: "openai", model: "gpt-5.6-sol-unverified" },

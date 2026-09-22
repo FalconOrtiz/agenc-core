@@ -8,7 +8,10 @@ import { isAgenCDeepSeekModel, AGENC_DEEPSEEK_REASONING_LEVELS } from "./registr
 import { isNativeDeepSeekModel, DEEPSEEK_REASONING_LEVELS } from "./registry/deepseek-models.js";
 import { anthropicEffortLevels } from "../utils/model/anthropicThinkingControl.js";
 import { normalizeProviderIdentity } from "../provider-identity.js";
-import { resolveRegisteredModelCatalogEntry } from "./registry/model-catalog.js";
+import {
+  bedrockConverseEffortLevels,
+  resolveRegisteredModelCatalogEntry,
+} from "./registry/model-catalog.js";
 import type { ReasoningEffort } from "../session/turn-context.js";
 
 /**
@@ -184,6 +187,15 @@ export function resolveReasoningEffort(input: {
   } else if (slug === "nvidia-nim") {
     reasoningEffortAllowedValues = nimReasoningEffortValues(model);
     acceptsReasoningEffort = (reasoningEffortAllowedValues?.size ?? 0) > 0;
+  } else if (
+    slug === "amazon-bedrock" &&
+    model !== undefined &&
+    bedrockConverseEffortLevels(model).length > 0
+  ) {
+    // The Converse adapter sends effort only for models with a registered
+    // Bedrock contract that has levels, so only those offer levels here.
+    reasoningEffortAllowedValues = new Set(bedrockConverseEffortLevels(model));
+    acceptsReasoningEffort = true;
   }
 
   const entry = resolveRegisteredModelCatalogEntry(input);

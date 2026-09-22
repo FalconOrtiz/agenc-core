@@ -26,6 +26,7 @@ import type { BudgetTracker } from "../conversation/token-budget.js";
 import type { Event } from "./event-log.js";
 import type { Sidecar } from "./sidecar.js";
 import { normalizeProviderMetadataIdentity } from "../provider-identity.js";
+import { parseClaudeModelId } from "../utils/model/claudeModelId.js";
 
 // ─────────────────────────────────────────────────────────────────────
 // Cost registry — USD per 1K tokens.
@@ -51,6 +52,12 @@ export interface ModelCostEntry {
    */
   readonly reasoningOutputUsdPer1K?: number;
   readonly webSearchUsdPerRequest?: number;
+  /**
+   * Rates for calls the provider reports as served in fast mode (Anthropic
+   * `usage.speed: "fast"`). Absent when the model has no fast mode; a fast
+   * call on such a model is billed at the entry's own rates.
+   */
+  readonly fastMode?: Readonly<ModelCostEntry>;
   /** Free-form label for display. */
   readonly label?: string;
   /**
@@ -334,6 +341,40 @@ const COST_TIER_OPUS_5_25: Readonly<ModelCostEntry> = Object.freeze({
   webSearchUsdPerRequest: 0.01,
 });
 
+// Fast mode (platform.claude.com fast-mode and pricing docs, 2026-09-22):
+// Claude Opus 5 and Opus 4.8 at $10/$50, Opus 5.5 at $8/$40, each 2x its
+// standard price. Prompt-caching multipliers apply on top, so cache reads
+// and 5-minute writes keep each model's ratio to base input.
+const COST_TIER_OPUS_5_25_FAST_10_50: Readonly<ModelCostEntry> = Object.freeze({
+  ...COST_TIER_OPUS_5_25,
+  fastMode: Object.freeze({
+    inputUsdPer1K: 0.01,
+    outputUsdPer1K: 0.05,
+    cachedInputUsdPer1K: 0.001,
+    cacheCreationUsdPer1K: 0.0125,
+    webSearchUsdPerRequest: 0.01,
+  }),
+});
+
+// Claude Opus 5.5 at $4/$20 (platform.claude.com pricing, 2026-09-22). Cache
+// reads cost 0.05x base input ($0.20/MTok), not the usual 0.1x; the 5-minute
+// cache write is the standard 1.25x ($5/MTok). Like the other tiers, the
+// 1-hour write ($8/MTok) has no separate rate here.
+const COST_TIER_OPUS_5_5_4_20: Readonly<ModelCostEntry> = Object.freeze({
+  inputUsdPer1K: 0.004,
+  outputUsdPer1K: 0.02,
+  cachedInputUsdPer1K: 0.0002,
+  cacheCreationUsdPer1K: 0.005,
+  webSearchUsdPerRequest: 0.01,
+  fastMode: Object.freeze({
+    inputUsdPer1K: 0.008,
+    outputUsdPer1K: 0.04,
+    cachedInputUsdPer1K: 0.0004,
+    cacheCreationUsdPer1K: 0.01,
+    webSearchUsdPerRequest: 0.01,
+  }),
+});
+
 // Claude Fable 5 / 5.1 at $10/$50 and Claude Sonnet 5 at $2/$10
 // (platform.claude.com models overview, 2026-09-11).
 const COST_TIER_FABLE_10_50: Readonly<ModelCostEntry> = Object.freeze({
@@ -472,8 +513,10 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     "claude-fable-5-1": COST_TIER_FABLE_10_50,
     "anthropic:claude-fable-5": COST_TIER_FABLE_10_50,
     "claude-fable-5": COST_TIER_FABLE_10_50,
-    "anthropic:claude-opus-5": COST_TIER_OPUS_5_25,
-    "claude-opus-5": COST_TIER_OPUS_5_25,
+    "anthropic:claude-opus-5-5": COST_TIER_OPUS_5_5_4_20,
+    "claude-opus-5-5": COST_TIER_OPUS_5_5_4_20,
+    "anthropic:claude-opus-5": COST_TIER_OPUS_5_25_FAST_10_50,
+    "claude-opus-5": COST_TIER_OPUS_5_25_FAST_10_50,
     "anthropic:claude-sonnet-5": COST_TIER_SONNET_2_10,
     "claude-sonnet-5": COST_TIER_SONNET_2_10,
     "anthropic:claude-sonnet-4-6": COST_TIER_SONNET,
@@ -483,8 +526,8 @@ export const DEFAULT_MODEL_COSTS: Readonly<Record<string, ModelCostEntry>> =
     // Current Opus generation (4.5-4.8) at $5/$25. canonicalModel routes the
     // whole modern family to claude-opus-4-8; the explicit slugs below keep the
     // exact-match lookup (which precedes canonical) on the same tier.
-    "anthropic:claude-opus-4-8": COST_TIER_OPUS_5_25,
-    "claude-opus-4-8": COST_TIER_OPUS_5_25,
+    "anthropic:claude-opus-4-8": COST_TIER_OPUS_5_25_FAST_10_50,
+    "claude-opus-4-8": COST_TIER_OPUS_5_25_FAST_10_50,
     "anthropic:claude-opus-4-7": COST_TIER_OPUS_5_25,
     "claude-opus-4-7": COST_TIER_OPUS_5_25,
     "anthropic:claude-opus-4-7-1m": COST_TIER_OPUS_5_25,
@@ -626,6 +669,12 @@ export interface ModelUsage {
   totalTokens: number;
   /** Number of completed turns attributed to this model. */
   turns: number;
+  /**
+   * Set when every token here was served in fast mode, so the entry's
+   * `fastMode` rates apply. Accumulated per-model usage leaves it unset and
+   * records fast turns as explicit cost instead.
+   */
+  readonly speed?: "fast";
 }
 
 export interface TokenUsageDelta {
@@ -702,7 +751,11 @@ export function computeUsdCostWithResolution(
   registry: Readonly<Record<string, ModelCostEntry>>,
 ): CostResolution {
   const match = resolveModelCostEntry(usage, registry);
-  const entry = match?.entry ?? DEFAULT_UNKNOWN_MODEL_COST;
+  const standardEntry = match?.entry ?? DEFAULT_UNKNOWN_MODEL_COST;
+  const entry =
+    usage.speed === "fast" && standardEntry.fastMode !== undefined
+      ? standardEntry.fastMode
+      : standardEntry;
   const fullRateInputTokens = entry.cachedInputIncludedInInputTokens
     ? Math.max(0, usage.inputTokens - usage.cachedInputTokens)
     : usage.inputTokens;
@@ -771,6 +824,16 @@ function canonicalModel(model: string): string {
   const unqualified = pathUnqualified.includes(":")
     ? pathUnqualified.slice(pathUnqualified.lastIndexOf(":") + 1)
     : pathUnqualified;
+  // The Claude 5 generation prices by exact identity through the shared
+  // parser, tried on the whole id first because a Bedrock `-v1:0` suffix
+  // would otherwise be cut at its colon. Opus 5 and Opus 5.5 bill
+  // differently, so an unknown minor (claude-opus-5-50) stays unpriced
+  // rather than inheriting either one.
+  const claude =
+    parseClaudeModelId(normalized) ??
+    parseClaudeModelId(pathUnqualified) ??
+    parseClaudeModelId(unqualified);
+  if (claude !== undefined && claude.major >= 5) return claude.canonical;
   if (unqualified.startsWith("grok-4-fast")) return "grok-4-fast";
   // Non-reasoning grok-4.x variants are priced explicitly below; route them to
   // their own keys so they are NOT collapsed onto the reasoning entry (which
@@ -1393,6 +1456,27 @@ export class CostSidecar implements Sidecar {
         this.currentModel = model;
         this.currentProvider = provider ?? null;
         this.lastUsageKey = key;
+        if (msg.payload.speed === "fast") {
+          // A turn served in fast mode is priced at the model's fast rates
+          // and recorded as explicit cost, so the per-model bucket (priced at
+          // standard rates) never counts its tokens a second time.
+          const fastDelta: ModelUsage = {
+            model,
+            ...(provider !== undefined ? { provider } : {}),
+            inputTokens: msg.payload.promptTokens ?? 0,
+            outputTokens: msg.payload.completionTokens ?? 0,
+            cachedInputTokens: msg.payload.cachedInputTokens ?? 0,
+            cacheCreationInputTokens: msg.payload.cacheCreationInputTokens ?? 0,
+            reasoningOutputTokens: msg.payload.reasoningOutputTokens ?? 0,
+            webSearchRequests: msg.payload.webSearchRequests ?? 0,
+            totalTokens: msg.payload.totalTokens ?? 0,
+            turns: 0,
+            speed: "fast",
+          };
+          if (resolveModelCostEntry(fastDelta, this.registry)?.entry.fastMode !== undefined) {
+            this.recordExplicitCost(key, fastDelta, computeUsdCost(fastDelta, this.registry));
+          }
+        }
         if (!computeUsdCostWithResolution(usage, this.registry).known) {
           this.unknownCostModels.add(key);
         }
@@ -1618,27 +1702,55 @@ export class CostSidecar implements Sidecar {
 
     const costUsd = normalizeCost(delta.costUsd);
     if (costUsd > 0) {
-      const explicit =
-        this.explicitPerModelUsage.get(key) ?? emptyModelUsage(delta.model, provider);
-      explicit.inputTokens += promptTokens;
-      explicit.outputTokens += completionTokens;
-      explicit.cachedInputTokens += normalizeCounter(delta.cachedInputTokens);
-      explicit.cacheCreationInputTokens += normalizeCounter(
-        delta.cacheCreationInputTokens,
-      );
-      explicit.reasoningOutputTokens += reasoningOutputTokens;
-      explicit.webSearchRequests += normalizeCounter(delta.webSearchRequests);
-      explicit.totalTokens += totalTokens;
-      this.explicitPerModelUsage.set(key, explicit);
-      this.explicitPerModelCostUsd.set(
+      this.recordExplicitCost(
         key,
-        (this.explicitPerModelCostUsd.get(key) ?? 0) + costUsd,
+        {
+          model: delta.model,
+          ...(provider !== undefined ? { provider } : {}),
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          cachedInputTokens: normalizeCounter(delta.cachedInputTokens),
+          cacheCreationInputTokens: normalizeCounter(
+            delta.cacheCreationInputTokens,
+          ),
+          reasoningOutputTokens,
+          webSearchRequests: normalizeCounter(delta.webSearchRequests),
+          totalTokens,
+          turns: 0,
+        },
+        costUsd,
       );
     }
 
     if (!computeUsdCostWithResolution(usage, this.registry).known) {
       this.unknownCostModels.add(key);
     }
+  }
+
+  /**
+   * Attribute `costUsd` to these tokens directly: getModelUsageCostUsd adds
+   * it and prices only the model's remaining tokens from the registry.
+   */
+  private recordExplicitCost(
+    key: string,
+    delta: ModelUsage,
+    costUsd: number,
+  ): void {
+    const explicit =
+      this.explicitPerModelUsage.get(key) ??
+      emptyModelUsage(delta.model, delta.provider);
+    explicit.inputTokens += delta.inputTokens;
+    explicit.outputTokens += delta.outputTokens;
+    explicit.cachedInputTokens += delta.cachedInputTokens;
+    explicit.cacheCreationInputTokens += delta.cacheCreationInputTokens;
+    explicit.reasoningOutputTokens += delta.reasoningOutputTokens;
+    explicit.webSearchRequests += delta.webSearchRequests;
+    explicit.totalTokens += delta.totalTokens;
+    this.explicitPerModelUsage.set(key, explicit);
+    this.explicitPerModelCostUsd.set(
+      key,
+      (this.explicitPerModelCostUsd.get(key) ?? 0) + costUsd,
+    );
   }
 
   getTotalLinesAdded(): number {
