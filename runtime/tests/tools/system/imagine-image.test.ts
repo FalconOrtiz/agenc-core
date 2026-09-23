@@ -1407,6 +1407,53 @@ describe("ImagineImage tool", () => {
     });
   });
 
+  it("sends the OpenAI image key to the session's configured URL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-openai-custom-"));
+    const fetchImpl = backendAwareImageFetch();
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("openai", {
+        apiKey: "session-key",
+        model: "gpt-6-astra",
+        baseURL: "https://custom.example/v1",
+      }),
+      env: { OPENAI_API_KEY: "custom-key" },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "a grey square" });
+    expect(result.isError).toBeUndefined();
+    expect(firstRequest(fetchImpl)).toMatchObject({
+      url: "https://custom.example/v1/images/generations",
+      authorization: "Bearer custom-key",
+    });
+  });
+
+  it("uses OPENAI_BASE_URL before the OpenAI session's default factory URL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "imagine-openai-env-"));
+    const fetchImpl = backendAwareImageFetch();
+    const tool = createSessionImagineImageTool({
+      workspaceRoot: root,
+      provider: createProvider("openai", {
+        apiKey: "session-key",
+        model: "gpt-6-astra",
+        baseURL: "https://api.openai.com/v1",
+      }),
+      env: {
+        OPENAI_API_KEY: "env-key",
+        OPENAI_BASE_URL: "https://env-openai.example/v1",
+      },
+      fetchImpl,
+    });
+
+    const result = await tool.execute({ prompt: "a grey square" });
+    expect(result.isError).toBeUndefined();
+    expect(firstRequest(fetchImpl)).toMatchObject({
+      url: "https://env-openai.example/v1/images/generations",
+      authorization: "Bearer env-key",
+    });
+  });
+
   it("saves the format GPT Image reports rather than assuming PNG", async () => {
     const root = await mkdtemp(join(tmpdir(), "imagine-openai-jpeg-"));
     const b64 = Buffer.from("openai-jpeg").toString("base64");
