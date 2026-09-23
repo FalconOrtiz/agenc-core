@@ -12,6 +12,7 @@ import type {
   AgenCBackgroundAgentSnapshot,
   AgenCBackgroundAgentStartParams,
 } from "../../src/app-server/background-agent-runner.js";
+import { AgenCDaemonClientMultiplexer } from "../../src/app-server/client-multiplexer.js";
 import { AgenCDaemonJsonRpcDispatcher } from "../../src/app-server/daemon-dispatcher.js";
 import {
   AGENC_DAEMON_METHOD_CAPABILITIES_KEY,
@@ -66,6 +67,8 @@ async function harness(options: { enabled?: boolean } = {}) {
   const terminal = deferred<0 | 1 | 130>();
   const submission = deferred<{ agentId: string; params: AgenCBackgroundAgentMessageParams }>();
   const starts: AgenCBackgroundAgentStartParams[] = [];
+  // The live permission mode of each running agent, as its registry would report it.
+  const liveModes = new Map<string, string>();
   const bindings = new Map<string, AgenCBackgroundAgentSessionEventBinding>();
   const snapshots = new Map<string, AgenCBackgroundAgentSnapshot>();
   const cancellationOrder: string[] = [];
@@ -78,10 +81,12 @@ async function harness(options: { enabled?: boolean } = {}) {
     async startAgent(params) {
       starts.push(params);
       const agentId = `routine-agent-${++agentSequence}`;
+      liveModes.set(agentId, params.permissionMode ?? "default");
       snapshots.set(agentId, { status: "running", lastActiveAt: NOW });
       return { agentId, startedAt: NOW, status: "running" };
     },
     getAgentSnapshot: async (agentId) => snapshots.get(agentId) ?? null,
+    getAgentPermissionMode: async (agentId) => liveModes.get(agentId) ?? null,
     async finishAgentRun(agentId) {
       snapshots.set(agentId, { status: "stopped", lastActiveAt: NOW });
       await agents.handleRunnerTerminated(agentId, snapshots.get(agentId)!);
@@ -147,22 +152,39 @@ async function harness(options: { enabled?: boolean } = {}) {
     now: () => new Date(NOW),
   });
   service.start();
+  // Session attachments are tracked per connection by the multiplexer, as in
+  // daemon-cli: routine authority reads them.
+  const multiplexer = new AgenCDaemonClientMultiplexer({ sessionManager: sessions });
   const dispatcher = new AgenCDaemonJsonRpcDispatcher({
-    agentManager: agents, sessionManager: sessions,
+    agentManager: agents, sessionManager: sessions, clientMultiplexer: multiplexer,
     ...(options.enabled === false ? {} : { routines: service }),
   });
   const connections: ReturnType<AgenCDaemonJsonRpcDispatcher["createConnection"]>[] = [];
-  async function connect(subscribe = false) {
+  /**
+   * A daemon client. `v2` negotiates the wider routine contract and
+   * `operator` declares a Routines screen connection.
+   */
+  async function connect(options: { subscribe?: boolean; v2?: boolean; operator?: boolean } | boolean = {}) {
+    const { subscribe = false, v2 = false, operator = false } = typeof options === "boolean" ? { subscribe: options } : options;
     const notifications: JsonObject[] = [];
     const connection = dispatcher.createConnection({ sendNotification: (event) => { notifications.push(event); } });
     connections.push(connection);
     const initialized = await connection.dispatch(request("initialize", "initialize", {
       protocol: { version: AGENC_DAEMON_PROTOCOL_VERSION },
-      capabilities: subscribe ? { "routine.updated.v1": true } : {},
+      capabilities: {
+        ...(subscribe ? { "routine.updated.v1": true } : {}),
+        ...(v2 ? { "routine.permissionModes.v2": true } : {}),
+        ...(operator ? { "routine.operator.v1": true } : {}),
+      },
     }));
     return { connection, notifications, initialized };
   }
-  const client = await connect(true);
+  let holders = 0;
+  /** Attach a session to a connection the way an SDK client does. */
+  async function hold(connection: (typeof connections)[number], sessionId: string) {
+    result(await connection.dispatch(request(`hold-${++holders}`, "session.attach", { sessionId, clientId: `holder-${holders}` })));
+  }
+  const client = await connect({ subscribe: true, v2: true });
   cleanups.push(async () => {
     terminal.resolve(130);
     await service.close();
@@ -187,8 +209,16 @@ async function harness(options: { enabled?: boolean } = {}) {
   async function history(id: string) {
     return result<{ runs: RoutineRun[] }>(await client.connection.dispatch(request("history", "routine.runs", { id }))).runs;
   }
+  /** A live chat session in `mode`, created the way the Desktop creates one. */
+  async function chat(mode: string) {
+    const created = await agents.createAgent({
+      objective: "Interactive session", cwd, deferInitialTurn: true,
+      permissionMode: mode as "default", runtimeOptions: authority,
+    });
+    return { ...created, sessionId: created.sessionId! };
+  }
   return {
-    ...client, connect, dispatcher, service, sessions, agents, starts, bindings,
+    ...client, connect, hold, dispatcher, service, sessions, agents, starts, bindings, liveModes, chat,
     terminal, submission, cancellationOrder, cwd, authority, createParams, create, run, history,
   };
 }
@@ -317,6 +347,155 @@ describe("routine dispatcher and daemon execution contract", () => {
       expect(listed.routines[0].lastRun).toEqual(final);
     },
   );
+
+  it.each(["bypassPermissions", "acceptEdits", "default"])(
+    "gives a routine the live mode of the %s session the Desktop names, and runs it in that mode with the sandbox kept",
+    async (mode) => {
+      const h = await harness();
+      const chat = await h.chat(mode);
+      await h.hold(h.connection, chat.sessionId);
+      const { permissionMode: _unset, ...fields } = h.createParams;
+      const routine = result<{ routine: Routine }>(await h.connection.dispatch(request("from-chat", "routine.create", {
+        ...fields, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+      }))).routine;
+      expect(routine.permissionMode).toBe(mode);
+      expect(routine).not.toHaveProperty("permissionAuthority");
+      await h.run(routine.id);
+      await h.submission.promise;
+      expect(h.starts.at(-1)).toMatchObject({
+        permissionMode: mode,
+        metadata: { routineId: routine.id },
+        runtimeOptions: { dangerouslyBypassApprovalsAndSandbox: false, remoteMode: false },
+      });
+    },
+  );
+
+  it("reads the session's current mode at request time, not the mode it was created with", async () => {
+    const h = await harness();
+    const chat = await h.chat("default");
+    await h.hold(h.connection, chat.sessionId);
+    h.liveModes.set(chat.agentId, "bypassPermissions");
+    const { permissionMode: _unset, ...fields } = h.createParams;
+    const routine = result<{ routine: Routine }>(await h.connection.dispatch(request("switched", "routine.create", {
+      ...fields, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }))).routine;
+    expect(routine.permissionMode).toBe("bypassPermissions");
+  });
+
+  it("refuses a wider mode than the session's, a closed or unknown session, and a forged authority", async () => {
+    const h = await harness();
+    const chat = await h.chat("default");
+    await h.hold(h.connection, chat.sessionId);
+    const denied = await h.connection.dispatch(request("wider", "routine.create", {
+      ...h.createParams, permissionMode: "bypassPermissions", permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }));
+    expect(denied).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    const unknown = await h.connection.dispatch(request("unknown", "routine.create", {
+      ...h.createParams, permissionAuthority: { kind: "session", sessionId: "session-that-does-not-exist" },
+    }));
+    expect(unknown).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    for (const permissionAuthority of [{ kind: "session" }, { kind: "session", sessionId: chat.sessionId, permissionMode: "bypassPermissions" }, { kind: "model" }, "operator"]) {
+      const forged = await h.connection.dispatch(request("forged", "routine.create", { ...h.createParams, permissionAuthority }));
+      expect(forged, JSON.stringify(permissionAuthority)).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_INVALID_ARGUMENT" } } });
+    }
+    await h.agents.stopAgent({ agentId: chat.agentId, reason: "chat closed" });
+    const closed = await h.connection.dispatch(request("closed", "routine.create", {
+      ...h.createParams, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }));
+    expect(closed).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    expect(h.service.list().routines).toEqual([]);
+  });
+
+  it("lets the operator's Routines screen choose any session mode, and keeps an update from a narrower chat off a wider routine", async () => {
+    const h = await harness();
+    const screen = await h.connect({ v2: true, operator: true });
+    const routine = result<{ routine: Routine }>(await screen.connection.dispatch(request("operator", "routine.create", {
+      ...h.createParams, permissionMode: "bypassPermissions", permissionAuthority: { kind: "operator" },
+    }))).routine;
+    expect(routine.permissionMode).toBe("bypassPermissions");
+    const chat = await h.chat("default");
+    await h.hold(h.connection, chat.sessionId);
+    const laundered = await h.connection.dispatch(request("launder", "routine.update", {
+      id: routine.id, patch: { instructions: "Something else" }, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }));
+    expect(laundered).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    const paused = result<{ routine: Routine }>(await h.connection.dispatch(request("pause", "routine.update", {
+      id: routine.id, patch: { enabled: false }, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }))).routine;
+    expect(paused).toMatchObject({ enabled: false, permissionMode: "bypassPermissions" });
+  });
+
+  it("speaks for a session only from the connection that holds it", async () => {
+    const h = await harness();
+    const chat = await h.chat("bypassPermissions");
+    const { permissionMode: _unset, ...fields } = h.createParams;
+    const bystander = await h.connect({ v2: true });
+    const borrowed = await bystander.connection.dispatch(request("borrow", "routine.create", {
+      ...fields, permissionAuthority: { kind: "session", sessionId: chat.sessionId },
+    }));
+    expect(borrowed).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    expect(JSON.stringify(borrowed)).toContain("not attached to this connection");
+    // The agent id names the same session, and borrowing it is refused too.
+    const byAgent = await bystander.connection.dispatch(request("borrow-agent", "routine.create", {
+      ...fields, permissionAuthority: { kind: "session", sessionId: chat.agentId },
+    }));
+    expect(byAgent).toMatchObject({ error: { data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    expect(h.service.list().routines).toEqual([]);
+    await h.hold(h.connection, chat.sessionId);
+    const own = result<{ routine: Routine }>(await h.connection.dispatch(request("own", "routine.create", {
+      ...fields, permissionAuthority: { kind: "session", sessionId: chat.agentId },
+    }))).routine;
+    expect(own.permissionMode).toBe("bypassPermissions");
+  });
+
+  it("accepts the operator authority only from a declared Routines screen connection that holds no session", async () => {
+    const h = await harness();
+    const wide = { ...h.createParams, permissionMode: "bypassPermissions", permissionAuthority: { kind: "operator" } };
+    const undeclared = await h.connection.dispatch(request("undeclared", "routine.create", wide));
+    expect(undeclared).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    const relaying = await h.connect({ v2: true, operator: true });
+    const chat = await h.chat("default");
+    await h.hold(relaying.connection, chat.sessionId);
+    const mixed = await relaying.connection.dispatch(request("mixed", "routine.create", wide));
+    expect(mixed).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_PERMISSION_DENIED" } } });
+    expect(h.service.list().routines).toEqual([]);
+    const screen = await h.connect({ v2: true, operator: true });
+    const created = result<{ routine: Routine }>(await screen.connection.dispatch(request("screen", "routine.create", wide))).routine;
+    expect(created.permissionMode).toBe("bypassPermissions");
+  });
+
+  it("keeps the original routine contract for a connection that did not negotiate routine.permissionModes.v2", async () => {
+    const h = await harness();
+    const screen = await h.connect({ v2: true, operator: true });
+    const wide = result<{ routine: Routine }>(await screen.connection.dispatch(request("wide", "routine.create", {
+      ...h.createParams, permissionMode: "bypassPermissions", permissionAuthority: { kind: "operator" },
+    }))).routine;
+    const plain = await h.create();
+    const older = await h.connect({ subscribe: true });
+    const capabilities = result<{ permissionModes: string[] }>(await older.connection.dispatch(request("caps", "routine.capabilities")));
+    expect(capabilities.permissionModes).toEqual(["default", "plan"]);
+    expect(result<{ permissionModes: string[] }>(await h.connection.dispatch(request("caps-v2", "routine.capabilities"))).permissionModes)
+      .toEqual(["default", "plan", "acceptEdits", "bypassPermissions"]);
+    const listed = result<{ routines: Routine[] }>(await older.connection.dispatch(request("list", "routine.list"))).routines;
+    expect(listed.map((routine) => routine.id)).toEqual([plain.id]);
+    for (const [method, params] of [
+      ["routine.get", { id: wide.id }], ["routine.runs", { id: wide.id }], ["routine.run", { id: wide.id }],
+      ["routine.update", { id: wide.id, patch: { enabled: false } }], ["routine.delete", { id: wide.id }],
+      ["routine.cancel", { id: wide.id, runId: "routine_run_missing" }],
+    ] as const) {
+      const hidden = await older.connection.dispatch(request(method, method, params));
+      expect(hidden, method).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_NOT_FOUND" } } });
+    }
+    expect(h.service.get({ id: wide.id }).routine).toMatchObject({ enabled: true, permissionMode: "bypassPermissions" });
+    // The authority field is not part of the original contract there.
+    const authority = await older.connection.dispatch(request("authority", "routine.create", {
+      ...h.createParams, permissionAuthority: { kind: "operator" },
+    }));
+    expect(authority).toMatchObject({ error: { code: -32602, data: { code: "ROUTINE_INVALID_ARGUMENT" } } });
+    // Invalidations carry only an id and a reason, so every subscriber keeps getting them.
+    h.service.update({ id: wide.id, patch: { name: "Renamed" } }, { source: "operator", ceiling: "bypassPermissions", defaultMode: "default" });
+    await vi.waitFor(() => expect(older.notifications.at(-1)).toMatchObject({ params: { id: wide.id, reason: "updated" } }));
+  });
 
   it("projects bound permission events and cancels through Core's canonical run-tree boundary", async () => {
     const h = await harness();

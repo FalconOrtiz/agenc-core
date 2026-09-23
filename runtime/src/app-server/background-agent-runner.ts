@@ -325,6 +325,7 @@ import {
   runtimeSettingsWithRestoreOverrides,
   buildBootstrapArgv,
   installUnattendedPermissionPolicy,
+  assertRoutineRunAuthority,
 } from "./background-agent-runner/runtime-settings.js";
 import type {
   PreparedRuntimeSettingsChange,
@@ -515,13 +516,20 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       this.#env,
       params.envOverrides,
     );
+    const routineRun = isRoutineRun(params.metadata);
+    // A routine run is marked in its immutable runtime options, so the shell
+    // sandbox, the dispatch path and MCP questions can tell it apart without
+    // reading permission state that changes or is fenced mid-run.
+    const runtimeOptions = routineRun
+      ? Object.freeze({ ...params.runtimeOptions, routineRun: true })
+      : params.runtimeOptions;
     // Bootstrap runs helper code that resolves the runtime-options
     // authority ambiently. With a second live session in this process the
     // module-level session fallback is ambiguous by design, so the
     // options must ride the async context — the same scope the daemon-only
     // TUI client establishes before ITS bound context is created.
     const bootstrap = await runWithAgentRuntimeOptions(
-      params.runtimeOptions,
+      runtimeOptions,
       () =>
         runWithBootstrapSessionScope(() =>
           this.#bootstrap({
@@ -531,7 +539,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         ? { authBackend: this.#authBackend }
         : {}),
       argv: buildBootstrapArgv(params, this.#argv),
-      runtimeOptions: params.runtimeOptions,
+      runtimeOptions,
       // Daemon agents are unattended execution for budget policy, but this
       // hint deliberately does not enable autonomous keepalive ticks.
       executionAdmissionAutonomous: true,
@@ -579,6 +587,13 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       // canonically resumable as `default` after a daemon restart.
       let initialInteractivePermissionContext =
         bootstrap.session.permissionModeRegistry.current();
+      if (routineRun) {
+        assertRoutineRunAuthority(
+          params.permissionMode,
+          initialInteractivePermissionContext,
+          bootstrap.session.services.sandboxExecutionBroker?.mode,
+        );
+      }
       const initialBypassTransition =
         initialInteractivePermissionContext.mode === "bypassPermissions" ||
         (initialInteractivePermissionContext.mode === "plan" &&
@@ -616,7 +631,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         bootstrap.session.permissionModeRegistry,
         params.unattendedAllow,
         params.unattendedDeny,
-        isRoutineRun(params.metadata),
+        routineRun ? { workspaceRoot: runtimeWorkspaceRoot(bootstrap) } : undefined,
       );
 
       // Upstream-parity top-level executor: bootstrap already registered
@@ -920,6 +935,18 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     });
   }
 
+  async getAgentPermissionMode(agentId: string): Promise<string | null> {
+    const active = this.#active.get(agentId);
+    if (active === undefined || !isRunnableActiveAgent(active)) return null;
+    try {
+      return active.bootstrap.session.permissionModeRegistry.current().mode;
+    } catch {
+      // Fenced while an external authority publishes a new context: there is
+      // no settled mode to lend a routine right now.
+      return null;
+    }
+  }
+
   async listPermissions(agentId: string): Promise<PermissionListResult | null> {
     const active = this.#active.get(agentId);
     if (active === undefined || !isRunnableActiveAgent(active)) return null;
@@ -1008,10 +1035,14 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           this.#env,
           params.envOverrides,
         );
+        // A restored routine run stays marked as one (see startAgent).
+        const restoreRuntimeOptions = isRoutineRun(params.metadata)
+          ? Object.freeze({ ...params.runtimeOptions, routineRun: true })
+          : params.runtimeOptions;
         // Same ambient-authority scope as first start: restores also run
         // bootstrap helpers outside any session context.
         bootstrap = await runWithAgentRuntimeOptions(
-          params.runtimeOptions,
+          restoreRuntimeOptions,
           () =>
             runWithBootstrapSessionScope(() =>
               this.#bootstrap({
@@ -1021,7 +1052,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
             ? { authBackend: this.#authBackend }
             : {}),
           conversationId: params.agentId,
-          runtimeOptions: params.runtimeOptions,
+          runtimeOptions: restoreRuntimeOptions,
           resumeConversation: true,
           ...(params.resumeRolloutPath !== undefined
             ? { resumeRolloutPath: params.resumeRolloutPath }
@@ -1105,7 +1136,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
           bootstrap.session.permissionModeRegistry,
           metadataStringList(params.metadata, "unattendedAllow"),
           metadataStringList(params.metadata, "unattendedDeny"),
-          isRoutineRun(params.metadata),
+          isRoutineRun(params.metadata)
+            ? { workspaceRoot: runtimeWorkspaceRoot(bootstrap) }
+            : undefined,
         );
         // `/goal` is session state journaled outside the conversation. A
         // reopened session gets its open goal back, paused: continuing is the
