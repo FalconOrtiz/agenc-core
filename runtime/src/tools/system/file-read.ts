@@ -436,9 +436,11 @@ function sliceLines(
     totalLines === 0 || startLine > totalLines
       ? []
       : lines.slice(startLine - 1, endLine);
-  const explicitWindow = offset > 1 || limit !== undefined;
-  const isPartial =
-    explicitWindow || !(startLine === 1 && selected.length === totalLines);
+  // A window the caller asked for is still a full view when it covered
+  // every line: models that fill optional fields send offset 1 with a large
+  // limit, and treating that as partial left NotebookEdit and other
+  // full-read gates refusing a file that was read whole.
+  const isPartial = !(startLine === 1 && selected.length === totalLines);
   return {
     content: selected.join("\n"),
     startLine,
@@ -1249,7 +1251,10 @@ async function readPDFFile(
     );
   }
 
-  const isPartial = parsedRange !== null || sliced.isPartial;
+  // A PDF snapshot's raw content is extracted text, not the file's bytes,
+  // so an explicit window never promotes it to a full raw read.
+  const explicitWindow = opts.offset > 1 || opts.limit !== undefined;
+  const isPartial = parsedRange !== null || sliced.isPartial || explicitWindow;
 
   recordSessionRead(sessionId, resolvedPath.canonical, {
     content: sliced.content,
@@ -1259,12 +1264,12 @@ async function readPDFFile(
         ? fileStats.mtimeMs
         : Date.now(),
     viewKind: isPartial ? "partial" : "full",
-    ...(sliced.isPartial
+    ...(sliced.isPartial || explicitWindow
       ? { readOffset: sliced.startLine }
       : parsedRange
         ? { readOffset: selectedRange?.firstPage ?? 1 }
         : {}),
-    ...(sliced.isPartial && opts.limit !== undefined
+    ...((sliced.isPartial || explicitWindow) && opts.limit !== undefined
       ? { readLimit: opts.limit }
       : parsedRange && selectedRange && selectedRange.lastPage !== Infinity
         ? { readLimit: pageRangeLength(selectedRange) }
