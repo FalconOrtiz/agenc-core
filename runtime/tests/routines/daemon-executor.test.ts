@@ -9,6 +9,9 @@ import {
 import { RoutineExecutionUnsettledError, RoutineService } from "../../src/routines/service.js";
 import type { Routine, RoutineRun } from "../../src/routines/types.js";
 import type { AgentRuntimeOptions } from "../../src/session/runtime-options.js";
+import { MCPManager } from "../../src/mcp-client/manager.js";
+import { createToolBridge } from "../../src/mcp-client/tools.js";
+import { withLocalMcpAccess } from "../../src/mcp-client/local-control.js";
 
 function fixture(environment?: Record<string, string | undefined>, defaultProvider?: () => string | undefined) {
   const manager = {
@@ -30,7 +33,7 @@ function routineService(f: ReturnType<typeof fixture>) {
   const cwd = join(home, "project"); mkdirSync(cwd);
   const service = new RoutineService({ home, executor: f.executor }); service.start();
   const routine = service.create({ name: "Check", instructions: "Inspect", cwd, schedule: { kind: "manual" } }).routine;
-  return { service, routine, cleanup: async () => { await service.close(); rmSync(home, { recursive: true, force: true }); } };
+  return { service, routine, home, cleanup: async () => { await service.close(); rmSync(home, { recursive: true, force: true }); } };
 }
 
 function projectedCoreTerminal(run: RoutineRun, status: "completed" | "failed" | "cancelled" | "unknown_outcome", terminalRunId = run.coreRunId, stopReason?: string) {
@@ -342,5 +345,157 @@ describe("a routine run's scratch folder", () => {
       expect(readFileSync(join(f.outside, "keep.txt"), "utf8")).toBe("keep");
       expect(prepareRoutineScratch(f.ws, "../escape")).toBeUndefined();
     } finally { f.dispose(); }
+  });
+});
+
+describe("routine Desktop preparation before dispatch", () => {
+  it.each(["default", "plan", "acceptEdits", "bypassPermissions"] as const)("grants local Desktop tool visibility and captured calls only after attachment in %s mode", async permissionMode => {
+    const config = { name: "agenc-desktop-control", transport: "http" as const, endpoint: "http://127.0.0.1:43119/mcp", localOnly: true, headers: { Authorization: `Bearer ${"f".repeat(48)}` }, origin: { scope: "session" as const } };
+    const callTool = vi.fn(async () => ({ content: [{ type: "text", text: "Desktop state" }] }));
+    const bridge = await createToolBridge({ listTools: async () => ({ tools: [{ name: "desktop_state", inputSchema: { type: "object", properties: {} } }] }), callTool, close: async () => {} }, config.name, undefined, { environment: {}, serverConfig: config });
+    const manager = new MCPManager([config]);
+    (manager as unknown as { bridges: Map<string, typeof bridge> }).bridges.set(config.name, bridge);
+    const captured = bridge.tools[0]!;
+    const f = fixture();
+    const observed: Array<{ names: string[]; error: boolean }> = [];
+    let status: "attached" | "declined" | "unavailable" = "attached";
+    f.manager.streamAgentMessage.mockImplementation(async (params: { localMcpAccess?: boolean }) => withLocalMcpAccess(params.localMcpAccess === true, async () => {
+      const result = await captured.execute({});
+      observed.push({ names: manager.getTools().map(tool => tool.name), error: result.isError === true });
+      return { terminal: { code: 0 } } as never;
+    }));
+    const executor = createDaemonRoutineExecutor({ agentManager: f.manager as never, runtimeOptions: options,
+      prepareSession: async () => ({ status, reason: status === "attached" ? null : "No Desktop window." }) });
+    for (status of ["attached", "declined", "unavailable"] as const) {
+      await executor.execute({ ...f.routine, permissionMode }, { ...f.run, id: `run_${status}` }, { signal: f.controller.signal, bind: vi.fn() });
+    }
+    expect(f.manager.createAgent.mock.calls.map(call => call[0])).toEqual(expect.arrayContaining([expect.objectContaining({ permissionMode })]));
+    expect(observed[0]).toEqual({ names: ["mcp.agenc-desktop-control.desktop_state"], error: false });
+    expect(observed.slice(1)).toEqual([{ names: [], error: true }, { names: [], error: true }]);
+    expect(callTool).toHaveBeenCalledOnce();
+    await bridge.dispose();
+  });
+  const options = { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins", sessionTempRoot: "/fixture/tmp" } as AgentRuntimeOptions;
+  function prepared(prepareSession: NonNullable<Parameters<typeof createDaemonRoutineExecutor>[0]["prepareSession"]>) {
+    const f = fixture();
+    const executor = createDaemonRoutineExecutor({ agentManager: f.manager as never, runtimeOptions: options, prepareSession });
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
+    return { ...f, executor };
+  }
+  it("requests preparation after bind and before the first message, retaining session permission mode", async () => {
+    const order: string[] = [];
+    const f = prepared(async input => { order.push("prepare"); expect(input).toEqual({ sessionId: "session", routineId: "routine", runId: "routine-run", cwd: "/fixture" }); return { status: "attached", reason: null }; });
+    f.manager.streamAgentMessage.mockImplementation(async () => { order.push("message"); return { terminal: { code: 0 } } as never; });
+    const setDesktopTools = vi.fn();
+    await f.executor.execute({ ...f.routine, model: "chosen-model" }, f.run, { signal: f.controller.signal, bind: () => order.push("bind"), setDesktopTools });
+    expect(order).toEqual(["bind", "prepare", "message"]);
+    expect(f.manager.createAgent.mock.calls[0]?.[0]).toMatchObject({ permissionMode: "plan", model: "chosen-model", deferInitialTurn: true });
+    expect(f.manager.streamAgentMessage.mock.calls[0]?.[0]).toMatchObject({ content: "Inspect" });
+    expect(setDesktopTools).toHaveBeenCalledWith({ status: "attached", reason: null });
+  });
+  it.each([
+    { status: "unavailable" as const, reason: "No Desktop client is connected." },
+    { status: "unavailable" as const, reason: "Desktop did not answer within 4 seconds." },
+    { status: "declined" as const, reason: "Desktop window is not open." },
+  ])("prefixes the instruction and records $status: $reason", async outcome => {
+    const f = prepared(async () => outcome); const setDesktopTools = vi.fn();
+    await f.executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn(), setDesktopTools });
+    expect(f.manager.streamAgentMessage.mock.calls[0]?.[0]).toMatchObject({ content: `Desktop tools (browser, terminal, windows) are unavailable in this run: ${outcome.reason.replace(/[.!?]+$/u, "")}.\nInspect` });
+    expect(setDesktopTools).toHaveBeenCalledWith(outcome);
+    expect(f.manager.createAgent.mock.calls[0]?.[0]).toMatchObject({ permissionMode: "plan" });
+  });
+});
+
+describe("routine cancellation while Desktop prepares", () => {
+  it("ends cancelled before dispatch and keeps the routine permission mode", async () => {
+    const f = fixture();
+    const clients = { hasClientWithCapability: vi.fn(async () => true),
+      broadcastCapabilityEvent: vi.fn(async () => ({ deliveredClientIds: ["desktop"], failed: [], sessionId: "session" })) };
+    const { RoutineSessionPreparation } = await import("../../src/routines/session-preparation.js");
+    const broker = new RoutineSessionPreparation(clients as never);
+    const executor = createDaemonRoutineExecutor({ agentManager: f.manager as never,
+      runtimeOptions: { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins", sessionTempRoot: "/fixture/tmp" } as AgentRuntimeOptions,
+      prepareSession: (input, signal) => broker.prepare(input, signal) });
+    const setDesktopTools = vi.fn();
+    const run = executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn(), setDesktopTools });
+    await vi.waitFor(() => expect(clients.broadcastCapabilityEvent).toHaveBeenCalledOnce());
+    f.controller.abort();
+    await expect(run).resolves.toBe("cancelled");
+    expect(f.manager.streamAgentMessage).not.toHaveBeenCalled();
+    expect(setDesktopTools).toHaveBeenCalledWith({ status: "unavailable", reason: "Routine was cancelled." });
+    expect(f.manager.createAgent.mock.calls[0]?.[0]).toMatchObject({ permissionMode: "plan" });
+  });
+
+  it("persists the cancelled preparation result through history reload", async () => {
+    const f = fixture(); const recorded = vi.fn();
+    const clients = { hasClientWithCapability: vi.fn(async () => true),
+      broadcastCapabilityEvent: vi.fn(async () => ({ deliveredClientIds: ["desktop"], failed: [], sessionId: "session" })) };
+    const { RoutineSessionPreparation } = await import("../../src/routines/session-preparation.js");
+    const broker = new RoutineSessionPreparation(clients as never);
+    const real = createDaemonRoutineExecutor({ agentManager: f.manager as never,
+      runtimeOptions: { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins" } as AgentRuntimeOptions,
+      prepareSession: (input, signal) => broker.prepare(input, signal) });
+    const wrapper = { execute: (routine: Routine, run: RoutineRun, context: Parameters<typeof real.execute>[2]) => real.execute(routine, run, {
+      ...context, setDesktopTools: outcome => { recorded(outcome); context.setDesktopTools?.(outcome); },
+    }) };
+    const serviceFixture = routineService({ ...f, executor: wrapper });
+    try {
+      serviceFixture.service.run({ id: serviceFixture.routine.id });
+      await vi.waitFor(() => expect(clients.broadcastCapabilityEvent).toHaveBeenCalledOnce());
+      await serviceFixture.service.cancel({ id: serviceFixture.routine.id });
+      await vi.waitFor(() => expect(serviceFixture.service.runs({ id: serviceFixture.routine.id }).runs[0]?.status).toBe("cancelled"));
+      expect(recorded).toHaveBeenCalledWith({ status: "unavailable", reason: "Routine was cancelled." });
+      const home = serviceFixture.home;
+      await serviceFixture.service.close();
+      const restored = new RoutineService({ home, executor: wrapper });
+      expect(restored.runs({ id: serviceFixture.routine.id }).runs[0]?.desktopTools).toEqual({ status: "unavailable", reason: "Routine was cancelled." });
+      await restored.close();
+    } finally { await serviceFixture.cleanup(); }
+  });
+});
+
+describe("routine dispatch after a missing Desktop answer", () => {
+  it.each([
+    { capable: false, timeoutMs: 500, reason: "No Desktop client is connected." },
+    { capable: true, timeoutMs: 5, reason: "Desktop did not answer within 4 seconds." },
+  ])("dispatches with a $reason prefix", async ({ capable, timeoutMs, reason }) => {
+    const f = fixture();
+    const clients = { hasClientWithCapability: vi.fn(async () => capable),
+      broadcastCapabilityEvent: vi.fn(async () => ({ deliveredClientIds: ["desktop"], failed: [], sessionId: "session" })) };
+    const { RoutineSessionPreparation } = await import("../../src/routines/session-preparation.js");
+    const broker = new RoutineSessionPreparation(clients as never, timeoutMs);
+    const executor = createDaemonRoutineExecutor({ agentManager: f.manager as never,
+      runtimeOptions: { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins", sessionTempRoot: "/fixture/tmp" } as AgentRuntimeOptions,
+      prepareSession: (input, signal) => broker.prepare(input, signal) });
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
+    const setDesktopTools = vi.fn();
+    await expect(executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn(), setDesktopTools })).resolves.toBe("completed");
+    expect(f.manager.streamAgentMessage.mock.calls[0]?.[0]).toMatchObject({ content: `Desktop tools (browser, terminal, windows) are unavailable in this run: ${reason.replace(/[.!?]+$/u, "")}.\nInspect` });
+    expect(setDesktopTools).toHaveBeenCalledWith({ status: "unavailable", reason });
+    expect(clients.broadcastCapabilityEvent).toHaveBeenCalledTimes(capable ? 1 : 0);
+  });
+});
+
+describe("routine preparation event ordering", () => {
+  it("delivers an attached answer before the first message dispatch", async () => {
+    const f = fixture(); const order: string[] = [];
+    const { RoutineSessionPreparation } = await import("../../src/routines/session-preparation.js");
+    let broker!: InstanceType<typeof RoutineSessionPreparation>;
+    const clients = {
+      hasClientWithCapability: vi.fn(async () => true),
+      broadcastCapabilityEvent: vi.fn(async (_sessionId: string, _capability: string, event: { params: { requestId: string } }) => {
+        order.push("event");
+        expect(broker.respond({ requestId: event.params.requestId, status: "attached" }, true)).toEqual({ accepted: true });
+        return { deliveredClientIds: ["desktop"], failed: [], sessionId: "session" };
+      }),
+    };
+    broker = new RoutineSessionPreparation(clients as never);
+    const executor = createDaemonRoutineExecutor({ agentManager: f.manager as never,
+      runtimeOptions: { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins", sessionTempRoot: "/fixture/tmp" } as AgentRuntimeOptions,
+      prepareSession: (input, signal) => broker.prepare(input, signal) });
+    f.manager.streamAgentMessage.mockImplementation(async () => { order.push("message"); return { terminal: { code: 0 } } as never; });
+    await expect(executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn() })).resolves.toBe("completed");
+    expect(order).toEqual(["event", "message"]);
+    expect(f.manager.streamAgentMessage.mock.calls[0]?.[0]).toMatchObject({ content: "Inspect" });
   });
 });

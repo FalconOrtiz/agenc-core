@@ -831,6 +831,7 @@ export class AgenCDaemonClientMultiplexer {
     sessionId: string,
     capability: string,
     event: JsonObject,
+    options: { bufferOnFailure?: boolean; signal?: AbortSignal; deadlineAt?: number } = {},
   ): Promise<AgenCSessionBroadcastResult> {
     const evictedClientIds: EvictedClient[] = [];
     const rejectedDeliveries: AgenCSessionBroadcastFailure[] = [];
@@ -849,6 +850,7 @@ export class AgenCDaemonClientMultiplexer {
           }
         }
         if (target === undefined) {
+          if (options.bufferOnFailure === false) return { deliveries: [] as EnqueuedDelivery[], bufferAfterDelivery: false };
           const buffered = state.capabilityBuffers.get(capability) ?? [];
           bufferCapabilityEvent(
             buffered,
@@ -869,18 +871,19 @@ export class AgenCDaemonClientMultiplexer {
           this.#maxPendingDeliveryCountPerClient,
           evictedClientIds,
           rejectedDeliveries,
+          options,
         );
         return {
           deliveries: delivery === null ? [] : [delivery],
           // A cap-triggered eviction returns no delivery. Preserve the action
           // just like an asynchronous socket-send failure below.
-          bufferAfterDelivery: delivery === null,
+          bufferAfterDelivery: delivery === null && options.bufferOnFailure !== false,
         };
       },
     );
     await this.#evictSlowClients(evictedClientIds);
     const result = await settleDeliveries(deliveries);
-    if (bufferAfterDelivery || result.failed.length > 0) {
+    if (options.bufferOnFailure !== false && (bufferAfterDelivery || result.failed.length > 0)) {
       await this.#state.with(async (state) => {
         if (!(await this.#isSessionLive(sessionId))) return [];
         const buffered = state.capabilityBuffers.get(capability) ?? [];
@@ -1101,6 +1104,7 @@ function enqueueDelivery(
   maxPendingCount: number,
   evictedClientIds: EvictedClient[],
   rejectedDeliveries: AgenCSessionBroadcastFailure[],
+  options: { signal?: AbortSignal; deadlineAt?: number } = {},
 ): EnqueuedDelivery | null {
   if (client === undefined || client.evicted) return null;
 
@@ -1136,9 +1140,14 @@ function enqueueDelivery(
   client.pendingDeliveryBytes += eventBytes;
   client.pendingDeliveryCount += 1;
 
-  const delivered = client.deliveryQueue.then(() =>
-    Promise.resolve(client.send(event)),
-  );
+  const delivered = client.deliveryQueue.then(() => {
+    // A one-shot caller can expire while waiting behind an earlier socket
+    // write. Check at the effect boundary, after the queue opens.
+    if (options.signal?.aborted || (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt)) {
+      throw new Error("AgenC capability delivery expired before send");
+    }
+    return Promise.resolve(client.send(event));
+  });
   // Decrement the pending counters once THIS delivery settles (success or
   // failure) so a healthy client's backlog drains back toward zero. Bound to a
   // local `client` reference so it is unaffected by later re-registration.
