@@ -57,6 +57,9 @@ function stubSession(
     services?: {
       readonly executionAdmission?: ExecutionAdmissionClient;
       readonly admissionRequired?: boolean;
+      readonly unifiedExecManager?: {
+        readonly terminateOwnedProcesses: (request: { ownerId: string }) => { results: [] };
+      };
     };
   } = {},
 ) {
@@ -2345,6 +2348,54 @@ describe("AgentControl", () => {
     expect(descendants).toContain(b.agentId);
     expect(descendants).toContain(c.agentId);
     expect(descendants.length).toBe(2);
+  });
+
+  it("an owner Stop reaches idle and nested children without selecting the root", async () => {
+    const terminateOwnedProcesses = vi.fn(() => ({ results: [] as [] }));
+    const session = stubSession({
+      services: { admissionRequired: false, unifiedExecManager: { terminateOwnedProcesses } },
+    });
+    const control = new AgentControl({ session, registry: new AgentRegistry(), maxDepth: 3 });
+    control.registerSessionRoot(session.conversationId);
+    const parent = await control.spawn({ parentPath: "/root" });
+    const sibling = await control.spawn({ parentPath: "/root" });
+    const nested = await control.spawn({ parentPath: parent.agentPath });
+    parent.status.markRunning("parent-turn");
+    parent.status.markIdle("parent-turn");
+    nested.status.markRunning("nested-turn");
+    nested.status.markIdle("nested-turn");
+
+    control.stopOpenSpawnChildren(session.conversationId, "user_stop");
+
+    expect(parent.abortController.signal.aborted).toBe(true);
+    expect(nested.abortController.signal.aborted).toBe(true);
+    expect(terminateOwnedProcesses.mock.calls.map(([request]) => request.ownerId).sort()).toEqual(
+      [parent.agentId, sibling.agentId, nested.agentId].sort(),
+    );
+    expect(terminateOwnedProcesses).not.toHaveBeenCalledWith({ ownerId: session.conversationId });
+  });
+
+  it("an owner Stop terminates sessions of descendants whose spawn edges closed during root cancellation", async () => {
+    const terminateOwnedProcesses = vi.fn(() => ({ results: [] as [] }));
+    const session = stubSession({
+      services: { admissionRequired: false, unifiedExecManager: { terminateOwnedProcesses } },
+    });
+    const control = new AgentControl({ session, registry: new AgentRegistry(), maxDepth: 3 });
+    control.registerSessionRoot(session.conversationId);
+    const closedParent = await control.spawn({ parentPath: "/root" });
+    const closedNested = await control.spawn({ parentPath: closedParent.agentPath });
+    const earlyDescendants = new Set(control.liveThreadSpawnDescendants(session.conversationId));
+
+    await control.shutdown(closedParent.agentId);
+    const stillOpen = await control.spawn({ parentPath: "/root" });
+    expect(control.liveThreadSpawnDescendants(session.conversationId)).toEqual([stillOpen.agentId]);
+
+    control.stopOpenSpawnChildren(session.conversationId, "user_stop", earlyDescendants);
+
+    expect(terminateOwnedProcesses.mock.calls.map(([request]) => request.ownerId).sort()).toEqual(
+      [closedParent.agentId, closedNested.agentId, stillOpen.agentId].sort(),
+    );
+    expect(terminateOwnedProcesses).not.toHaveBeenCalledWith({ ownerId: session.conversationId });
   });
 
   it("renderInputPreview() keeps first line + truncates", () => {

@@ -4498,6 +4498,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     const active = this.#active.get(agentId);
     if (active === undefined || !isInterruptibleActiveAgent(active))
       return false;
+    const earlyDescendants = new Set(
+      active.control.liveThreadSpawnDescendants(active.thread.threadId),
+    );
     // A client asked for the stop; hold child receipts until the next prompt.
     try {
       active.bootstrap.session.markStoppedByUser?.();
@@ -4510,11 +4513,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
       void active.thread.submit({ type: "interrupt", reason }).catch(() => {
         /* interrupt delivery surfaces via session events */
       });
-      for (const [childThreadId] of active.control.openThreadSpawnChildren(
-        active.thread.threadId,
-      )) {
-        active.control.interrupt(childThreadId, reason);
-      }
+      active.control.stopOpenSpawnChildren(active.thread.threadId, reason, earlyDescendants);
       active.lastActiveAt = this.#now();
     }
     return true;
@@ -4539,6 +4538,9 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
         stale: true,
       };
     }
+    const earlyDescendants = new Set(
+      active.control.liveThreadSpawnDescendants(active.thread.threadId),
+    );
     let cancelled = false;
     try {
       cancelled = await active.bootstrap.session.abortTurnIfActive(
@@ -4561,11 +4563,7 @@ export class AgenCDelegateBackgroundAgentRunner implements AgenCBackgroundAgentR
     try {
       active.bootstrap.session.markStoppedByUser?.();
     } finally {
-      for (const [childThreadId] of active.control.openThreadSpawnChildren(
-        active.thread.threadId,
-      )) {
-        active.control.interrupt(childThreadId, reason);
-      }
+      active.control.stopOpenSpawnChildren(active.thread.threadId, reason, earlyDescendants);
       active.lastActiveAt = this.#now();
     }
     return { cancelled: true, activeTurnId: expectedTurnId };
