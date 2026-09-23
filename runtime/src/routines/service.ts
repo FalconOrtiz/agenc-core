@@ -7,6 +7,8 @@ import type { Routine, RoutineCapabilities, RoutineConfig, RoutineRun, RoutineRu
 export const MAX_ROUTINES = 100;
 export const MAX_ROUTINE_RUNS = 50;
 const GENERIC_RUN_FAILURE = "Routine could not run. Check its workspace, provider configuration, and session details.";
+const PERMISSION_DENIED_RUN_FAILURE = "A tool action was blocked by this routine's read-only permissions. Update its instructions to use only read-only actions, then run it again. Open its session for details.";
+const UNKNOWN_OUTCOME_RUN_FAILURE = "An action's outcome could not be confirmed. Open the session for details.";
 /** Raised by Core when the agent's provider has no usable credential. */
 const CREDENTIALS_MISSING = /requires credentials/u;
 
@@ -193,13 +195,14 @@ class RoutineStore {
 
 export interface RoutineExecutionContext {
   readonly signal: AbortSignal;
+  readonly terminal?: Promise<"completed" | "failed" | "cancelled">;
   bind(ids: { agentId: string; sessionId: string; coreRunId: string }): void;
 }
 export interface RoutineExecutor {
   /** A permission denial is a failed run with a fixed, actionable public explanation. */
   execute(routine: Routine, run: RoutineRun, context: RoutineExecutionContext): Promise<"completed" | "failed" | "cancelled" | "permission_denied">;
 }
-type Active = { controller: AbortController; done: Promise<void>; runId: string };
+type Active = { controller: AbortController; done: Promise<void>; runId: string; resolveTerminal: (status: "completed" | "failed" | "cancelled") => void };
 
 export class RoutineService {
   readonly #store: RoutineStore;
@@ -312,8 +315,39 @@ export class RoutineService {
     return { run: structuredClone(entry.runs.find((run) => run.id === selected.id)!) };
   }
   /** Called from the existing daemon event fan-out, without lifecycle polling. */
-  observeSessionEvent(sessionId: string, event: { method?: unknown }): void {
+  observeSessionEvent(sessionId: string, event: { method?: unknown; params?: unknown }): void {
     if (this.#closed || !this.#healthy) return;
+    if (event.method === "event.agent_status" && record(event.params)) {
+      const params = event.params;
+      const inner = record(params.turnEvent) ? params.turnEvent : undefined;
+      const payload = inner && record(inner.payload) ? inner.payload : undefined;
+      if (inner?.type === "run_terminal" && payload && params.sessionId === sessionId &&
+          typeof params.eventId === "string" && params.eventId.length > 0 &&
+          typeof params.sequence === "number" && Number.isSafeInteger(params.sequence) && params.sequence > 0 &&
+          ((payload.status === "completed" && params.status === "idle" && params.runStatus === "completed") ||
+            ((payload.status === "failed" || payload.status === "unknown_outcome") && params.status === "error" && params.runStatus === "errored") ||
+            (payload.status === "cancelled" && params.status === "stopped" && params.runStatus === "stopped"))) {
+        const status = payload.status === "unknown_outcome" ? "failed" : payload.status;
+        for (const entry of this.#entries) {
+          const active = this.#active.get(entry.routine.id);
+          const heldRunId = this.#held.has(entry.routine.id) ? entry.runs[0]?.id : undefined;
+          const run = entry.runs.find((r) => ACTIVE.has(r.status) && r.finishedAt === null &&
+            (active?.runId === r.id || heldRunId === r.id) &&
+            r.sessionId === sessionId && r.agentId !== null && r.coreRunId !== null &&
+            r.agentId === params.agentId && r.coreRunId === params.runId && r.coreRunId === payload.runId);
+          if (!run) continue;
+          try {
+            this.#replaceRun(entry, run.id, { status, finishedAt: this.#now().toISOString(),
+              error: payload.status === "unknown_outcome" ? UNKNOWN_OUTCOME_RUN_FAILURE
+                : status === "failed" ? payload.stopReason === "routine_permission_denied" ? PERMISSION_DENIED_RUN_FAILURE
+                  : "Core could not complete this run. Open its session for details." : null });
+            if (entry.runs[0]?.id === run.id) this.#held.delete(entry.routine.id);
+            if (active?.runId === run.id) { active.resolveTerminal(status); this.#active.delete(entry.routine.id); }
+          } catch { /* Routine storage failure must not interrupt the owning Core event stream. */ }
+          return;
+        }
+      }
+    }
     const waiting = ["event.permission_request", "event.user_input_request", "event.mcp_elicitation_request"].includes(String(event.method));
     if (!waiting && event.method !== "event.message_chunk") return;
     for (const entry of this.#entries) {
@@ -353,20 +387,23 @@ export class RoutineService {
     const snapshot = structuredClone(entry.routine); const cwdIdentity = { ...entry.cwdIdentity };
     this.#commit(() => { entry.runs = [run, ...entry.runs].slice(0, MAX_ROUTINE_RUNS); entry.routine = { ...entry.routine, lastRun: run }; });
     const controller = new AbortController();
+    let resolveTerminal!: Active["resolveTerminal"];
+    const terminal = new Promise<"completed" | "failed" | "cancelled">((resolve) => { resolveTerminal = resolve; });
     const done = Promise.resolve().then(async () => {
       let status: RoutineRunStatus = "failed"; let error: string | null = null;
       try {
         if (controller.signal.aborted) status = "cancelled";
         else {
           if (realpathSync(snapshot.cwd) !== snapshot.cwd || !sameIdentity(identity(snapshot.cwd), cwdIdentity)) throw new Error("workspace changed");
-          const outcome = await this.#executor.execute(snapshot, run, { signal: controller.signal, bind: (ids) => { this.#replaceRun(entry, run.id, { ...ids, status: "running" }); } });
+          const outcome = await this.#executor.execute(snapshot, run, { signal: controller.signal, terminal, bind: (ids) => { this.#replaceRun(entry, run.id, { ...ids, status: "running" }); } });
           status = outcome === "permission_denied" ? "failed" : outcome;
-          if (outcome === "permission_denied") error = "A tool action was blocked by this routine's read-only permissions. Update its instructions to use only read-only actions, then run it again. Open its session for details.";
+          if (outcome === "permission_denied") error = PERMISSION_DENIED_RUN_FAILURE;
         }
         if (status === "failed" && error === null) error = "Core could not complete this run. Open its session for details.";
       } catch (cause) {
         if (cause instanceof RoutineExecutionUnsettledError) {
-          this.#held.add(entry.routine.id); status = "running";
+          if (entry.runs.find((r) => r.id === run.id)?.finishedAt === null) this.#held.add(entry.routine.id);
+          status = "running";
           error = "Core could not confirm this run stopped. Further invocations are blocked until the daemon restarts.";
         } else {
           const reason = classifyRunFailure(cause);
@@ -376,10 +413,10 @@ export class RoutineService {
         }
       }
       if (this.#closed) { status = "interrupted"; error = "Daemon stopped before this run finished. It was not restarted automatically."; }
-      try { this.#replaceRun(entry, run.id, { status, finishedAt: ACTIVE.has(status) ? null : this.#now().toISOString(), error }); }
-      finally { this.#active.delete(entry.routine.id); }
-    }).catch(() => { this.#active.delete(entry.routine.id); });
-    this.#active.set(entry.routine.id, { controller, done, runId: run.id }); this.#emit(entry.routine.id, "run"); return structuredClone(run);
+      try { if (entry.runs.find((r) => r.id === run.id)?.finishedAt === null) this.#replaceRun(entry, run.id, { status, finishedAt: ACTIVE.has(status) ? null : this.#now().toISOString(), error }); }
+      finally { if (this.#active.get(entry.routine.id)?.runId === run.id) this.#active.delete(entry.routine.id); }
+    }).catch(() => { if (this.#active.get(entry.routine.id)?.runId === run.id) this.#active.delete(entry.routine.id); });
+    this.#active.set(entry.routine.id, { controller, done, runId: run.id, resolveTerminal }); this.#emit(entry.routine.id, "run"); return structuredClone(run);
   }
   #arm(): void {
     if (this.#timer) clearTimeout(this.#timer);

@@ -2,6 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { notificationFromDaemonEvent } from "../../src/app-server/background-agent-runner/daemon-events.js";
 import { MAX_ROUTINE_RUNS, RoutineExecutionUnsettledError, RoutineService, type RoutineExecutor, type RoutineRunFailure } from "../../src/routines/service.js";
 
 const roots: string[] = [];
@@ -203,6 +204,48 @@ describe("daemon-owned local routines", () => {
     expect(f.service.runs({ id: routine.id }).runs[0]).toMatchObject({ status: "running", finishedAt: null });
     expect(() => f.service.run({ id: routine.id })).toThrow("active run");
     expect(() => f.service.delete({ id: routine.id })).toThrow("Cancel");
+  });
+
+  it("keeps a newer unsettled run fenced when an older terminal arrives late", async () => {
+    let number = 0;
+    const f = setup({ execute: async (_routine, _run, context) => {
+      const agentId = `agent-${++number}`;
+      context.bind({ agentId, sessionId: `session-${number}`, coreRunId: agentId });
+      if (number === 1) return "completed";
+      throw new RoutineExecutionUnsettledError("unsettled");
+    } });
+    const { routine } = f.service.create(f.params);
+    f.service.run({ id: routine.id }); await terminal(f.service, routine.id);
+    f.service.run({ id: routine.id });
+    await vi.waitFor(() => expect(f.service.runs({ id: routine.id }).runs[0]?.error).toContain("could not confirm"));
+    f.service.observeSessionEvent("session-1", notificationFromDaemonEvent("session-1", "agent-1", {
+      id: "terminal:agent-1:1", eventId: "terminal:agent-1:1", sequence: 3, runId: "agent-1",
+      type: "run_terminal", payload: { runId: "agent-1", status: "failed", exitCode: 1 },
+    }));
+    expect(f.service.runs({ id: routine.id }).runs[0]).toMatchObject({ status: "running", finishedAt: null });
+    expect(f.service.runs({ id: routine.id }).runs[1]).toMatchObject({ status: "completed", error: null });
+    expect(() => f.service.run({ id: routine.id })).toThrow("active run");
+  });
+
+  it("preserves an interrupted run when its terminal is replayed after restart", async () => {
+    const f = setup({ execute: async (_routine, _run, context) => {
+      context.bind({ agentId: "agent-replayed", sessionId: "session-replayed", coreRunId: "core-replayed" });
+      return new Promise<"cancelled">((resolve) => context.signal.addEventListener("abort", () => resolve("cancelled")));
+    } });
+    const { routine } = f.service.create(f.params);
+    f.service.run({ id: routine.id });
+    await vi.waitFor(() => expect(f.service.runs({ id: routine.id }).runs[0]?.coreRunId).toBe("core-replayed"));
+    await f.service.close();
+    const restored = new RoutineService({ home: f.home, executor: f.executor }); services.push(restored);
+    restored.start();
+    const before = readFileSync(f.path, "utf8");
+    expect(restored.runs({ id: routine.id }).runs[0]).toMatchObject({ status: "interrupted", error: expect.stringContaining("Daemon stopped") });
+    restored.observeSessionEvent("session-replayed", notificationFromDaemonEvent("session-replayed", "agent-replayed", {
+      id: "terminal:core-replayed:1", eventId: "terminal:core-replayed:1", sequence: 3, runId: "core-replayed",
+      type: "run_terminal", payload: { runId: "core-replayed", status: "completed", exitCode: 0 },
+    }));
+    expect(restored.runs({ id: routine.id }).runs[0]).toMatchObject({ status: "interrupted", error: expect.stringContaining("Daemon stopped") });
+    expect(readFileSync(f.path, "utf8")).toBe(before);
   });
 
   it("can pause a routine whose workspace was removed, without rebinding its authority", () => {

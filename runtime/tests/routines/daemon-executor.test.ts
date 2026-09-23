@@ -1,6 +1,10 @@
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { notificationFromDaemonEvent } from "../../src/app-server/background-agent-runner/daemon-events.js";
 import { createDaemonRoutineExecutor, providerEnvironmentKeys, routineSessionEnvironment } from "../../src/routines/daemon-executor.js";
-import { RoutineExecutionUnsettledError } from "../../src/routines/service.js";
+import { RoutineExecutionUnsettledError, RoutineService } from "../../src/routines/service.js";
 import type { Routine, RoutineRun } from "../../src/routines/types.js";
 import type { AgentRuntimeOptions } from "../../src/session/runtime-options.js";
 
@@ -10,13 +14,35 @@ function fixture(environment?: Record<string, string | undefined>, defaultProvid
     streamAgentMessage: vi.fn(() => new Promise<never>(() => {})),
     cancelRunTree: vi.fn(async () => ({ runId: "agent" })),
     stopAgent: vi.fn(async () => ({ agentId: "agent", stopped: true })),
-    finishRoutineRun: vi.fn(async () => {}),
+    finishRoutineRun: vi.fn(async () => "completed" as const),
   };
   const executor = createDaemonRoutineExecutor({ agentManager: manager as never, ...(environment ? { environment } : {}), ...(defaultProvider ? { defaultProvider } : {}), runtimeOptions: { simpleMode: false, dangerouslyBypassApprovalsAndSandbox: false, stdinDataMode: false, remoteMode: false, allowUntrustedHooks: false, pluginStorageRoot: "/fixture/plugins", sessionTempRoot: "/fixture/tmp" } as AgentRuntimeOptions });
   const controller = new AbortController();
   const routine = { id: "routine", name: "Check", instructions: "Inspect", cwd: "/fixture", permissionMode: "plan" } as Routine;
   const run = { id: "routine-run" } as RoutineRun;
   return { manager, executor, controller, routine, run };
+}
+
+function routineService(f: ReturnType<typeof fixture>) {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "agenc-routine-terminal-")));
+  const cwd = join(home, "project"); mkdirSync(cwd);
+  const service = new RoutineService({ home, executor: f.executor }); service.start();
+  const routine = service.create({ name: "Check", instructions: "Inspect", cwd, schedule: { kind: "manual" } }).routine;
+  return { service, routine, cleanup: async () => { await service.close(); rmSync(home, { recursive: true, force: true }); } };
+}
+
+function projectedCoreTerminal(run: RoutineRun, status: "completed" | "failed" | "cancelled" | "unknown_outcome", terminalRunId = run.coreRunId, stopReason?: string) {
+  return notificationFromDaemonEvent(run.sessionId!, run.agentId!, {
+    id: "terminal:agent:1", eventId: "terminal:agent:1", sequence: 3,
+    runId: run.coreRunId!, type: "run_terminal",
+    payload: { runId: terminalRunId, status, exitCode: status === "completed" ? 0 : 1,
+      ...(stopReason ? { stopReason } : {}) },
+  });
+}
+
+function failedCoreTerminal(service: RoutineService, routineId: string, terminalRunId?: string, stopReason?: string): void {
+  const run = service.runs({ id: routineId }).runs[0]!;
+  service.observeSessionEvent(run.sessionId!, projectedCoreTerminal(run, "failed", terminalRunId ?? run.coreRunId, stopReason));
 }
 
 const AMBIENT = {
@@ -66,6 +92,68 @@ describe("routine agent environment", () => {
 });
 
 describe("routine execution finalization", () => {
+  /** A routine's run held open, its stream and stop both rejected, waiting for a canonical terminal. */
+  async function runAwaitingUnconfirmedTerminal() {
+    const f = fixture();
+    f.manager.streamAgentMessage.mockRejectedValue(new Error("turn failed"));
+    f.manager.stopAgent.mockRejectedValue(new Error("stop failed"));
+    const h = routineService(f);
+    h.service.run({ id: h.routine.id });
+    await vi.waitFor(() => expect(h.service.runs({ id: h.routine.id }).runs[0]?.error).toContain("could not confirm"));
+    const run = h.service.runs({ id: h.routine.id }).runs[0]!;
+    return { h, run };
+  }
+
+  it("settles only a projected terminal with matching run identity and journal proof", async () => {
+    const { h, run } = await runAwaitingUnconfirmedTerminal();
+    try {
+      const projected = projectedCoreTerminal(run, "failed");
+      expect(projected).toMatchObject({ method: "event.agent_status", params: {
+        agentId: run.agentId, runId: run.coreRunId, eventId: "terminal:agent:1", sequence: 3,
+        status: "error", runStatus: "errored",
+        turnEvent: { type: "run_terminal", payload: { runId: run.coreRunId, status: "failed" } },
+      } });
+      const params = projected.params;
+      for (const bad of [
+        { ...params, sessionId: "other-session" },
+        { ...params, agentId: "other-agent" },
+        { ...params, runId: "other-run" },
+        { ...params, turnEvent: { type: "run_terminal", payload: { runId: "other-run", status: "failed" } } },
+        { ...params, turnEvent: { type: "turn_complete", payload: { runId: run.coreRunId, status: "failed" } } },
+        { ...params, status: "idle" },
+        { ...params, eventId: "" },
+        { ...params, sequence: 0 },
+      ]) {
+        h.service.observeSessionEvent(run.sessionId!, { method: "event.agent_status", params: bad });
+        expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "running", finishedAt: null });
+      }
+      h.service.observeSessionEvent(run.sessionId!, { method: "event.session_event", params: {
+        ...params, event: { type: "run_terminal", payload: { runId: run.coreRunId, status: "failed" } },
+      } });
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "running", finishedAt: null });
+      h.service.observeSessionEvent(run.sessionId!, projected);
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+      expect(h.service.delete({ id: h.routine.id })).toEqual({ deleted: true });
+    } finally { await h.cleanup(); }
+  });
+
+  it("records a projected unknown outcome as failed and releases the held routine", async () => {
+    const { h, run } = await runAwaitingUnconfirmedTerminal();
+    try {
+      const projected = projectedCoreTerminal(run, "unknown_outcome");
+      expect(projected).toMatchObject({ method: "event.agent_status", params: {
+        status: "error", runStatus: "errored",
+        turnEvent: { type: "run_terminal", payload: { status: "unknown_outcome" } },
+      } });
+      h.service.observeSessionEvent(run.sessionId!, projected);
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({
+        status: "failed", finishedAt: expect.any(String),
+        error: "An action's outcome could not be confirmed. Open the session for details.",
+      });
+      expect(h.service.delete({ id: h.routine.id })).toEqual({ deleted: true });
+    } finally { await h.cleanup(); }
+  });
+
   it("preserves the canonical permission denial even when the model finishes its answer", async () => {
     const f = fixture();
     f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
@@ -95,5 +183,105 @@ describe("routine execution finalization", () => {
     const executing = f.executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn() });
     await vi.waitFor(() => expect(f.manager.streamAgentMessage).toHaveBeenCalledOnce()); f.controller.abort();
     await expect(executing).rejects.toBeInstanceOf(RoutineExecutionUnsettledError);
+  });
+
+  it("requires stop confirmation when the finish seam has no outcome", async () => {
+    const f = fixture();
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 1 } }) as never);
+    f.manager.finishRoutineRun.mockImplementation(async () => undefined as never);
+    f.manager.stopAgent.mockRejectedValue(new Error("stop failed"));
+    await expect(f.executor.execute(f.routine, f.run, { signal: f.controller.signal, bind: vi.fn() }))
+      .rejects.toBeInstanceOf(RoutineExecutionUnsettledError);
+  });
+
+  it("settles a failed Core terminal after stopping its ended agent throws", async () => {
+    const f = fixture();
+    f.manager.streamAgentMessage.mockRejectedValue(new Error("turn failed"));
+    f.manager.stopAgent.mockRejectedValue(Object.assign(new Error("agent already ended"), { code: "AGENT_NOT_FOUND" }));
+    const h = routineService(f);
+    try {
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(h.service.runs({ id: h.routine.id }).runs[0]?.error).toContain("could not confirm"));
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "running", finishedAt: null });
+      failedCoreTerminal(h.service, h.routine.id);
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "failed", finishedAt: expect.any(String) });
+      expect(h.service.delete({ id: h.routine.id })).toEqual({ deleted: true });
+    } finally { await h.cleanup(); }
+  });
+
+  it("settles a failed Core terminal while the message submission promise is pending", async () => {
+    const f = fixture();
+    let agentNumber = 0;
+    f.manager.createAgent.mockImplementation(async () => { const number = ++agentNumber; return { agentId: `agent-${number}`, sessionId: `session-${number}` }; });
+    let finishMessage!: (value: never) => void;
+    f.manager.streamAgentMessage.mockImplementationOnce(() => new Promise<never>((resolve) => { finishMessage = resolve; }));
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
+    const execute = vi.spyOn(f.executor, "execute");
+    const h = routineService(f);
+    try {
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(f.manager.streamAgentMessage).toHaveBeenCalledOnce());
+      failedCoreTerminal(h.service, h.routine.id, "another-agent");
+      expect(h.service.runs({ id: h.routine.id }).runs[0]?.status).toBe("running");
+      failedCoreTerminal(h.service, h.routine.id);
+      await vi.waitFor(() => expect(h.service.runs({ id: h.routine.id }).runs[0]?.status).toBe("failed"));
+      await expect(execute.mock.results[0]?.value).resolves.toBe("failed");
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(h.service.runs({ id: h.routine.id }).runs[0]?.status).toBe("completed"));
+      expect(h.service.delete({ id: h.routine.id })).toEqual({ deleted: true });
+    } finally {
+      finishMessage?.({ terminal: { code: 1 } } as never);
+      await h.cleanup();
+    }
+  });
+
+  it("preserves a completed run when a later failed Core terminal arrives", async () => {
+    const f = fixture();
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
+    f.manager.finishRoutineRun.mockImplementation(async () => undefined as never);
+    const h = routineService(f);
+    try {
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(h.service.runs({ id: h.routine.id }).runs[0]?.status).toBe("completed"));
+      expect(f.manager.finishRoutineRun).toHaveBeenCalledOnce();
+      const completed = h.service.runs({ id: h.routine.id }).runs[0];
+      failedCoreTerminal(h.service, h.routine.id);
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toEqual(completed);
+    } finally { await h.cleanup(); }
+  });
+
+  it("keeps the permission denial explanation when Core settles during finalization", async () => {
+    const f = fixture();
+    f.manager.streamAgentMessage.mockImplementation(async () => ({ terminal: { code: 0 } }) as never);
+    let finish!: (value: never) => void;
+    f.manager.finishRoutineRun.mockImplementation(() => new Promise<never>((resolve) => { finish = resolve; }));
+    const h = routineService(f);
+    try {
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(f.manager.finishRoutineRun).toHaveBeenCalledOnce());
+      failedCoreTerminal(h.service, h.routine.id, undefined, "routine_permission_denied");
+      expect(h.service.runs({ id: h.routine.id }).runs[0]).toMatchObject({ status: "failed", error: expect.stringContaining("read-only permissions") });
+    } finally {
+      finish?.("permission_denied" as never);
+      await h.cleanup();
+    }
+  });
+
+  it("finishes cancellation when Core ends before a pending cancellation call returns", async () => {
+    const f = fixture();
+    let finishCancellation!: () => void;
+    f.manager.cancelRunTree.mockImplementation(() => new Promise((resolve) => { finishCancellation = () => resolve({ runId: "agent" }); }));
+    const h = routineService(f);
+    try {
+      h.service.run({ id: h.routine.id });
+      await vi.waitFor(() => expect(f.manager.streamAgentMessage).toHaveBeenCalledOnce());
+      const cancelling = h.service.cancel({ id: h.routine.id });
+      await vi.waitFor(() => expect(f.manager.cancelRunTree).toHaveBeenCalledOnce());
+      failedCoreTerminal(h.service, h.routine.id);
+      await expect(cancelling).resolves.toMatchObject({ run: { status: "failed", finishedAt: expect.any(String) } });
+    } finally {
+      finishCancellation?.();
+      await h.cleanup();
+    }
   });
 });
