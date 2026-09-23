@@ -764,6 +764,12 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       this.releaseProcessId(processId);
       return collected;
     }
+    if (entry.hardTimeoutExpired === true) {
+      // Exit has not been observed. Keep the owned entry as stopping without
+      // giving the caller a live session handle.
+      entry.backgrounded = true;
+      return collected;
+    }
     entry.backgrounded = true;
     return {
       ...collected,
@@ -981,6 +987,7 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       this.releaseProcessId(entry.processId);
       return collected;
     }
+    if (entry.hardTimeoutExpired === true) return collected;
     return {
       ...collected,
       process_id: entry.processId,
@@ -1638,6 +1645,17 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
         timeout,
         entry.exitPromise.then(() => "exit" as const),
       ]);
+      if (
+        outcome === "timeout" &&
+        entry.hardTimeoutExpired === true &&
+        entry.exitState === null
+      ) {
+        // The hard timeout already signalled this process (forceTerminate
+        // escalates to SIGKILL after 500 ms). Returning now would name it as
+        // a live yielded session although it is being stopped, so wait for
+        // the exit, bounded like the abort path below.
+        await Promise.race([entry.exitPromise, delay(1_000)]);
+      }
       timedOut = outcome === "timeout" && entry.exitState === null;
     } catch (error) {
       if (isAbortError(error)) {
@@ -1669,7 +1687,8 @@ export class UnifiedExecProcessManager implements UnifiedExecProcessManagerLike 
       stdout,
       stderr,
       exitCode: entry.exitState?.exitCode ?? null,
-      processId: entry.exitState === null ? entry.processId : undefined,
+      processId: entry.exitState === null && entry.hardTimeoutExpired !== true
+        ? entry.processId : undefined,
       durationMs: (entry.endedAt ?? Date.now()) - entry.startedAt,
       timedOut: entry.hardTimeoutExpired === true || timedOut,
       maxOutputTokens: options.maxOutputTokens,
