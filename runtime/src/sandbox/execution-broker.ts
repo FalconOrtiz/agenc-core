@@ -132,6 +132,9 @@ export interface SandboxExecutionStatus {
 }
 
 export interface SandboxSpawnCommand {
+  /** Browser-owned CDP pipes; the Linux launcher carries these on standard IO. */
+  readonly browserCdp?: boolean;
+  readonly browserCdpOverStdio?: boolean;
   readonly program: string;
   readonly args: readonly string[];
   readonly cwd: string;
@@ -1063,6 +1066,11 @@ export class SandboxExecutionBroker implements SandboxExecutionBrokerLike {
     command: SandboxSpawnCommand,
     options: SandboxPrepareSpawnOptions = {},
   ): SandboxPreparedSpawn {
+    // CDP over stdio takes over the child's stdin and stdout; only the browser
+    // speaks it.
+    if (command.browserCdp === true && surface !== "browser") {
+      throw new Error(`browserCdp is only valid for the browser surface, not ${surface}`);
+    }
     try {
       const participantName = options.lifecycleParticipant;
       const requiresLifecyclePermit =
@@ -1928,6 +1936,14 @@ export function transformSandboxedCommand(params: SandboxSpawnCommand & {
       ...(params.runtimeSandbox.allowGpu === true ? { allowGpu: true } : {}),
     });
     const [program, ...args] = transformed.command;
+    const browserCdpOverStdio = params.browserCdp === true && sandbox === "linux_seccomp";
+    if (browserCdpOverStdio) {
+      const separator = args.indexOf("--");
+      if (separator < 0) {
+        throw new Error("Linux browser sandbox command separator missing");
+      }
+      args.splice(separator, 0, "--browser-cdp-over-stdio");
+    }
     if (program === undefined) {
       throw new UnifiedExecError(
         "create_process",
@@ -1940,6 +1956,7 @@ export function transformSandboxedCommand(params: SandboxSpawnCommand & {
       cwd: transformed.cwd,
       env: { ...transformed.env },
       argv0: transformed.arg0 ?? basename(program),
+      ...(browserCdpOverStdio ? { browserCdpOverStdio: true } : {}),
     };
   } catch (error) {
     if (error instanceof UnifiedExecError) throw error;
