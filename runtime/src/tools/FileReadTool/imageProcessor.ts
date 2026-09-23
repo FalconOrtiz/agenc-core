@@ -16,10 +16,16 @@ export type SharpInstance = {
     colors?: number
   }): SharpInstance
   webp(options?: { quality?: number }): SharpInstance
+  /** Uncompressed pixel output; sharp decodes every pixel to produce it. */
+  raw?(): SharpInstance
   toBuffer(): Promise<Buffer>
 }
 
-export type SharpFunction = (input: Buffer) => SharpInstance
+export type SharpFunction = (
+  input: Buffer,
+  /** `animated: true` reads every frame of an animation, not just the first. */
+  options?: { animated?: boolean },
+) => SharpInstance
 
 type SharpCreatorOptions = {
   create: {
