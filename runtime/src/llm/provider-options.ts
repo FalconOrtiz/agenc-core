@@ -38,6 +38,7 @@ import {
   resolveBuiltInProviderInfo,
 } from "./registry/provider-info.js";
 import { resolveGrokProviderCredential } from "./xai-capability-config.js";
+import { isXaiOauthBearer } from "../utils/xaiOauthCredentials.js";
 import { providerAuthPreference } from "./provider-auth-selection.js";
 import type { ProviderFactoryOptions, ProviderName } from "./provider.js";
 import {
@@ -47,6 +48,10 @@ import {
 } from "./providers/gemini/runtime-options.js";
 import { createGeminiEndpointPlan } from "./providers/gemini/endpoint-plan.js";
 import { isGrokComposerModel } from "./providers/grok/acp-adapter.js";
+import {
+  assertXaiOauthBaseUrl,
+  isTrustedXaiOauthInferenceBaseUrl,
+} from "../services/xai/oauth.js";
 import type { AuthBackend, AuthSubscriptionTier } from "../auth/backend.js";
 import { hasActivePilotModelAccess } from "../auth/pilot-access.js";
 
@@ -492,19 +497,61 @@ function resolveProviderCredentialAuthorityCore(
       ? credentialEnvironment.apiKey?.value
       : undefined;
   const explicitApiKey = nonEmpty(requested.apiKey);
+  if (
+    provider === "grok" &&
+    home !== undefined &&
+    authPreference === "api-key" &&
+    isXaiOauthBearer(home, explicitApiKey)
+  ) {
+    throw new Error("Grok API-key mode cannot use an xAI sign-in token");
+  }
   const explicitAuthToken = nonEmpty(requested.authToken);
   const environmentAuthToken =
     provider === "anthropic" && explicitApiKey === undefined
       ? nonEmpty(snapshot.ANTHROPIC_AUTH_TOKEN)
       : undefined;
   const authToken = explicitAuthToken ?? environmentAuthToken;
-  const grokCredential =
+  let grokCredential =
     provider === "grok" && home !== undefined
       ? resolveGrokProviderCredential(home, requested.apiKey, snapshot)
       : undefined;
+  let baseURL =
+    requestedBaseURL ??
+    resolveProviderBaseURLEnvironment(provider, snapshot)?.value;
+  const grokComposer =
+    provider === "grok" && isGrokComposerModel(requested.model);
+  let grokCustomApiKey = false;
+  if (
+    provider === "grok" &&
+    grokCredential?.isOAuth === true &&
+    !grokComposer &&
+    baseURL !== undefined &&
+    !isTrustedXaiOauthInferenceBaseUrl(baseURL)
+  ) {
+    const fallbackApiKey = authPreference === "auto"
+      ? [
+          explicitApiKey,
+          environmentApiKey,
+          nonEmpty(candidates.savedApiKey),
+        ]
+          .find(
+            (key) => key !== undefined &&
+              (home === undefined || !isXaiOauthBearer(home, key)),
+          )
+      : undefined;
+    if (fallbackApiKey === undefined) {
+      assertXaiOauthBaseUrl(baseURL);
+    }
+    grokCredential = { value: fallbackApiKey, isOAuth: false };
+    grokCustomApiKey = true;
+  }
   let apiKey =
     provider === "grok" && home !== undefined
-      ? (grokCredential?.value ??
+      ? ((grokComposer && grokCredential?.isOAuth === true
+          ? (isXaiOauthBearer(home, explicitApiKey)
+              ? undefined : explicitApiKey) ??
+            environmentApiKey ?? nonEmpty(candidates.savedApiKey)
+          : grokCredential?.value) ??
         (authPreference === "oauth" ? undefined : nonEmpty(candidates.savedApiKey)))
       : (explicitApiKey ??
         environmentApiKey ??
@@ -515,16 +562,17 @@ function resolveProviderCredentialAuthorityCore(
   if (authToken !== undefined) {
     apiKey = undefined;
   }
-  let baseURL =
-    requestedBaseURL ??
-    resolveProviderBaseURLEnvironment(provider, snapshot)?.value;
-
   const resolvedExtra: Record<string, unknown> = {};
   const forcedExtra: Record<string, unknown> = {};
-  if (provider === "grok" && authPreference !== "auto") {
+  if (
+    provider === "grok" &&
+    (authPreference !== "auto" || grokCustomApiKey ||
+      (grokCredential?.isOAuth === true && !grokComposer))
+  ) {
     // Preserve the captured selection when providers are recreated from their
     // recorded options; the raw factory must not reinterpret API-key intent.
-    forcedExtra.authMode = authPreference === "api-key" ? "api_key" : "oauth";
+    forcedExtra.authMode =
+      authPreference === "api-key" || grokCustomApiKey ? "api_key" : "oauth";
   }
   let chatGptSubscription = false;
   let openAiNativeAuthMode: "api-key" | "oauth" | undefined;
@@ -892,9 +940,9 @@ function withRuntimeAuthExtra(
 
 /**
  * Resolve the complete credential authority for a live provider binding.
- * Saved BYOK is read only when explicit, native, and environment credentials
- * are absent. Subscription credentials remain lazy and are vended only by the
- * provider wrapper when the first model operation starts.
+ * Saved BYOK is normally read after other credentials are absent. A custom
+ * Grok URL needs it before the OAuth endpoint check. Subscription credentials
+ * remain lazy and are vended when the first model operation starts.
  */
 export async function resolveProviderRuntimeAuthority(
   provider: ProviderName,
@@ -907,13 +955,28 @@ export async function resolveProviderRuntimeAuthority(
   const authPreference = provider === "openai" || provider === "grok"
     ? providerAuthPreference(provider, env)
     : "auto";
-  let resolved = resolveProviderCredentialAuthority(provider, requested, env);
   const info = resolveBuiltInProviderInfo(provider);
+  const requestedBaseURL = nonEmpty(requested.baseURL) ??
+    resolveProviderBaseURLEnvironment(provider, env)?.value;
+  const customGrokBaseURL = provider === "grok" &&
+    requestedBaseURL !== undefined &&
+    !isTrustedXaiOauthInferenceBaseUrl(requestedBaseURL);
+  const savedApiKey = customGrokBaseURL &&
+    authPreference !== "oauth" &&
+    runtime.readSavedApiKey !== undefined
+      ? nonEmpty(await runtime.readSavedApiKey(provider))
+      : undefined;
+  let resolved = resolveProviderCredentialAuthority(
+    provider, requested, env,
+    savedApiKey === undefined ? {} : { savedApiKey },
+  );
   if (
     resolved.credential.status === "missing" &&
     authPreference !== "oauth" &&
     info?.onboarding.access === "api-key" &&
-    runtime.readSavedApiKey !== undefined
+    runtime.readSavedApiKey !== undefined &&
+    savedApiKey === undefined &&
+    !customGrokBaseURL
   ) {
     const savedApiKey = nonEmpty(await runtime.readSavedApiKey(provider));
     if (savedApiKey !== undefined) {

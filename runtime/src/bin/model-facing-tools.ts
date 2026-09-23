@@ -49,10 +49,11 @@ import type { GrokCapabilityConfig } from "../config/schema.js";
 import {
   isDirectXaiInferenceHost,
   isXaiLiveXSearchEnabled,
-  resolveXaiBearerToken,
+  tryResolveXaiBearerTokenForBaseUrl,
   resolveXaiLiveWebSearchOptions,
   resolveXaiLiveXSearchOptions,
 } from "../llm/xai-capability-config.js";
+import { isTrustedXaiOauthInferenceBaseUrl } from "../services/xai/oauth.js";
 import {
   BUILT_IN_PROVIDER_BASE_URLS,
   BUILT_IN_PROVIDER_DEFAULT_MODELS,
@@ -984,30 +985,26 @@ function resolveXaiToolBackend(
   const currentFactory = currentIsGrok && currentProvider
     ? readProviderFactoryOptions(currentProvider)
     : undefined;
-  const currentIsDirect =
-    currentFactory !== undefined &&
-    isDirectXaiInferenceHost(currentFactory.baseURL);
   const sessionApiKey =
-    currentIsDirect && typeof currentFactory?.apiKey === "string"
+    typeof currentFactory?.apiKey === "string"
       ? currentFactory.apiKey
       : undefined;
-  const apiKey = resolveXaiBearerToken(
-    credentialHome,
-    environment,
-    sessionApiKey,
-  );
-  if (apiKey === undefined) return undefined;
-
   const configuredBaseURL = resolveProviderBaseURLEnvironment(
     "grok",
     environment,
   )?.value;
-  const baseURL = currentIsDirect
+  const baseURL = currentFactory !== undefined
     ? (currentFactory?.baseURL ?? BUILT_IN_PROVIDER_BASE_URLS.grok)
     : (configuredBaseURL ?? BUILT_IN_PROVIDER_BASE_URLS.grok);
-  if (!isDirectXaiInferenceHost(baseURL)) return undefined;
+  if (currentFactory === undefined && !isDirectXaiInferenceHost(baseURL)) {
+    return undefined;
+  }
+  const apiKey = tryResolveXaiBearerTokenForBaseUrl(
+    credentialHome, environment, baseURL, sessionApiKey,
+  ).bearer;
+  if (apiKey === undefined) return undefined;
 
-  const currentModel = currentIsDirect ? currentFactory?.model : undefined;
+  const currentModel = currentFactory?.model;
   const model = supportsProviderNativeXSearch({
     provider: "grok",
     model: currentModel,
@@ -1281,6 +1278,9 @@ function buildGrokNativeXSearchProvider(
   })();
   const extra: ProviderFactoryOptions["extra"] = {
     // One-shot only: native x_search, no dual continuous web search spam.
+    ...(!isTrustedXaiOauthInferenceBaseUrl(backend.baseURL)
+      ? { authMode: "api_key" as const }
+      : {}),
     webSearch: false,
     xSearch: true,
     ...(mergedXSearchOptions !== undefined

@@ -21,7 +21,7 @@ import {
 } from "../../llm/provider.js";
 import {
   isDirectXaiInferenceHost,
-  resolveXaiBearerToken,
+  tryResolveXaiBearerTokenForBaseUrl,
 } from "../../llm/xai-capability-config.js";
 import {
   resolveProviderApiKeyEnvironment,
@@ -450,6 +450,7 @@ function resolveImageBackend(opts: ImagineImageToolOptions): BackendResolution {
   const env = opts.env ?? process.env;
   const provider = opts.getSession()?.services?.provider;
   const providerIdentity = readProviderIdentity(provider as never);
+  let oauthBaseUrlError: string | undefined;
   const metaCredential = resolveProviderApiKeyEnvironment("meta", env);
   const metaBackend = (): ImageBackend | undefined => {
     if (metaCredential === undefined) return undefined;
@@ -542,27 +543,33 @@ function resolveImageBackend(opts: ImagineImageToolOptions): BackendResolution {
 
   if (providerIdentity === "grok" && provider !== undefined) {
     const factory = readProviderFactoryOptions(provider as never);
-    if (isDirectXaiInferenceHost(factory.baseURL)) {
-      const sessionKey =
-        typeof factory.apiKey === "string" ? factory.apiKey : undefined;
-      const bearer = resolveXaiBearerToken(opts.home, env, sessionKey);
-      if (bearer !== undefined) {
-        return {
-          backend: {
-            kind: "xai",
-            baseURL: withoutTrailingSlash(
-              factory.baseURL ?? DEFAULT_XAI_BASE_URL,
-            ),
-            bearer,
-          },
-        };
-      }
+    const sessionKey =
+      typeof factory.apiKey === "string" ? factory.apiKey : undefined;
+    const xaiResolution = tryResolveXaiBearerTokenForBaseUrl(
+      opts.home, env, factory.baseURL ?? DEFAULT_XAI_BASE_URL, sessionKey,
+    );
+    oauthBaseUrlError = xaiResolution.oauthBaseUrlError;
+    const bearer = xaiResolution.bearer;
+    if (bearer !== undefined) {
+      return {
+        backend: {
+          kind: "xai",
+          baseURL: withoutTrailingSlash(
+            factory.baseURL ?? DEFAULT_XAI_BASE_URL,
+          ),
+          bearer,
+        },
+      };
     }
   }
 
-  // A non-direct Grok session follows this path too: use only independent
-  // xAI authority, never the gateway's session key or base URL.
-  const xaiBearer = resolveXaiBearerToken(opts.home, env);
+  // Without a usable Grok session key, use only independent xAI authority.
+  const xaiResolution = tryResolveXaiBearerTokenForBaseUrl(
+    opts.home, env,
+    resolveProviderBaseURLEnvironment("grok", env)?.value ?? DEFAULT_XAI_BASE_URL,
+  );
+  oauthBaseUrlError ??= xaiResolution.oauthBaseUrlError;
+  const xaiBearer = xaiResolution.bearer;
   if (xaiBearer !== undefined) {
     const xaiBaseURL =
       resolveProviderBaseURLEnvironment("grok", env)?.value ??
@@ -616,7 +623,7 @@ function resolveImageBackend(opts: ImagineImageToolOptions): BackendResolution {
   }
 
   return {
-    error:
+    error: oauthBaseUrlError ??
       "ImagineImage needs a media backend credential: MODEL_API_KEY for Meta Muse Image; DASHSCOPE_API_KEY/QWEN_API_KEY or QWEN_TOKEN_PLAN_API_KEY for QwenCloud; ZAI_API_KEY for GLM-Image; OPENAI_API_KEY for GPT Image; MINIMAX_API_KEY for MiniMax Image; or /grok-login, XAI_API_KEY, or GROK_API_KEY for xAI Imagine.",
   };
 }

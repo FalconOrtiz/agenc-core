@@ -83,6 +83,7 @@ import {
 export { resolveBuiltInProviderSlug } from "./registry/provider-info.js";
 import {
   forceRefreshXaiOauthCredentials,
+  isXaiOauthBearer,
   readXaiOauthAccessToken,
   xaiOauthRequiresRelogin,
 } from "../utils/xaiOauthCredentials.js";
@@ -1598,6 +1599,16 @@ export function createProvider(
             "grok composer provider requires a prepared child environment in factory options extra",
           );
         }
+        if (
+          opts.credentialHome !== undefined &&
+          (isXaiOauthBearer(opts.credentialHome, factoryApiKey) ||
+            isXaiOauthBearer(opts.credentialHome, acpEnvironment.XAI_API_KEY) ||
+            isXaiOauthBearer(opts.credentialHome, acpEnvironment.GROK_API_KEY))
+        ) {
+          throw new Error(
+            "grok composer provider: refusing to pass the xAI sign-in token to the Grok CLI as an API key",
+          );
+        }
         const acpProvider = new GrokAcpProvider({
           model: grokRequestedModel as string,
           env: acpEnvironment,
@@ -1646,6 +1657,15 @@ export function createProvider(
       // bearer snapshot; once the stored grant has been refreshed the
       // snapshot no longer matches, and treating it as an API key sends a
       // dead token with no refresh path (xAI answers 403).
+      if (
+        extra.authMode === "api_key" &&
+        opts.credentialHome !== undefined &&
+        isXaiOauthBearer(opts.credentialHome, factoryApiKey)
+      ) {
+        throw new Error(
+          "grok provider: refusing to use the stored xAI sign-in token as an API key",
+        );
+      }
       const storedOauthBearer =
         extra.authMode !== "api_key" && opts.credentialHome !== undefined
           ? readXaiOauthAccessToken(opts.credentialHome)
@@ -1696,7 +1716,7 @@ export function createProvider(
       if (usesXaiOauth && !isTrustedXaiOauthInferenceBaseUrl(cfg.baseURL)) {
         throw new Error(
           "grok provider: refusing to send the xAI OAuth bearer to a " +
-            `non-xAI base URL (${cfg.baseURL}). Unset the base URL override ` +
+            `custom base URL (${cfg.baseURL}). Unset the base URL override ` +
             "or set XAI_API_KEY to use an API key with custom gateways.",
         );
       }
@@ -1740,7 +1760,11 @@ export function createProvider(
       }
       const storedExtra = readProviderRuntimeExtra({
         ...(cfg as unknown as Record<string, unknown>),
-        ...(extra.authMode !== undefined ? { authMode: extra.authMode } : {}),
+        ...(usesXaiOauth
+          ? { authMode: "oauth" }
+          : extra.authMode !== undefined
+            ? { authMode: extra.authMode }
+            : {}),
       });
       // Recreate through the factory so child sessions own both continuation
       // state and the OAuth refresh callback bound to their provider instance.
