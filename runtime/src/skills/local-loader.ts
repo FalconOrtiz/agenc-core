@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
+  lstat,
+  open,
   readdir,
-  readFile,
   realpath,
   stat,
 } from "node:fs/promises";
@@ -77,6 +79,8 @@ export interface LocalSkillMetadata {
   readonly description: string;
   readonly hasUserSpecifiedDescription: boolean;
   readonly path: string;
+  /** Canonical file path retained for project skill reads after scanning. */
+  readonly projectRealPath?: string;
   readonly root: string;
   readonly scope: LocalSkillScope;
   readonly source: SkillSource;
@@ -302,34 +306,124 @@ function normalizeDisplayPath(path: string): string {
   return process.platform === "win32" ? path.replace(/\\/g, "/") : path;
 }
 
-function projectDirsUpToHome(
+/** Walk from the workspace through its nearest git root, excluding HOME. */
+async function projectSkillDirs(
   workspaceRoot: string,
   home?: string,
-): string[] {
-  const dirs: string[] = [];
-  const homeResolved = home ? resolve(home) : null;
-  let current = resolve(workspaceRoot);
+): Promise<string[]> {
+  const workspace = (await getFileIdentity(workspaceRoot)) ?? resolve(workspaceRoot);
+  const ancestors: string[] = [];
+  const homeResolved = home
+    ? (await getFileIdentity(home)) ?? resolve(home)
+    : null;
+  let current = workspace;
+  let foundGitRoot = false;
   while (true) {
     if (homeResolved !== null && current === homeResolved) break;
-    dirs.push(join(current, ".agents", "skills"));
-    dirs.push(join(current, ".agenc", "skills"));
+    ancestors.push(current);
+    try {
+      const gitMarker = await lstat(join(current, ".git"));
+      if (gitMarker.isDirectory() || gitMarker.isFile()) {
+        foundGitRoot = true;
+        break;
+      }
+    } catch {
+      // Keep looking for a git root within the home boundary.
+    }
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
   }
-  return dirs;
+  const projectDirs = foundGitRoot ? ancestors : ancestors.slice(0, 1);
+  return projectDirs.flatMap((dir) => [
+    join(dir, ".agents", "skills"),
+    join(dir, ".agenc", "skills"),
+  ]);
 }
 
-function localSkillRootCandidates(
+const warnedUnsafeProjectRoots = new Set<string>();
+const WORLD_WRITABLE_PROJECT_ROOT_WARNING = "skipped world-writable project skill root";
+const WORLD_WRITABLE_PROJECT_LINK_WARNING = "skipped world-writable project skill symlink target";
+
+async function projectSkillPathIsSafe(path: string, allowMissing = false): Promise<boolean> {
+  if (process.platform === "win32") return true;
+  for (const component of [dirname(dirname(path)), dirname(path), path]) {
+    try {
+      if (((await stat(component)).mode & 0o002) !== 0) return false;
+    } catch (error) {
+      if (allowMissing && isRecord(error) &&
+        (error.code === "ENOENT" || error.code === "ENOTDIR")) continue;
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Device and inode of the file a safety check approved. */
+interface CheckedFile {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+/**
+ * The identity of a project skill file at its recorded real path, or null when
+ * that path is no longer a regular file in a safe location. A read compares
+ * what it opened with this identity and refuses any other file.
+ */
+async function checkedProjectSkillFile(path: string): Promise<CheckedFile | null> {
+  let checked: CheckedFile;
+  try {
+    // lstat: a link here is refused, never resolved to its target's identity.
+    const stats = await lstat(path, { bigint: true });
+    if (!stats.isFile()) return null;
+    checked = { dev: stats.dev, ino: stats.ino };
+  } catch {
+    return null;
+  }
+  // A recorded real path may later be replaced by a link. Reject it rather
+  // than following the replacement to a different file.
+  if ((await getFileIdentity(path)) !== path || !(await projectSkillPathIsSafe(path))) return null;
+  return checked;
+}
+
+/** Check every directory that can let another user replace a project root. */
+async function projectSkillRootIsSafe(
+  root: string,
+  warnings?: SkillLoadWarning[],
+): Promise<boolean> {
+  if (process.platform === "win32") return true;
+  // Missing components stay eligible for watches until they are created.
+  const lexicalSafe = await projectSkillPathIsSafe(root, true);
+  const realRoot = lexicalSafe ? await getFileIdentity(root) : null;
+  if (!lexicalSafe || (realRoot !== null &&
+    realRoot !== resolve(root) && !(await projectSkillPathIsSafe(realRoot)))) {
+    // Missing roots are watch candidates, but have no skill to warn about.
+    if (await pathIsDirectory(root)) {
+      if (warnings && !warnings.some((warning) =>
+        warning.path === root && warning.reason === WORLD_WRITABLE_PROJECT_ROOT_WARNING
+      )) {
+        warnings.push({ path: root, reason: WORLD_WRITABLE_PROJECT_ROOT_WARNING });
+      }
+      if (!warnedUnsafeProjectRoots.has(root)) {
+        warnedUnsafeProjectRoots.add(root);
+        console.warn(`Skills: ${WORLD_WRITABLE_PROJECT_ROOT_WARNING}: ${root}`);
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+async function localSkillRootCandidates(
   options: LocalSkillsServiceOptions,
-): SkillRoot[] {
+): Promise<SkillRoot[]> {
   const home = options.env?.HOME ?? homedir();
   const agencHome = normalizeExistingCandidate(options.agencHome);
   const workspaceRoot = normalizeExistingCandidate(options.workspaceRoot);
 
   const roots: SkillRoot[] = [];
 
-  for (const path of projectDirsUpToHome(workspaceRoot, home)) {
+  for (const path of await projectSkillDirs(workspaceRoot, home)) {
     roots.push({
       path,
       scope: "project",
@@ -366,15 +460,16 @@ function localSkillRootCandidates(
   return roots;
 }
 
-export async function discoverSkillRoots(
+async function discoverSkillRootsWithWarnings(
   options: LocalSkillsServiceOptions,
-  discoveredSkillRoots: readonly string[] = [],
+  discoveredSkillRoots: readonly string[],
+  warnings: SkillLoadWarning[],
 ): Promise<readonly SkillRoot[]> {
   const pluginStorageRoot = normalizeExistingCandidate(
     options.pluginStorageRoot,
   );
   const workspaceRoot = normalizeExistingCandidate(options.workspaceRoot);
-  const roots = localSkillRootCandidates(options);
+  const roots = await localSkillRootCandidates(options);
 
   for (const path of discoveredSkillRoots) {
     const normalized = normalizeExistingCandidate(path);
@@ -418,10 +513,20 @@ export async function discoverSkillRoots(
       ...root,
       path: normalizeExistingCandidate(root.path),
     };
+    if (normalized.scope === "project" && !(await projectSkillRootIsSafe(normalized.path, warnings))) {
+      continue;
+    }
     if (!(await pathIsDirectory(normalized.path))) continue;
     deduped.set(rootKey(normalized), normalized);
   }
   return [...deduped.values()];
+}
+
+export async function discoverSkillRoots(
+  options: LocalSkillsServiceOptions,
+  discoveredSkillRoots: readonly string[] = [],
+): Promise<readonly SkillRoot[]> {
+  return discoverSkillRootsWithWarnings(options, discoveredSkillRoots, []);
 }
 
 export async function discoverSkillWatchRoots(
@@ -431,8 +536,14 @@ export async function discoverSkillWatchRoots(
     options.pluginStorageRoot,
   );
   const workspaceRoot = normalizeExistingCandidate(options.workspaceRoot);
+  const localRoots = await localSkillRootCandidates(options);
+  const safeLocalRoots = await Promise.all(localRoots.map(async (root) =>
+    root.scope !== "project" || await projectSkillRootIsSafe(root.path)
+      ? root.path
+      : null
+  ));
   const roots = [
-    ...localSkillRootCandidates(options).map((root) => root.path),
+    ...safeLocalRoots.filter((path): path is string => path !== null),
     ...(await discoverPluginSkillRootsWithProvenance({
       pluginStorageRoot,
       workspaceRoot,
@@ -474,7 +585,9 @@ interface SkillFileScan {
   readonly files: readonly ScannedSkillFile[];
   readonly droppedCount: number;
   readonly rootRealPath: string;
+  readonly unsafeRoot?: boolean;
   readonly emptyDirectories: readonly EmptySkillDirectory[];
+  readonly warnings: readonly SkillLoadWarning[];
 }
 
 interface ScanFrame {
@@ -531,9 +644,9 @@ function byPath<T extends { readonly path: string }>(a: T, b: T): number {
  * Files past the per-root cap are counted, shallowest and then
  * alphabetically first loaded, the same way on every scan.
  */
-async function findSkillFiles(root: string): Promise<SkillFileScan> {
+async function findSkillFiles(root: SkillRoot): Promise<SkillFileScan> {
   const maxFiles = maxSkillFilesPerRoot();
-  const rootRealPath = (await getFileIdentity(root)) ?? resolve(root);
+  const rootRealPath = (await getFileIdentity(root.path)) ?? resolve(root.path);
   const visited = new Set<string>([rootRealPath]);
   const loaded: Array<ScannedSkillFile & { readonly depth: number }> = [];
   let droppedCount = 0;
@@ -541,6 +654,15 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
   const topLevel: string[] = [];
   const topsWithSkills = new Set<string>();
   const topMarkdown = new Map<string, string>();
+  const warnings: SkillLoadWarning[] = [];
+  // A project root may have changed since discovery. Validate the real path
+  // that the scan will actually read.
+  if (root.scope === "project" && !(await projectSkillPathIsSafe(rootRealPath))) {
+    return {
+      files: [], droppedCount: 0, rootRealPath, unsafeRoot: true, emptyDirectories: [],
+      warnings: [{ path: root.path, reason: WORLD_WRITABLE_PROJECT_ROOT_WARNING }],
+    };
+  }
 
   const walk = async (start: readonly ScanFrame[], oneLevel = false): Promise<ScanFrame[]> => {
     let level = start;
@@ -548,7 +670,7 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
       const listings = await mapWithConcurrency(
         level,
         SCAN_CONCURRENCY,
-        (frame) => readDirEntries(frame.path),
+        (frame) => readDirEntries(root.scope === "project" ? frame.realPath : frame.path),
       );
       const found: Array<ScannedSkillFile & { readonly depth: number }> = [];
       const next: ScanFrame[] = [];
@@ -596,7 +718,7 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
     return [];
   };
 
-  await walk([{ path: root, realPath: rootRealPath, depth: 0, top: null }]);
+  await walk([{ path: root.path, realPath: rootRealPath, depth: 0, top: null }]);
   const pendingDirectories: ScanFrame[] = [];
   while (pendingLinks.length > 0 || pendingDirectories.length > 0) {
     pendingLinks.sort((a, b) => a.depth - b.depth || byPath(a, b));
@@ -617,6 +739,10 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
       async (link): Promise<ScanFrame | null> => {
         const realPath = await getFileIdentity(link.path);
         if (realPath === null || !(await pathIsDirectory(realPath))) return null;
+        if (root.scope === "project" && !(await projectSkillPathIsSafe(realPath))) {
+          warnings.push({ path: link.path, reason: WORLD_WRITABLE_PROJECT_LINK_WARNING });
+          return null;
+        }
         return { path: link.path, realPath, depth: link.depth, top: link.top };
       },
     );
@@ -632,6 +758,7 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
     files: loaded.toSorted(byPath),
     droppedCount,
     rootRealPath,
+    warnings,
     // Hidden directories (.system, .cache) hold support files by convention.
     emptyDirectories: topLevel
       .filter((dir) => !topsWithSkills.has(dir) && !basename(dir).startsWith("."))
@@ -641,6 +768,31 @@ async function findSkillFiles(root: string): Promise<SkillFileScan> {
         return markdownFile === undefined ? { path: dir } : { path: dir, markdownFile };
       }),
   };
+}
+
+/**
+ * Read a SKILL.md without following a link at its last component, and only
+ * when the opened descriptor is a regular file (null otherwise). A project
+ * skill is read through a real path that passed the safety check, with the
+ * identity that check saw: the open can still reach another file where
+ * O_NOFOLLOW does not exist (Windows) or through a folder swapped above the
+ * file, and such a file is refused.
+ */
+async function readRegularFileNoFollow(
+  path: string,
+  checked?: CheckedFile,
+): Promise<Buffer | null> {
+  const handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile()) return null;
+    if (checked !== undefined && (opened.dev !== checked.dev || opened.ino !== checked.ino)) {
+      return null;
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 function isSkillFile(fileName: string): boolean {
@@ -904,16 +1056,14 @@ function detachStrings<T>(value: T): T {
 async function readParsedSkillFile(
   filePath: string,
   warnings: SkillLoadWarning[],
+  readPath = filePath,
+  checked?: CheckedFile,
 ): Promise<ParsedSkillFile | null> {
-  try {
-    const stats = await stat(filePath);
-    if (!stats.isFile()) return null;
-  } catch {
-    return null;
-  }
   let bytes: Buffer;
   try {
-    bytes = await readFile(filePath);
+    const read = await readRegularFileNoFollow(readPath, checked);
+    if (read === null) return null;
+    bytes = read;
   } catch (error) {
     warnings.push({
       path: filePath,
@@ -953,7 +1103,18 @@ async function loadSkillFile(
   warnings: SkillLoadWarning[],
 ): Promise<LoadedSkillFile | null> {
   const filePath = file.path;
-  const parsedFile = await readParsedSkillFile(filePath, warnings);
+  let readPath = filePath;
+  let checked: CheckedFile | undefined;
+  if (root.scope === "project") {
+    const checkedFile = file.identity === null ? null : await checkedProjectSkillFile(file.identity);
+    if (file.identity === null || checkedFile === null) {
+      warnings.push({ path: filePath, reason: "skipped unsafe project skill path" });
+      return null;
+    }
+    readPath = file.identity;
+    checked = checkedFile;
+  }
+  const parsedFile = await readParsedSkillFile(filePath, warnings, readPath, checked);
   if (parsedFile === null) return null;
   const { frontmatter, warning } = parsedFile;
   if (warning !== undefined) warnings.push({ path: filePath, reason: warning });
@@ -1011,6 +1172,7 @@ async function loadSkillFile(
     ...safeParsed,
     name: skillName,
     path: filePath,
+    ...(root.scope === "project" ? { projectRealPath: readPath } : {}),
     root: root.path,
     scope: root.scope,
     source: root.source,
@@ -1036,17 +1198,17 @@ interface LoadedSkillRoot {
 }
 
 async function loadSkillsFromRoot(root: SkillRoot): Promise<LoadedSkillRoot> {
-  const scan = await findSkillFiles(root.path);
+  const scan = await findSkillFiles(root);
   const files: Array<{ readonly path: string; readonly identity: string | null }> =
     [...scan.files];
   // A root can BE one skill: plugin manifests may declare each skill
   // dir individually (skills: ["./skills/flash-board"]), so the root
   // itself carries the SKILL.md instead of holding child skill dirs.
   let leafRoot = false;
-  if (files.length === 0) {
+  if (files.length === 0 && !scan.unsafeRoot) {
     const leaf = join(root.path, SKILL_FILE_NAME);
     try {
-      const stats = await stat(leaf);
+      const stats = await lstat(leaf);
       if (stats.isFile()) {
         files.push({ path: leaf, identity: await getFileIdentity(leaf) });
         leafRoot = true;
@@ -1055,7 +1217,7 @@ async function loadSkillsFromRoot(root: SkillRoot): Promise<LoadedSkillRoot> {
       // Genuinely empty root.
     }
   }
-  const warnings: SkillLoadWarning[] = [];
+  const warnings: SkillLoadWarning[] = [...scan.warnings];
   // A directory in a user, project or managed root with no SKILL.md is a
   // skill that failed to install (the audited catalog had one holding only
   // CLAUDE.md). Plugin layouts are the plugin author's to choose, and a
@@ -1168,7 +1330,8 @@ export async function loadLocalSkillsSnapshot(
   activePaths: readonly string[] = [],
   discoveredSkillRoots: readonly string[] = [],
 ): Promise<LocalSkillsSnapshot> {
-  const roots = await discoverSkillRoots(options, discoveredSkillRoots);
+  const warnings: SkillLoadWarning[] = [];
+  const roots = await discoverSkillRootsWithWarnings(options, discoveredSkillRoots, warnings);
   const loadedNested = await Promise.all(roots.map(loadSkillsFromRoot));
   const deduped = dedupeSkillsByRealPath(
     loadedNested.flatMap((loaded) => loaded.skills),
@@ -1182,7 +1345,7 @@ export async function loadLocalSkillsSnapshot(
       }]
       : [],
   );
-  const warnings = loadedNested.flatMap((loaded) => loaded.warnings);
+  warnings.push(...loadedNested.flatMap((loaded) => loaded.warnings));
 
   const allFileSkills = deduped.map((entry) => entry.skill);
   const unconditional: LocalSkillMetadata[] = [];
@@ -1366,8 +1529,21 @@ async function loadSkillContent(
     return renderBundledSkill(skill, args);
   }
   let raw: string;
+  let readPath = skill.path;
+  let checked: CheckedFile | undefined;
+  if (skill.scope === "project") {
+    const realPath = skill.projectRealPath;
+    const checkedFile = realPath === undefined ? null : await checkedProjectSkillFile(realPath);
+    if (realPath === undefined || checkedFile === null) {
+      throw new Error(`Project skill is no longer in a safe location: ${skill.path}`);
+    }
+    readPath = realPath;
+    checked = checkedFile;
+  }
   try {
-    raw = await readFile(skill.path, "utf8");
+    const read = await readRegularFileNoFollow(readPath, checked);
+    if (read === null) return null;
+    raw = read.toString("utf8");
   } catch {
     return null;
   }
@@ -2233,7 +2409,9 @@ export async function discoverDynamicSkillDirsForPaths(
         const skillDir = join(current, rootName, "skills");
         if (seen.has(skillDir)) continue;
         seen.add(skillDir);
-        if (await pathIsDirectory(skillDir)) dirs.push(skillDir);
+        if (await pathIsDirectory(skillDir) && await projectSkillRootIsSafe(skillDir)) {
+          dirs.push(skillDir);
+        }
       }
       const parent = dirname(current);
       if (parent === current) break;
