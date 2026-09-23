@@ -389,6 +389,33 @@ async function stopKeepAliveRun(
   return (await collectRun(iter)).result;
 }
 
+async function sendQueuedMessageDuringRun(
+  session: Session,
+  waitForKind: RunAgentProgressEvent["kind"],
+  content: string,
+): Promise<{
+  result: RunAgentResult;
+  live: Awaited<ReturnType<typeof spawnLive>>["live"];
+}> {
+  const { control, live } = await spawnLive(session);
+  const iter = runAgent({
+    live,
+    parent: session,
+    initialMessages: [{ role: "user", content: "go" }],
+    taskPrompt: "go",
+  });
+  await nextProgressEvent(iter, waitForKind);
+  await control.sendInterAgentCommunication(live.agentId, {
+    author: "/root",
+    recipient: live.agentPath,
+    content,
+    triggerTurn: false,
+    metadata: createMailboxMetadataRecord("inter_agent_communication", [["deliveryMode", "queue_only"]]),
+  });
+  const { result } = await collectRun(iter);
+  return { result, live };
+}
+
 async function spawnLive(session: Session, roleName?: string) {
   const registry = new AgentRegistry();
   const control = new AgentControl({
@@ -1094,9 +1121,9 @@ describe("runAgent", () => {
     const childDispose = vi.fn(async () => {});
     const childProvider: LLMProvider = {
       ...makeProvider([{ content: "summary seed" }]),
-      forkForSession: nestedFork,
       dispose: childDispose,
     };
+    Object.setPrototypeOf(childProvider, { forkForSession: nestedFork });
     const parentBroker = new SandboxExecutionBroker({
       mode: "danger_full_access",
       cwd: "/tmp",
@@ -1543,6 +1570,58 @@ describe("runAgent", () => {
         totalTokens: 100,
       },
     );
+  });
+
+  it("keeps a passive child message out of the current turn's model calls", async () => {
+    const provider = makeProvider([
+      {
+        content: "",
+        toolCalls: [{ id: "call-1", name: "system.echo", arguments: "{}" }],
+        finishReason: "tool_calls",
+      },
+      { content: "done", finishReason: "stop" },
+    ]);
+    const session = makeStubSession({
+      services: {
+        provider,
+        registry: {
+          tools: [{
+            name: "system.echo",
+            description: "echo",
+            inputSchema: { type: "object" },
+            execute: async () => ({ content: "ok" }),
+          }],
+          toLLMTools: () => [{
+            type: "function",
+            function: { name: "system.echo", description: "echo", parameters: { type: "object" } },
+          }],
+          dispatch: async () => ({ content: "ok" }),
+        } satisfies ToolRegistry,
+      },
+    });
+    const { result, live } = await sendQueuedMessageDuringRun(
+      session,
+      "tool_call",
+      "check the edge case",
+    );
+    expect(result.outcome).toBe("completed");
+    expect(provider.chatStream).toHaveBeenCalledTimes(2);
+    const secondMessages = (provider.chatStream as ReturnType<typeof vi.fn>).mock.calls[1]![0] as LLMMessage[];
+    expect(JSON.stringify(secondMessages)).not.toContain("check the edge case");
+    expect(live.downInbox.hasPending()).toBe(true);
+  });
+
+  it("does not read a message sent after the child's last model call", async () => {
+    const provider = makeProvider([{ content: "finished" }]);
+    const session = makeStubSession({ services: { provider } });
+    const { result, live } = await sendQueuedMessageDuringRun(
+      session,
+      "message",
+      "too late for this turn",
+    );
+    expect(result.outcome).toBe("completed");
+    expect(provider.chatStream).toHaveBeenCalledTimes(1);
+    expect(live.downInbox.hasPending()).toBe(true);
   });
 
   it("ignores array-shaped parent services when resolving the provider", async () => {

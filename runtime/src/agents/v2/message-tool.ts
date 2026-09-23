@@ -109,6 +109,8 @@ export async function handleMessageStringTool(
   let deliveryError: unknown;
   let acceptedTask:
     { readonly taskId: string; readonly turnId: string } | undefined;
+  let passiveAdmission:
+    ReturnType<typeof control.sendPassiveMessageToActiveAgent> | undefined;
   try {
     if (mode === "trigger_turn") {
       acceptedTask = control.assignTask(agentId, {
@@ -117,8 +119,18 @@ export async function handleMessageStringTool(
         content: message,
         taskId: callId,
       });
-    } else {
+    } else if (agentId === sessionOrError.conversationId) {
       await control.sendInterAgentCommunication(agentId, {
+        author: current.agentPath,
+        recipient: receiverAgentPath,
+        content: message,
+        triggerTurn: false,
+        metadata: createMailboxMetadataRecord("inter_agent_communication", [
+          ["deliveryMode", mode],
+        ]),
+      });
+    } else {
+      passiveAdmission = control.sendPassiveMessageToActiveAgent(agentId, {
         author: current.agentPath,
         recipient: receiverAgentPath,
         content: message,
@@ -158,11 +170,32 @@ export async function handleMessageStringTool(
       true,
     );
   }
+  if (passiveAdmission?.accepted === false) {
+    return confirmedNoAgentEffect(
+      json({
+        ok: false,
+        delivered: false,
+        mode: "send_message",
+        target: receiverAgentPath,
+        status: passiveAdmission.status,
+        hint: "This child is idle or finished. Use assign_task to start an idle worker's next turn.",
+      }),
+    );
+  }
   return json({
     ok: true,
     mode: mode === "trigger_turn" ? "assign_task" : "send_message",
     target: receiverAgentPath,
     status,
+    ...(mode === "queue_only"
+      ? {
+          delivered: false,
+          delivery: "accepted_unconfirmed",
+          hint: agentId === sessionOrError.conversationId
+            ? "Queued for the root mailbox's next drain."
+            : "Queued for the child's next turn. If the child finishes first, the message is lost.",
+        }
+      : {}),
     ...(acceptedTask !== undefined
       ? {
           task_id: acceptedTask.taskId,
