@@ -536,6 +536,10 @@ export interface BuildToolRegistryOptions {
   readonly agencHome?: string;
   /** Already-layered canonical `[browser]` snapshot for this session. */
   readonly browserConfig?: BrowserConfig;
+  /** Session root markers used by trust and browser profile identity. */
+  readonly projectRootMarkers?: readonly string[];
+  readonly projectRootMarkersProvider?: () => readonly string[] | undefined;
+  readonly subscribeProjectRootMarkers?: (listener: () => void) => () => void;
   /** Live session used to admit direct registry/code-mode dispatches. */
   readonly getSession?: () => Session | null;
   /** Fail closed when direct dispatch has no live admission session. */
@@ -786,6 +790,15 @@ export function buildToolRegistry(
         : {}),
       ...(options.browserConfig !== undefined
         ? { config: options.browserConfig }
+        : {}),
+      ...(options.projectRootMarkers !== undefined
+        ? { projectRootMarkers: options.projectRootMarkers }
+        : {}),
+      ...(options.projectRootMarkersProvider !== undefined
+        ? { projectRootMarkersProvider: options.projectRootMarkersProvider }
+        : {}),
+      ...(options.subscribeProjectRootMarkers !== undefined
+        ? { subscribeProjectRootMarkers: options.subscribeProjectRootMarkers }
         : {}),
     }),
   ] as const;

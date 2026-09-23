@@ -24,6 +24,7 @@ import type { PermissionResult, PermissionUpdate } from "../../permissions/types
 import type { ToolEvaluatorContext } from "../../permissions/evaluator.js";
 import { getRuleByContentsForTool } from "../../permissions/rules.js";
 import { BrowserManager } from "../../browser/manager.js";
+import { resolveBrowserProjectRootSync } from "../../browser/profile-root.js";
 import {
   BROWSER_NAMED_KEYS,
   readBrowserNavigationFailureReceipt,
@@ -85,6 +86,10 @@ export interface CreateBrowserToolOptions {
   readonly agencHome?: string;
   /** Already-layered canonical `[browser]` snapshot for this session. */
   readonly config?: BrowserConfig;
+  /** Session root markers, from the same layered config used for trust. */
+  readonly projectRootMarkers?: readonly string[];
+  readonly projectRootMarkersProvider?: () => readonly string[] | undefined;
+  readonly subscribeProjectRootMarkers?: (listener: () => void) => () => void;
   /** Inject a lifecycle-owned manager (tests). When absent one is created lazily. */
   readonly manager?: BrowserManager;
 }
@@ -183,6 +188,17 @@ export function createBrowserTool(
         const agencHome = safeAgencHome(options.agencHome);
         created = new BrowserManager({
           ...(agencHome !== undefined ? { agencHome } : {}),
+          projectRoot: resolveBrowserProjectRootSync(
+            sandboxExecutionBroker.cwd,
+            options.projectRootMarkersProvider?.() ?? options.projectRootMarkers,
+          ),
+          projectRootMarkers: options.projectRootMarkers,
+          ...(options.projectRootMarkersProvider !== undefined
+            ? { projectRootMarkersProvider: options.projectRootMarkersProvider }
+            : {}),
+          ...(options.subscribeProjectRootMarkers !== undefined
+            ? { subscribeProjectRootMarkers: options.subscribeProjectRootMarkers }
+            : {}),
           policy,
           sandboxExecutionBroker,
         });
@@ -196,7 +212,9 @@ export function createBrowserTool(
           resume: async () => {},
           dispose: async () => {
             try {
-              await created.closeAll();
+              // Injected test managers implement only the original lifecycle API.
+              if (created === injectedManager) await created.closeAll();
+              else await created.dispose();
             } finally {
               if (managers.get(sandboxExecutionBroker) === created) {
                 managers.delete(sandboxExecutionBroker);
