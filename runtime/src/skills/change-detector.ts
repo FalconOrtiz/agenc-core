@@ -1,3 +1,5 @@
+import { lstatSync } from "node:fs";
+
 import type { WatchRegistration } from "../file-watcher/index.js";
 import { FileWatcher } from "../file-watcher/index.js";
 import { createSignal } from "../utils/signal.js";
@@ -224,8 +226,27 @@ async function clearCommandCaches(): Promise<void> {
   }
 }
 
+/**
+ * Whether a change at this path can alter the skill catalog. The loader
+ * reads SKILL.md files and the directories that lead to them, nothing else,
+ * so an existing regular file under any other name (a skill's scripts,
+ * references, logs, caches) cannot add, remove or edit a skill. Anything
+ * that is gone, a directory, a link or a SKILL.md still reloads, including
+ * scratch-looking names that could belong to a directory. On the audited
+ * catalog four bursts of regular file writes caused four full reloads.
+ */
 function shouldIgnorePath(path: string): boolean {
-  return path.split(/[\\/]/u).includes(".git");
+  const parts = path.split(/[\\/]/u);
+  if (parts.includes(".git")) return true;
+  const name = parts.at(-1) ?? "";
+  if (name.toLowerCase() === "skill.md") return false;
+  // A plugin manifest names the skills' owner; a root can sit on a plugin.
+  if (parts.includes(".agenc-plugin")) return false;
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 export const skillChangeDetector = createSkillChangeDetector();
