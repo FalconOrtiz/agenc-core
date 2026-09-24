@@ -1,6 +1,7 @@
 import React from "react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { STREAM_QUIET_WARNING_MS } from "../../../../src/llm/stream-watchdog.js";
 import {
   SpinnerAnimationRow,
   formatRate,
@@ -175,12 +176,12 @@ describe("SpinnerAnimationRow liveness + token grammar", () => {
     vi.spyOn(Date, "now").mockReturnValue(NOW);
 
     const output = await renderRow({
-      loadingStartTimeRef: makeRef(NOW - 13 * 60_000),
+      loadingStartTimeRef: makeRef(NOW - STREAM_QUIET_WARNING_MS),
       responseLengthRef: makeRef(0),
       thinkingStatus: "thinking",
     });
 
-    expect(output).toContain("no output from the model for 13 minutes");
+    expect(output).toContain("no output from the model for 5 minutes");
     expect(output).toContain("thinking");
     expect(output).toContain("esc to interrupt");
   });

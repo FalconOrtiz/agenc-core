@@ -11,11 +11,12 @@
  *
  * Invariants wired here:
  *   I-11 (stream idle watchdog) — installStreamWatchdog wraps the stream;
- *        `kick("delta"|"bytes")` on every chunk. Heartbeats keep a dead-socket
- *        abort from firing. Quiet reasoning warns instead of aborting. The
- *        canonical config carries a ten-minute default dead-socket expiry
+ *        `kick("delta"|"bytes")` on every chunk. Heartbeats refresh the
+ *        last-byte idle abort clock. Quiet reasoning warns at half of
+ *        `timeoutMs`. Abort still fires `timeoutMs` after the last byte.
+ *        Canonical config default is ten minutes
  *        (`stream_watchdog_timeout_ms`, `0` disables abort). Sessions without
- *        a config store still warn after ten minutes of no delta.
+ *        a config store still warn after the shared quiet-warning threshold.
  *   I-22 (token budget mid-stream) — per-chunk
  *        `budgetTracker.addEmitted(..., "estimate") + sampleMidStream`
  *        keeps a coarse estimate during streaming, but the actual

@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS } from "../config/schema.js";
 import {
   classifyStreamLiveness,
   formatStreamQuietWarning,
   installStreamWatchdog,
+  resolveStreamIdleWarningMs,
   STREAM_IDLE_ABORT_REASON,
   STREAM_IDLE_WARNING_REASON,
+  STREAM_QUIET_WARNING_MS,
   streamChunkHasDelta,
 } from "./stream-watchdog.js";
 
@@ -157,6 +160,23 @@ describe("stream-watchdog", () => {
     expect(onFired).not.toHaveBeenCalled();
     expect(abortController.signal.aborted).toBe(false);
     expect(handle.firedAt).toBeNull();
+  });
+
+  test("text_delta stubs without content do not throw", () => {
+    const stub = { type: "text_delta" as const, text: "done" };
+    expect(() => streamChunkHasDelta(stub)).not.toThrow();
+    expect(streamChunkHasDelta(stub)).toBe(false);
+  });
+
+  test("quiet warning shares the default abort half-timeout", () => {
+    expect(
+      resolveStreamIdleWarningMs({
+        timeoutMs: DEFAULT_STREAM_WATCHDOG_TIMEOUT_MS,
+      }),
+    ).toBe(STREAM_QUIET_WARNING_MS);
+    expect(resolveStreamIdleWarningMs({ timeoutMs: 0 })).toBe(
+      STREAM_QUIET_WARNING_MS,
+    );
   });
 
   test("zero-timeout watchdog returns a no-op handle", () => {

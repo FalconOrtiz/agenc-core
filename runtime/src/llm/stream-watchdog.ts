@@ -7,9 +7,9 @@
  *
  * Abort is opt-in (`timeoutMs` > 0) and measures idle time from the most
  * recent byte (`kick("bytes")` or any kick). Model deltas (`kick("delta")`)
- * reset the quiet-warning window separately. A zero abort timeout still
- * warns when `onWarning` is set, so long grok-4.6 xhigh quiet phases stay
- * alive with a ticker signal instead of a hard kill.
+ * reset the quiet-warning window separately. Quiet streams still abort
+ * `timeoutMs` after the last byte. A zero abort timeout still warns when
+ * `onWarning` is set.
  *
  * Timers use monotonic clock (I-82) via `monotonicMs()`.
  *
@@ -70,8 +70,8 @@ export function resolveSessionStreamIdleTimeoutMs(input: {
   return resolveStreamIdleTimeoutMs(preferred);
 }
 
-/** Soft "no model delta" warning when abort is disabled. Matches the session default idle window. */
-export const STREAM_QUIET_WARNING_MS = 600_000;
+/** Soft "no model delta" warning. Shared with the TUI spinner; half of the default 10-minute abort. */
+export const STREAM_QUIET_WARNING_MS = 300_000;
 
 export type StreamWatchdogKickSource = "bytes" | "delta";
 export type StreamLiveness = "live" | "quiet" | "dead";
@@ -119,7 +119,7 @@ export function formatStreamQuietWarning(elapsedMs: number): string {
 }
 
 export function streamChunkHasDelta(chunk: {
-  readonly content: string;
+  readonly content?: string;
   readonly thinkingDelta?: unknown;
   readonly reasoningSummaryDelta?: unknown;
   readonly toolInputDelta?: unknown;
@@ -128,7 +128,7 @@ export function streamChunkHasDelta(chunk: {
   readonly toolCalls?: readonly unknown[];
 }): boolean {
   return (
-    chunk.content.length > 0 ||
+    (chunk.content?.length ?? 0) > 0 ||
     chunk.thinkingDelta !== undefined ||
     chunk.reasoningSummaryDelta !== undefined ||
     chunk.toolInputDelta !== undefined ||
