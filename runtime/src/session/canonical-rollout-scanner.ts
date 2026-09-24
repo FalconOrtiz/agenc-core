@@ -57,6 +57,7 @@ import {
   reconstructCompactionPayloadV1,
 } from "../services/compact/payload-manifest.js";
 import {
+  isCompactionRolloutType,
   readCompactionPersistedCommittedV1,
   readCompactionPersistedIntentV1,
   readCompactionPersistedRollbackCommittedV1,
@@ -914,6 +915,26 @@ function observeCanonicalRecord(
     return;
   }
 
+  const incompleteAttempt = [...state.attempts.values()].find(
+    (attempt) =>
+      attempt.persistedIntent !== undefined &&
+      attempt.intent === undefined &&
+      !attempt.terminal,
+  );
+  if (incompleteAttempt?.persistedIntent !== undefined) {
+    const incompleteAttemptId = incompleteAttempt.persistedIntent.attempt_id;
+    const sameAttemptLifecycle =
+      isCompactionRolloutType(item.type) && attemptId === incompleteAttemptId;
+    const sealedWithoutPayloads =
+      item.type === "compaction_committed" ||
+      item.type === "compaction_rollback_committed";
+    if (!sameAttemptLifecycle || sealedWithoutPayloads) {
+      throw new Error(
+        "canonical compaction intent is missing its required source payload bundle",
+      );
+    }
+  }
+
   if (persistedIntent !== undefined) {
     state.attempts.set(persistedIntent.attempt_id, {
       persistedIntent,
@@ -937,22 +958,6 @@ function observeCanonicalRecord(
       );
     }
     return;
-  }
-
-  const incompleteAttempt = [...state.attempts.values()].find(
-    (attempt) =>
-      attempt.persistedIntent !== undefined &&
-      attempt.intent === undefined &&
-      !attempt.terminal,
-  );
-  if (
-    incompleteAttempt !== undefined &&
-    (item.type === "compaction_committed" ||
-      item.type === "compaction_rollback_committed")
-  ) {
-    throw new Error(
-      "canonical compaction intent is missing its required source payload bundle",
-    );
   }
 
   const persistedCommit = persistedCommitPayload(item);

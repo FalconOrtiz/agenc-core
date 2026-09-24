@@ -152,11 +152,17 @@ function isCompactionPayloadKind(
   );
 }
 
-function rolloutPhysicalIdentity(decoded: string): {
+type PhysicalRolloutRecord = {
   readonly type: string;
-  readonly attemptId?: string;
-  readonly payloadKind?: string;
-} | undefined {
+  readonly payload: Record<string, unknown> | undefined;
+};
+
+type LiveHistoryOrdinalSpan = {
+  readonly first_sequence: number;
+  readonly last_sequence: number;
+};
+
+function parsePhysicalRolloutRecord(decoded: string): PhysicalRolloutRecord | undefined {
   let value: unknown;
   try {
     value = JSON.parse(decoded);
@@ -168,13 +174,38 @@ function rolloutPhysicalIdentity(decoded: string): {
   if (typeof type !== "string") return undefined;
   const payload = (value as { readonly payload?: unknown }).payload;
   if (typeof payload !== "object" || payload === null) return { type };
-  const attemptId = (payload as { readonly attempt_id?: unknown }).attempt_id;
-  const payloadKind = (payload as { readonly payload_kind?: unknown })
-    .payload_kind;
+  return { type, payload: payload as Record<string, unknown> };
+}
+
+function physicalStringField(
+  payload: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  if (payload === undefined) return undefined;
+  const value = payload[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function tryReadCompactionRecord(
+  type: "compaction_intent" | "compaction_failed" | "compaction_source_release",
+  payload: Record<string, unknown> | undefined,
+) {
+  if (payload === undefined) return undefined;
+  try {
+    return readCompactionRolloutPayload(type, payload);
+  } catch {
+    return undefined;
+  }
+}
+
+function intentSourceSpan(
+  payload: Record<string, unknown> | undefined,
+): LiveHistoryOrdinalSpan | undefined {
+  const intent = tryReadCompactionRecord("compaction_intent", payload);
+  if (intent === undefined || !("source" in intent)) return undefined;
   return {
-    type,
-    ...(typeof attemptId === "string" ? { attemptId } : {}),
-    ...(typeof payloadKind === "string" ? { payloadKind } : {}),
+    first_sequence: intent.source.first_sequence,
+    last_sequence: intent.source.last_sequence,
   };
 }
 
@@ -184,18 +215,20 @@ function assertPhysicalExclusionMatch(
   decoded: string,
   digestDomain: string,
 ): void {
-  const identity = rolloutPhysicalIdentity(decoded);
+  const record = parsePhysicalRolloutRecord(decoded);
   const digest = createHash("sha256")
     .update(digestDomain, "utf8")
     .update(physical)
     .digest("hex");
+  const attemptId = physicalStringField(record?.payload, "attempt_id");
+  const payloadKind = physicalStringField(record?.payload, "payload_kind");
   if (
     physical.byteLength !== exclusion.encodedBytes ||
     digest !== exclusion.sha256 ||
-    identity?.type !== exclusion.itemType ||
+    record?.type !== exclusion.itemType ||
     (exclusion.itemType === "compaction_payload_chunk" &&
-      (identity.attemptId !== exclusion.attemptId ||
-        identity.payloadKind !== exclusion.payloadKind))
+      (attemptId !== exclusion.attemptId ||
+        payloadKind !== exclusion.payloadKind))
   ) {
     throw new Error(
       "physical-row exclusion no longer matches canonical source",
@@ -203,11 +236,18 @@ function assertPhysicalExclusionMatch(
   }
 }
 
-function failedCompactionPayloadExclusions(
+function collectFailedPayloadRepair(
   bytes: Buffer,
   digestDomain: string,
-): RolloutPhysicalLineExclusion[] {
-  const failedAttemptIds = new Set<string>();
+): {
+  readonly exclusions: RolloutPhysicalLineExclusion[];
+  readonly unreleasedIntentRefs: LiveHistoryOrdinalSpan[];
+} {
+  const validatedFailedAttemptIds = new Set<string>();
+  const committedAttemptIds = new Set<string>();
+  const rollbackAttemptIds = new Set<string>();
+  const releasedAttemptIds = new Set<string>();
+  const intentSpans = new Map<string, LiveHistoryOrdinalSpan>();
   const chunks: Array<{
     readonly lineNumber: number;
     readonly physical: Buffer;
@@ -221,48 +261,88 @@ function failedCompactionPayloadExclusions(
     lineNumber += 1;
     const physical = bytes.subarray(start, offset + 1);
     start = offset + 1;
-    const identity = rolloutPhysicalIdentity(
+    const record = parsePhysicalRolloutRecord(
       new TextDecoder("utf-8", { fatal: true }).decode(
         physical.subarray(0, physical.byteLength - 1),
       ),
     );
-    if (identity === undefined) continue;
-    if (
-      identity.type === "compaction_failed" &&
-      identity.attemptId !== undefined
-    ) {
-      failedAttemptIds.add(identity.attemptId);
+    if (record === undefined) continue;
+    const attemptId = physicalStringField(record.payload, "attempt_id");
+    if (record.type === "compaction_intent" && attemptId !== undefined) {
+      const span = intentSourceSpan(record.payload);
+      if (span !== undefined) intentSpans.set(attemptId, span);
+    }
+    if (record.type === "compaction_source_release") {
+      const release = tryReadCompactionRecord(
+        "compaction_source_release",
+        record.payload,
+      );
+      if (release !== undefined) releasedAttemptIds.add(release.attempt_id);
+    }
+    if (record.type === "compaction_failed") {
+      const failure = tryReadCompactionRecord(
+        "compaction_failed",
+        record.payload,
+      );
+      if (failure !== undefined) validatedFailedAttemptIds.add(failure.attempt_id);
+    }
+    if (record.type === "compaction_committed" && attemptId !== undefined) {
+      committedAttemptIds.add(attemptId);
     }
     if (
-      identity.type === "compaction_payload_chunk" &&
-      identity.attemptId !== undefined &&
-      isCompactionPayloadKind(identity.payloadKind)
+      record.type === "compaction_rollback_committed" &&
+      attemptId !== undefined
+    ) {
+      rollbackAttemptIds.add(attemptId);
+    }
+    const payloadKind = physicalStringField(record.payload, "payload_kind");
+    if (
+      record.type === "compaction_payload_chunk" &&
+      attemptId !== undefined &&
+      isCompactionPayloadKind(payloadKind)
     ) {
       chunks.push({
         lineNumber,
         physical,
-        attemptId: identity.attemptId,
-        payloadKind: identity.payloadKind,
+        attemptId,
+        payloadKind,
       });
     }
   }
-  return chunks.flatMap((chunk) =>
-    failedAttemptIds.has(chunk.attemptId)
-      ? [
-          {
-            lineNumber: chunk.lineNumber,
-            encodedBytes: chunk.physical.byteLength,
-            sha256: createHash("sha256")
-              .update(digestDomain, "utf8")
-              .update(chunk.physical)
-              .digest("hex"),
-            itemType: "compaction_payload_chunk" as const,
-            attemptId: chunk.attemptId,
-            payloadKind: chunk.payloadKind,
-          },
-        ]
-      : [],
-  );
+  const unreleasedIntentRefs: LiveHistoryOrdinalSpan[] = [];
+  for (const [attemptId, span] of intentSpans) {
+    if (!releasedAttemptIds.has(attemptId)) unreleasedIntentRefs.push(span);
+  }
+  const exclusions: RolloutPhysicalLineExclusion[] = [];
+  for (const chunk of chunks) {
+    if (!validatedFailedAttemptIds.has(chunk.attemptId)) continue;
+    if (committedAttemptIds.has(chunk.attemptId)) continue;
+    if (rollbackAttemptIds.has(chunk.attemptId)) continue;
+    exclusions.push({
+      lineNumber: chunk.lineNumber,
+      encodedBytes: chunk.physical.byteLength,
+      sha256: createHash("sha256")
+        .update(digestDomain, "utf8")
+        .update(chunk.physical)
+        .digest("hex"),
+      itemType: "compaction_payload_chunk",
+      attemptId: chunk.attemptId,
+      payloadKind: chunk.payloadKind,
+    });
+  }
+  return { exclusions, unreleasedIntentRefs };
+}
+
+function highestLastSequence(
+  refs: readonly LiveHistoryOrdinalSpan[],
+): number | undefined {
+  let highest: number | undefined;
+  for (const ref of refs) {
+    if (highest === undefined || ref.last_sequence > highest) {
+      highest = ref.last_sequence;
+    }
+  }
+  return highest;
 }
 
 /**
@@ -271,17 +351,12 @@ function failedCompactionPayloadExclusions(
  */
 function exclusionsSafeForLiveOrdinals(
   exclusions: readonly RolloutPhysicalLineExclusion[],
-  liveHistoryRefs: readonly {
-    readonly first_sequence: number;
-    readonly last_sequence: number;
-  }[],
+  liveHistoryRefs: readonly LiveHistoryOrdinalSpan[],
 ): readonly RolloutPhysicalLineExclusion[] {
-  if (exclusions.length === 0 || liveHistoryRefs.length === 0) {
+  const maxLiveOrdinal = highestLastSequence(liveHistoryRefs);
+  if (exclusions.length === 0 || maxLiveOrdinal === undefined) {
     return exclusions;
   }
-  const maxLiveOrdinal = Math.max(
-    ...liveHistoryRefs.map((ref) => ref.last_sequence),
-  );
   return exclusions.filter(
     (exclusion) => exclusion.lineNumber > maxLiveOrdinal,
   );
@@ -3052,15 +3127,17 @@ export class SessionStore {
    */
   rewriteFailedCompactionPayloadChunksAtomically(
     digestDomain: string,
-    liveHistoryRefs: readonly {
-      readonly first_sequence: number;
-      readonly last_sequence: number;
-    }[] = [],
+    liveHistoryRefs: readonly LiveHistoryOrdinalSpan[] = [],
   ): void {
     const bytes = this.readCurrentRolloutBytes();
+    const repair = collectFailedPayloadRepair(bytes, digestDomain);
+    const protectedOrdinals: LiveHistoryOrdinalSpan[] = [
+      ...repair.unreleasedIntentRefs,
+    ];
+    for (const ref of liveHistoryRefs) protectedOrdinals.push(ref);
     const exclusions = exclusionsSafeForLiveOrdinals(
-      failedCompactionPayloadExclusions(bytes, digestDomain),
-      liveHistoryRefs,
+      repair.exclusions,
+      protectedOrdinals,
     );
     if (exclusions.length === 0) return;
     this.rewriteRolloutExcludingPhysicalLinesAtomically(

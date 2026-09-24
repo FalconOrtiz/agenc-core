@@ -1164,6 +1164,327 @@ describe("RolloutStore transactional compaction", () => {
     }
   });
 
+  it("keeps failed-payload ordinals after a terminal-run reopen uses a later SQLite epoch", () => {
+    let nowMs = Date.now();
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "failed-payload-after-terminal-reopen";
+    const failedAttemptId = "pre-reopen-failed-attempt";
+    const store = openStore(
+      sessionId,
+      { nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    let pinnedAttemptId: string;
+    let pinnedCommittedAtMs: number;
+    try {
+      recordIsolatedFailedAttempt(store, {
+        attemptId: failedAttemptId,
+        content: "terminal-reopen keep",
+        nowMs,
+        policyDigest: "11".repeat(32),
+        configurationDigest: "22".repeat(32),
+        accountingRef: "33".repeat(32),
+        detailDigest: "6".repeat(64),
+      });
+      const pinned = commitSmallCompaction(store, "post-fail-pinned-attempt");
+      pinnedAttemptId = pinned.intent.attempt_id;
+      pinnedCommittedAtMs = pinned.committedAtMs;
+      store.markProjectionComplete(pinnedAttemptId);
+      let terminalSeq = 1;
+      for (const item of store.readAll()) {
+        if (
+          item.type === "event_msg" &&
+          item.payload.seq !== undefined &&
+          item.payload.seq >= terminalSeq
+        ) {
+          terminalSeq = item.payload.seq + 1;
+        }
+      }
+      expect(
+        store.append(
+          {
+            eventId: `run-terminal:${sessionId}:${terminalSeq}`,
+            id: `run-terminal:${sessionId}:${terminalSeq}`,
+            seq: terminalSeq,
+            msg: {
+              type: "run_terminal",
+              payload: {
+                runId: sessionId,
+                epoch: 1,
+                status: "completed",
+                exitCode: 0,
+                stopReason: "turn_completed",
+                finalMessage: "terminal-reopen-done",
+                usage: null,
+                lastSequenceBeforeTerminal: null,
+                finishedAt: "2026-09-24T00:00:00.000Z",
+              },
+            },
+          },
+          { durable: true },
+        ),
+      ).toBe(true);
+    } finally {
+      store.close();
+    }
+
+    const reopened = openStore(
+      sessionId,
+      {
+        resume: true,
+        reopenTerminalRun: true,
+        nowMilliseconds: () => nowMs,
+      },
+      cwd,
+    );
+    try {
+      expect(reopened.runEpoch).toBe(2);
+    } finally {
+      reopened.close();
+    }
+
+    const resumed = openStore(
+      sessionId,
+      { resume: true, nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    try {
+      expect(resumed.runEpoch).toBe(2);
+      const failedChunkCount = readTestRolloutRows(resumed.rolloutPath).filter(
+        (row) =>
+          row.type === "compaction_payload_chunk" &&
+          (row.payload as CompactionPayloadChunkV1).attempt_id ===
+            failedAttemptId,
+      ).length;
+      expect(failedChunkCount).toBeGreaterThan(0);
+      nowMs = pinnedCommittedAtMs + COMPACTION_ROLLBACK_RETENTION_MS;
+      resumed.beginCompactionSourceRelease({
+        attemptId: pinnedAttemptId,
+        nowMs,
+      });
+      expect(
+        resumed.resumeCompactionSourceRelease({
+          attemptId: pinnedAttemptId,
+          nowMs: nowMs + 2,
+        }),
+      ).toBe(true);
+    } finally {
+      resumed.close();
+    }
+  });
+
+  it("skips failed-payload drop when the lifecycle epoch row is missing", () => {
+    let nowMs = Date.now();
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "failed-payload-missing-epoch-row";
+    const failedAttemptId = "missing-epoch-failed-attempt";
+    const store = openStore(
+      sessionId,
+      { nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    let pinnedAttemptId: string;
+    let pinnedCommittedAtMs: number;
+    try {
+      recordIsolatedFailedAttempt(store, {
+        attemptId: failedAttemptId,
+        content: "missing-epoch keep",
+        nowMs,
+        policyDigest: "44".repeat(32),
+        configurationDigest: "55".repeat(32),
+        accountingRef: "66".repeat(32),
+        detailDigest: "7".repeat(64),
+      });
+      const pinned = commitSmallCompaction(store, "missing-epoch-pinned-attempt");
+      pinnedAttemptId = pinned.intent.attempt_id;
+      pinnedCommittedAtMs = pinned.committedAtMs;
+      store.markProjectionComplete(pinnedAttemptId);
+    } finally {
+      store.close();
+    }
+
+    const paths = resolveStateDatabasePaths({
+      cwd,
+      agencHome: temporaryHome,
+    });
+    for (const sidecar of [
+      paths.stateDbPath,
+      paths.logsDbPath,
+      `${paths.stateDbPath}-wal`,
+      `${paths.stateDbPath}-shm`,
+      `${paths.logsDbPath}-wal`,
+      `${paths.logsDbPath}-shm`,
+    ]) {
+      try {
+        unlinkSync(sidecar);
+      } catch {
+        /* sidecar may be absent */
+      }
+    }
+
+    const resumed = openStore(
+      sessionId,
+      { resume: true, nowMilliseconds: () => nowMs },
+      cwd,
+    );
+    try {
+      expect(resumed.runEpoch).toBe(1);
+      expect(
+        readTestRolloutRows(resumed.rolloutPath).some(
+          (row) =>
+            row.type === "compaction_payload_chunk" &&
+            (row.payload as CompactionPayloadChunkV1).attempt_id ===
+              failedAttemptId &&
+            (row.payload as CompactionPayloadChunkV1).payload_kind ===
+              "source_history",
+        ),
+      ).toBe(true);
+      nowMs = pinnedCommittedAtMs + COMPACTION_ROLLBACK_RETENTION_MS;
+      expect(() =>
+        resumed.beginCompactionSourceRelease({
+          attemptId: pinnedAttemptId,
+          nowMs,
+        }),
+      ).not.toThrow();
+      expect(
+        resumed.resumeCompactionSourceRelease({
+          attemptId: pinnedAttemptId,
+          nowMs: nowMs + 3,
+        }),
+      ).toBe(true);
+    } finally {
+      resumed.close();
+    }
+  });
+
+  it("rejects a non-lifecycle row between an incomplete intent and its failure", () => {
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "failed-payload-stray-row-before-lifecycle";
+    const attemptId = "stray-row-failed-attempt";
+    const store = openStore(sessionId, {}, cwd);
+    const rolloutPath = store.rolloutPath;
+    try {
+      recordIsolatedFailedAttempt(store, {
+        attemptId,
+        content: "stray-row keep",
+        nowMs: Date.now(),
+        policyDigest: "77".repeat(32),
+        configurationDigest: "88".repeat(32),
+        accountingRef: "99".repeat(32),
+        detailDigest: "8".repeat(64),
+      });
+    } finally {
+      store.close();
+    }
+    const rows = readTestRolloutRows(rolloutPath).filter(
+      (row) => row.type !== "compaction_payload_chunk",
+    );
+    const failedAt = rows.findIndex((row) => row.type === "compaction_failed");
+    if (failedAt < 0) throw new Error("test failure row is missing");
+    rows.splice(failedAt, 0, {
+      type: "response_item",
+      payload: { role: "user", content: "stray-before-failed-lifecycle" },
+    });
+    writeTestRolloutRows(rolloutPath, rows);
+    expect(() => openStore(sessionId, { resume: true }, cwd)).toThrow(
+      /missing its required source payload bundle/i,
+    );
+  });
+
+  it("does not drop committed payload chunks when a later failed row reuses the attempt", () => {
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "committed-attempt-smuggled-failed-row";
+    const store = openStore(sessionId, {}, cwd);
+    const rolloutPath = store.rolloutPath;
+    let attemptId: string;
+    try {
+      const transaction = commitSmallCompaction(
+        store,
+        "smuggled-failed-commit-attempt",
+      );
+      attemptId = transaction.intent.attempt_id;
+      store.markProjectionComplete(attemptId);
+      store.markCleanupComplete(attemptId);
+    } finally {
+      store.close();
+    }
+    const rows = readTestRolloutRows(rolloutPath);
+    const persistedCommit = rows.find((row) => row.type === "compaction_committed")
+      ?.payload as CompactionPersistedCommittedV1 | undefined;
+    if (persistedCommit === undefined) {
+      throw new Error("test commit row is missing");
+    }
+    rows.push({
+      type: "compaction_failed",
+      payload: {
+        format_version: COMPACTION_EVENT_FORMAT_VERSION,
+        minimum_reader_runtime: COMPACTION_MINIMUM_READER_RUNTIME,
+        attempt_id: persistedCommit.attempt_id,
+        recorded_at_ms: Date.now(),
+        source_sha256: persistedCommit.source.source_sha256,
+        history_digest: persistedCommit.source.history_digest,
+        reason: "commit_failed",
+        detail_digest: "9".repeat(64),
+      },
+    });
+    writeTestRolloutRows(rolloutPath, rows);
+    try {
+      const resumed = openStore(sessionId, { resume: true }, cwd);
+      resumed.close();
+    } catch {
+      /* dual terminal may fail closed; chunks must still remain */
+    }
+    expect(
+      readTestRolloutRows(rolloutPath).some(
+        (row) =>
+          row.type === "compaction_payload_chunk" &&
+          (row.payload as CompactionPayloadChunkV1).attempt_id === attemptId,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not drop chunks when compaction_failed fails schema validation", () => {
+    const cwd = createTestWorkspace();
+    temporaryWorkspaces.push(cwd);
+    const sessionId = "unvalidated-failed-row-keeps-chunks";
+    const attemptId = "unvalidated-failed-attempt";
+    const store = openStore(sessionId, {}, cwd);
+    const rolloutPath = store.rolloutPath;
+    try {
+      recordIsolatedFailedAttempt(store, {
+        attemptId,
+        content: "unvalidated-failed keep",
+        nowMs: Date.now(),
+        policyDigest: "aa".repeat(32),
+        configurationDigest: "bb".repeat(32),
+        accountingRef: "cc".repeat(32),
+        detailDigest: "b".repeat(64),
+      });
+    } finally {
+      store.close();
+    }
+    const rows = readTestRolloutRows(rolloutPath);
+    const failedAt = rows.findIndex((row) => row.type === "compaction_failed");
+    if (failedAt < 0) throw new Error("test failure row is missing");
+    rows[failedAt] = {
+      type: "compaction_failed",
+      payload: { attempt_id: attemptId },
+    };
+    writeTestRolloutRows(rolloutPath, rows);
+    expect(() => openStore(sessionId, { resume: true }, cwd)).toThrow();
+    expect(
+      readTestRolloutRows(rolloutPath).some(
+        (row) =>
+          row.type === "compaction_payload_chunk" &&
+          (row.payload as CompactionPayloadChunkV1).attempt_id === attemptId,
+      ),
+    ).toBe(true);
+  });
+
   it("binds a persisted rollback to the hydrated canonical commit digest", () => {
     const cwd = createTestWorkspace();
     temporaryWorkspaces.push(cwd);
@@ -1868,6 +2189,53 @@ function createTestWorkspace(): string {
   return cwd;
 }
 
+function recordIsolatedFailedAttempt(
+  store: RolloutStore,
+  params: {
+    readonly attemptId: string;
+    readonly content: string;
+    readonly nowMs: number;
+    readonly policyDigest: string;
+    readonly configurationDigest: string;
+    readonly accountingRef: string;
+    readonly detailDigest: string;
+  },
+): void {
+  store.appendRollout(
+    {
+      type: "response_item",
+      payload: { role: "user", content: params.content },
+    },
+    { durable: true },
+  );
+  const prepared = store.prepareSource(params.attemptId, []);
+  const intent: CompactionIntentV1 = {
+    format_version: COMPACTION_EVENT_FORMAT_VERSION,
+    minimum_reader_runtime: COMPACTION_MINIMUM_READER_RUNTIME,
+    attempt_id: params.attemptId,
+    recorded_at_ms: params.nowMs,
+    source: prepared.source,
+    policy_digest: params.policyDigest,
+    configuration_digest: params.configurationDigest,
+    accounting_ref: params.accountingRef,
+    automatic: false,
+    selected_history_indexes: [0],
+    admission_required: true,
+    planned_provider_calls: 1,
+  };
+  store.pinAndRecordIntent(intent, sourcePayloadBundles(prepared, intent));
+  store.recordFailure({
+    format_version: COMPACTION_EVENT_FORMAT_VERSION,
+    minimum_reader_runtime: COMPACTION_MINIMUM_READER_RUNTIME,
+    attempt_id: params.attemptId,
+    recorded_at_ms: params.nowMs + 1,
+    source_sha256: prepared.source.source_sha256,
+    history_digest: prepared.source.history_digest,
+    reason: "commit_failed",
+    detail_digest: params.detailDigest,
+  });
+}
+
 function openStore(
   sessionId: string,
   options: {
@@ -1876,6 +2244,7 @@ function openStore(
     readonly afterCompactionRollbackAppendForTestingOnly?: () => void;
     readonly nowMilliseconds?: () => number;
     readonly resume?: boolean;
+    readonly reopenTerminalRun?: boolean;
   } = {},
   existingCwd?: string,
 ): RolloutStore {
