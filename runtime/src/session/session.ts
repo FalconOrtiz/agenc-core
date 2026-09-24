@@ -33,6 +33,8 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { persistDisplayAttachments } from "./display-artifact-store.js";
+import { boundDisplayCompletionEvent } from "./display-completion.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readPersistedUserStopState, type RolloutItem } from "./rollout-item.js";
 import type { ReadOnlyDelegationConstraint } from "../agents/readonly-delegation.js";
@@ -4744,6 +4746,25 @@ export class Session {
         `cannot append ${event.msg.type}: canonical run journal is sealed`,
       );
     }
+    if (event.msg.type === "tool_call_completed") {
+      let completion = boundDisplayCompletionEvent(event as Parameters<typeof boundDisplayCompletionEvent>[0]);
+      const pending = completion.msg.payload.metadata?.displayAttachments;
+      if (Array.isArray(pending) && pending.length > 0 && this.rolloutStore) {
+        const { displayAttachments: _pending, ...metadata } = completion.msg.payload.metadata ?? {};
+        completion = {
+          ...completion,
+          msg: {
+            ...completion.msg,
+            payload: {
+              ...completion.msg.payload,
+              metadata,
+              displayAttachments: persistDisplayAttachments(this.rolloutStore.store.sessionDir, pending as import("../mcp-client/display-attachments.js").DisplayAttachment[]),
+            },
+          },
+        };
+      }
+      event = completion;
+    }
     if (
       event.msg.type === "context_compacted" ||
       (event.msg as { type?: string }).type === "compacted"
@@ -4785,7 +4806,9 @@ export class Session {
         ? measureToolResultBytes(stamped.msg.payload.result)
         : undefined);
     // T6: persist if store is wired. isDurableEvent triggers I-4 fsync.
-    const durable = isDurableEvent(stamped) || appendOpts.durable === true;
+    const durable = isDurableEvent(stamped) ||
+      (stamped.msg.type === "tool_call_completed" && (stamped.msg.payload.displayAttachments?.length ?? 0) > 0) ||
+      appendOpts.durable === true;
     if (this.rolloutStore) {
       const committed = this.rolloutStore.append(stamped, {
         durable,

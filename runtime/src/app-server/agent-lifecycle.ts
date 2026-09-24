@@ -27,6 +27,7 @@ import {
   resolve,
 } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readDisplayArtifactChunk } from "../session/display-artifact-store.js";
 import type { LiveApprovalBroker } from "./live-approval-broker.js";
 import { permissionGrantsFromToolPermissionContext } from "../permissions/permission-grants.js";
 import { isDeepStrictEqual } from "node:util";
@@ -122,6 +123,8 @@ import type {
   SessionTranscriptResult,
   SessionTranscriptV2Params,
   SessionTranscriptV2Result,
+  SessionArtifactReadParams,
+  SessionArtifactReadResult,
   SessionPartialCompactFromMessageParams,
   SessionPartialCompactFromMessageResult,
   SessionRollbackCompactionParams,
@@ -3498,6 +3501,7 @@ export class AgenCDaemonAgentManager {
 
   async getSessionTranscriptV2(
     params: SessionTranscriptV2Params,
+    options: { readonly includeCompleteMessages?: boolean } = {},
   ): Promise<SessionTranscriptV2Result> {
     if (this.#sessionManager === undefined) {
       throw new AgenCDaemonAgentLifecycleError(
@@ -3508,6 +3512,7 @@ export class AgenCDaemonAgentManager {
     if (this.#runner?.getAgentSessionTranscriptV2 === undefined) {
       const persisted = await this.#readPersistedSessionTranscriptV2(
         params.sessionId,
+        options,
       );
       if (persisted !== undefined) return persisted;
       throw new AgenCDaemonAgentLifecycleError(
@@ -3524,6 +3529,7 @@ export class AgenCDaemonAgentManager {
       if (isNoLiveAgentError(error)) {
         const persisted = await this.#readPersistedSessionTranscriptV2(
           params.sessionId,
+          options,
         );
         if (persisted !== undefined) return persisted;
       }
@@ -3532,16 +3538,29 @@ export class AgenCDaemonAgentManager {
     try {
       return await this.#runner.getAgentSessionTranscriptV2(agentId, {
         sessionId: params.sessionId,
+        includeCompleteMessages: options.includeCompleteMessages,
       });
     } catch (error) {
       if (isNoLiveAgentRunnerError(error)) {
         const persisted = await this.#readPersistedSessionTranscriptV2(
           params.sessionId,
+          options,
         );
         if (persisted !== undefined) return persisted;
       }
       throw error;
     }
+  }
+
+  async readSessionArtifact(params: SessionArtifactReadParams): Promise<SessionArtifactReadResult> {
+    const thread = await this.#readPersistedThreadForSession(params.sessionId, false);
+    if (!thread?.rolloutPath) {
+      throw new AgenCDaemonAgentLifecycleError("INVALID_ARGUMENT", "session artifact not found");
+    }
+    let chunk: ReturnType<typeof readDisplayArtifactChunk>;
+    try { chunk = readDisplayArtifactChunk(dirname(thread.rolloutPath), params.id, params.offset ?? 0, params.length); }
+    catch { throw new AgenCDaemonAgentLifecycleError("INVALID_ARGUMENT", "session artifact not found"); }
+    return { sessionId: params.sessionId, id: params.id, encoding: "base64", data: chunk.data.toString("base64"), size: chunk.size, offset: params.offset ?? 0, nextOffset: chunk.nextOffset };
   }
 
   /**
@@ -3587,6 +3606,7 @@ export class AgenCDaemonAgentManager {
 
   async #readPersistedThreadForSession(
     sessionId: string,
+    includeHistory = true,
   ): Promise<StoredThread | undefined> {
     const threadStore = this.#threadStore;
     if (threadStore === undefined) return undefined;
@@ -3595,7 +3615,7 @@ export class AgenCDaemonAgentManager {
         return threadStore.readThread({
           threadId,
           includeArchived: true,
-          includeHistory: true,
+          includeHistory,
         });
       } catch (error) {
         if (isThreadLogReadMiss(error)) continue;
@@ -3618,6 +3638,7 @@ export class AgenCDaemonAgentManager {
 
   async #readPersistedSessionTranscriptV2(
     sessionId: string,
+    options: { readonly includeCompleteMessages?: boolean } = {},
   ): Promise<SessionTranscriptV2Result | undefined> {
     const thread = await this.#readPersistedThreadForSession(sessionId);
     if (thread === undefined) return undefined;
@@ -3625,6 +3646,17 @@ export class AgenCDaemonAgentManager {
       thread.history?.items ?? [],
       sessionId,
       thread.threadId,
+      undefined,
+      undefined,
+      {
+        ...options,
+        publishTextArtifact: (bytes) => {
+          if (!thread.rolloutPath || !this.#threadStore?.publishTranscriptArtifact) {
+            throw new Error("oversized transcript message requires a session artifact store");
+          }
+          return this.#threadStore.publishTranscriptArtifact(thread.threadId, thread.rolloutPath, bytes);
+        },
+      },
     );
   }
 

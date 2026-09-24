@@ -87,6 +87,7 @@ import {
  * I-74 supply-chain pin.
  */
 export interface MCPToolCatalogPolicyConfig {
+  readonly displayDataRoot?: string;
   readonly desktopAuthorityGrant?: import("./desktop-authority.js").DesktopAuthorityGrant;
   readonly localOnly?: boolean;
   readonly sensitiveHeaders?: Readonly<Record<string, string>>;
@@ -1190,6 +1191,11 @@ export async function createToolBridge(
             callId,
             environment,
             logger,
+            displayRoots: [
+              ...(options.serverConfig?.displayDataRoot ? [options.serverConfig.displayDataRoot] : []),
+              ...(options.permissions?.cwd ? [options.permissions.cwd] : []),
+            ],
+            displayDataRoot: options.serverConfig?.displayDataRoot,
           });
           const effectDisposition = desktopControlEffectReceipt(rawResult, {
             serverName,

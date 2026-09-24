@@ -8,7 +8,7 @@ import { ROUTINE_SESSION_PREPARE_CAPABILITY, type RoutineSessionPreparation } fr
  * land.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { sessionMcpAttachmentIssue } from "../mcp-client/local-control.js";
 import { isAbsolute } from "node:path";
 import { WhisperError, type WhisperService } from "../audio/whisper.js";
@@ -161,6 +161,7 @@ import {
   type SessionAttachResult,
   type SessionCancelTurnParams,
   type SessionTranscriptV2Params,
+  type SessionArtifactReadParams,
   type SessionResolveToolCallAttestationParams,
   type SessionResolveToolCallEvidenceParams,
   type SessionResolveToolCallLegacyParams,
@@ -271,6 +272,7 @@ const MINIMUM_PROTOCOL_MINOR_BY_METHOD: Readonly<
   Partial<Record<AgenCDaemonKnownMethod, number>>
 > = Object.freeze({
   "session.transcript.v2": 2,
+  "session.artifact.read": 18,
   "session.mcp.status": 3,
   "session.permissions.mutateRule": 7,
   "session.shell.execute": 9,
@@ -372,6 +374,7 @@ function buildServerCapabilities(
     "session.processes.stop": hasMethod(agentManager, "stopSessionProcess"),
     "session.transcript": hasMethod(agentManager, "getSessionTranscript"),
     "session.transcript.v2": hasMethod(agentManager, "getSessionTranscriptV2"),
+    "session.artifact.read": hasMethod(agentManager, "readSessionArtifact"),
     "session.cancelTurn": hasMethod(agentManager, "cancelSessionTurn"),
     "session.resolveToolCall": hasMethod(
       agentManager,
@@ -512,6 +515,7 @@ export interface AgenCDaemonDispatcherOptions {
     | "snapshotSession"
     | "getSessionTranscript"
     | "getSessionTranscriptV2"
+    | "readSessionArtifact"
     | "getMcpStatusForSession"
     | "addMcpServerToSession"
     | "reconnectMcpServerOnSession"
@@ -639,6 +643,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     | "snapshotSession"
     | "getSessionTranscript"
     | "getSessionTranscriptV2"
+    | "readSessionArtifact"
     | "getMcpStatusForSession"
     | "addMcpServerToSession"
     | "reconnectMcpServerOnSession"
@@ -1320,12 +1325,63 @@ export class AgenCDaemonJsonRpcDispatcher {
           ),
         );
       case "session.transcript.v2":
-        return successResponse(
-          id,
-          await this.#agentManager.getSessionTranscriptV2(
+        {
+          const clientMinor = Number(connection.initializeState?.clientProtocol.version.split(".")[1] ?? 0);
+          const transcript = await this.#agentManager.getSessionTranscriptV2(
             validateSessionTranscriptV2Params(params),
-          ),
-        );
+            { includeCompleteMessages: clientMinor < 18 },
+          );
+          if (clientMinor >= 18) return successResponse(id, transcript);
+          // Protocol 1.17 has no artifact RPC. Restore complete messages only
+          // while the serialized reply still fits this connection's frame.
+          const maxLegacyBytes = connection.remoteAccess === undefined
+            ? 16 * 1024 * 1024
+            : 1024 * 1024;
+          const messages: Array<(typeof transcript.messages)[number]> = [];
+          const legacyEvents = transcript.events?.filter(event => event.type !== "tool_call_completed");
+          const emptyResponse = successResponse(id, { ...transcript, messages, events: legacyEvents });
+          const emptyPayload = JSON.stringify(emptyResponse);
+          const remote = connection.remoteAccess !== undefined;
+          let measuredBytes = Buffer.byteLength(remote
+            ? JSON.stringify({ t: "data", cid: connection.remoteCid ?? "", payload: emptyPayload })
+            : emptyPayload, "utf8");
+          const addMessage = (message: (typeof transcript.messages)[number]): void => {
+            const part = `${messages.length > 0 ? "," : ""}${JSON.stringify(message)}`;
+            // The remote relay quotes and escapes the JSON payload once more.
+            // Measure that one message's contribution without constructing the
+            // complete reply or relay envelope.
+            measuredBytes += Buffer.byteLength(remote ? JSON.stringify(part).slice(1, -1) : part, "utf8");
+            if (measuredBytes > maxLegacyBytes) throw new Error("legacy transcript exceeds transport limit");
+            messages.push(message);
+          };
+          if (measuredBytes > maxLegacyBytes) throw new Error("legacy transcript exceeds transport limit");
+          for (const { textArtifact, ...message } of transcript.messages) {
+            if (textArtifact === undefined) {
+              addMessage(message);
+              continue;
+            }
+            if (textArtifact.size > maxLegacyBytes - measuredBytes) throw new Error("legacy transcript exceeds transport limit");
+            const chunks: Buffer[] = [];
+            let offset = 0;
+            while (offset < textArtifact.size) {
+              const chunk = await this.#agentManager.readSessionArtifact({ sessionId: transcript.sessionId, id: textArtifact.id, offset, length: 256 * 1024 });
+              const data = Buffer.from(chunk.data, "base64");
+              if (chunk.id !== textArtifact.id || chunk.size !== textArtifact.size || chunk.offset !== offset || data.length === 0 || offset + data.length > textArtifact.size || chunk.nextOffset !== (offset + data.length < textArtifact.size ? offset + data.length : null)) {
+                throw new Error("legacy transcript artifact changed during read");
+              }
+              chunks.push(data);
+              offset += data.length;
+            }
+            const bytes = Buffer.concat(chunks, offset);
+            if (createHash("sha256").update(bytes).digest("hex") !== textArtifact.digest) throw new Error("legacy transcript artifact digest mismatch");
+            addMessage({ ...message, text: bytes.toString("utf8") });
+          }
+          return emptyResponse;
+        }
+      case "session.artifact.read":
+        {
+          return successResponse(id, await this.#agentManager.readSessionArtifact(validateSessionArtifactReadParams(params)));
+        }
       case "session.cancelTurn":
         return successResponse(
           id,
@@ -2256,6 +2312,8 @@ export class AgenCDaemonJsonRpcDispatcher {
 export interface AgenCDaemonJsonRpcConnectionOptions {
   /** In-process browser authority. No JSON-RPC field can populate this. */
   readonly remoteAccess?: RemoteAccessBoundary;
+  /** Remote peer identity used in the relay's outbound JSON envelope. */
+  readonly remoteCid?: string;
   readonly sendNotification?: (message: JsonObject) => void | Promise<void>;
   readonly overloadLimits?: AgenCDaemonOverloadLimitOptions;
 }
@@ -2264,6 +2322,7 @@ let nextConnectionId = 0;
 
 export class AgenCDaemonJsonRpcConnection {
   readonly remoteAccess: RemoteAccessBoundary | undefined;
+  readonly remoteCid: string | undefined;
   readonly #dispatcher: AgenCDaemonJsonRpcDispatcher;
   readonly #sendNotification:
     ((message: JsonObject) => void | Promise<void>) | undefined;
@@ -2283,6 +2342,7 @@ export class AgenCDaemonJsonRpcConnection {
   ) {
     this.#dispatcher = dispatcher;
     this.remoteAccess = options.remoteAccess;
+    this.remoteCid = options.remoteCid;
     this.#sendNotification = options.sendNotification;
     this.#limiter = new AgenCDaemonConnectionLimiter(options.overloadLimits);
     nextConnectionId += 1;
@@ -3399,6 +3459,16 @@ function validateSessionTranscriptV2Params(
   });
   validateRequiredString(validated, "session.transcript.v2", "sessionId");
   return validated as SessionTranscriptV2Params;
+}
+
+function validateSessionArtifactReadParams(params: JsonObject): SessionArtifactReadParams {
+  const validated = validateObjectShape(params, { methodName: "session.artifact.read", stringFields: ["sessionId", "id"], numberFields: ["offset", "length"] });
+  validateRequiredString(validated, "session.artifact.read", "sessionId");
+  validateRequiredString(validated, "session.artifact.read", "id");
+  if (typeof validated.id !== "string" || !/^[a-f0-9]{64}$/u.test(validated.id)) throw invalidParams("session.artifact.read.id must be a SHA-256 digest");
+  if (validated.offset !== undefined && (typeof validated.offset !== "number" || !Number.isSafeInteger(validated.offset) || validated.offset < 0 || validated.offset > 32 * 1024 * 1024)) throw invalidParams("session.artifact.read.offset is invalid");
+  if (validated.length !== undefined && (typeof validated.length !== "number" || !Number.isSafeInteger(validated.length) || validated.length < 1 || validated.length > 512 * 1024)) throw invalidParams("session.artifact.read.length is invalid");
+  return validated as SessionArtifactReadParams;
 }
 
 function validateSessionCancelTurnParams(
