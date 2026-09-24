@@ -6,7 +6,10 @@ import { afterEach, describe, expect, test } from "vitest";
 
 import { linkDirectory, writeUtf8 } from "../helpers/directory-link.js";
 import { loadPlugins } from "../../src/plugins/loader.js";
-import { PLUGIN_MANIFEST_RELATIVE_PATH } from "../../src/plugins/manifest.js";
+import {
+  MAX_PLUGIN_JSON_BYTES,
+  PLUGIN_MANIFEST_RELATIVE_PATH,
+} from "../../src/plugins/manifest.js";
 import { loadPluginCommands } from "../../src/plugins/registration/load-plugin-commands.js";
 
 const roots: string[] = [];
@@ -72,6 +75,33 @@ describe("plugin root containment", () => {
       commands.map((command) => command.getPromptForCommand?.("", {}) ?? []),
     );
     expect(JSON.stringify(prompts)).not.toContain(SECRET);
+  });
+
+  test("rejects a hook file over MAX_PLUGIN_JSON_BYTES without keeping the body", async () => {
+    const { pluginStorageRoot, workspaceRoot } = await workspace();
+    const installedRoot = join(pluginStorageRoot, "oversize-hooks");
+    await writeUtf8(
+      join(installedRoot, PLUGIN_MANIFEST_RELATIVE_PATH),
+      `${JSON.stringify({ name: "oversize-hooks", hooks: "./hooks.json" })}\n`,
+    );
+    const marker = "HOOK_OVERSIZE_SECRET_BYTES";
+    await writeUtf8(
+      join(installedRoot, "hooks.json"),
+      marker + "x".repeat(MAX_PLUGIN_JSON_BYTES),
+    );
+
+    const loaded = await loadPlugins({
+      pluginStorageRoot,
+      workspaceRoot,
+      config: { plugins: { enabled: true } },
+    });
+    const plugin = loaded.enabled.find((entry) => entry.name === "oversize-hooks");
+    expect(plugin).toBeDefined();
+    const issues = [...loaded.errors, ...(plugin?.errors ?? [])];
+    expect(issues.some((issue) => issue.component === "hooks")).toBe(true);
+    expect(JSON.stringify(issues)).toContain("contained read size limit");
+    expect(JSON.stringify(issues)).not.toContain(marker);
+    expect(plugin?.hookSources ?? []).toEqual([]);
   });
 });
 

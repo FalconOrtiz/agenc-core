@@ -19,7 +19,8 @@ export type ContainedRejectCode =
   | "outside-root"
   | "not-file"
   | "not-directory"
-  | "changed";
+  | "changed"
+  | "too-large";
 
 export interface ContainedRoot {
   readonly declaredPath: string;
@@ -71,6 +72,11 @@ export interface ContainedRootIo {
   readonly readdir: (path: string) => Promise<Dirent[]>;
 }
 
+export interface ContainedReadOptions {
+  readonly io?: ContainedRootIo;
+  readonly maxBytes?: number;
+}
+
 export const defaultContainedRootIo: ContainedRootIo = {
   lstat: (path) => lstat(path, { bigint: true }),
   realpath,
@@ -98,6 +104,8 @@ export function containedRejectReason(code: ContainedRejectCode): string {
       return "path is not a directory";
     case "changed":
       return "path changed during read";
+    case "too-large":
+      return "file exceeds the contained read size limit";
   }
 }
 
@@ -181,8 +189,9 @@ export async function inspectContainedPath(
 export async function readContainedUtf8(
   root: ContainedRoot,
   candidatePath: string,
-  io: ContainedRootIo = defaultContainedRootIo,
+  options: ContainedReadOptions = {},
 ): Promise<ContainedRead> {
+  const io = options.io ?? defaultContainedRootIo;
   const inspected = await inspectContainedPath(root, candidatePath, io);
   if (!inspected.ok) return inspected;
   if (inspected.kind !== "file") {
@@ -195,7 +204,13 @@ export async function readContainedUtf8(
     return { ok: false, code: "not-found", declaredPath: inspected.declaredPath };
   }
   try {
-    return await readOpenedContainedUtf8(root, inspected, handle, io);
+    return await readOpenedContainedUtf8(
+      root,
+      inspected,
+      handle,
+      io,
+      options.maxBytes,
+    );
   } catch {
     return { ok: false, code: "not-found", declaredPath: inspected.declaredPath };
   } finally {
@@ -208,10 +223,14 @@ async function readOpenedContainedUtf8(
   inspected: ContainedInspectOk,
   handle: FileHandle,
   io: ContainedRootIo,
+  maxBytes: number | undefined,
 ): Promise<ContainedRead> {
   const opened = await handle.stat({ bigint: true });
   if (!opened.isFile() || !sameStats(inspected.identity, opened)) {
     return { ok: false, code: "changed", declaredPath: inspected.declaredPath };
+  }
+  if (maxBytes !== undefined && opened.size > BigInt(maxBytes)) {
+    return { ok: false, code: "too-large", declaredPath: inspected.declaredPath };
   }
   const finalPath = await resolveOpenedContainedPath(
     handle,
@@ -338,9 +357,25 @@ async function visitContainedDirectory(
     return;
   }
   for (const entry of entries) {
-    if (state.files.length >= options.maxFiles) return;
+    if (state.files.length >= options.maxFiles) {
+      dropContainedListingEntry(current, entry, options, state);
+      continue;
+    }
     await visitContainedChild(root, current, entry, options, io, state);
   }
+}
+
+function dropContainedListingEntry(
+  current: ContainedWalkFrame,
+  entry: Dirent,
+  options: ContainedWalkOptions,
+  state: ContainedWalkState,
+): void {
+  if (options.skipDir?.(entry.name) === true) return;
+  if (entry.isDirectory()) return;
+  if (current.depth === 0 && options.includeStartFiles === false) return;
+  if (!options.collectFile(entry.name)) return;
+  state.droppedCount += 1;
 }
 
 async function visitContainedChild(

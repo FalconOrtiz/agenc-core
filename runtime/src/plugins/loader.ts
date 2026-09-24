@@ -32,6 +32,7 @@ import {
   assertNoRetiredRootPluginManifest,
   findPluginManifestPath,
   loadRequiredPluginManifest,
+  MAX_PLUGIN_JSON_BYTES,
   PLUGIN_MANIFEST_FILE,
   PLUGIN_MANIFEST_RELATIVE_PATH,
   readJsonText,
@@ -1311,7 +1312,9 @@ async function appendHookFile(
     });
     return;
   }
-  const read = await readContainedUtf8(bound, path);
+  const read = await readContainedUtf8(bound, path, {
+    maxBytes: MAX_PLUGIN_JSON_BYTES,
+  });
   if (!read.ok) {
     errors.push({
       type: "hooks",

@@ -42,7 +42,7 @@ describe("root-contained-read", () => {
     expect(root).not.toBeNull();
     const opened: string[] = [];
     const io = symlinkLstatIo(filePath, opened);
-    const read = await readContainedUtf8(root!, filePath, io);
+    const read = await readContainedUtf8(root!, filePath, { io });
     expect(read).toEqual({
       ok: false,
       code: "symlink",
@@ -133,7 +133,7 @@ describe("root-contained-read", () => {
       },
       readdir: defaultContainedRootIo.readdir,
     };
-    await expect(readContainedUtf8(root!, filePath, io)).resolves.toEqual({
+    await expect(readContainedUtf8(root!, filePath, { io })).resolves.toEqual({
       ok: false,
       code: "not-found",
       declaredPath: resolve(filePath),
@@ -163,11 +163,67 @@ describe("root-contained-read", () => {
         return defaultContainedRootIo.open(path, flags);
       },
     };
-    const read = await readContainedUtf8(root!, filePath, io);
+    const read = await readContainedUtf8(root!, filePath, { io });
     expect(read.ok).toBe(false);
     if (read.ok) return;
     expect(["changed", "not-found", "outside-root"]).toContain(read.code);
     expect(JSON.stringify(read)).not.toContain("OUTSIDE_SWAP_SECRET");
+  });
+
+  test("counts leftover collectable names as dropped after maxFiles without inspecting them", async () => {
+    const rootDir = await tempRoot();
+    await writeFile(join(rootDir, "keep-a.md"), "keep-a\n", "utf8");
+    await writeFile(join(rootDir, "keep-b.md"), "keep-b\n", "utf8");
+    await writeFile(join(rootDir, "drop-c.md"), "DROP_C_BODY\n", "utf8");
+    await writeFile(join(rootDir, "drop-d.md"), "DROP_D_BODY\n", "utf8");
+    await writeFile(join(rootDir, "notes.txt"), "ignored\n", "utf8");
+    const root = await bindContainedRoot(rootDir);
+    expect(root).not.toBeNull();
+    const inspected: string[] = [];
+    const listingOrder = ["keep-a.md", "keep-b.md", "drop-c.md", "drop-d.md", "notes.txt"];
+    const io: ContainedRootIo = {
+      ...defaultContainedRootIo,
+      lstat: async (path) => {
+        inspected.push(resolve(path));
+        return defaultContainedRootIo.lstat(path);
+      },
+      readdir: async (path) => {
+        const entries = await defaultContainedRootIo.readdir(path);
+        return [...entries].sort(
+          (left, right) => listingOrder.indexOf(left.name) - listingOrder.indexOf(right.name),
+        );
+      },
+    };
+    const walked = await walkContainedFiles(
+      root!,
+      rootDir,
+      {
+        maxDepth: 2,
+        maxFiles: 2,
+        collectFile: (name) => name.endsWith(".md"),
+      },
+      io,
+    );
+    expect(walked.files).toHaveLength(2);
+    expect(walked.droppedCount).toBe(2);
+    expect(inspected.some((path) => path.endsWith("drop-c.md"))).toBe(false);
+    expect(inspected.some((path) => path.endsWith("drop-d.md"))).toBe(false);
+  });
+
+  test("rejects a contained read larger than maxBytes before returning the body", async () => {
+    const rootDir = await tempRoot();
+    const filePath = join(rootDir, "hooks.json");
+    const oversized = `{"secret":"${"HOOK_OVERSIZE_SECRET".repeat(8)}"}`;
+    await writeFile(filePath, oversized, "utf8");
+    const root = await bindContainedRoot(rootDir);
+    expect(root).not.toBeNull();
+    const read = await readContainedUtf8(root!, filePath, { maxBytes: 32 });
+    expect(read).toEqual({
+      ok: false,
+      code: "too-large",
+      declaredPath: resolve(filePath),
+    });
+    expect(JSON.stringify(read)).not.toContain("HOOK_OVERSIZE_SECRET");
   });
 });
 
