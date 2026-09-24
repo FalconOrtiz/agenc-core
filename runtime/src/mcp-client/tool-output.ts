@@ -19,7 +19,8 @@ import {
 } from "../utils/toolResultStorage.js";
 import type { Logger } from "./_deps/logger.js";
 import type { ToolResult } from "./_deps/tools-types.js";
-import { DISPLAY_ATTACHMENT_LIMIT, DISPLAY_BINARY_LIMIT, DISPLAY_WORK_LIMIT, DisplayValidationError, validateDisplayBlock, type DisplayAttachment } from "./display-attachments.js";
+import { DISPLAY_ATTACHMENT_LIMIT, DISPLAY_BINARY_LIMIT, DISPLAY_WORK_LIMIT, DisplayValidationError, peekDisplayArtifactBytes, releaseDisplayArtifactBytes, validateDisplayBlock, withDisplayAttachmentTitle, type DisplayAttachment } from "./display-attachments.js";
+import { redactMcpAttachmentText, redactMcpAttachmentValue } from "./local-control.js";
 import {
   consumeMcpSanitizationBudget,
   createMcpSanitizationBudget,
@@ -55,6 +56,8 @@ interface BinaryArtifact {
 
 export interface NormalizeMcpToolOutputOptions {
   readonly raw: unknown;
+  /** Original plugin result retained solely for decisions and authorized file reads. */
+  readonly originalRaw?: unknown;
   readonly serverName: string;
   readonly toolName: string;
   readonly callId: string;
@@ -63,6 +66,38 @@ export interface NormalizeMcpToolOutputOptions {
   /** Trusted roots supplied by the plugin bridge, never from MCP output. */
   readonly displayRoots?: readonly string[];
   readonly displayDataRoot?: string;
+  readonly sensitiveHeaders?: Readonly<Record<string, string>>;
+}
+
+function containsLiteralSecret(bytes: Buffer, headers?: Readonly<Record<string, string>>): boolean {
+  for (const value of Object.values(headers ?? {})) {
+    for (const secret of [value, value.replace(/^Bearer\s+/i, "")]) {
+      if (secret.length < 4) continue;
+      // JSON bytes (a chart or table, a .json file) hold the escaped form.
+      for (const form of new Set([secret, JSON.stringify(secret).slice(1, -1)])) {
+        if (bytes.includes(Buffer.from(form, "utf8"))) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Chart/table JSON is redacted structurally before validation. Binary bytes
+ * must be checked after the authorized read, before an attachment is emitted. */
+function displayContainsLiteralSecret(attachment: DisplayAttachment, headers?: Readonly<Record<string, string>>): boolean {
+  if (headers === undefined) return false;
+  const bytes = peekDisplayArtifactBytes(attachment);
+  return attachment.kind !== "chart" && attachment.kind !== "table" && bytes !== undefined && containsLiteralSecret(bytes, headers);
+}
+
+function containsEncodedLiteralSecret(encoded: unknown, headers?: Readonly<Record<string, string>>): boolean {
+  if (typeof encoded !== "string" || encoded.length > MAX_MCP_BASE64_INSPECTION_BYTES) return false;
+  for (const value of Object.values(headers ?? {})) {
+    for (const secret of [value, value.replace(/^Bearer\s+/i, "")]) {
+      if (secret.length >= 4 && encoded.includes(secret)) return true;
+    }
+  }
+  return false;
 }
 
 interface RenderState {
@@ -243,7 +278,13 @@ async function appendBinary(
   index: number,
   options: NormalizeMcpToolOutputOptions,
 ): Promise<void> {
-  const bytes = decodeBase64WithinBudget(state, record.data ?? record.blob);
+  const encoded = record.data ?? record.blob;
+  if (containsEncodedLiteralSecret(encoded, options.sensitiveHeaders)) {
+    appendStaticText(state, `[MCP ${contentType} omitted: contained a saved secret]`);
+    state.omitted = true;
+    return;
+  }
+  const bytes = decodeBase64WithinBudget(state, encoded);
   const mimeType = sanitizeMimeType(
     state,
     record.mimeType ?? record.mediaType,
@@ -253,6 +294,13 @@ async function appendBinary(
     options.logger.warn?.(
       `MCP tool ${JSON.stringify(options.toolName)} returned invalid or oversized ${contentType} content; omitted`,
     );
+    return;
+  }
+  // Binary bytes cannot be rewritten without corrupting them. Omit a blob
+  // whose decoded text contains a literal saved secret before persistence.
+  if (containsLiteralSecret(bytes, options.sensitiveHeaders)) {
+    appendStaticText(state, `[MCP ${contentType} omitted: contained a saved secret]`);
+    state.omitted = true;
     return;
   }
 
@@ -304,6 +352,12 @@ async function appendImage(
   }
   state.imagesProcessed += 1;
 
+  if (containsEncodedLiteralSecret(encoded, options.sensitiveHeaders)) {
+    appendStaticText(state, "[MCP image omitted: contained a saved secret]");
+    state.omitted = true;
+    return;
+  }
+
   const bytes = decodeBase64WithinBudget(state, encoded);
   const rawDeclaredMime = record.mimeType ?? record.mediaType;
   const declaredMime = rawDeclaredMime === undefined
@@ -311,6 +365,11 @@ async function appendImage(
     : sanitizeMimeType(state, rawDeclaredMime);
   if (bytes === undefined) {
     appendStaticText(state, IMAGE_OMITTED);
+    return;
+  }
+  if (containsLiteralSecret(bytes, options.sensitiveHeaders)) {
+    appendStaticText(state, "[MCP image omitted: contained a saved secret]");
+    state.omitted = true;
     return;
   }
   const inspection = inspectImageBytes(bytes);
@@ -596,6 +655,8 @@ export async function normalizeMcpToolOutput(
     for (const [index, block] of retainedBlocks.entries()) {
       state.contentBlocksProcessed += 1;
       const displayRecord = asRecord(block);
+      const originalContent = asRecord(options.originalRaw)?.content;
+      const originalDisplayRecord = asRecord(Array.isArray(originalContent) ? originalContent[index] : block);
       const annotations = asRecord(displayRecord?.annotations);
       if (Array.isArray(annotations?.audience) && annotations.audience.length === 1 && annotations.audience[0] === "user") {
         if (state.displayAttachments.length >= DISPLAY_ATTACHMENT_LIMIT) {
@@ -603,13 +664,37 @@ export async function normalizeMcpToolOutput(
           continue;
         }
         try {
-          const shown = await validateDisplayBlock(displayRecord ?? {}, options.displayRoots ?? [], undefined, options.displayDataRoot, displayBudget);
+          const safeDisplay = redactMcpAttachmentValue(displayRecord ?? {}, options.sensitiveHeaders, undefined, "content-block");
+          // The bridge redacts before normalizing: a block whose bytes held a
+          // saved secret arrives emptied and marked omitted. Never show it.
+          if (options.sensitiveHeaders !== undefined &&
+              (safeDisplay.omitted === true || asRecord(safeDisplay.resource)?.omitted === true)) {
+            throw new DisplayValidationError("contained a saved secret");
+          }
+          const fileLink = originalDisplayRecord?.type === "resource_link" && displayRecord?.type === "resource_link";
+          // A file is read from its original URI, but its title is built from
+          // the redacted name: the validator truncates titles, and a secret cut
+          // at that boundary could no longer be matched afterwards.
+          const linkBlock = fileLink ? {
+            ...originalDisplayRecord,
+            ...("name" in safeDisplay ? { name: safeDisplay.name } : {}),
+            ...("title" in safeDisplay ? { title: safeDisplay.title } : {}),
+          } : safeDisplay;
+          const shown = await validateDisplayBlock(linkBlock, options.displayRoots ?? [], undefined, options.displayDataRoot, displayBudget);
+          if (displayContainsLiteralSecret(shown.attachment, options.sensitiveHeaders)) {
+            releaseDisplayArtifactBytes(shown.attachment);
+            throw new DisplayValidationError("contained a saved secret");
+          }
+          const attachment = fileLink
+            ? withDisplayAttachmentTitle(shown.attachment, redactMcpAttachmentText(shown.attachment.title, options.sensitiveHeaders))
+            : shown.attachment;
+          const caption = fileLink ? redactMcpAttachmentText(shown.caption, options.sensitiveHeaders) : shown.caption;
           const imageBytes = state.displayAttachments.filter(item => item.kind === "image").reduce((sum, item) => sum + item.size, 0);
-          if (shown.attachment.kind === "image" && imageBytes + shown.attachment.size > DISPLAY_BINARY_LIMIT) throw new DisplayValidationError("images exceed 5 MiB per result");
-          const inlineBytes = [...state.displayAttachments, shown.attachment].reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item), "utf8"), 0);
+          if (attachment.kind === "image" && imageBytes + attachment.size > DISPLAY_BINARY_LIMIT) throw new DisplayValidationError("images exceed 5 MiB per result");
+          const inlineBytes = [...state.displayAttachments, attachment].reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item), "utf8"), 0);
           if (inlineBytes > MAX_DISPLAY_INLINE_COMPLETION_BYTES) throw new DisplayValidationError("display attachments exceed journal budget");
-          state.displayAttachments.push(shown.attachment);
-          appendStaticText(state, shown.caption);
+          state.displayAttachments.push(attachment);
+          appendStaticText(state, caption);
         } catch (error) {
           const reason = error instanceof DisplayValidationError ? error.message : "file could not be read";
           appendStaticText(state, `[Display attachment could not be shown: ${reason}]`);

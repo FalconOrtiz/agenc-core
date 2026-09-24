@@ -42,6 +42,7 @@ import { redactSecretsInValue } from "../../src/secrets/sanitizer.js";
 import { sessionTranscriptV2FromRollout } from "../../src/app-server/background-agent-runner.js";
 import { adaptTranscriptEvents } from "../../src/tui/session-transcript.js";
 import { toToolCatalogPolicyConfig } from "../../src/mcp-client/resilient-client.js";
+import { redactMcpAttachmentValue } from "../../src/mcp-client/local-control.js";
 
 const directories: string[] = [];
 afterEach(async () => { fsyncFailure.enabled = false; fsyncFailure.directoryCalls = 0; fileOpens.count = 0; fileRace.target = ""; fileRace.switched = false; fileRace.restored = false; fileRace.switchAncestor = undefined; fileRace.restoreAncestor = undefined; vi.restoreAllMocks(); await Promise.all(directories.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
@@ -52,6 +53,135 @@ const table = { version: 1, title: "Holdings", columns: [{ key: "symbol", label:
 const resource = (mimeType: string, data: unknown) => ({ type: "resource", annotations: user, resource: { uri: "agenc:test", mimeType, text: JSON.stringify(data) } });
 const normalize = (content: unknown[], displayRoots: string[] = []) => normalizeMcpToolOutput({ raw: { content }, serverName: "fixture", toolName: "show", callId: "call-1", environment: { MAX_MCP_OUTPUT_TOKENS: "100000" }, logger, displayRoots, displayDataRoot: displayRoots[0] });
 const attachments = (result: Awaited<ReturnType<typeof normalize>>) => result.metadata?.displayAttachments as Array<{ id: string; kind: string; title: string; data?: unknown }> | undefined;
+
+describe("display attachments and saved plugin secrets", () => {
+  const secret = "s3cret-\"quoted\"-value";
+  const normalizeWithSecret = (content: unknown[]) => normalizeMcpToolOutput({ raw: { content }, serverName: "plugin:demo:show", toolName: "show", callId: "call-secret", environment: { MAX_MCP_OUTPUT_TOKENS: "100000" }, logger, displayRoots: [], sensitiveHeaders: { token: secret } });
+  it.each([
+    ["a chart series name", resource("application/vnd.agenc.chart+json", { ...chart, series: [{ ...chart.series[0], name: `Close ${secret}` }] })],
+    ["a table cell", resource("application/vnd.agenc.table+json", { ...table, rows: [{ symbol: secret }] })],
+  ])("redacts %s while retaining a valid display attachment", async (_where, block) => {
+    const result = await normalizeWithSecret([block]);
+    expect(attachments(result)).toHaveLength(1);
+    expect(JSON.stringify(attachments(result))).toContain("[REDACTED]");
+    expect(JSON.stringify(result)).not.toContain("s3cret-");
+  });
+  it("omits an embedded file containing a saved secret", async () => {
+    const result = await normalizeWithSecret([{ type: "resource", annotations: user, resource: { uri: "agenc:test", name: "notes.txt", mimeType: "text/plain", blob: Buffer.from(`token=${secret}`).toString("base64") } }]);
+    expect(attachments(result)).toBeUndefined();
+    expect(result.content).toContain("contained a saved secret");
+  });
+  it("redacts an unknown chart kind in a model-facing resource", async () => {
+    const secret = "private-phrase";
+    const raw = redactMcpAttachmentValue({ content: [{
+      type: "resource",
+      resource: { uri: "agenc:chart", mimeType: "application/vnd.agenc.chart+json", text: JSON.stringify({ kind: secret }) },
+    }] }, { token: secret }, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-kind", environment: {}, logger });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(result.content).toContain("[REDACTED]");
+  });
+  it.each([
+    ["series type", "application/vnd.agenc.chart+json", { ...chart, series: [{ ...chart.series[0], type: "private-phrase" }] }],
+    ["series scale", "application/vnd.agenc.chart+json", { ...chart, series: [{ ...chart.series[0], scale: "private-phrase" }] }],
+    ["currency", "application/vnd.agenc.chart+json", { ...chart, currency: "private-phrase" }],
+    ["table column key", "application/vnd.agenc.table+json", { ...table, columns: [{ key: "private-phrase", label: "Symbol" }], rows: [{ "private-phrase": "NVDA" }] }],
+    ["table column format", "application/vnd.agenc.table+json", { ...table, columns: [{ key: "symbol", label: "Symbol", format: "private-phrase" }] }],
+  ])("redacts plugin payload in %s on a model-facing resource", async (_field, mimeType, data) => {
+    const secret = "private-phrase";
+    const raw = redactMcpAttachmentValue({ content: [{ type: "resource", resource: { uri: "agenc:data", mimeType, text: JSON.stringify(data) } }] }, { token: secret }, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-payload", environment: {}, logger });
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(result.content).toContain("[REDACTED]");
+  });
+  it("does not treat a timeseries type as structure in a category chart", () => {
+    const input = { type: "resource", resource: { mimeType: "application/vnd.agenc.chart+json", text: JSON.stringify({ kind: "category", series: [{ type: "line" }] }) } };
+    const safe = redactMcpAttachmentValue(input, { token: "line" }, undefined, "content-block");
+    expect(safe.resource.text).toContain('"type":"[REDACTED]"');
+  });
+  it.each(["title", "rows", "line", "price"])("keeps display schema and Core defaults when the saved secret is %s", async value => {
+    const headers = { token: value };
+    const chartInput = value === "title" ? { ...chart, title: value } : chart;
+    const tableInput = value === "line" ? { ...table, columns: [{ key: "type", label: "Type" }], rows: [{ type: value }] }
+      : value === "rows" ? { ...table, rows: [{ symbol: value }] }
+      : value === "title" ? { ...table, title: value } : table;
+    const content = [resource("application/vnd.agenc.chart+json", chartInput), resource("application/vnd.agenc.table+json", tableInput)];
+    const raw = redactMcpAttachmentValue({ content }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: `call-${value}`, environment: {}, logger, sensitiveHeaders: headers });
+    expect(attachments(result)?.map(item => item.kind)).toEqual(["chart", "table"]);
+    expect(result.content).not.toContain("could not be shown");
+    expect((attachments(result)?.[0]?.data as typeof chart).series[0]?.type).toBe("line");
+    expect((attachments(result)?.[0]?.data as typeof chart).series[0]?.scale).toBe("price");
+    if (value === "line") expect((attachments(result)?.[1]?.data as typeof tableInput).rows[0]?.type).toBe("[REDACTED]");
+    if (value === "rows") expect((attachments(result)?.[1]?.data as typeof table).rows[0]?.symbol).toBe("[REDACTED]");
+    if (value === "title") expect(attachments(result)?.map(item => item.title)).toEqual(["[REDACTED]", "[REDACTED]"]);
+  });
+  it.each([
+    ["an embedded file", { type: "resource", annotations: user, resource: { uri: "agenc:test", name: "notes.txt", mimeType: "text/plain", blob: Buffer.from(`notes ${secret}`).toString("base64") } }],
+    ["an image", { type: "image", annotations: user, mimeType: "image/png", data: Buffer.from(`png ${secret}`).toString("base64") }],
+  ])("does not show %s the bridge already emptied for holding a saved secret", async (_what, block) => {
+    // Same order as the MCP bridge: redact the raw result, then normalize it.
+    const headers = { token: secret };
+    const raw = redactMcpAttachmentValue({ content: [block] }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-secret", environment: { MAX_MCP_OUTPUT_TOKENS: "100000" }, logger, displayRoots: [], sensitiveHeaders: headers });
+    expect(attachments(result)).toBeUndefined();
+    expect(result.content).toContain("[Display attachment could not be shown: contained a saved secret]");
+    expect(result.content).not.toContain("0 bytes");
+  });
+  it.each(["user", "audience"])("keeps a user-only table away from the model when a saved secret is %j", async (value) => {
+    // Same order as the MCP bridge: redact the raw result, then normalize it.
+    const headers = { token: value };
+    const raw = redactMcpAttachmentValue({ content: [resource("application/vnd.agenc.table+json", table)] }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-secret", environment: { MAX_MCP_OUTPUT_TOKENS: "100000" }, logger, displayRoots: [], sensitiveHeaders: headers });
+    expect(attachments(result)).toHaveLength(1);
+    expect(result.content).not.toContain("NVDA");
+    expect(JSON.stringify(result.codeModeResult ?? null)).not.toContain("NVDA");
+  });
+  it.each(["json", "image", "table"])("keeps MIME routing when a saved secret is %j", async (value) => {
+    const headers = { token: value };
+    const sharp = (await import("sharp")).default;
+    const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: "red" } }).png().toBuffer();
+    const raw = redactMcpAttachmentValue({ content: [
+      resource("application/vnd.agenc.table+json", table),
+      { type: "image", annotations: user, mimeType: "image/png", data: png.toString("base64"), name: "Plot" },
+    ] }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-secret", environment: { MAX_MCP_OUTPUT_TOKENS: "100000" }, logger, displayRoots: [], sensitiveHeaders: headers });
+    expect(attachments(result)?.map(item => item.kind)).toEqual(["table", "image"]);
+  });
+  it.each(["resource", "text"])("keeps a user-only table when a saved secret is %j", async value => {
+    const headers = { token: value };
+    const raw = redactMcpAttachmentValue({ content: [resource("application/vnd.agenc.table+json", table)] }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-table", environment: {}, logger, sensitiveHeaders: headers });
+    expect(attachments(result)?.map(item => item.kind)).toEqual(["table"]);
+    expect(JSON.stringify(result.codeModeResult)).not.toContain('"symbol":"NVDA"');
+  });
+  it("keeps a file link URI scheme through redaction and display routing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mcp-link-"));
+    directories.push(root);
+    const path = join(root, "report.txt");
+    await writeFile(path, "report bytes");
+    const uri = pathToFileURL(path).href;
+    const raw = redactMcpAttachmentValue({ content: [{ type: "resource_link", annotations: user, uri, name: "report.txt", mimeType: "text/plain" }] }, { token: "file" }, undefined, "tool-result");
+    expect(raw.content[0]!.uri).toBe(uri);
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-file", environment: {}, logger, displayRoots: [root], displayDataRoot: root });
+    expect(result.content).not.toContain("file link must use a file: URI");
+    if (process.platform === "linux") expect(attachments(result)?.map(item => item.kind)).toEqual(["file"]);
+  });
+  it.each(["image/png; charset=binary", "image/jpg"])("retains routed model image MIME %s", async mimeType => {
+    const sharp = (await import("sharp")).default;
+    const bytes = mimeType.includes("jpg")
+      ? await sharp({ create: { width: 2, height: 2, channels: 3, background: "red" } }).jpeg().toBuffer()
+      : await sharp({ create: { width: 2, height: 2, channels: 3, background: "red" } }).png().toBuffer();
+    const headers = { token: "image" };
+    const raw = redactMcpAttachmentValue({ content: [{ type: "image", mimeType, data: bytes.toString("base64") }] }, headers, undefined, "tool-result");
+    const result = await normalizeMcpToolOutput({ raw, serverName: "plugin:demo:show", toolName: "show", callId: "call-image", environment: {}, logger, sensitiveHeaders: headers });
+    expect(result.contentItems?.some(item => item.type === "input_image")).toBe(true);
+  });
+  it("still shows an attachment without a saved secret", async () => {
+    const result = await normalizeWithSecret([resource("application/vnd.agenc.chart+json", chart)]);
+    expect(attachments(result)).toHaveLength(1);
+  });
+});
 
 describe("MCP user audience display attachments", () => {
   it("does not treat a user configured AGENC_PLUGIN_DATA variable as an AgenC created plugin directory", () => {

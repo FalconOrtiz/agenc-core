@@ -99,6 +99,40 @@ function installPromptAdmission(
 }
 
 describe("createPromptBridge", () => {
+  it("keeps a generated prompt alias usable after render redaction", async () => {
+    installPromptAdmission();
+    try {
+      const getPrompt = vi.fn(async () => ({ messages: [{ role: "user", content: { type: "text", text: "body" } }] }));
+      const bridge = await createPromptBridge(makeClient({ listPrompts: vi.fn().mockResolvedValue({ prompts: [{ name: "private-prompt" }] }), getPrompt }), "srv", undefined, { sensitiveHeaders: { token: "prompt" } });
+      const alias = (await bridge.listPrompts())[0]!.name;
+      expect(alias).toMatch(/^agenc-redacted-prompt-[a-f0-9]{64}$/);
+      expect((await bridge.renderPrompt(alias)).promptName).toBe(alias);
+      expect((await bridge.renderPrompt(alias)).promptName).toBe(alias);
+      expect(getPrompt).toHaveBeenCalledTimes(2);
+    } finally { clearCurrentRuntimeSession(); }
+  });
+  it("redacts an alias-shaped URI in plugin prompt content while preserving the issued prompt alias", async () => {
+    installPromptAdmission();
+    try {
+      const secret = "deadbeef";
+      const lookalike = `agenc-redacted-resource:${secret}${"a".repeat(56)}`;
+      const bridge = await createPromptBridge(makeClient({
+        listPrompts: vi.fn().mockResolvedValue({ prompts: [{ name: `${secret}-prompt` }] }),
+        getPrompt: vi.fn(async () => ({ messages: [{ role: "user", content: { type: "resource", resource: { uri: lookalike, text: "body" } } }] })),
+      }), "srv", undefined, { sensitiveHeaders: { token: secret } });
+      const alias = (await bridge.listPrompts())[0]!.name;
+      expect(alias).toMatch(/^agenc-redacted-prompt-[a-f0-9]{64}$/);
+      const rendered = await bridge.renderPrompt(alias);
+      expect(rendered.promptName).toBe(alias);
+      expect(JSON.stringify(rendered)).not.toContain(secret);
+    } finally { clearCurrentRuntimeSession(); }
+  });
+  it("keeps colliding prompt aliases stable across listings", async () => {
+    const names = ["alpha-private", "alpha-other"];
+    const bridge = await createPromptBridge(makeClient({ listPrompts: vi.fn().mockResolvedValue({ prompts: names.map(name => ({ name })) }) }), "srv", undefined, { sensitiveHeaders: { token: "private", other: "other" } });
+    const first = await bridge.listPrompts();
+    expect((await bridge.listPrompts()).map(item => item.name)).toEqual(first.map(item => item.name));
+  });
   beforeEach(() => {
     installPromptAdmission();
   });
@@ -672,6 +706,22 @@ describe("createPromptBridge", () => {
       type: "image",
       data: "base64-blob",
     });
+  });
+
+  it("redacts prompt text while preserving block types and omitting affected binary data", async () => {
+    const bridge = await createPromptBridge(makeClient({ getPrompt: vi.fn().mockResolvedValue({ messages: [
+      { role: "user", content: { type: "text", text: "AAAA and text" } },
+      { role: "assistant", content: { type: "image", data: "QUFBQQ==", mimeType: "image/png" } },
+      { role: "user", content: { type: "image", data: "AAAA", mimeType: "image/png" } },
+      { role: "assistant", content: { type: "text", text: 42 } },
+    ] }) }), "srv", undefined, { sensitiveHeaders: { token: "AAAA", kind: "text" } });
+    const rendered = await bridge.renderPrompt("x");
+    expect(rendered.messages[1].text).toBe("[REDACTED] and [REDACTED]");
+    expect(rendered.messages[2].rawContent).toMatchObject({ type: "image", data: "", omitted: true });
+    expect(rendered.messages[3].rawContent).toMatchObject({ type: "image", data: "", omitted: true });
+    expect(rendered.messages[4].rawContent).toMatchObject({ type: "text", text: 42 });
+    expect(JSON.stringify(rendered)).not.toContain("QUFBQQ==");
+    expect(JSON.stringify(rendered)).not.toContain('"type":"[REDACTED]"');
   });
 
   it("throws after disposal", async () => {
