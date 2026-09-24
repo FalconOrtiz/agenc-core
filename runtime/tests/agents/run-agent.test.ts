@@ -32,6 +32,9 @@ import { UnifiedExecProcessManager } from "../../src/unified-exec/process-manage
 import { childApprovalRevocationSignal, isApprovalSessionOwnedBy, observeChildApprovalSessions } from "../../src/agents/child-approval-context.js";
 import { AgentRegistry } from "./registry.js";
 import { createMultiAgentV2Tools } from "./v2/index.js";
+import { createSpawnAgentTool } from "./v2/spawn.js";
+import { AgentRoleCatalog } from "./role-catalog.js";
+import type { MultiAgentV2Options } from "./v2/common.js";
 import { bindLiveAgentSession, liveAgentSession } from "./live-session.js";
 import {
   buildFilteredRegistry,
@@ -53,6 +56,8 @@ import {
   readProviderIdentity,
 } from "../llm/provider.js";
 import { createGeminiEndpointPlan } from "../llm/providers/gemini/endpoint-plan.js";
+import { GrokProvider } from "../llm/providers/grok/adapter.js";
+import { AgenCProvider } from "../llm/providers/agenc/index.js";
 import { ZaiProvider } from "../llm/providers/zai/index.js";
 import { OpenAIProvider } from "../llm/providers/openai/adapter.js";
 import {
@@ -722,14 +727,20 @@ describe("wrapProviderForAgentSummary", () => {
 });
 
 describe("runAgent", () => {
-  function crossProviderRuntime(target: LLMProvider, configStore: ConfigStore) {
+  function crossProviderRuntime(target: LLMProvider, configStore: ConfigStore,
+    selection = { provider: "deepseek", model: "deepseek-v4-pro" },
+    authProfile?: "sign_in") {
     const rootProvider = makeProvider([]);
     const prepare = vi.fn(async () => ({
-      binding: { provider: "deepseek", model: "deepseek-v4-pro", instance: target },
+      binding: { ...selection, instance: target },
+      ...(authProfile !== undefined ? { authProfile, billingSource: authProfile } : {}),
     }));
     const providerService = {
       current: () => ({ provider: "grok", model: "grok-4.6", instance: rootProvider }),
       environment: () => Object.freeze({ DEEPSEEK_API_KEY: "captured-target-key" }),
+      ...(authProfile !== undefined ? { previewChildDestination: async () => ({
+        endpoint: "https://api.openai.com/v1", authProfile, billingSource: authProfile,
+      }) } : {}),
       prepare,
       prepareChild: prepare,
       forkForChild: (provider: LLMProvider, selection: { provider: string; model: string }) =>
@@ -747,13 +758,14 @@ describe("runAgent", () => {
       sandboxExecutionBroker: new SandboxExecutionBroker({ mode: "read_only", cwd: "/tmp" }),
     } });
     const modelInfo: ModelInfo = {
-      ...mkModelInfo(), slug: "deepseek-v4-pro", contextWindow: 1_048_576,
+      ...mkModelInfo(), slug: selection.model, contextWindow: 1_048_576,
       supportedReasoningLevels: ["low", "high", "max"],
     };
     return { parent, rootProvider, prepare, modelInfo };
   }
 
-  async function authorizedCrossProviderPlan(parent: Session, modelInfo: ModelInfo) {
+  async function authorizedCrossProviderPlan(parent: Session, modelInfo: ModelInfo,
+    selection = { provider: "deepseek", model: "deepseek-v4-pro" }) {
     Object.assign(parent.services, { crossProviderConsent: {
       ownerSessionId: parent.conversationId, sessionEpoch: "run-agent-test-human",
       request: async (_session: Session, disclosure: { taskId: string; scopeKey: string; payloadKey: string }) => ({
@@ -764,13 +776,250 @@ describe("runAgent", () => {
       }),
     } });
     const proposed = await createChildExecutionPlan({ session: parent,
-      selection: { provider: "deepseek", model: "deepseek-v4-pro" }, modelInfo,
+      selection, modelInfo,
       parentPath: "/root", taskId: "run-agent-test-task", taskName: "worker", taskText: "go",
       toolFree: false, forkedHistory: false });
     const authorized = await authorizeChildExecutionPlan(parent, proposed);
     if (authorized.kind !== "granted") throw new Error("fixture consent failed");
     return authorized.plan;
   }
+
+  it.each([
+    { provider: "deepseek", model: "deepseek-v4-pro", authProfile: undefined },
+    { provider: "openai", model: "gpt-6-luna", authProfile: "sign_in" as const },
+  ])("sends a $provider child's own identity and prompt to its provider", async ({ provider, model, authProfile }) => {
+    const selection = { provider, model };
+    const configStore = new ConfigStore({ cwd: "/tmp", base: {
+      agents: { cross_provider_enabled: true, allowed_providers: ["deepseek", "openai"] },
+    } });
+    let requestPrompt = "";
+    let requestSpawnModel: { description: string; enum?: string[] } | undefined;
+    const target = { ...makeProvider([]), name: provider,
+      chatStream: vi.fn(async (_messages: LLMMessage[], _onChunk: StreamProgressCallback,
+        options?: LLMChatOptions): Promise<LLMResponse> => {
+        requestPrompt = options?.systemPrompt ?? "";
+        requestSpawnModel = (options?.tools?.find((tool) => tool.function.name === "spawn_agent")?.function.parameters as
+          { properties?: { model?: { description: string; enum?: string[] } } } | undefined)?.properties?.model;
+        return { content: "done", toolCalls: [], usage: {
+          promptTokens: 0, completionTokens: 0, totalTokens: 0,
+        }, model, finishReason: "stop" };
+      }),
+    } satisfies LLMProvider;
+    const { parent, modelInfo } = crossProviderRuntime(target, configStore, selection, authProfile);
+    const spawnTool = createSpawnAgentTool({
+      getSession: () => parent,
+      workspace: ROLE_WORKSPACE,
+      roleCatalog: new AgentRoleCatalog(ROLE_WORKSPACE),
+      ensureAgentControl: () => { throw new Error("not used"); },
+    } as unknown as MultiAgentV2Options);
+    Object.assign(parent.services, { registry: {
+      ...mkRegistry(), tools: [spawnTool],
+      toLLMTools: () => [{ type: "function", function: {
+        name: spawnTool.name, description: spawnTool.description, parameters: spawnTool.inputSchema,
+      } }],
+    } satisfies ToolRegistry });
+    await parent.state.with((state) => { state.sessionConfiguration = {
+      ...state.sessionConfiguration,
+      collaborationMode: { model: "grok-4.7" },
+      baseInstructions: "# Grok-specific notes\nModel: grok-4.7 (provider: grok)",
+    }; });
+    const plan = await authorizedCrossProviderPlan(parent, {
+      ...modelInfo,
+      modelMessages: { instructionsTemplate:
+        `${provider.toUpperCase()} provider notes\n{{ base_instructions }}` },
+    }, selection);
+    expect(plan.destination.authProfile).toBe(authProfile ?? "api_key");
+    const { live } = await spawnLive(parent);
+    const { result } = await collectRun(runAgent({ live, parent,
+      initialMessages: [{ role: "user", content: "go" }], taskPrompt: "go", plan,
+    }));
+    expect(result.outcome).toBe("completed");
+    expect(target.chatStream).toHaveBeenCalled();
+    expect(requestPrompt).toContain(`Model: ${model} (provider: ${provider})`);
+    expect(requestSpawnModel?.description).toContain(`current model (\`${model}\`)`);
+    expect(requestSpawnModel?.description).not.toContain("current model (`grok-4.7`)");
+    expect(requestPrompt).toContain(`${provider.toUpperCase()} provider notes`);
+    expect(requestPrompt).not.toMatch(/grok|xai/iu);
+  });
+
+  it.each([
+    { model: "grok-4.6", expected: "Model: grok-4.6 (provider: grok)" },
+    { model: "grok-4.7", expected: "SAME_MODEL_BASE" },
+  ])("sends a same-provider $model child's correct base instructions", async ({ model, expected }) => {
+    let requestPrompt = "";
+    const provider = { ...makeProvider([]), name: "grok",
+      chatStream: vi.fn(async (_messages: LLMMessage[], _onChunk: StreamProgressCallback,
+        options?: LLMChatOptions): Promise<LLMResponse> => {
+        requestPrompt = options?.systemPrompt ?? "";
+        return { content: "done", toolCalls: [], usage: {
+          promptTokens: 0, completionTokens: 0, totalTokens: 0,
+        }, model, finishReason: "stop" };
+      }),
+    } satisfies LLMProvider;
+    const parent = makeStubSession({ services: { provider },
+      sessionConfiguration: mkSessionConfiguration({
+        collaborationMode: { model: "grok-4.7" },
+        baseInstructions: "SAME_MODEL_BASE\nModel: grok-4.7 (provider: grok)",
+      }),
+      config: { ...mkConfig(), model: "grok-4.7" },
+      modelInfo: { ...mkModelInfo(), slug: "grok-4.7",
+        modelMessages: { instructionsTemplate: "Grok 4.7-only note\n{{ base_instructions }}" } },
+    });
+    const { live } = await spawnLive(parent);
+    const { result } = await collectRun(runAgent({ live, parent,
+      initialMessages: [{ role: "user", content: "go" }], taskPrompt: "go", model,
+    }));
+    expect(result.outcome).toBe("completed");
+    expect(requestPrompt).toContain(expected);
+    if (model !== "grok-4.7") {
+      expect(requestPrompt).not.toContain("Model: grok-4.7");
+      expect(requestPrompt).not.toContain("Grok 4.7-only note");
+    } else {
+      expect(requestPrompt).toContain("Model: grok-4.7 (provider: grok)");
+      expect(requestPrompt).toContain("Grok 4.7-only note");
+    }
+  });
+
+  it("dispatches another Grok model when the parent provider has factory model metadata", async () => {
+    const provider = createProvider("grok", { apiKey: "xai-test", model: "grok-4.7" });
+    const providerService = new SessionProviderService({
+      initialProvider: provider,
+      resolvePreparationRequest: ({ model }) => ({ requested: {
+        ...readProviderFactoryOptions(provider), model,
+      } }),
+    });
+    const chat = vi.spyOn(GrokProvider.prototype, "chatStream").mockResolvedValue({
+      content: "child completed", toolCalls: [],
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      model: "grok-4.6", finishReason: "stop",
+    });
+    const parent = makeStubSession({
+      services: { provider, providerService,
+        sandboxExecutionBroker: new SandboxExecutionBroker({ mode: "danger_full_access", cwd: "/tmp" }) },
+      sessionConfiguration: mkSessionConfiguration({ collaborationMode: { model: "grok-4.7" } }),
+      config: { ...mkConfig(), model: "grok-4.7" },
+      modelInfo: { ...mkModelInfo(), slug: "grok-4.7" },
+    });
+    try {
+      const { live } = await spawnLive(parent);
+      const { result } = await collectRun(runAgent({ live, parent,
+        initialMessages: [{ role: "user", content: "go" }], taskPrompt: "go", model: "grok-4.6",
+      }));
+      expect(result.outcome, result.error).toBe("completed");
+      expect(chat).toHaveBeenCalled();
+    } finally {
+      await parent.shutdown();
+      await provider.dispose?.();
+      chat.mockRestore();
+    }
+  });
+
+  it("dispatches another hosted AgenC model using the parent session authority", async () => {
+    const parentModel = "deepseek/deepseek-v4-flash-0731";
+    const authBackend = {
+      kind: "remote" as const,
+      login: vi.fn(), logout: vi.fn(), whoami: vi.fn(),
+      vendKey: vi.fn(), inferAgencModel: vi.fn(),
+      getLlmUsage: vi.fn(), getSubscriptionTier: vi.fn(),
+    } as never;
+    const provider = createProvider("agenc", {
+      model: parentModel, extra: { authBackend, sessionId: "hosted-parent" },
+    });
+    const factoryExtra = readProviderFactoryOptions(provider).extra ?? {};
+    expect(factoryExtra).not.toHaveProperty("authBackend");
+    expect(factoryExtra).not.toHaveProperty("sessionId");
+    const providerService = new SessionProviderService({
+      initialProvider: provider,
+      authBackend,
+      sessionId: "hosted-parent",
+      subscriptionTier: "pro",
+      resolvePreparationRequest: ({ model }) => ({ requested: { model } }),
+    });
+    const prepare = vi.spyOn(providerService, "prepareChild");
+    let live!: Awaited<ReturnType<typeof spawnLive>>["live"];
+    const profile = vi.spyOn(AgenCProvider.prototype, "getExecutionProfile").mockResolvedValue({
+      provider: "agenc", model: "agenc", usageReporting: "unavailable",
+      supportsMaxOutputTokens: false,
+    });
+    const accounting = vi.spyOn(AgenCProvider.prototype, "projectRequestForAccounting")
+      .mockImplementation((messages, options) => ({ messages, options }));
+    const chat = vi.spyOn(AgenCProvider.prototype, "chatStream").mockImplementation(async () => {
+      const child = liveAgentSession(live)!;
+      expect(child.providerService.current()).toMatchObject({ provider: "agenc", model: "agenc" });
+      expect(child.services.provider).not.toBe(provider);
+      return { content: "child completed", toolCalls: [],
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        model: "agenc", finishReason: "stop" };
+    });
+    const parent = makeStubSession({
+      services: { provider, providerService,
+        sandboxExecutionBroker: new SandboxExecutionBroker({ mode: "danger_full_access", cwd: "/tmp" }) },
+      sessionConfiguration: mkSessionConfiguration({ collaborationMode: { model: parentModel } }),
+      config: { ...mkConfig(), model: parentModel },
+      modelInfo: { ...mkModelInfo(), slug: parentModel },
+    });
+    try {
+      ({ live } = await spawnLive(parent));
+      const { result } = await collectRun(runAgent({ live, parent,
+        initialMessages: [{ role: "user", content: "go" }], taskPrompt: "go", model: "agenc",
+      }));
+      if (result.error) throw result.error;
+      expect(result.outcome, result.error).toBe("completed");
+      expect(prepare).toHaveBeenCalledWith({ provider: "agenc", model: "agenc" },
+        undefined, { signal: expect.any(AbortSignal) });
+      expect(chat).toHaveBeenCalledOnce();
+      expect(parent.providerService.current().model).toBe(parentModel);
+    } finally {
+      await parent.shutdown();
+      await provider.dispose?.();
+      accounting.mockRestore();
+      profile.mockRestore();
+      chat.mockRestore();
+    }
+  });
+
+  it("sends a restored cross-provider child's own identity after restart", async () => {
+    const configStore = new ConfigStore({ cwd: "/tmp", base: {
+      agents: { cross_provider_enabled: true, allowed_providers: ["deepseek"] },
+    } });
+    let requestPrompt = "";
+    const target = { ...makeProvider([]), name: "deepseek",
+      chatStream: vi.fn(async (_messages: LLMMessage[], _onChunk: StreamProgressCallback,
+        options?: LLMChatOptions): Promise<LLMResponse> => {
+        requestPrompt = options?.systemPrompt ?? "";
+        return { content: "done", toolCalls: [], usage: {
+          promptTokens: 0, completionTokens: 0, totalTokens: 0,
+        }, model: "deepseek-v4-pro", finishReason: "stop" };
+      }),
+    } satisfies LLMProvider;
+    const { parent, modelInfo } = crossProviderRuntime(target, configStore);
+    const plan = await authorizedCrossProviderPlan(parent, modelInfo);
+    const originalControl = new AgentControl({ session: parent, registry: new AgentRegistry() });
+    const original = await originalControl.spawn({ parentPath: "/root", agentName: "worker",
+      providerSelection: plan.route, executionPlan: plan });
+
+    const { parent: restoredParent } = crossProviderRuntime(target, configStore);
+    Object.assign(restoredParent.services, {
+      crossProviderConsent: parent.services.crossProviderConsent,
+    });
+    await restoredParent.state.with((state) => { state.sessionConfiguration = {
+      ...state.sessionConfiguration,
+      collaborationMode: { model: "grok-4.7" },
+      baseInstructions: "# Grok-specific notes\nModel: grok-4.7 (provider: grok)",
+    }; });
+    const restoredControl = new AgentControl({ session: restoredParent,
+      registry: new AgentRegistry() });
+    const restored = await restoredControl.resume({ parentPath: "/root",
+      metadata: structuredClone(original.metadata) });
+    expect(restored).not.toBeNull();
+    const { result } = await collectRun(runAgent({ live: restored!, parent: restoredParent,
+      initialMessages: [{ role: "user", content: "go" }], taskPrompt: "go",
+      taskId: plan.task.id,
+    }));
+    expect(result.outcome).toBe("completed");
+    expect(requestPrompt).toContain("Model: deepseek-v4-pro (provider: deepseek)");
+    expect(requestPrompt).not.toMatch(/grok|xai/iu);
+  });
 
   it("binds a cross-provider child to its own provider, model data, and parent authority", async () => {
     const configStore = new ConfigStore({
@@ -2034,20 +2283,34 @@ describe("runAgent", () => {
       expect(nullDefault.content).toContain("child-cwd-hit.txt");
       expect(nullDefault.content).not.toContain("parent-cwd-hit.txt");
 
-      // Explicit relative paths keep their existing registry-root resolution.
-      // Caller-relative explicit paths are a separate issue from omitted cwd.
+      // The signed child cwd is the base for explicit relative searches.
       for (const relativePath of [".", "src"]) {
         const relative = await invoke({ path: relativePath });
-        if (role === "read-only") {
+        if (role === "read-only" && toolName !== "Grep") {
           expect(relative).toMatchObject({
             isError: true, content: expect.stringContaining("outside delegated read authority"),
           });
         } else {
           expect(relative.isError, relative.content).not.toBe(true);
-          expect(relative.content).toContain("parent-src-hit.txt");
+          if (toolName === "Grep") {
+            expect(relative.content).toContain("child-src-hit.txt");
+            expect(relative.content).not.toContain("parent-src-hit.txt");
+          } else {
+            expect(relative.content).toContain("parent-src-hit.txt");
+          }
         }
       }
+      if (toolName === "Grep" && role === "writer") {
+        const worktreeOnly = await invoke({ path: "src/child-src-hit.txt" });
+        expect(worktreeOnly.isError, worktreeOnly.content).not.toBe(true);
+        expect(worktreeOnly.content).toContain("child-src-hit.txt");
+      }
       if (role === "read-only") {
+        if (toolName === "Grep") {
+          expect(await invoke({ path: ".", cwd: workspace })).toMatchObject({
+            isError: true, content: expect.stringContaining("outside delegated read authority"),
+          });
+        }
         expect(await invoke({ path: workspace })).toMatchObject({
           isError: true, content: expect.stringContaining("Read-only delegation cannot read"),
         });

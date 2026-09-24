@@ -9,6 +9,7 @@ import {
   inDeadlineReserve,
 } from "../../session/run-deadline.js";
 import type { Session } from "../../session/session.js";
+import { SESSION_BOUND_TOOL_SURFACE } from "../../tools/session-bound-surface.js";
 import type { ModelInfo, ReasoningEffort } from "../../session/turn-context.js";
 import { delegate } from "../delegate.js";
 import { terminalFromAgentStatus } from "../status.js";
@@ -438,8 +439,7 @@ function roleServiceTier(role: AgentRole | undefined): string | undefined {
   return role?.config.serviceTier;
 }
 
-function buildSpawnAgentSchema(opts: MultiAgentV2Options): Record<string, unknown> {
-  const session = opts.getSession();
+function buildSpawnAgentSchema(opts: MultiAgentV2Options, session = opts.getSession()): Record<string, unknown> {
   const workspaceRoles = opts.roleCatalog?.list() ?? (
     session === null
       ? listAgentRoles(opts.workspace)
@@ -473,7 +473,7 @@ function buildSpawnAgentSchema(opts: MultiAgentV2Options): Record<string, unknow
             "Use only a listed role name. For implementation, edits, or tests use `runner`. For codebase reconnaissance use `scanner`. Omit this field for a general `netrunner` fork. Do not invent role names such as `code-implementer` or `reviewer` unless they are listed here.",
           ].join("\n\n"),
       },
-      model: buildSpawnModelSchema(opts.getSession()),
+      model: buildSpawnModelSchema(session),
       provider: {
         type: "string",
         description: "Optional provider for the child model. Cross-provider choices require [agents] cross_provider_enabled and an allowed provider/model pair.",
@@ -782,6 +782,16 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
           return confirmedNoSpawn(failure);
         }
       }
+      if (!provenancedDescendant && effectiveModel !== undefined &&
+          effectiveModel !== currentChildProvider(session).model) {
+        try {
+          targetModelInfo = await childModelInfo(session, {
+            provider: activeProvider, model: effectiveModel,
+          });
+        } catch (error) {
+          return failSpawn(error instanceof Error ? error.message : String(error));
+        }
+      }
       try {
         serviceTierResult = await resolveSameProviderServiceTier({ session, model: effectiveModel,
           ...(provenancedDescendant && targetModelInfo !== undefined
@@ -866,6 +876,8 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
         ...(role !== undefined ? { role } : {}),
         ...(plan !== undefined ? { plan } : {}),
         ...(plan === undefined && effectiveModel !== undefined ? { model: effectiveModel } : {}),
+        ...(plan === undefined && targetModelInfo !== undefined
+          ? { modelInfo: targetModelInfo } : {}),
         ...(plan === undefined && effectiveReasoningEffort !== undefined
           ? { reasoningEffort: effectiveReasoningEffort } : {}),
         ...(plan === undefined && serviceTierResult.serviceTier !== undefined
@@ -1051,6 +1063,10 @@ export function createSpawnAgentTool(opts: MultiAgentV2Options): Tool {
   };
 
   return {
+    [SESSION_BOUND_TOOL_SURFACE]: (session: Session | null) => ({
+      description: buildSpawnAgentDescription(session),
+      inputSchema: buildSpawnAgentSchema(opts, session),
+    }),
     name: "spawn_agent",
     // Read per request: the tool is built before its session exists, and the
     // allowed cross-provider pairs follow the live config.

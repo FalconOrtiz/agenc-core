@@ -19,6 +19,7 @@
 
 import { normalize } from "node:path";
 import { inheritBuiltinToolProvenance } from "../tools/builtin-provenance.js";
+import { SESSION_BOUND_TOOL_SURFACE, type SessionBoundToolSurface } from "../tools/session-bound-surface.js";
 import { SYSTEM_SEARCH_TOOLS_NAME } from "../tools/system/tool-search-name.js";
 import {
   SESSION_ADVERTISED_TOOL_NAMES_ARG,
@@ -35,6 +36,8 @@ import { LRUCache } from "lru-cache";
 import { registerChildApprovalSession, revokeChildApprovalSession } from "./child-approval-context.js";
 import { bindLiveAgentSession } from "./live-session.js";
 import { createInertMcpManager } from "../mcp-client/inert-manager.js";
+import { assembleBaseInstructionsForModel } from "../prompts/system-prompt.js";
+import { usesLocalToolProfile } from "../llm/wire/capability-gating.js";
 import { createChildAbortController } from "../utils/abortController.js";
 import type {
   LLMChatOptions,
@@ -53,6 +56,7 @@ import type {
 import { createCacheSafeParams } from "../services/PromptSuggestion/runtime.js";
 import { llmMessageToAgentSummaryMessage } from "../services/AgentSummary/transcript.js";
 import {
+  isFactoryProvider,
   preserveProviderFactoryState,
   readProviderIdentity,
 } from "../llm/provider.js";
@@ -2268,7 +2272,33 @@ export function buildFilteredRegistry(
   const eligibleTools = base.tools.filter((tool) => isEligible(tool.name));
   const toolCatalogScope: ReadonlySet<string> = new Set(eligibleTools.map((tool) => tool.name));
   const wrappedTools = eligibleTools
-    .map((tool) => wrapToolForChild(tool, { ...opts, toolCatalogScope }));
+    .map((tool) => {
+      const wrapped = wrapToolForChild(tool, { ...opts, toolCatalogScope });
+      const sessionSurface = (wrapped as Tool & {
+        readonly [SESSION_BOUND_TOOL_SURFACE]?: SessionBoundToolSurface;
+      })[SESSION_BOUND_TOOL_SURFACE];
+      if (sessionSurface !== undefined) {
+        Object.defineProperties(wrapped, {
+          description: {
+            enumerable: true,
+            configurable: true,
+            get: () => {
+              const session = opts.getSession?.();
+              return session == null ? tool.description : sessionSurface(session).description;
+            },
+          },
+          inputSchema: {
+            enumerable: true,
+            configurable: true,
+            get: () => {
+              const session = opts.getSession?.();
+              return session == null ? tool.inputSchema : sessionSurface(session).inputSchema;
+            },
+          },
+        });
+      }
+      return wrapped;
+    });
   const wrappedByName = new Map(wrappedTools.map((tool) => [tool.name, tool]));
   const fallbackAdvertisedTools = () =>
     wrappedTools.map((tool) => ({
@@ -2281,12 +2311,20 @@ export function buildFilteredRegistry(
     }));
   const advertisedLLMTools = () => {
     const advertised = base.toLLMTools();
-    if (advertised.length === 0) {
-      return fallbackAdvertisedTools();
-    }
-    return advertised.filter((tool) =>
-      isEligible(tool.function.name as string),
-    );
+    const visible = (advertised.length === 0 ? fallbackAdvertisedTools() : advertised)
+      .filter((tool) => isEligible(tool.function.name as string));
+    const session = opts.getSession?.();
+    if (session === undefined || session === null) return visible;
+    return visible.map((tool) => {
+      const wrapped = wrappedByName.get(tool.function.name as string);
+      const surface = (wrapped as (Tool & {
+        readonly [SESSION_BOUND_TOOL_SURFACE]?: SessionBoundToolSurface;
+      }) | undefined)?.[SESSION_BOUND_TOOL_SURFACE]?.(session);
+      return surface === undefined ? tool : {
+        ...tool,
+        function: { ...tool.function, description: surface.description, parameters: surface.inputSchema },
+      };
+    });
   };
   const advertisedNames = () =>
     new Set(advertisedLLMTools().map((tool) => tool.function.name as string));
@@ -3134,8 +3172,14 @@ function buildChildModelInfo(
   modelInfo?: ModelInfo,
 ): Session["modelInfo"] {
   if (modelInfo !== undefined) return modelInfo;
+  if (sessionConfiguration.collaborationMode.model === parent.modelInfo.slug) {
+    return parent.modelInfo;
+  }
+  // A different model cannot reuse the parent's instruction template. The
+  // spawn path supplies the selected model's metadata when it is available.
+  const { modelMessages: _parentModelMessages, ...parentModelInfo } = parent.modelInfo;
   return {
-    ...parent.modelInfo,
+    ...parentModelInfo,
     slug: sessionConfiguration.collaborationMode.model,
   };
 }
@@ -3251,7 +3295,8 @@ function prepareChildSessionAuthority(
   params: RunAgentParams,
 ): ChildSessionAuthority {
   const roleConfig = params.live.role.config;
-  const childModel = params.model ?? roleConfig.model;
+  const childModel = params.model ?? roleConfig.model ??
+    params.parent.providerService.current().model;
   const childReasoningEffort =
     params.reasoningEffort ?? roleConfig.reasoningEffort;
   const childServiceTier = params.serviceTier ?? roleConfig.serviceTier;
@@ -3350,8 +3395,9 @@ function buildChildSession(
       // survive the spread above and silently override the forked provider in
       // the ChildSession constructor.
       providerService: params.parent.providerService.forkForChild(provider, {
-        provider: params.providerSelection?.provider ?? params.parent.providerService.current().provider,
-        model: params.providerSelection?.model ?? params.parent.providerService.current().model,
+        provider: params.providerSelection?.provider ??
+          params.parent.providerService.current().provider,
+        model: sessionConfiguration.collaborationMode.model,
       }, params.plan?.crossProvider ? params.plan.route : undefined),
       providerEnvironment: params.parent.providerService.environment(),
       registry,
@@ -3454,6 +3500,31 @@ function buildChildSession(
 
   registerChildApprovalSession(childSession, params.parent);
   return childSession;
+}
+
+/** A forked session must not carry the parent's model-specific base prompt. */
+async function refreshChildBaseInstructions(parent: Session, child: ChildSession,
+  promptIdentity?: ProviderSelection): Promise<void> {
+  const parentBinding = parent.providerService.current();
+  const childBinding = child.providerService.current();
+  const childIdentity = promptIdentity ?? childBinding;
+  if (parentBinding.provider === childIdentity.provider &&
+      parentBinding.model === childIdentity.model) return;
+
+  const baseInstructions = await assembleBaseInstructionsForModel({
+    session: child,
+    ctx: child.newDefaultTurnWithSubId(child.nextInternalSubId()),
+    registry: child.services.registry,
+    provider: childIdentity.provider,
+    ...(promptIdentity !== undefined ? { promptIdentity } : {}),
+    permissionContext: child.permissionModeRegistry.current(),
+    profile: child.config.coordinatorMode === true
+      ? "coordinator"
+      : usesLocalToolProfile(childIdentity.provider) ? "compact" : "standard",
+  });
+  await child.state.with((state) => {
+    state.sessionConfiguration = { ...state.sessionConfiguration, baseInstructions };
+  });
 }
 
 /**
@@ -3985,6 +4056,19 @@ export async function* runAgent(
           live.abortController.abort("cross-provider subagent policy was disabled or provider removed");
         }
       }) ?? null;
+    } else if (provider && isFactoryProvider(provider)) {
+      const selectedModel = params.model ?? live.role.config.model ??
+        parent.providerService.current().model;
+      const currentBinding = parent.providerService.current();
+      if (currentBinding.model !== selectedModel) {
+        const prepared = await parent.providerService.prepareChild(
+          { provider: currentBinding.provider, model: selectedModel },
+          undefined,
+          { signal: merged.signal },
+        );
+        provider = prepared.binding.instance;
+        ownedPreparedProvider = provider;
+      }
     }
     if (!provider) {
       const err = new Error(
@@ -4105,6 +4189,7 @@ export async function* runAgent(
       childAuthority,
       terminalResultForPendingWorker,
     );
+    await refreshChildBaseInstructions(parent, childSession, params.plan?.destination);
     revokeLiveSession = bindLiveAgentSession(live, childSession);
     const {
       history,
