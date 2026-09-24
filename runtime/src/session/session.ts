@@ -1037,6 +1037,7 @@ export interface RolloutRecorder {
 /** Runtime provider/model catalog. */
 export interface ModelsManager {
   getModelInfo(modelSlug: string, config?: unknown): Promise<ModelInfo>;
+  getModelInfoForProvider?(provider: string, model: string): Promise<ModelInfo>;
   tryListModels(): ReadonlyArray<ModelInfo> | undefined;
   listModels(
     strategy?: "online_if_uncached",
@@ -1452,6 +1453,7 @@ export interface SessionServices {
   readonly querySource?: QuerySource;
   readonly permissionRequestHooks?: ReadonlyArray<PermissionRequestHook>;
   readonly approvalResolver?: ApprovalResolver;
+  readonly crossProviderConsent?: import("../agents/cross-provider.js").CrossProviderConsentService;
   /** Maintenance may use existing grants but must defer new interactive approval. */
   readonly deferInteractiveApprovals?: (toolName: string) => void;
   readonly permissionAuditLogger?: PermissionAuditLogger;

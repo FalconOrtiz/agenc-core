@@ -106,9 +106,12 @@ import {
 import { TerminalRunEpochOpenError } from "../session/rollout-store.js";
 import {
   threadConfigSnapshot,
+  type ModelInfo,
   type ReasoningEffort,
   type TurnContext,
 } from "../session/turn-context.js";
+import type { ProviderSelection } from "../session/provider-service.js";
+import { assertChildExecutionPlan, assertPreparedChildMatchesPlan, consentGrantCoversPlan, type ChildExecutionPlan } from "./cross-provider.js";
 import type { LiveAgent } from "./control.js";
 import {
   createMailboxMetadata,
@@ -143,6 +146,7 @@ import {
   isFinal,
   type AgentStatus,
 } from "./status.js";
+import { childDispatchCertainty, childTerminalOutcome, type ChildTerminalOutcome, type ChildTerminalReason } from "./child-terminal.js";
 import { asRecord } from "../utils/record.js";
 import {
   attachSandboxExecutionBroker,
@@ -176,6 +180,9 @@ export interface RunAgentParams {
   readonly timeoutMs?: number;
   /** Optional child model override. */
   readonly model?: string;
+  readonly modelInfo?: ModelInfo;
+  readonly providerSelection?: ProviderSelection;
+  readonly plan?: ChildExecutionPlan;
   /** Optional child reasoning-effort override. */
   readonly reasoningEffort?: ReasoningEffort;
   /** Optional child service-tier override. */
@@ -212,6 +219,8 @@ export interface RunAgentParams {
   readonly worktreeBaseCommit?: string;
   /** Internal cleanup evidence, including receipts that cannot be persisted. */
   readonly onWorktreeEvidence?: (evidence: WorktreeTurnEvidence) => void;
+  /** Close the durable spawn edge before recording a funds terminal. */
+  readonly onTerminalFundsStop?: () => Promise<void>;
   /** Backpressured provider-delta sink for bounded workflow handoffs. */
   readonly finalMessageSink?: AssistantOutputStreamSink;
 }
@@ -1008,6 +1017,9 @@ interface TaskTurnReceipt {
   readonly outcome: "completed" | "errored" | "interrupted" | "nack";
   readonly message?: string;
   readonly reason?: string;
+  readonly terminalReason?: ChildTerminalReason;
+  readonly terminalRetryable?: boolean;
+  readonly terminal?: ChildTerminalOutcome;
   readonly toolCallCount: number;
   readonly worktreeEvidence?: WorktreeTurnEvidence;
 }
@@ -1032,6 +1044,11 @@ function projectTaskReceiptForParent(
 ): TaskTurnReceipt {
   return {
     ...receipt,
+    ...(receipt.terminal !== undefined ? { terminal: {
+      ...receipt.terminal,
+      completedWork: truncateReceiptField(receipt.terminal.completedWork),
+      unfinishedWork: truncateReceiptField(receipt.terminal.unfinishedWork),
+    } } : {}),
     ...(receipt.message !== undefined
       ? { message: truncateReceiptField(receipt.message) }
       : {}),
@@ -1115,6 +1132,7 @@ function taskTurnOutcomePayload(
     toolCallCount: receipt.toolCallCount,
     ...(receipt.message !== undefined ? { message: receipt.message } : {}),
     ...(receipt.reason !== undefined ? { reason: receipt.reason } : {}),
+    ...(receipt.terminal !== undefined ? { terminal: receipt.terminal } : {}),
     ...(receipt.worktreeEvidence !== undefined
       ? { worktreeEvidence: receipt.worktreeEvidence }
       : {}),
@@ -1132,6 +1150,7 @@ function statusForTaskTurnReceipt(receipt: TaskTurnReceipt): AgentStatus {
         ...(receipt.message !== undefined
           ? { lastMessage: receipt.message }
           : {}),
+        ...(receipt.terminal !== undefined ? { terminal: receipt.terminal } : {}),
       };
     case "errored":
       return {
@@ -1139,6 +1158,7 @@ function statusForTaskTurnReceipt(receipt: TaskTurnReceipt): AgentStatus {
         turnId: receipt.turnId,
         endedAtMs,
         error: receipt.reason ?? receipt.message ?? "task errored",
+        ...(receipt.terminal !== undefined ? { terminal: receipt.terminal } : {}),
       };
     case "interrupted":
     case "nack":
@@ -1151,6 +1171,7 @@ function statusForTaskTurnReceipt(receipt: TaskTurnReceipt): AgentStatus {
           (receipt.outcome === "nack"
             ? "accepted task was not started"
             : "task interrupted"),
+        ...(receipt.terminal !== undefined ? { terminal: receipt.terminal } : {}),
       };
   }
 }
@@ -1231,6 +1252,9 @@ function sendSubagentNotificationToParent(params: {
               : {}),
             ...(projectedReceipt.reason !== undefined
               ? { reason: projectedReceipt.reason }
+              : {}),
+            ...(projectedReceipt.terminal !== undefined
+              ? { terminal: projectedReceipt.terminal }
               : {}),
             ...(projectedReceipt.worktreeEvidence !== undefined
               ? {
@@ -3029,16 +3053,20 @@ function cloneSessionConfiguration(
     readonly model?: string;
     readonly reasoningEffort?: ReasoningEffort;
     readonly serviceTier?: string;
+    readonly crossProvider?: boolean;
   } = {},
 ): Session["sessionConfiguration"] {
   const base = parent.sessionConfiguration;
   const cwd = worktree?.path ?? base.cwd;
-  const serviceTier =
+  const serviceTier = overrides.crossProvider === true
+    ? overrides.serviceTier
+    :
     overrides.serviceTier !== undefined
       ? overrides.serviceTier
       : base.serviceTier;
+  const { reasoningEffort: _parentReasoningEffort, ...withoutParentReasoningEffort } = base.collaborationMode;
   const collaborationMode = {
-    ...base.collaborationMode,
+    ...(overrides.crossProvider === true ? withoutParentReasoningEffort : base.collaborationMode),
     ...(overrides.model !== undefined ? { model: overrides.model } : {}),
     ...(overrides.reasoningEffort !== undefined
       ? { reasoningEffort: overrides.reasoningEffort }
@@ -3047,7 +3075,7 @@ function cloneSessionConfiguration(
   return {
     ...base,
     cwd,
-    ...(serviceTier !== undefined ? { serviceTier } : {}),
+    ...(serviceTier !== undefined || overrides.crossProvider === true ? { serviceTier } : {}),
     collaborationMode,
     sessionSource: {
       kind: "subagent",
@@ -3103,7 +3131,9 @@ function buildChildConfig(
 function buildChildModelInfo(
   parent: Session,
   sessionConfiguration: Session["sessionConfiguration"],
+  modelInfo?: ModelInfo,
 ): Session["modelInfo"] {
+  if (modelInfo !== undefined) return modelInfo;
   return {
     ...parent.modelInfo,
     slug: sessionConfiguration.collaborationMode.model,
@@ -3237,6 +3267,7 @@ function prepareChildSessionAuthority(
       ...(childServiceTier !== undefined
         ? { serviceTier: childServiceTier }
         : {}),
+      ...(params.providerSelection !== undefined ? { crossProvider: true } : {}),
     },
   );
   const sandboxExecutionBroker =
@@ -3306,7 +3337,7 @@ function buildChildSession(
         : {}),
     },
     initialState: {
-      sessionConfiguration,
+      sessionConfiguration: { ...sessionConfiguration, provider },
       history: [],
     },
     features: params.parent.features,
@@ -3318,7 +3349,10 @@ function buildChildSession(
       // A provider service is session-owned. Do not let the parent's service
       // survive the spread above and silently override the forked provider in
       // the ChildSession constructor.
-      providerService: undefined,
+      providerService: params.parent.providerService.forkForChild(provider, {
+        provider: params.providerSelection?.provider ?? params.parent.providerService.current().provider,
+        model: params.providerSelection?.model ?? params.parent.providerService.current().model,
+      }, params.plan?.crossProvider ? params.plan.route : undefined),
       providerEnvironment: params.parent.providerService.environment(),
       registry,
       ...(params.parent.services.executionAdmission !== undefined
@@ -3364,11 +3398,31 @@ function buildChildSession(
     },
     jsRepl: params.parent.jsRepl,
     config: buildChildConfig(params.parent, sessionConfiguration),
-    modelInfo: buildChildModelInfo(params.parent, sessionConfiguration),
+    modelInfo: buildChildModelInfo(params.parent, sessionConfiguration, params.modelInfo),
   });
   params.live.configSnapshot = threadConfigSnapshot(
     sessionConfiguration,
   ) as unknown as Record<string, unknown>;
+  if (params.plan !== undefined) {
+    params.live.configSnapshot = {
+      ...params.live.configSnapshot,
+      provider: params.plan.destination.provider,
+      model: params.plan.destination.model,
+      reasoningEffort: params.plan.reasoningEffort,
+      executionPlan: params.plan,
+    };
+  }
+  if (params.providerSelection !== undefined) {
+    // TODO(phase 4): project provider/model and reconciled child cost into the
+    // protocol/native worker status together with the admission run ID.
+    params.live.configSnapshot = {
+      ...params.live.configSnapshot,
+      crossProvider: {
+        ...params.providerSelection,
+        policy: "user-or-managed-agents-v1",
+      },
+    };
+  }
 
   try {
     const childRolloutStore = mountChildRunJournal({
@@ -3376,6 +3430,7 @@ function buildChildSession(
       child: childSession,
       originator: "agenc-subagent",
       terminalResult,
+      ...(params.plan !== undefined ? { destination: params.plan.destination } : {}),
     });
     if (childRolloutStore) {
       params.live.rolloutPath = childRolloutStore.rolloutPath;
@@ -3416,14 +3471,18 @@ export async function* runAgent(
   const { live, parent } = params;
   let childSession: ChildSession | null = null;
   let ownedChildProvider: LLMProvider | null = null;
+  let ownedPreparedProvider: LLMProvider | null = null;
+  let unsubscribeCrossPolicy: (() => void) | null = null;
   let childSandboxExecutionBroker: SandboxExecutionBrokerLike | undefined;
   let unsubscribeChildUsage: (() => void) | null = null;
   let forwardMergedAbort: (() => void) | null = null;
   let roleTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
   let currentTaskId = params.taskId;
+  let currentTaskText = params.taskPrompt;
   let currentTurnReceiptCommitted = false;
   let currentCommittedReceipt: TaskTurnReceipt | undefined;
   let currentTurnToolCallCount = 0;
+  let latestChildProgress = "";
   let currentWorktreeBaseCommit = params.worktreeBaseCommit;
   let currentReceiptWorktreeEvidence: WorktreeTurnEvidence | undefined;
   let reuseBlockedReason: string | undefined;
@@ -3436,16 +3495,19 @@ export async function* runAgent(
         readonly status: "completed";
         readonly turnId: string;
         readonly message?: string;
+        readonly terminal?: ChildTerminalOutcome;
       }
     | {
         readonly status: "errored";
         readonly turnId: string;
         readonly error: string;
+        readonly terminal?: ChildTerminalOutcome;
       }
     | {
         readonly status: "interrupted";
         readonly turnId: string;
         readonly reason: string;
+        readonly terminal?: ChildTerminalOutcome;
       }
     | undefined;
   const terminalResultForPendingWorker = (): ChildRunTerminalResult => {
@@ -3473,15 +3535,11 @@ export async function* runAgent(
     return terminalResultForLiveAgent(live);
   };
   const markInterruptedAfterDurability = (reason: string): void => {
+    pendingWorkerTerminal = { status: "interrupted", turnId, reason };
     if (childSession === null) {
-      pendingWorkerTerminal = {
-        status: "interrupted",
-        turnId,
-        reason,
-      };
       return;
     }
-    live.status.markInterrupted(turnId, reason);
+    live.status.markInterrupted(turnId, reason, currentCommittedReceipt?.terminal);
   };
   const relayAgentEvent = (
     event: Omit<Parameters<typeof relayToParentMailbox>[0], "live" | "parent">,
@@ -3517,12 +3575,52 @@ export async function* runAgent(
     }
     return disposition;
   };
+  const publishTerminalReceipt = (receipt: TaskTurnReceipt): void => {
+    if (receipt.terminal?.reason === "insufficient_funds") {
+      const provider = receipt.terminal.provider;
+      const model = receipt.terminal.model;
+      parent.emit({
+        id: parent.nextInternalSubId(),
+        msg: { type: "subagent_funds_notice", payload: {
+          agentPath: live.agentPath,
+          taskId: receipt.taskId,
+          taskText: currentTaskText,
+          terminal: projectTaskReceiptForParent(receipt).terminal!,
+          message: `${provider}/${model} ran out of credits. The child stopped; ask before switching providers.`,
+        } },
+      }, { durable: true });
+    }
+    sendParentNotification(receipt);
+  };
   const commitTaskReceipt = async (
     receipt: TaskTurnReceipt,
     options: { readonly deferParentNotification?: boolean } = {},
   ): Promise<boolean> => {
     if (currentTurnReceiptCommitted) return false;
-    let receiptToCommit = receipt;
+    const provider = params.plan?.destination.provider ??
+      params.providerSelection?.provider ??
+      readProviderIdentity(ownedChildProvider ?? parent.services.provider) ??
+      parent.services.provider.name;
+    const model = params.plan?.destination.model ?? params.model ??
+      live.role.config.model ?? parent.sessionConfiguration.collaborationMode.model;
+    const cost = parent.services.executionAdmission?.getUsageSummary?.().agents
+      .find((agent) => agent.runId === live.agentId);
+    let receiptToCommit: TaskTurnReceipt = {
+      ...receipt,
+      terminal: receipt.terminal ?? childTerminalOutcome({
+        provider, model,
+        ...(receipt.terminalReason !== undefined ? { reason: receipt.terminalReason } :
+          receipt.outcome === "completed" ? { reason: "completed" as const } :
+            receipt.outcome === "interrupted" || receipt.outcome === "nack"
+              ? { reason: "parent_cancelled" as const }
+              : { error: new Error(receipt.reason ?? receipt.message ?? "subagent failed") }),
+        ...(receipt.terminalRetryable !== undefined ? { retryable: receipt.terminalRetryable } : {}),
+        dispatch: receipt.outcome === "completed" ? "sent" : childSession === null ? "not_sent" : "unknown",
+        completedWork: receipt.message ?? latestChildProgress,
+        unfinishedWork: receipt.outcome === "completed" ? "" : currentTaskText,
+        ...(cost !== undefined && !cost.hasUnknownCost ? { costUsd: cost.costUsd } : {}),
+      }),
+    };
     if (params.worktree !== undefined) {
       let evidence: WorktreeTurnEvidence;
       if (
@@ -3555,10 +3653,20 @@ export async function* runAgent(
                 : "worktree sandbox authority is unavailable",
         };
       }
-      receiptToCommit = { ...receipt, worktreeEvidence: evidence };
+      receiptToCommit = { ...receiptToCommit, worktreeEvidence: evidence };
       // Cleanup must observe evidence on every exit path, independently of
       // progress events or whether this receipt can reach durable storage.
       params.onWorktreeEvidence?.(evidence);
+    }
+    if (receiptToCommit.terminal?.reason === "insufficient_funds") {
+      try {
+        await params.onTerminalFundsStop?.();
+      } catch (error) {
+        reuseBlockedReason = "funds stop spawn edge could not be closed";
+        emitWarning(parent.eventLog, parent.nextInternalSubId(),
+          "funds_stop_spawn_edge_close_failed",
+          error instanceof Error ? error.message : String(error));
+      }
     }
     if (childSession === null) {
       // Session construction has not reached the child-owned EventLog yet.
@@ -3608,6 +3716,7 @@ export async function* runAgent(
     live.lastTaskReceipt = {
       turnId: receiptToCommit.turnId,
       outcome: receiptToCommit.outcome,
+      ...(receiptToCommit.terminal !== undefined ? { terminal: receiptToCommit.terminal } : {}),
     };
     if (
       receiptToCommit.taskId !== undefined &&
@@ -3631,7 +3740,7 @@ export async function* runAgent(
       reuseBlockedReason = `worktree evidence is ${evidence.state}`;
     }
     if (!options.deferParentNotification) {
-      sendParentNotification(receiptToCommit);
+      publishTerminalReceipt(receiptToCommit);
     }
     return true;
   };
@@ -3645,6 +3754,8 @@ export async function* runAgent(
   const finishErroredRun = async (opts: {
     readonly message: string;
     readonly error: unknown;
+    readonly terminalReason?: ChildTerminalReason;
+    readonly terminalRetryable?: boolean;
     readonly toolCallCount?: number;
     readonly relayToParent?: boolean;
   }): Promise<RunAgentResult> => {
@@ -3652,6 +3763,22 @@ export async function* runAgent(
       ...taskCorrelation(),
       outcome: "errored",
       reason: opts.message,
+      terminal: childTerminalOutcome({
+        provider: params.plan?.destination.provider ?? params.providerSelection?.provider ??
+          readProviderIdentity(ownedChildProvider ?? parent.services.provider) ?? parent.services.provider.name,
+        model: params.plan?.destination.model ?? params.model ?? live.role.config.model ??
+          parent.sessionConfiguration.collaborationMode.model,
+        error: opts.error,
+        ...(opts.terminalReason !== undefined ? { reason: opts.terminalReason } : {}),
+        ...(opts.terminalRetryable !== undefined ? { retryable: opts.terminalRetryable } : {}),
+        dispatch: childSession === null ? "not_sent" : childDispatchCertainty(opts.error),
+        completedWork: latestChildProgress,
+        unfinishedWork: currentTaskText,
+        ...(parent.services.executionAdmission?.getUsageSummary?.().agents
+          .find((agent) => agent.runId === live.agentId && !agent.hasUnknownCost)?.costUsd !== undefined
+          ? { costUsd: parent.services.executionAdmission.getUsageSummary!().agents
+            .find((agent) => agent.runId === live.agentId)!.costUsd } : {}),
+      }),
       toolCallCount: currentTurnToolCallCount,
     });
     if (receiptCommitted) {
@@ -3722,6 +3849,34 @@ export async function* runAgent(
   if (params.externalSignal?.aborted) onExternalAbort?.();
 
   try {
+    const plan = params.plan ?? live.metadata.executionPlan;
+    if (plan !== undefined) {
+      await assertChildExecutionPlan(parent, plan);
+      if (params.taskId !== undefined && params.taskId !== plan.task.id) {
+        throw new Error("child execution plan task identity changed");
+      }
+      if (live.metadata.executionPlan !== undefined &&
+          JSON.stringify(live.metadata.executionPlan) !== JSON.stringify(plan)) {
+        throw new Error("child execution plan conflicts with durable spawn metadata");
+      }
+      params = {
+        ...params,
+        plan,
+        ...(plan.crossProvider && plan.budgetAllocation !== null
+          ? { maxTurns: Math.min(params.maxTurns ?? Number.POSITIVE_INFINITY,
+              plan.budgetAllocation.maxModelCalls) } : {}),
+        model: plan.route.model,
+        modelInfo: plan.modelInfo,
+        providerSelection: plan.crossProvider ? plan.route : undefined,
+        reasoningEffort: plan.reasoningEffort,
+        serviceTier: plan.serviceTier,
+        toolAllowlist: plan.scope.tools === "parent_filtered" ? params.toolAllowlist : plan.scope.tools,
+      };
+    } else {
+      if (params.providerSelection !== undefined || live.metadata.crossProvider !== undefined) {
+        throw new Error("consent_unavailable: cross-provider dispatch requires a granted execution plan");
+      }
+    }
     relayAgentEvent({
       content: `spawned subagent ${live.agentPath} (role=${live.role.name})`,
       triggerTurn: false,
@@ -3806,8 +3961,31 @@ export async function* runAgent(
       };
     }
 
-    // Resolve the parent provider (subagents share model access).
-    const provider = providerFromParent(parent);
+    // Resolve a child-owned provider through the session's captured credential
+    // sources. prepare() does not commit a switch to the parent session.
+    let provider = providerFromParent(parent);
+    if (params.providerSelection !== undefined) {
+      if (params.plan === undefined) throw new Error("consent_unavailable: child provider dispatch has no granted plan");
+      await assertChildExecutionPlan(parent, params.plan);
+      const prepared = await parent.providerService.prepareChild(params.providerSelection, undefined,
+        { signal: merged.signal }, true,
+        params.plan.route.provider === "agenc" ? params.plan.destination : undefined,
+        params.plan.destination);
+      provider = prepared.binding.instance;
+      ownedPreparedProvider = provider;
+      if (params.plan !== undefined) {
+        assertPreparedChildMatchesPlan(params.plan, prepared);
+        await assertChildExecutionPlan(parent, params.plan);
+      }
+      unsubscribeCrossPolicy = parent.services.configStore?.subscribe((config) => {
+        if (config.agents?.cross_provider_enabled !== true ||
+            !(config.agents.allowed_providers ?? []).includes(params.providerSelection!.provider) ||
+            (params.plan?.route.provider === "agenc" &&
+             !(config.agents.allowed_providers ?? []).includes(params.plan.destination.provider))) {
+          live.abortController.abort("cross-provider subagent policy was disabled or provider removed");
+        }
+      }) ?? null;
+    }
     if (!provider) {
       const err = new Error(
         "subagent has no provider on parent.services.provider",
@@ -3992,10 +4170,24 @@ export async function* runAgent(
       readonly taskId?: string;
       readonly turnId?: string;
     }): void => {
+      if (params.plan?.crossProvider && accepted.taskId !== undefined) {
+        const taskPlan = live.assignment?.executionPlan ?? live.metadata.executionPlan;
+        const epoch = parent.services.crossProviderConsent?.sessionEpoch;
+        if (taskPlan === undefined || epoch === undefined ||
+            taskPlan.task.id !== accepted.taskId ||
+            !consentGrantCoversPlan(taskPlan, parent.services.crossProviderConsent!.ownerSessionId,
+              taskPlan.task.text, taskPlan.task.attachments, epoch)) {
+          throw new Error("resume_blocked: reusable cross-provider worker has no grant for this task");
+        }
+      }
       nextUserMessage = accepted.nextUserMessage;
+      currentTaskText = live.assignment?.executionPlan?.task.text ??
+        live.metadata.executionPlan?.task.text ??
+        (typeof accepted.nextUserMessage === "string" ? accepted.nextUserMessage : currentTaskText);
       currentTaskId = accepted.taskId;
       turnId = accepted.turnId ?? crypto.randomUUID();
       currentTurnReceiptCommitted = false;
+      latestChildProgress = "";
       currentCommittedReceipt = undefined;
       currentTurnToolCallCount = 0;
       pendingWorkerTerminal = undefined;
@@ -4126,6 +4318,7 @@ export async function* runAgent(
         const event = step.value;
         if (event.type === "assistant_text") {
           turnAssistantText = event.content;
+          if (event.content.trim().length > 0) latestChildProgress = event.content;
           yield {
             kind: "message",
             message: {
@@ -4194,6 +4387,7 @@ export async function* runAgent(
       stopTurnCall();
 
       assistantText = turnAssistantText;
+      if (turnAssistantText.trim().length > 0) latestChildProgress = turnAssistantText;
       // Each sampling iteration emits a durable token_count event. The
       // subscription above projects those counts immediately so a long,
       // tool-using turn does not sit at `tokens 0` until it finishes. Retain
@@ -4225,6 +4419,12 @@ export async function* runAgent(
         stopReason === "deadline_reached" ||
         stopReason === "compact_failed" ||
         stopReason === "empty_response";
+      const boundedTerminalReason: ChildTerminalReason | undefined =
+        stopReason === "max_budget_usd" ? "cost_cap_reached" :
+        stopReason === "effect_review_required" ? "effect_outcome_unknown" :
+        stopReason === "compact_failed" ? "context_insufficient" :
+        stopReason === "empty_response" ? "model_refused" :
+        boundedStop ? "timeout" : undefined;
       // A bounded stop in a keep-alive (interactive) run is a per-turn
       // outcome: the backstop's message already reached the transcript,
       // and the user must be able to keep prompting. Ending the run here
@@ -4268,6 +4468,8 @@ export async function* runAgent(
           message,
           error:
             terminalError instanceof Error ? terminalError : new Error(message),
+          ...(boundedTerminalReason !== undefined ? { terminalReason: boundedTerminalReason } : {}),
+          ...(boundedStop ? { terminalRetryable: false } : {}),
           toolCallCount,
         });
         yield { kind: "run_error", error: message, ...taskCorrelation() };
@@ -4339,6 +4541,8 @@ export async function* runAgent(
           ...taskCorrelation(),
           outcome: boundedStop ? "errored" : "completed",
           ...(turnFailureMessage !== undefined ? { reason: turnFailureMessage } : {}),
+          ...(boundedTerminalReason !== undefined ? { terminalReason: boundedTerminalReason } : {}),
+          ...(boundedStop ? { terminalRetryable: false } : {}),
           ...(assistantText ? { message: assistantText } : {}),
           toolCallCount: turnToolCallCount,
         };
@@ -4370,13 +4574,15 @@ export async function* runAgent(
           throw new Error("committed task receipt payload is unavailable");
         }
         if (reuseBlockedReason === undefined) {
-          live.status.markIdle(completedTurnId);
+          live.status.markIdle(completedTurnId, currentCommittedReceipt?.terminal);
           pendingWorkerTerminal = turnFailureMessage !== undefined
-            ? { status: "errored", turnId: completedTurnId, error: turnFailureMessage }
+            ? { status: "errored", turnId: completedTurnId, error: turnFailureMessage,
+                terminal: committedReceipt.terminal }
             : {
                 status: "completed",
                 turnId: completedTurnId,
                 ...(assistantText ? { message: assistantText } : {}),
+                terminal: committedReceipt.terminal,
               };
           // The completed receipt owns the previous correlation. While parked,
           // teardown is a worker-lifecycle event, not a second task outcome.
@@ -4616,6 +4822,8 @@ export async function* runAgent(
     yield { kind: "run_error", error: message, ...taskCorrelation() };
     return result;
   } finally {
+    unsubscribeCrossPolicy?.();
+    unsubscribeCrossPolicy = null;
     let taskReceiptFinalizeError: unknown;
     revokeLiveSession?.();
     const acceptedNotStarted =
@@ -4668,10 +4876,12 @@ export async function* runAgent(
           childRunId: live.agentId,
           cwd: params.worktree?.path ?? parent.sessionConfiguration.cwd,
           model:
+            params.plan?.destination.model ??
             params.model ??
             live.role.config.model ??
             parent.sessionConfiguration.collaborationMode.model,
           modelProvider:
+            params.plan?.destination.provider ??
             readProviderIdentity(parent.services.provider) ??
             parent.services.provider.name,
           originator: "agenc-subagent-preconstruction",
@@ -4688,9 +4898,12 @@ export async function* runAgent(
         if (rolloutPath !== null) live.rolloutPath = rolloutPath;
         if (pendingPreconstructionReceipt !== undefined) {
           const committedReceipt = pendingPreconstructionReceipt;
+          currentCommittedReceipt = committedReceipt;
+          currentReceiptWorktreeEvidence = committedReceipt.worktreeEvidence;
           live.lastTaskReceipt = {
             turnId: committedReceipt.turnId,
             outcome: committedReceipt.outcome,
+            ...(committedReceipt.terminal !== undefined ? { terminal: committedReceipt.terminal } : {}),
           };
           if (
             committedReceipt.taskId !== undefined &&
@@ -4698,7 +4911,7 @@ export async function* runAgent(
           ) {
             live.assignment = undefined;
           }
-          sendParentNotification(committedReceipt);
+          publishTerminalReceipt(committedReceipt);
           pendingPreconstructionReceipt = undefined;
         }
       } catch (error) {
@@ -4731,6 +4944,13 @@ export async function* runAgent(
     if (ownedChildProvider !== null) {
       try {
         await ownedChildProvider.dispose?.();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    if (ownedPreparedProvider !== null && ownedPreparedProvider !== ownedChildProvider) {
+      try {
+        await ownedPreparedProvider.dispose?.();
       } catch (error) {
         cleanupErrors.push(error);
       }
@@ -4796,16 +5016,19 @@ export async function* runAgent(
       live.status.markCompleted(
         pendingWorkerTerminal.turnId,
         pendingWorkerTerminal.message,
+        pendingWorkerTerminal.terminal ?? currentCommittedReceipt?.terminal,
       );
     } else if (pendingWorkerTerminal?.status === "errored") {
       live.status.markErrored(
         pendingWorkerTerminal.turnId,
         pendingWorkerTerminal.error,
+        pendingWorkerTerminal.terminal ?? currentCommittedReceipt?.terminal,
       );
     } else if (pendingWorkerTerminal?.status === "interrupted") {
       live.status.markInterrupted(
         pendingWorkerTerminal.turnId,
         pendingWorkerTerminal.reason,
+        pendingWorkerTerminal.terminal ?? currentCommittedReceipt?.terminal,
       );
     }
   }
