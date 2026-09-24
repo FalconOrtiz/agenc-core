@@ -75,6 +75,7 @@ import {
 } from "./realtime.js";
 import {
   AgenCDaemonConnectionLimiter,
+  daemonCausalRoutineHead,
   type AgenCDaemonOverloadLimitOptions,
 } from "./overload.js";
 import {
@@ -104,6 +105,7 @@ import type { AgenCDaemonProjectTrustService } from "./project-trust.js";
 import {
   AGENC_DAEMON_INTERNAL_METHODS,
   AGENC_DAEMON_METHOD_CAPABILITIES_KEY,
+  AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY,
   AGENC_DAEMON_METHODS,
   AGENC_DAEMON_PROTOCOL_VERSION,
   AGENC_PORTAL_MOBILE_STATUS_PUSH_CAPABILITY,
@@ -485,6 +487,7 @@ function buildServerCapabilities(
     [AGENC_DAEMON_METHOD_CAPABILITIES_KEY]: Object.freeze(
       methodCapabilities,
     ) as AgenCDaemonMethodCapabilities,
+    ...(inputs.routines !== undefined ? { [AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY]: true } : {}),
   }) as AgenCDaemonServerCapabilities;
 }
 
@@ -540,6 +543,7 @@ export interface AgenCDaemonDispatcherOptions {
     readonly setSessionHooksDisabled?: AgenCDaemonAgentManager["setSessionHooksDisabled"];
     readonly updateSessionGoal?: AgenCDaemonAgentManager["updateSessionGoal"];
     readonly getLiveSessionPermission?: AgenCDaemonAgentManager["getLiveSessionPermission"];
+    readonly isLiveSessionToolCallExecuting?: AgenCDaemonAgentManager["isLiveSessionToolCallExecuting"];
   };
   readonly initializeAuthenticator?: (
     params: InitializeParams,
@@ -666,6 +670,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     readonly setSessionHooksDisabled?: AgenCDaemonAgentManager["setSessionHooksDisabled"];
     readonly updateSessionGoal?: AgenCDaemonAgentManager["updateSessionGoal"];
     readonly getLiveSessionPermission?: AgenCDaemonAgentManager["getLiveSessionPermission"];
+    readonly isLiveSessionToolCallExecuting?: AgenCDaemonAgentManager["isLiveSessionToolCallExecuting"];
   };
   readonly #initializeAuthenticator:
     | ((
@@ -893,8 +898,11 @@ export class AgenCDaemonJsonRpcDispatcher {
           const negotiated = negotiateInitializeProtocol(
             initializeParams,
             connection.remoteAccess ? {
-              ...this.#serverCapabilities,
+              ...Object.fromEntries(Object.entries(this.#serverCapabilities).filter(([key]) => key !== AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY)),
               [AGENC_DAEMON_METHOD_CAPABILITIES_KEY]: Object.fromEntries(Object.entries(this.#serverCapabilities[AGENC_DAEMON_METHOD_CAPABILITIES_KEY]).map(([key, value]) => [key, value && connection.remoteAccess!.allowsMethod(key)])) as AgenCDaemonMethodCapabilities,
+              // Match the filtered routine methods in this remote-access view.
+              ...(this.#serverCapabilities[AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY] && connection.remoteAccess.allowsMethod("routine.create") && connection.remoteAccess.allowsMethod("routine.update")
+                ? { [AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY]: true as const } : {}),
             } : this.#serverCapabilities,
           );
           if (!negotiated.supported) {
@@ -977,7 +985,7 @@ export class AgenCDaemonJsonRpcDispatcher {
 
       if (methodSupportsRequestCancellation(method)) {
         return await connection.runCancellableRequest(id, (signal) =>
-          this.#dispatchKnownMethod(connection, id, method, params, signal),
+          this.#dispatchKnownMethod(connection, id, method, params, signal, message),
         );
       }
 
@@ -987,6 +995,7 @@ export class AgenCDaemonJsonRpcDispatcher {
         method,
         params,
         INERT_ABORT_SIGNAL,
+        message,
       );
     } catch (error) {
       return mapDispatchError(id, error);
@@ -1004,7 +1013,12 @@ export class AgenCDaemonJsonRpcDispatcher {
   async #routinePermissionGrant(
     connection: AgenCDaemonJsonRpcConnection,
     authority: RoutinePermissionAuthority | undefined,
+    priorityHeadSessionId?: string,
   ): Promise<RoutinePermissionGrant> {
+    if (priorityHeadSessionId !== undefined &&
+        (authority?.kind !== "session" || authority.toolCallId === undefined)) {
+      throw new RoutineError("ROUTINE_PERMISSION_DENIED", "A bypassed routine write requires its executing session tool call.");
+    }
     if (authority === undefined) return LEGACY_ROUTINE_GRANT;
     const agentManager = this.#agentManager;
     const multiplexer = this.#clientMultiplexer;
@@ -1020,11 +1034,18 @@ export class AgenCDaemonJsonRpcDispatcher {
       operator,
       async liveSession(sessionId) {
         if (agentManager.getLiveSessionPermission === undefined) return undefined;
-        return await agentManager.getLiveSessionPermission(sessionId);
+        return await agentManager.getLiveSessionPermission(sessionId, priorityHeadSessionId);
       },
       async holdsSession(liveSessionId) {
         if (multiplexer?.deliveryHoldsSession === undefined) return false;
         return await multiplexer.deliveryHoldsSession(deliveryKey, liveSessionId);
+      },
+      async executingToolCall(liveSessionId, toolCallId) {
+        // A tool's routine write is part of the turn already streaming on this
+        // connection. Judge it using the session's mode now, like that tool's
+        // other effects. Queued permission changes and attach/detach apply
+        // after the turn under the connection's ordinary FIFO.
+        return (await agentManager.isLiveSessionToolCallExecuting?.(liveSessionId, toolCallId)) === true;
       },
     });
   }
@@ -1066,6 +1087,7 @@ export class AgenCDaemonJsonRpcDispatcher {
     method: AgenCDaemonKnownMethod,
     params: JsonObject,
     signal: AbortSignal,
+    message: JsonObject,
   ): Promise<AgenCDaemonResponse> {
     switch (method) {
       case "audio.whisper.status":
@@ -1101,13 +1123,13 @@ export class AgenCDaemonJsonRpcDispatcher {
       case "routine.create": {
         if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
         const request = this.#routineRequest(connection, params);
-        const grant = await this.#routinePermissionGrant(connection, request.authority);
+        const grant = await this.#routinePermissionGrant(connection, request.authority, daemonCausalRoutineHead(message));
         return successResponse(id, this.#routines.create(request.params, grant));
       }
       case "routine.update": {
         if (this.#routines === undefined) return methodNotImplementedResponse(id, method);
         const request = this.#routineRequest(connection, params);
-        const grant = await this.#routinePermissionGrant(connection, request.authority);
+        const grant = await this.#routinePermissionGrant(connection, request.authority, daemonCausalRoutineHead(message));
         // Checked after the grant's await so nothing interleaves before the update.
         this.#assertRoutineVisible(connection, params);
         return successResponse(id, this.#routines.update(request.params, grant));

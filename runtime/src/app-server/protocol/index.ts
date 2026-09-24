@@ -60,6 +60,9 @@ export const AGENC_DAEMON_PROTOCOL_PUBLISH_TARGET = {
   schemaId: AGENC_DAEMON_PROTOCOL_SCHEMA_ID,
 } as const;
 export const AGENC_DAEMON_METHOD_CAPABILITIES_KEY = "daemon.methods" as const;
+/** A session authority may carry its in-flight toolCallId; that write answers during the turn. */
+export const AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY =
+  "routine.sessionAuthority.v1" as const;
 /**
  * A client advertising this reconciles pending permission requests through
  * `permission.list` (on attach, reconnect or a poll), so it can show a
@@ -225,6 +228,7 @@ export type AgenCDaemonMethodCapabilities = JsonObject & {
 
 export type AgenCDaemonServerCapabilities = JsonObject & {
   readonly [AGENC_DAEMON_METHOD_CAPABILITIES_KEY]: AgenCDaemonMethodCapabilities;
+  readonly [AGENC_ROUTINE_SESSION_AUTHORITY_CAPABILITY]?: true;
 };
 
 /**
